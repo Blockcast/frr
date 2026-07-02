@@ -42,6 +42,7 @@
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_mplsvpn.h"
 #include "bgpd/bgp_evpn.h"
+#include "bgpd/bgp_mvpn.h"
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_updgrp.h"
@@ -327,6 +328,8 @@ int bgp_nlri_parse(struct peer *peer, struct attr *attr,
 					  packet);
 	case SAFI_EVPN:
 		return bgp_nlri_parse_evpn(peer, attr, packet, mp_withdraw);
+	case SAFI_MCAST_VPN:
+		return bgp_nlri_parse_mvpn(peer, attr, packet, mp_withdraw);
 	case SAFI_FLOWSPEC:
 		return bgp_nlri_parse_flowspec(peer, attr, packet, mp_withdraw);
 	case SAFI_BGP_LS:

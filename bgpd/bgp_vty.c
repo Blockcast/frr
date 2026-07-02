@@ -60,6 +60,7 @@
 #include "bgpd/bgp_bfd.h"
 #include "bgpd/bgp_io.h"
 #include "bgpd/bgp_evpn.h"
+#include "bgpd/bgp_mvpn.h"
 #include "bgpd/bgp_evpn_vty.h"
 #include "bgpd/bgp_evpn_mh.h"
 #include "bgpd/bgp_addpath.h"
@@ -22169,6 +22170,9 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 	if (safi == SAFI_MPLS_VPN)
 		bgp_vpn_config_write(vty, bgp, afi, safi);
 
+	if (safi == SAFI_MCAST_VPN)
+		bgp_mvpn_config_write(vty, bgp, afi, safi);
+
 	if (safi == SAFI_UNICAST) {
 		bgp_vpn_policy_config_write_afi(vty, bgp, afi);
 		if (CHECK_FLAG(bgp->af_flags[afi][safi],
@@ -23286,6 +23290,54 @@ static void bgp_vty_if_init(void)
 			&mpls_bgp_l3vpn_multi_domain_switching_cmd);
 }
 
+/* MCAST-VPN (RFC 6514) Global Table Multicast — Route Type 5 Source Active. */
+
+DEFPY (bgp_mvpn_source_active,
+       bgp_mvpn_source_active_cmd,
+       "[no] bgp mvpn source-active A.B.C.D$source group A.B.C.D$group",
+       NO_STR
+       BGP_STR
+       "Multicast VPN (MCAST-VPN) commands\n"
+       "Originate a Global Table Multicast Source Active (Type 5) route\n"
+       "Multicast source address (C-S)\n"
+       "Multicast group\n"
+       "Multicast group address (C-G), SSM range 232.0.0.0/8\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+
+	/* GTM is SSM-only: enforce group in 232.0.0.0/8. */
+	if ((ntohl(group.s_addr) & 0xff000000U) != 0xe8000000U) {
+		vty_out(vty, "%% MCAST-VPN group %pI4 is not in the SSM range 232.0.0.0/8\n",
+			&group);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	return bgp_mvpn_source_active_set(bgp, source, group, !!no);
+}
+
+DEFPY (show_bgp_ipv4_mvpn,
+       show_bgp_ipv4_mvpn_cmd,
+       "show bgp ipv4 mvpn [json$uj]",
+       SHOW_STR
+       BGP_STR
+       "Address Family\n"
+       "Display MCAST-VPN (Source Active) routes\n"
+       JSON_STR)
+{
+	struct bgp *bgp = bgp_get_default();
+
+	if (!bgp) {
+		if (uj)
+			vty_out(vty, "{}\n");
+		else
+			vty_out(vty, "%% No BGP process configured\n");
+		return CMD_SUCCESS;
+	}
+
+	bgp_mvpn_show_routes(vty, bgp, AFI_IP, !!uj);
+	return CMD_SUCCESS;
+}
+
 void bgp_vty_init(void)
 {
 	cmd_variable_handler_register(bgp_var_neighbor);
@@ -23743,6 +23795,11 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV4_MVPN_NODE, &neighbor_activate_cmd);
 	install_element(BGP_IPV6_MVPN_NODE, &neighbor_activate_cmd);
 	install_element(BGP_LS_NODE, &neighbor_activate_cmd);
+
+	/* MCAST-VPN (RFC 6514 GTM) config + show commands. */
+	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_source_active_cmd);
+	install_element(VIEW_NODE, &show_bgp_ipv4_mvpn_cmd);
+	install_element(ENABLE_NODE, &show_bgp_ipv4_mvpn_cmd);
 
 	/* "no neighbor activate" commands. */
 	install_element(BGP_NODE, &no_neighbor_activate_hidden_cmd);

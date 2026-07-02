@@ -50,6 +50,7 @@
 #include "bgpd/bgp_trace.h"
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_unreach.h"
+#include "bgpd/bgp_mvpn.h"
 
 /* Attribute strings for logging. */
 static const struct message attr_str[] = {
@@ -4966,6 +4967,10 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 			stream_putc(s, 0); /* no nexthop for unreachability */
 			break;
 		case SAFI_MCAST_VPN:
+			/* GTM (RFC 7716): plain IPv4 next hop, no RD prefix. */
+			stream_putc(s, BGP_ATTR_NHLEN_IPV4);
+			stream_put_ipv4(s, attr->nexthop.s_addr);
+			break;
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			assert(!"SAFI's UNSPEC or MAX being specified are a DEV ESCAPE");
@@ -5030,6 +5035,10 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 			stream_putc(s, 0); /* no nexthop for unreachability */
 			break;
 		case SAFI_MCAST_VPN:
+			/* GTM (RFC 7716): plain IPv6 global next hop. */
+			stream_putc(s, IPV6_MAX_BYTELEN);
+			stream_put(s, &attr->mp_nexthop_global, IPV6_MAX_BYTELEN);
+			break;
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			assert(!"SAFI's UNSPEC or MAX being specified are a DEV ESCAPE");
@@ -5190,8 +5199,10 @@ void bgp_packet_mpattr_prefix(struct stream *s, afi_t afi, safi_t safi, const st
 	switch (safi) {
 	case SAFI_UNSPEC:
 	case SAFI_MAX:
-	case SAFI_MCAST_VPN:
 		assert(!"Dev escape usage of SAFI_UNSPEC or MAX");
+		break;
+	case SAFI_MCAST_VPN:
+		bgp_mvpn_encode_type5(s, p, addpath_capable, addpath_tx_id);
 		break;
 	case SAFI_MPLS_VPN:
 		if (addpath_capable)
@@ -5316,8 +5327,11 @@ size_t bgp_packet_mpattr_prefix_size(afi_t afi, safi_t safi,
 	switch (safi) {
 	case SAFI_UNSPEC:
 	case SAFI_MAX:
-	case SAFI_MCAST_VPN:
 		assert(!"Attempting to figure size for a SAFI_UNSPEC/SAFI_MAX this is a DEV ESCAPE");
+		break;
+	case SAFI_MCAST_VPN:
+		/* RFC 6514 Type-5 (IPv4): RouteType(1) + Length(1) + spec(18). */
+		size = BGP_MVPN_TYPE5_V4_NLRI_LEN;
 		break;
 	case SAFI_UNICAST:
 	case SAFI_MULTICAST:

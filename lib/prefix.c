@@ -343,6 +343,8 @@ void prefix_copy(union prefixptr udest, union prefixconstptr usrc)
 	} else if (src->family == AF_EVPN) {
 		memcpy(&dest->u.prefix_evpn, &src->u.prefix_evpn,
 		       sizeof(struct evpn_addr));
+	} else if (src->family == AF_MVPN) {
+		memcpy(&dest->u.prefix_mvpn, &src->u.prefix_mvpn, sizeof(struct mvpn_addr));
 	} else if (src->family == AF_UNSPEC) {
 		dest->u.lp.id = src->u.lp.id;
 		dest->u.lp.adv_router = src->u.lp.adv_router;
@@ -436,6 +438,10 @@ int prefix_same(union prefixconstptr up1, union prefixconstptr up2)
 				return 1;
 		if (p1->family == AF_EVPN)
 			if (evpn_addr_same(&p1->u.prefix_evpn, &p2->u.prefix_evpn))
+				return 1;
+		if (p1->family == AF_MVPN)
+			if (!memcmp(&p1->u.prefix_mvpn, &p2->u.prefix_mvpn,
+				    sizeof(struct mvpn_addr)))
 				return 1;
 		if (p1->family == AF_FLOWSPEC) {
 			if (p1->u.prefix_flowspec.family !=
@@ -1184,6 +1190,17 @@ const char *prefix2str(union prefixconstptr pu, char *str, int size)
 	case AF_EVPN:
 		prefixevpn2str((const struct prefix_evpn *)p, str, size);
 		break;
+
+	case AF_MVPN: {
+		const struct mvpn_addr *m = &p->u.prefix_mvpn;
+		char srcbuf[INET_ADDRSTRLEN];
+		char grpbuf[INET_ADDRSTRLEN];
+
+		inet_ntop(AF_INET, &m->src, srcbuf, sizeof(srcbuf));
+		inet_ntop(AF_INET, &m->grp, grpbuf, sizeof(grpbuf));
+		snprintf(str, size, "[%u]:[%s]:[%s]", m->route_type, srcbuf, grpbuf);
+		break;
+	}
 
 	case AF_FLOWSPEC:
 		strlcpy(str, "FS prefix", size);

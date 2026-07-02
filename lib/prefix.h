@@ -125,6 +125,17 @@ struct evpn_addr {
 #define prefix_addr u._prefix_addr
 };
 
+/* MCAST-VPN address (RFC 6514), constrained to Global Table Multicast
+ * (RFC 7716). Only the fields needed to key a Route Type 5 (Source Active
+ * A-D) route are carried: the Route Distinguisher is always zero under GTM
+ * (single global table), so it is not stored here.
+ */
+struct mvpn_addr {
+	uint8_t route_type;
+	struct in_addr src; /* C-S (multicast source) */
+	struct in_addr grp; /* C-G (multicast group)  */
+};
+
 /*
  * A struct prefix contains an address family, a prefix length, and an
  * address.  This can represent either a 'network prefix' as defined
@@ -158,6 +169,10 @@ struct evpn_addr {
 #define AF_FLOWSPEC (AF_MAX + 2)
 #endif
 
+#if !defined(AF_MVPN)
+#define AF_MVPN (AF_MAX + 3)
+#endif
+
 struct flowspec_prefix {
 	uint8_t family;
 	uint16_t prefixlen; /* length in bytes */
@@ -182,6 +197,7 @@ struct prefix {
 		uintptr_t ptr;
 		struct evpn_addr prefix_evpn; /* AF_EVPN */
 		struct flowspec_prefix prefix_flowspec; /* AF_FLOWSPEC */
+		struct mvpn_addr prefix_mvpn;		/* AF_MVPN */
 	} u __attribute__((aligned(8)));
 };
 
@@ -225,6 +241,13 @@ struct prefix_evpn {
 	uint8_t family;
 	uint16_t prefixlen;
 	struct evpn_addr prefix __attribute__((aligned(8)));
+};
+
+/* MCAST-VPN prefix structure (RFC 6514, GTM per RFC 7716). */
+struct prefix_mvpn {
+	uint8_t family;
+	uint16_t prefixlen;
+	struct mvpn_addr prefix __attribute__((aligned(8)));
 };
 
 static inline int is_evpn_prefix_ipaddr_none(const struct prefix_evpn *evp)

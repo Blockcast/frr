@@ -24,11 +24,9 @@ Topology:
 
 Both routers run `router bgp 65001`, peer over the shared subnet, and enable
 `address-family ipv4 mvpn` with `neighbor <peer> activate`. The test asserts
-the MVPN AF is advertised and received in the multiprotocol capability.
-
-NOTE: This scaffold exercises AF registration and capability negotiation only.
-No MVPN NLRI encode/decode logic exists yet (that is a later task), so this
-test intentionally does not assert on any MVPN route exchange.
+the MVPN AF is advertised and received in the multiprotocol capability, and
+that a locally-originated Route Type 5 (Source Active A-D, RFC 6514 / GTM
+RFC 7716) route on r1 propagates to r2.
 """
 
 import os
@@ -131,6 +129,34 @@ def test_mvpn_af_negotiated():
             router
         )
 
+
+def test_type5_source_active_propagates():
+    """A local GTM Source Active (Type 5) route on r1 must reach r2 via BGP.
+
+    r1 is configured with `bgp mvpn source-active 10.10.10.1 group 232.1.1.1`
+    under `address-family ipv4 mvpn`. r2 must learn it and expose it via
+    `show bgp ipv4 mvpn json` with routeType 5 and the matching (S,G).
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _type5_present(router):
+        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv4 mvpn json"))
+        routes = out.get("routes", [])
+        for r in routes:
+            if (
+                r.get("routeType") == 5
+                and r.get("source") == "10.10.10.1"
+                and r.get("group") == "232.1.1.1"
+            ):
+                return None
+        return "Type-5 (10.10.10.1, 232.1.1.1) not found in {}".format(routes)
+
+    test_func = functools.partial(_type5_present, "r2")
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, "r2 did not learn r1's MVPN Type-5 Source Active route"
 
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
