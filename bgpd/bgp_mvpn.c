@@ -501,8 +501,11 @@ static bool bgp_mvpn_gtm_af_active(struct bgp *bgp)
  * KNOWN LIMITATION (GTM MVP): on a router-id X->Y change this originates the new
  * Type-1 keyed by Y but does not withdraw the stale one keyed by X, so the PE
  * briefly advertises two I-PMSI A-D routes until the session/AF refreshes. The
- * startup 0.0.0.0->addr path is clean (no prior route). Follow-up: withdraw the
- * old-router-id Type-1 before re-originating, as
+ * startup 0.0.0.0->addr path is clean (no prior route). Likewise, deactivating
+ * the GTM MVPN AF (or tearing down the bgp instance) does not withdraw this
+ * self-originated Type-1, leaving a stale I-PMSI A-D marker until peers age it
+ * out. Follow-up (both cases): a bgp_mvpn_withdraw_type1(bgp, old_id) hook
+ * called before re-originating and on AF-deactivate/teardown, as
  * bgp_evpn_handle_router_id_update does.
  */
 void bgp_mvpn_originate_type1(struct bgp *bgp)

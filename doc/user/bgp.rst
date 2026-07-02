@@ -4483,9 +4483,12 @@ not yet implemented.
    with the router-id as the tunnel endpoint is automatically originated.
    Only the IPv4 MCAST-VPN address family is currently available;
    ``address-family ipv6 mvpn`` is gated until the IPv6 NLRI codec lands
-   (a later plan). A router-id change may transiently
-   leave a stale Intra-AS I-PMSI A-D route keyed by the old router-id until
-   the session or address family refreshes.
+   (a later plan). Two transient staleness cases exist in this MVP: a
+   router-id change leaves a stale Intra-AS I-PMSI A-D route keyed by the
+   old router-id, and deactivating the MCAST-VPN address family (or tearing
+   down the BGP instance) does not withdraw this PE's self-originated
+   Intra-AS I-PMSI A-D route. Both clear when the session or address family
+   refreshes.
 
 .. clicmd:: bgp mvpn source-active A.B.C.D group A.B.C.D
 

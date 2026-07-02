@@ -120,6 +120,13 @@ afi_t family2afi(int family)
 		return AFI_IP6;
 	else if (family == AF_ETHERNET || family == AF_EVPN)
 		return AFI_L2VPN;
+	else if (family == AF_MVPN)
+		/*
+		 * v4-only in the GTM MVP. When the IPv6 MCAST-VPN NLRI codec
+		 * lands, derive the AFI from the inner (S,G) address rather than
+		 * from AF_MVPN alone, which spans both v4 and v6.
+		 */
+		return AFI_IP;
 	return 0;
 }
 
@@ -555,6 +562,10 @@ int prefix_common_bits(union prefixconstptr ua, union prefixconstptr ub)
 		length = ETH_ALEN;
 	if (p1->family == AF_EVPN)
 		length = 8 * sizeof(struct evpn_addr);
+	/*
+	 * AF_MVPN intentionally omitted: GTM host routes (route-type/src/grp)
+	 * are not aggregated, so length stays 0 and this returns -1 below.
+	 */
 
 	if (p1->family != p2->family || !length)
 		return -1;
@@ -586,6 +597,8 @@ const char *prefix_family_str(union prefixconstptr pu)
 		return "ether";
 	if (p->family == AF_EVPN)
 		return "evpn";
+	if (p->family == AF_MVPN)
+		return "mvpn";
 	return "unspec";
 }
 
