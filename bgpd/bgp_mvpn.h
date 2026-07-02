@@ -20,7 +20,7 @@
  * Source Active) and 7 (C-multicast Source Tree Join) are implemented.
  */
 #define BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI   1
-#define BGP_MVPN_ROUTE_TYPE_SOURCE_ACTIVE 5
+#define BGP_MVPN_ROUTE_TYPE_SOURCE_ACTIVE    5
 #define BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN 7
 
 /*

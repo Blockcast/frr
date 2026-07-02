@@ -244,6 +244,123 @@ def test_type1_ipmsi_with_ir_pmsi():
     assert result is None, "r2 did not learn r1's MVPN Type-1 Intra-AS I-PMSI route"
 
 
+def test_plan1_full_mvpn_exchange():
+    """Plan-1 end-to-end: SAFI-5 session + Type-1/5/7 exchange in one scenario.
+
+    Combined assertion over the whole Plan-1 deliverable: with the iBGP
+    session Established and the MVPN AF negotiated, BOTH peers' MVPN tables
+    (`show bgp ipv4 mvpn json`) must simultaneously contain the full expected
+    route mix:
+
+    - r2 sees r1's Type-1 Intra-AS I-PMSI A-D with an Ingress Replication
+      PMSI tunnel and endpoint 10.0.0.1, AND r1's Type-5 Source Active for
+      (10.10.10.1, 232.1.1.1).
+    - r1 sees r2's Type-1 with endpoint 10.0.0.2, AND (after the test-only
+      Type-7 inject on r2) r2's Type-7 Source Tree Join for
+      (10.10.10.1, 232.1.1.1) carrying Source AS 65001.
+
+    All of this is RIB-level control plane; forwarding is a later milestone.
+
+    AUTHORED-NOT-RUN: this repo has no network namespaces, so the topotest is
+    authored and py_compile-checked but not executed here.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _established(router, peer):
+        output = json.loads(
+            tgen.gears[router].vtysh_cmd(
+                "show bgp neighbor {} json".format(peer)
+            )
+        )
+        expected = {peer: {"bgpState": "Established"}}
+        return topotest.json_cmp(output, expected)
+
+    for router, peer in (("r1", "10.0.0.2"), ("r2", "10.0.0.1")):
+        test_func = functools.partial(_established, router, peer)
+        _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+        assert result is None, "{}: session with {} not Established".format(
+            router, peer
+        )
+
+    # Re-assert the test-only Type-7 inject on r2. Idempotent, so this keeps
+    # the combined test self-contained regardless of per-type test ordering.
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+router bgp 65001
+ address-family ipv4 mvpn
+  bgp mvpn test-join 10.10.10.1 group 232.1.1.1 source-as 65001
+"""
+    )
+
+    def _has_type1(routes, endpoint):
+        for r in routes:
+            if r.get("routeType") != 1:
+                continue
+            pmsi = r.get("pmsiTunnel", {})
+            if (
+                pmsi.get("type") == "ingressReplication"
+                and pmsi.get("endpoint") == endpoint
+            ):
+                return True
+        return False
+
+    def _has_type5(routes, source, group):
+        for r in routes:
+            if (
+                r.get("routeType") == 5
+                and r.get("source") == source
+                and r.get("group") == group
+            ):
+                return True
+        return False
+
+    def _has_type7(routes, source, group, source_as):
+        for r in routes:
+            if (
+                r.get("routeType") == 7
+                and r.get("source") == source
+                and r.get("group") == group
+                and r.get("sourceAs") == source_as
+            ):
+                return True
+        return False
+
+    def _full_exchange():
+        r1_routes = json.loads(
+            tgen.gears["r1"].vtysh_cmd("show bgp ipv4 mvpn json")
+        ).get("routes", [])
+        r2_routes = json.loads(
+            tgen.gears["r2"].vtysh_cmd("show bgp ipv4 mvpn json")
+        ).get("routes", [])
+
+        missing = []
+        if not _has_type1(r2_routes, "10.0.0.1"):
+            missing.append("r2 lacks r1's Type-1 (IR endpoint 10.0.0.1)")
+        if not _has_type5(r2_routes, "10.10.10.1", "232.1.1.1"):
+            missing.append("r2 lacks r1's Type-5 (10.10.10.1, 232.1.1.1)")
+        if not _has_type1(r1_routes, "10.0.0.2"):
+            missing.append("r1 lacks r2's Type-1 (IR endpoint 10.0.0.2)")
+        if not _has_type7(r1_routes, "10.10.10.1", "232.1.1.1", 65001):
+            missing.append(
+                "r1 lacks r2's Type-7 (10.10.10.1, 232.1.1.1, AS 65001)"
+            )
+
+        if missing:
+            return "{} [r1={} r2={}]".format(
+                "; ".join(missing), r1_routes, r2_routes
+            )
+        return None
+
+    _, result = topotest.run_and_expect(_full_exchange, None, count=60, wait=1)
+    assert result is None, "Plan-1 full MVPN exchange incomplete: {}".format(
+        result
+    )
+
+
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
     sys.exit(pytest.main(args))

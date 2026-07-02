@@ -4457,6 +4457,46 @@ This makes it possible to separate not only layer 3 networks like VRF-lite netwo
 Also, VRF netns based make possible to separate layer 2 networks on separate VRF
 instances.
 
+.. _bgp-mcast-vpn-gtm:
+
+MCAST-VPN Global Table Multicast
+--------------------------------
+
+*bgpd* supports a subset of the BGP Multicast VPN (MCAST-VPN) address family
+(:rfc:`6514`, SAFI 5) operating in Global Table Multicast mode
+(:rfc:`7716`): multicast state is exchanged for the global routing table,
+with the Route Distinguisher always set to 0. Only Source-Specific
+Multicast groups (232.0.0.0/8) are supported, and the PMSI tunnel type is
+Ingress Replication. Route Types 1 (Intra-AS I-PMSI A-D), 5 (Source Active
+A-D) and 7 (C-Multicast Source Tree Join) are exchanged. This is a
+RIB-level control plane: MCAST-VPN routes are originated, propagated and
+displayed, but multicast data-plane forwarding driven by these routes is
+not yet implemented.
+
+.. clicmd:: address-family <ipv4|ipv6> mvpn
+
+   Enter the MCAST-VPN address family under ``router bgp``. Neighbors must
+   be activated in this address family with ``neighbor PEER activate`` for
+   the MVPN multiprotocol capability to be negotiated. When the IPv4
+   MCAST-VPN address family is enabled, an Intra-AS I-PMSI A-D route
+   (Route Type 1) carrying an Ingress Replication PMSI tunnel attribute
+   with the router-id as the tunnel endpoint is automatically originated.
+   The IPv6 address family currently only negotiates the capability; route
+   origination commands are IPv4-only.
+
+.. clicmd:: bgp mvpn source-active A.B.C.D group A.B.C.D
+
+   Under ``address-family ipv4 mvpn``, originate a Source Active A-D route
+   (Route Type 5) for the given (S,G). The group address must be in the
+   SSM range 232.0.0.0/8; other groups are rejected. The Route
+   Distinguisher is always 0 (Global Table Multicast).
+
+.. clicmd:: show bgp ipv4 mvpn [json]
+
+   Display the MCAST-VPN table of the default BGP instance. Each entry
+   reports its route type, originator, (S,G) where applicable, and, for
+   Route Type 1 routes, the PMSI tunnel type and endpoint.
+
 .. _bgp-conditional-advertisement:
 
 BGP Conditional Advertisement
