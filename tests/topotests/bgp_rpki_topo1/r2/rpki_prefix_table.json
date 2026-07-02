@@ -1,0 +1,30 @@
+{
+  "prefixes":[
+    {
+      "prefix":"10.0.0.0",
+      "prefixLenMin":24,
+      "prefixLenMax":24,
+      "asn":65099
+    },
+    {
+      "prefix":"198.51.100.0",
+      "prefixLenMin":24,
+      "prefixLenMax":24,
+      "asn":65530
+    },
+    {
+      "prefix":"203.0.113.0",
+      "prefixLenMin":24,
+      "prefixLenMax":24,
+      "asn":65530
+    },
+    {
+      "prefix":"2001:db8:1::",
+      "prefixLenMin":48,
+      "prefixLenMax":48,
+      "asn":65530
+    }
+  ],
+  "ipv4PrefixCount":3,
+  "ipv6PrefixCount":1
+}

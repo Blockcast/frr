@@ -1,0 +1,246 @@
+// SPDX-License-Identifier: ISC
+/*	$OpenBSD$ */
+
+/*
+ * Copyright (c) 2013, 2016 Renato Westphal <renato@openbsd.org>
+ * Copyright (c) 2009 Michele Marchetto <michele@openbsd.org>
+ * Copyright (c) 2004, 2005 Esben Norby <norby@openbsd.org>
+ */
+
+#ifndef _LDE_H_
+#define _LDE_H_
+
+#include "queue.h"
+#include "openbsd-tree.h"
+#include "if.h"
+
+enum fec_type {
+	FEC_TYPE_IPV4,
+	FEC_TYPE_IPV6,
+	FEC_TYPE_PWID
+};
+
+struct fec {
+	RB_ENTRY(fec)		entry;
+	enum fec_type		type;
+	union {
+		struct {
+			struct in_addr	prefix;
+			uint8_t		prefixlen;
+		} ipv4;
+		struct {
+			struct in6_addr	prefix;
+			uint8_t		prefixlen;
+		} ipv6;
+		struct {
+			uint16_t	type;
+			uint32_t	pwid;
+			struct in_addr	lsr_id;
+		} pwid;
+	} u;
+};
+RB_HEAD(fec_tree, fec);
+RB_PROTOTYPE(fec_tree, fec, entry, fec_compare)
+
+/* request entries */
+struct lde_req {
+	struct fec		 fec;
+	uint32_t		 msg_id;
+};
+
+/* mapping entries */
+struct lde_map {
+	struct fec		 fec;
+	struct lde_map_head	*head;	/* fec_node's upstream/downstream */
+	RB_ENTRY(lde_map)	 entry;
+	struct lde_nbr		*nexthop;
+	struct map		 map;
+};
+RB_HEAD(lde_map_head, lde_map);
+RB_PROTOTYPE(lde_map_head, lde_map, entry, lde_map_cmp);
+
+/* withdraw entries */
+struct lde_wdraw {
+	struct fec		 fec;
+	uint32_t		 label;
+};
+
+/* Addresses belonging to neighbor */
+struct lde_addr {
+	TAILQ_ENTRY(lde_addr)	 entry;
+	int			 af;
+	union ldpd_addr		 addr;
+};
+
+/* just the info LDE needs */
+struct lde_nbr {
+	RB_ENTRY(lde_nbr)	 entry;
+	uint32_t		 peerid;
+	struct in_addr		 id;
+	int			 v4_enabled;	/* announce/process v4 msgs */
+	int			 v6_enabled;	/* announce/process v6 msgs */
+	int			 flags;		/* capabilities */
+	struct fec_tree		 recv_req;
+	struct fec_tree		 sent_req;
+	struct fec_tree		 recv_map;
+	struct fec_tree		 sent_map;
+	struct fec_tree		 sent_map_pending;
+	struct fec_tree		 sent_wdraw;
+	TAILQ_HEAD(, lde_addr)	 addr_list;
+};
+RB_HEAD(nbr_tree, lde_nbr);
+RB_PROTOTYPE(nbr_tree, lde_nbr, entry, lde_nbr_compare)
+
+struct fec_nh {
+	LIST_ENTRY(fec_nh)	 entry;
+	int			 af;
+	union ldpd_addr		 nexthop;
+	ifindex_t		 ifindex;
+	uint32_t		 remote_label;
+	uint8_t			 route_type;
+	unsigned short		 route_instance;
+	uint8_t			 flags;
+};
+#define F_FEC_NH_NEW		0x01
+#define F_FEC_NH_CONNECTED	0x02
+#define F_FEC_NH_DEFER		0x04		/* running ordered control */
+#define F_FEC_NH_NO_LDP		0x08		/* no ldp on this interface */
+
+struct fec_node {
+	struct fec		 fec;
+
+	LIST_HEAD(, fec_nh)	 nexthops;	/* fib nexthops */
+	struct lde_map_head	 downstream;	/* recv mappings */
+	struct lde_map_head	 upstream;	/* sent mappings */
+
+	uint32_t		 local_label;
+
+	uint32_t		 pw_remote_status;
+
+	void			*data;		/* fec specific data */
+};
+
+#define CHUNK_SIZE		64
+struct label_chunk {
+	uint32_t		 start;
+	uint32_t		 end;
+	uint64_t		 used_mask;
+};
+
+#define LDE_GC_INTERVAL 300
+
+extern struct ldpd_conf	*ldeconf;
+extern struct fec_tree	 ft;
+extern struct nbr_tree	 lde_nbrs;
+extern struct event *gc_timer;
+
+/* lde.c */
+void		 lde(void);
+void lde_init(struct ldpd_init *init);
+int lde_imsg_compose_parent(int type, pid_t pid, void *data, uint16_t datalen);
+void lde_imsg_compose_parent_sync(int type, pid_t pid, void *data, uint16_t datalen);
+int lde_imsg_compose_ldpe(int type, uint32_t peerid, pid_t pid, void *data, uint16_t datalen);
+int lde_acl_check(char *acl_name, int af, union ldpd_addr *addr, uint8_t prefixlen);
+uint32_t lde_update_label(struct fec_node *fn);
+void		 lde_free_label(uint32_t label);
+void lde_send_change_klabel(struct fec_node *fn, struct fec_nh *fnh);
+void lde_send_delete_klabel(struct fec_node *fn, struct fec_nh *fnh);
+void		 lde_fec2prefix(const struct fec *fec, struct prefix *prefix);
+void		 lde_prefix2fec(const struct prefix *prefix, struct fec *fec);
+void lde_fec2map(struct fec *fec, struct map *map);
+void lde_map2fec(struct map *map, struct in_addr lsr_id, struct fec *fec);
+void lde_send_labelmapping(struct lde_nbr *ln, struct fec_node *fn, int single);
+void lde_send_labelwithdraw(struct lde_nbr *ln, struct fec_node *fn, struct map *wcard,
+			    struct status_tlv *st);
+void lde_send_labelwithdraw_wcard(struct lde_nbr *ln, uint32_t label);
+void lde_send_labelwithdraw_twcard_prefix(struct lde_nbr *ln, uint16_t af, uint32_t label);
+void lde_send_labelwithdraw_twcard_pwid(struct lde_nbr *ln, uint16_t pw_type, uint32_t label);
+void lde_send_labelwithdraw_pwid_wcard(struct lde_nbr *ln, uint16_t pw_type, uint32_t group_id);
+void lde_send_labelrelease(struct lde_nbr *ln, struct fec_node *fn, struct map *wcard,
+			   uint32_t label);
+void lde_send_labelrequest(struct lde_nbr *ln, struct fec_node *fn, struct map *wcard, int single);
+void lde_send_labelrequest_wcard(struct lde_nbr *ln, uint16_t af);
+void lde_send_notification(struct lde_nbr *ln, uint32_t status_code, uint32_t msg_id,
+			   uint16_t msg_type);
+void lde_send_notification_eol_prefix(struct lde_nbr *ln, int af);
+void lde_send_notification_eol_pwid(struct lde_nbr *ln, uint16_t pw_type);
+struct lde_nbr *lde_nbr_find_by_lsrid(struct in_addr addr);
+struct lde_nbr *lde_nbr_find_by_addr(int af, union ldpd_addr *addr);
+struct lde_map *lde_map_add(struct lde_nbr *ln, struct fec_node *fn, int sent);
+void lde_map_del(struct lde_nbr *ln, struct lde_map *me, int sent);
+struct fec *lde_map_pending_add(struct lde_nbr *ln, struct fec_node *fn);
+void lde_map_pending_del(struct lde_nbr *ln, struct fec *map);
+struct lde_req *lde_req_add(struct lde_nbr *ln, struct fec *fec, int sent);
+void lde_req_del(struct lde_nbr *ln, struct lde_req *lre, int sent);
+struct lde_wdraw *lde_wdraw_add(struct lde_nbr *ln, struct fec_node *fn);
+void lde_wdraw_del(struct lde_nbr *ln, struct lde_wdraw *lw);
+void lde_change_egress_label(int af);
+void lde_change_allocate_filter(int af);
+void lde_change_advertise_filter(int af);
+void lde_change_accept_filter(int af);
+void lde_change_expnull_for_filter(int af);
+void lde_route_update(struct iface *iface, int af);
+void lde_route_update_release(struct iface *iface, int af);
+void lde_route_update_release_all(int af);
+struct lde_addr *lde_address_find(struct lde_nbr *ln, int af, union ldpd_addr *addr);
+void		 lde_allow_broken_lsp_update(int new_config);
+
+/* lde_lib.c */
+void fec_init(struct fec_tree *fh);
+struct fec *fec_find(struct fec_tree *fh, struct fec *f);
+int fec_insert(struct fec_tree *fh, struct fec *f);
+int fec_remove(struct fec_tree *fh, struct fec *f);
+void fec_clear(struct fec_tree *fh, void (*free_cb)(void *));
+void rt_dump(pid_t pid);
+void fec_snap(struct lde_nbr *ln);
+void		 fec_tree_clear(void);
+struct fec_nh *fec_nh_find(struct fec_node *fn, int af, union ldpd_addr *nexthop,
+			   ifindex_t ifindex, uint8_t route_type, unsigned short route_instance);
+void lde_kernel_insert(struct fec *fec, int af, union ldpd_addr *nexthop, ifindex_t ifindex,
+		       uint8_t priority, unsigned short route_type, int route_instance,
+		       void *zclient);
+void lde_kernel_remove(struct fec *fec, int af, union ldpd_addr *nexthop, ifindex_t ifindex,
+		       uint8_t priority, unsigned short route_type);
+void lde_kernel_update(struct fec *fec);
+void lde_check_mapping(struct map *map, struct lde_nbr *ln, int rcvd_label_mapping);
+void lde_check_request(struct map *map, struct lde_nbr *ln);
+void lde_check_request_wcard(struct map *map, struct lde_nbr *ln);
+void lde_check_release(struct map *map, struct lde_nbr *ln);
+void lde_check_release_wcard(struct map *map, struct lde_nbr *ln);
+void lde_check_withdraw(struct map *map, struct lde_nbr *ln);
+void lde_check_withdraw_wcard(struct map *map, struct lde_nbr *ln);
+int lde_wildcard_apply(struct map *wcard, struct fec *fec, struct lde_map *me);
+void lde_gc_timer(struct event *event);
+void		 lde_gc_start_timer(void);
+void		 lde_gc_stop_timer(void);
+
+/* l2vpn.c */
+struct l2vpn *l2vpn_new(const char *name);
+struct l2vpn *l2vpn_find(struct ldpd_conf *xconf, const char *name);
+void l2vpn_del(struct l2vpn *l2vpn);
+void l2vpn_init(struct l2vpn *l2vpn);
+void l2vpn_exit(struct l2vpn *l2vpn);
+struct l2vpn_if *l2vpn_if_new(struct l2vpn *l2vpn, const char *ifname);
+struct l2vpn_if *l2vpn_if_find(struct l2vpn *l2vpn, const char *ifname);
+void l2vpn_if_update_info(struct l2vpn_if *lif, struct kif *kif);
+void l2vpn_if_update(struct l2vpn_if *lif);
+struct l2vpn_pw *l2vpn_pw_new(struct l2vpn *l2vpn, const char *ifname);
+struct l2vpn_pw *l2vpn_pw_find(struct l2vpn *l2vpn, const char *ifname);
+struct l2vpn_pw *l2vpn_pw_find_active(struct l2vpn *l2vpn, const char *ifname);
+struct l2vpn_pw *l2vpn_pw_find_inactive(struct l2vpn *l2vpn, const char *ifname);
+void l2vpn_pw_update_info(struct l2vpn_pw *pw, struct kif *kif);
+void l2vpn_pw_init(struct l2vpn_pw *pw);
+void l2vpn_pw_exit(struct l2vpn_pw *pw);
+void l2vpn_pw_reset(struct l2vpn_pw *pw);
+int l2vpn_pw_ok(struct l2vpn_pw *pw, struct fec_nh *fnh);
+int l2vpn_pw_negotiate(struct lde_nbr *ln, struct fec_node *fn, struct map *map);
+void l2vpn_send_pw_status(struct lde_nbr *ln, uint32_t status, struct fec *fec);
+void l2vpn_send_pw_status_wcard(struct lde_nbr *ln, uint32_t status, uint16_t pw_type,
+				uint32_t group_id);
+void l2vpn_recv_pw_status(struct lde_nbr *ln, struct notify_msg *nm);
+void l2vpn_recv_pw_status_wcard(struct lde_nbr *ln, struct notify_msg *nm);
+int l2vpn_pw_status_update(struct zapi_pw_status *zpw);
+void l2vpn_pw_ctl(pid_t pid);
+void l2vpn_binding_ctl(pid_t pid);
+
+#endif	/* _LDE_H_ */

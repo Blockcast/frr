@@ -1,0 +1,682 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * PIM for Quagga
+ * Copyright (C) 2008  Everton da Silva Marques
+ */
+
+#include <zebra.h>
+
+#include "if.h"
+#include "linklist.h"
+#include "prefix.h"
+#include "vty.h"
+#include "vrf.h"
+#include "plist.h"
+#include "plist_int.h"
+#include "filter.h"
+
+#include "pimd.h"
+#include "pim_vty.h"
+#include "pim_iface.h"
+#include "pim_str.h"
+#include "pim_ssmpingd.h"
+#include "pim_pim.h"
+#include "pim_oil.h"
+#include "pim_static.h"
+#include "pim_rp.h"
+#include "pim_msdp.h"
+#include "pim_ssm.h"
+#include "pim_dm.h"
+#include "pim_bfd.h"
+#include "pim_bsm.h"
+#include "pim_vxlan.h"
+#include "pim_nht.h"
+#include "pim6_mld.h"
+
+int pim_debug_config_write(struct vty *vty)
+{
+	int writes = 0;
+
+	if (PIM_DEBUG_MSDP_EVENTS) {
+		vty_out(vty, "debug msdp events\n");
+		++writes;
+	}
+	if (PIM_DEBUG_MSDP_PACKETS) {
+		vty_out(vty, "debug msdp packets\n");
+		++writes;
+	}
+	if (PIM_DEBUG_MSDP_INTERNAL) {
+		vty_out(vty, "debug msdp internal\n");
+		++writes;
+	}
+	if (PIM_DEBUG_GM_EVENTS) {
+		vty_out(vty, "debug " GM_AF_DBG " events\n");
+		++writes;
+	}
+	if (PIM_DEBUG_GM_PACKETS) {
+		vty_out(vty, "debug " GM_AF_DBG " packets\n");
+		++writes;
+	}
+	/* PIM_DEBUG_GM_TRACE catches _DETAIL too */
+	if (router->debugs & PIM_MASK_GM_TRACE) {
+		vty_out(vty, "debug " GM_AF_DBG " trace\n");
+		++writes;
+	}
+	if (PIM_DEBUG_GM_TRACE_DETAIL) {
+		vty_out(vty, "debug " GM_AF_DBG " trace detail\n");
+		++writes;
+	}
+
+	/* PIM_DEBUG_MROUTE catches _DETAIL too */
+	if (router->debugs & PIM_MASK_MROUTE) {
+		vty_out(vty, "debug " PIM_MROUTE_DBG "\n");
+		++writes;
+	}
+	if (PIM_DEBUG_MROUTE_DETAIL) {
+		vty_out(vty, "debug " PIM_MROUTE_DBG " detail\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_MTRACE) {
+		vty_out(vty, "debug mtrace\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_PIM_EVENTS) {
+		vty_out(vty, "debug " PIM_AF_DBG " events\n");
+		++writes;
+	}
+	if (PIM_DEBUG_PIM_PACKETS) {
+		vty_out(vty, "debug " PIM_AF_DBG " packets\n");
+		++writes;
+	}
+	if (PIM_DEBUG_PIM_PACKETDUMP_SEND) {
+		vty_out(vty, "debug " PIM_AF_DBG " packet-dump send\n");
+		++writes;
+	}
+	if (PIM_DEBUG_PIM_PACKETDUMP_RECV) {
+		vty_out(vty, "debug " PIM_AF_DBG " packet-dump receive\n");
+		++writes;
+	}
+
+	/* PIM_DEBUG_PIM_TRACE catches _DETAIL too */
+	if (router->debugs & PIM_MASK_PIM_TRACE) {
+		vty_out(vty, "debug " PIM_AF_DBG " trace\n");
+		++writes;
+	}
+	if (PIM_DEBUG_PIM_TRACE_DETAIL) {
+		vty_out(vty, "debug " PIM_AF_DBG " trace detail\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_ZEBRA) {
+		vty_out(vty, "debug " PIM_AF_DBG " zebra\n");
+		++writes;
+	}
+
+        if (PIM_DEBUG_MLAG) {
+                vty_out(vty, "debug pim mlag\n");
+                ++writes;
+        }
+
+	if (PIM_DEBUG_BSM) {
+		vty_out(vty, "debug " PIM_AF_DBG " bsm\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_VXLAN) {
+		vty_out(vty, "debug " PIM_AF_DBG " vxlan\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_SSMPINGD) {
+		vty_out(vty, "debug ssmpingd\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_PIM_HELLO) {
+		vty_out(vty, "debug " PIM_AF_DBG " packets hello\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_PIM_J_P) {
+		vty_out(vty, "debug " PIM_AF_DBG " packets joins\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_PIM_REG) {
+		vty_out(vty, "debug " PIM_AF_DBG " packets register\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_STATIC) {
+		vty_out(vty, "debug pim static\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_PIM_NHT) {
+		vty_out(vty, "debug " PIM_AF_DBG " nht\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_PIM_NHT_RP) {
+		vty_out(vty, "debug pim nht rp\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_PIM_NHT_DETAIL) {
+		vty_out(vty, "debug " PIM_AF_DBG " nht detail\n");
+		++writes;
+	}
+
+	if (PIM_DEBUG_AUTORP) {
+		vty_out(vty, "debug pim autorp\n");
+		++writes;
+	}
+
+	return writes;
+}
+
+int pim_global_config_write_worker(struct pim_instance *pim, struct vty *vty)
+{
+	int writes = 0;
+	struct pim_ssm *ssm = pim->ssm_info;
+	struct pim_dm *dm = pim->dm_info;
+
+#if PIM_IPV == 4
+	writes += pim_msdp_peer_config_write(vty, pim);
+	writes += pim_msdp_config_write(pim, vty);
+#endif /* PIM_IPV == 4 */
+
+	if (!pim->send_v6_secondary) {
+		vty_out(vty, " no send-v6-secondary\n");
+		++writes;
+	}
+
+#if PIM_IPV == 6
+	if (pim->embedded_rp.enable) {
+		vty_out(vty, " embedded-rp\n");
+		writes++;
+	}
+
+	if (pim->embedded_rp.maximum_rps != PIM_EMBEDDED_RP_MAXIMUM) {
+		vty_out(vty, " embedded-rp limit %u\n", pim->embedded_rp.maximum_rps);
+		writes++;
+	}
+
+	if (pim->embedded_rp.group_list) {
+		vty_out(vty, " embedded-rp group-list %s\n", pim->embedded_rp.group_list);
+		writes++;
+	}
+#endif /* PIM_IPV == 6 */
+
+	writes += pim_rp_config_write(pim, vty);
+#if PIM_IPV == 4
+	writes += pim_autorp_config_write(pim, vty);
+#endif
+	writes += pim_cand_config_write(pim, vty);
+
+	if (pim->vrf->vrf_id == VRF_DEFAULT) {
+		if (router->register_suppress_time
+		    != PIM_REGISTER_SUPPRESSION_TIME_DEFAULT) {
+			vty_out(vty, " register-suppress-time %d\n",
+				router->register_suppress_time);
+			++writes;
+		}
+		if (router->t_periodic != PIM_DEFAULT_T_PERIODIC) {
+			vty_out(vty, " join-prune-interval %d\n",
+				router->t_periodic);
+			++writes;
+		}
+
+		if (router->packet_process != PIM_DEFAULT_PACKET_PROCESS) {
+			vty_out(vty, " packets %d\n", router->packet_process);
+			++writes;
+		}
+	}
+	if (pim->keep_alive_time != PIM_KEEPALIVE_PERIOD) {
+		vty_out(vty, " keep-alive-timer %d\n", pim->keep_alive_time);
+		++writes;
+	}
+	if (pim->rp_keep_alive_time != MIN(PIM_RP_KEEPALIVE_PERIOD, UINT16_MAX)) {
+		vty_out(vty, " rp keep-alive-timer %d\n", pim->rp_keep_alive_time);
+		++writes;
+	}
+	if (ssm->plist_name) {
+		vty_out(vty, " ssm prefix-list %s\n", ssm->plist_name);
+		++writes;
+	}
+	if (dm->plist_name) {
+		vty_out(vty, " dm prefix-list %s\n", dm->plist_name);
+		++writes;
+	}
+	if (pim->register_plist) {
+		vty_out(vty, " register-accept-list %s\n", pim->register_plist);
+		++writes;
+	}
+	if (pim->spt.switchover == PIM_SPT_INFINITY) {
+		if (pim->spt.plist)
+			vty_out(vty,
+				" spt-switchover infinity-and-beyond prefix-list %s\n",
+				pim->spt.plist);
+		else
+			vty_out(vty, " spt-switchover infinity-and-beyond\n");
+		++writes;
+	}
+	if (pim->ecmp_rebalance_enable) {
+		vty_out(vty, " ecmp rebalance\n");
+		++writes;
+	} else if (pim->ecmp_enable) {
+		vty_out(vty, " ecmp\n");
+		++writes;
+	}
+
+	if (pim->ssmpingd_list) {
+		struct listnode *node;
+		struct ssmpingd_sock *ss;
+		++writes;
+		for (ALL_LIST_ELEMENTS_RO(pim->ssmpingd_list, node, ss)) {
+			vty_out(vty, " ssmpingd %pPA\n", &ss->source_addr);
+			++writes;
+		}
+	}
+
+	writes += pim_lookup_mode_write(pim, vty);
+
+	if (pim->join_filter.rmapname) {
+		vty_out(vty, " join-filter route-map %s\n", pim->join_filter.rmapname);
+		++writes;
+	}
+
+	if (pim->shutdown) {
+		vty_out(vty, " shutdown\n");
+		++writes;
+	}
+
+	return writes;
+}
+
+#if PIM_IPV == 4
+static int gm_config_write(struct vty *vty, int writes,
+			   struct pim_interface *pim_ifp)
+{
+	/* IF ip igmp */
+	if (pim_ifp->gm_enable) {
+		vty_out(vty, " ip igmp\n");
+		++writes;
+	}
+
+	/* IF ip igmp require-router-alert */
+	if (pim_ifp->gmp_require_ra) {
+		vty_out(vty, " ip igmp require-router-alert\n");
+		++writes;
+	}
+
+	/* ip igmp version */
+	if (pim_ifp->igmp_version != IGMP_DEFAULT_VERSION) {
+		vty_out(vty, " ip igmp version %d\n", pim_ifp->igmp_version);
+		++writes;
+	}
+
+	/* IF ip igmp query-max-response-time */
+	if (pim_ifp->gm_query_max_response_time_dsec !=
+	    GM_QUERY_MAX_RESPONSE_TIME_DSEC) {
+		vty_out(vty, " ip igmp query-max-response-time %d\n",
+			pim_ifp->gm_query_max_response_time_dsec);
+		++writes;
+	}
+
+	/* IF ip igmp query-interval */
+	if (pim_ifp->gm_default_query_interval != GM_GENERAL_QUERY_INTERVAL) {
+		vty_out(vty, " ip igmp query-interval %d\n",
+			pim_ifp->gm_default_query_interval);
+		++writes;
+	}
+
+	/* IF ip igmp robustness */
+	if (pim_ifp->gm_default_robustness_variable != GM_DEFAULT_ROBUSTNESS_VARIABLE) {
+		vty_out(vty, " ip igmp robustness %d\n", pim_ifp->gm_default_robustness_variable);
+		++writes;
+	}
+
+	/* IF ip igmp last-member_query-count */
+	if (pim_ifp->gm_last_member_query_count != 0) {
+		vty_out(vty, " ip igmp last-member-query-count %d\n",
+			pim_ifp->gm_last_member_query_count);
+		++writes;
+	}
+
+	/* IF ip igmp last-member_query-interval */
+	if (pim_ifp->gm_specific_query_max_response_time_dsec !=
+	    GM_SPECIFIC_QUERY_MAX_RESPONSE_TIME_DSEC) {
+		vty_out(vty, " ip igmp last-member-query-interval %d\n",
+			pim_ifp->gm_specific_query_max_response_time_dsec);
+		++writes;
+	}
+
+	/* IF ip igmp join-group */
+	if (pim_ifp->gm_join_list) {
+		struct listnode *node;
+		struct gm_join *ij;
+		for (ALL_LIST_ELEMENTS_RO(pim_ifp->gm_join_list, node, ij)) {
+			if (ij->join_type == GM_JOIN_PROXY)
+				continue;
+
+			if (pim_addr_is_any(ij->source_addr))
+				vty_out(vty, " ip igmp join-group %pPAs\n",
+					&ij->group_addr);
+			else
+				vty_out(vty, " ip igmp join-group %pPAs %pPAs\n",
+					&ij->group_addr, &ij->source_addr);
+			++writes;
+		}
+	}
+
+	/* IF ip igmp static-group */
+	if (pim_ifp->static_group_list) {
+		struct listnode *node;
+		struct static_group *stgrp;
+		for (ALL_LIST_ELEMENTS_RO(pim_ifp->static_group_list, node,
+					  stgrp)) {
+			if (pim_addr_is_any(stgrp->source_addr))
+				vty_out(vty, " ip igmp static-group %pPAs\n",
+					&stgrp->group_addr);
+			else
+				vty_out(vty,
+					" ip igmp static-group %pPAs %pPAs\n",
+					&stgrp->group_addr, &stgrp->source_addr);
+			++writes;
+		}
+	}
+
+	return writes;
+}
+#else
+static int gm_config_write(struct vty *vty, int writes,
+			   struct pim_interface *pim_ifp)
+{
+	/* IF ipv6 mld */
+	if (pim_ifp->gm_enable) {
+		vty_out(vty, " ipv6 mld\n");
+		++writes;
+	}
+
+	/* IF ip igmp require-router-alert */
+	if (pim_ifp->gmp_require_ra) {
+		vty_out(vty, " ipv6 mld require-router-alert\n");
+		++writes;
+	}
+
+	if (pim_ifp->mld_version != MLD_DEFAULT_VERSION)
+		vty_out(vty, " ipv6 mld version %d\n", pim_ifp->mld_version);
+
+	/* IF ipv6 mld query-max-response-time */
+	if (pim_ifp->gm_query_max_response_time_dsec !=
+	    GM_QUERY_MAX_RESPONSE_TIME_DSEC)
+		vty_out(vty, " ipv6 mld query-max-response-time %d\n",
+			pim_ifp->gm_query_max_response_time_dsec);
+
+	if (pim_ifp->gm_default_query_interval != GM_GENERAL_QUERY_INTERVAL)
+		vty_out(vty, " ipv6 mld query-interval %d\n",
+			pim_ifp->gm_default_query_interval);
+
+	/* IF ipv6 mld robustness */
+	if (pim_ifp->gm_default_robustness_variable != GM_DEFAULT_ROBUSTNESS_VARIABLE) {
+		vty_out(vty, " ipv6 mld robustness %d\n", pim_ifp->gm_default_robustness_variable);
+		++writes;
+	}
+
+	/* IF ipv6 mld last-member_query-count */
+	if (pim_ifp->gm_last_member_query_count != 0)
+		vty_out(vty, " ipv6 mld last-member-query-count %d\n",
+			pim_ifp->gm_last_member_query_count);
+
+	/* IF ipv6 mld last-member_query-interval */
+	if (pim_ifp->gm_specific_query_max_response_time_dsec !=
+	    GM_SPECIFIC_QUERY_MAX_RESPONSE_TIME_DSEC)
+		vty_out(vty, " ipv6 mld last-member-query-interval %d\n",
+			pim_ifp->gm_specific_query_max_response_time_dsec);
+
+	/* IF ipv6 mld join-group */
+	if (pim_ifp->gm_join_list) {
+		struct listnode *node;
+		struct gm_join *ij;
+
+		for (ALL_LIST_ELEMENTS_RO(pim_ifp->gm_join_list, node, ij)) {
+			if (ij->join_type == GM_JOIN_PROXY)
+				continue;
+
+			if (pim_addr_is_any(ij->source_addr))
+				vty_out(vty, " ipv6 mld join-group %pPAs\n",
+					&ij->group_addr);
+			else
+				vty_out(vty,
+					" ipv6 mld join-group %pPAs %pPAs\n",
+					&ij->group_addr, &ij->source_addr);
+			++writes;
+		}
+	}
+
+	/* IF ipv6 mld static-group */
+	if (pim_ifp->static_group_list) {
+		struct listnode *node;
+		struct static_group *stgrp;
+
+		for (ALL_LIST_ELEMENTS_RO(pim_ifp->static_group_list, node,
+					  stgrp)) {
+			if (pim_addr_is_any(stgrp->source_addr))
+				vty_out(vty, " ipv6 mld static-group %pPAs\n",
+					&stgrp->group_addr);
+			else
+				vty_out(vty,
+					" ipv6 mld static-group %pPAs %pPAs\n",
+					&stgrp->group_addr, &stgrp->source_addr);
+			++writes;
+		}
+	}
+
+	return writes;
+}
+#endif
+
+int pim_config_write(struct vty *vty, int writes, struct interface *ifp,
+		     struct pim_instance *pim)
+{
+	struct pim_interface *pim_ifp = ifp->info;
+
+	if (pim_ifp->pim_enable) {
+		if (pim_ifp->pim_mode == PIM_MODE_DENSE)
+			vty_out(vty, " " PIM_AF_NAME " pim dm\n");
+		else if (pim_ifp->pim_mode == PIM_MODE_SPARSE_DENSE)
+			vty_out(vty, " " PIM_AF_NAME " pim sm-dm\n");
+		else if (pim_ifp->pim_mode == PIM_MODE_SSM)
+			vty_out(vty, " " PIM_AF_NAME " pim ssm\n");
+		else
+			vty_out(vty, " " PIM_AF_NAME " pim\n");
+		++writes;
+	}
+
+	/* IF igmp/mld routemap */
+	if (pim_ifp->gmp_filter.rmapname) {
+		vty_out(vty, " " PIM_AF_NAME " " GM_AF_DBG " route-map %s\n",
+			pim_ifp->gmp_filter.rmapname);
+		++writes;
+	}
+
+	/* IF igmp/mld access-list */
+	if (pim_ifp->gmp_filter.alistname) {
+		vty_out(vty, " " PIM_AF_NAME " " GM_AF_DBG " access-list %s\n",
+			pim_ifp->gmp_filter.alistname);
+		++writes;
+	}
+
+	/*
+	 * IF igmp/mld proxy route-map
+	 *
+	 * Must be emitted before 'proxy' so that on config replay
+	 * pim_if_gm_proxy_init() runs with the filter already set.
+	 */
+	if (pim_ifp->gm_proxy_filter.rmapname) {
+		vty_out(vty, " " PIM_AF_NAME " " GM_AF_DBG " proxy route-map %s\n",
+			pim_ifp->gm_proxy_filter.rmapname);
+		++writes;
+	}
+
+	/* IF igmp/mld proxy */
+	if (pim_ifp->gm_proxy) {
+		vty_out(vty, " " PIM_AF_NAME " " GM_AF_DBG " proxy\n");
+		++writes;
+	}
+
+	/* IF igmp/mld max-sources */
+	if (pim_ifp->gm_source_limit != UINT32_MAX) {
+		vty_out(vty, " " PIM_AF_NAME " " GM_AF_DBG " max-sources %u\n",
+			pim_ifp->gm_source_limit);
+		++writes;
+	}
+
+	/* IF igmp/mld max-groups */
+	if (pim_ifp->gm_group_limit != UINT32_MAX) {
+		vty_out(vty, " " PIM_AF_NAME " " GM_AF_DBG " max-groups %u\n",
+			pim_ifp->gm_group_limit);
+		++writes;
+	}
+
+	/* IF ip/ipv6 igmp/mld immediate-leave */
+	if (pim_ifp->gmp_immediate_leave) {
+		vty_out(vty, " " PIM_AF_NAME " " GM_AF_DBG " immediate-leave\n");
+		++writes;
+	}
+
+	if (pim_ifp->nbr_plist) {
+		vty_out(vty, " " PIM_AF_NAME " pim allowed-neighbors prefix-list %s\n",
+			pim_ifp->nbr_plist);
+		++writes;
+	}
+
+	/* IF ip pim drpriority */
+	if (pim_ifp->pim_dr_priority != PIM_DEFAULT_DR_PRIORITY) {
+		vty_out(vty, " " PIM_AF_NAME " pim drpriority %u\n",
+			pim_ifp->pim_dr_priority);
+		++writes;
+	}
+
+	/* IF ip pim hello */
+	if (pim_ifp->pim_hello_period != PIM_DEFAULT_HELLO_PERIOD) {
+		vty_out(vty, " " PIM_AF_NAME " pim hello %d", pim_ifp->pim_hello_period);
+		if (pim_ifp->pim_default_holdtime != -1)
+			vty_out(vty, " %d", pim_ifp->pim_default_holdtime);
+		vty_out(vty, "\n");
+		++writes;
+	}
+
+	writes += gm_config_write(vty, writes, pim_ifp);
+
+	if (pim_ifp->periodic_jp_sec != -1) {
+		vty_out(vty, " " PIM_AF_NAME " pim join-prune-interval %d\n",
+			pim_ifp->periodic_jp_sec);
+		++writes;
+	}
+
+	if (pim_ifp->assert_msec != PIM_ASSERT_TIME) {
+		vty_out(vty, " " PIM_AF_NAME " pim assert-interval %d\n", pim_ifp->assert_msec);
+		++writes;
+	}
+
+	if (pim_ifp->assert_override_msec != -1) {
+		vty_out(vty, " " PIM_AF_NAME " pim assert-override-interval %d\n",
+			pim_ifp->assert_override_msec);
+		++writes;
+	}
+
+	if (pim_ifp->pim_override_interval_msec != PIM_DEFAULT_OVERRIDE_INTERVAL_MSEC) {
+		vty_out(vty, " " PIM_AF_NAME " pim override-interval %u\n",
+			pim_ifp->pim_override_interval_msec);
+		++writes;
+	}
+
+	/* update source */
+	if (!pim_addr_is_any(pim_ifp->update_source)) {
+		vty_out(vty, " " PIM_AF_NAME " pim use-source %pPA\n",
+			&pim_ifp->update_source);
+		++writes;
+	}
+	/* allow-rp */
+	if (pim_ifp->allow_rp) {
+		vty_out(vty, " " PIM_AF_NAME " pim allow-rp");
+		if (pim_ifp->allow_rp_plist)
+			vty_out(vty, " rp-list %s", pim_ifp->allow_rp_plist);
+		vty_out(vty, "\n");
+		++writes;
+	}
+
+	if (pim_ifp->activeactive)
+		vty_out(vty, " " PIM_AF_NAME " pim active-active\n");
+
+	/* boundary */
+	if (pim_ifp->boundary_oil_plist) {
+		vty_out(vty, " " PIM_AF_NAME " multicast boundary oil %s\n",
+			pim_ifp->boundary_oil_plist);
+		++writes;
+	}
+
+	if (pim_ifp->boundary_acl) {
+		vty_out(vty, " " PIM_AF_NAME " multicast boundary %s\n", pim_ifp->boundary_acl);
+		++writes;
+	}
+
+	if (pim_ifp->pim_passive_enable) {
+		vty_out(vty, " " PIM_AF_NAME " pim passive\n");
+		++writes;
+	}
+
+	writes += pim_static_write_mroute(pim, vty, ifp);
+	pim_bsm_write_config(vty, ifp);
+	++writes;
+	pim_bfd_write_config(vty, ifp);
+	++writes;
+
+	return writes;
+}
+
+int pim_interface_config_write(struct vty *vty)
+{
+	struct pim_instance *pim;
+	struct interface *ifp;
+	struct vrf *vrf;
+	int writes = 0;
+
+	RB_FOREACH (vrf, vrf_name_head, &vrfs_by_name) {
+		pim = vrf->info;
+		if (!pim)
+			continue;
+
+		FOR_ALL_INTERFACES (pim->vrf, ifp) {
+			/* pim is enabled internally/implicitly on the vxlan
+			 * termination device ipmr-lo. skip displaying that
+			 * config to avoid confusion
+			 */
+			if (pim_vxlan_is_term_dev_cfg(pim, ifp))
+				continue;
+
+			/* IF name */
+			if_vty_config_start(vty, ifp);
+
+			++writes;
+
+			if (ifp->desc) {
+				vty_out(vty, " description %s\n", ifp->desc);
+				++writes;
+			}
+
+			if (ifp->info) {
+				pim_config_write(vty, writes, ifp, pim);
+			}
+			if_vty_config_end(vty);
+
+			++writes;
+		}
+	}
+
+	return writes;
+}

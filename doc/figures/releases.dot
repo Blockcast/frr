@@ -1,0 +1,45 @@
+digraph ReleaseTimeline {
+    rankdir=LR;
+    node [shape=box, style=rounded, fontsize=10, width=1.5, fontname="Helvetica"];
+
+    subgraph cluster_dev {
+        label="Development";
+        style=dashed;
+        color=blue;
+        node [fillcolor=lightblue, style=filled];
+        "dev/X.Y.Z";
+    }
+
+    subgraph cluster_rc {
+        label="Release Candidate";
+        style=dashed;
+        color=orange;
+        node [fillcolor=orange, style=filled];
+        "RC";
+    }
+
+    subgraph cluster_stable {
+        label="Stable Release";
+        style=dashed;
+        color=green;
+        node [fillcolor=lightgreen, style=filled];
+        "release";
+    }
+
+    // Release steps with actions
+    "freeze" [label="Freeze", shape=ellipse, style=dotted, fontcolor=red];
+    "dev/X.Y.Z" [label="dev/X.Y.Z\n(Development)", fillcolor=lightblue];
+    "RC" [label="RC\n(Release Candidate)", fillcolor=orange];
+    "release" [label="Release\n(Final)", fillcolor=lightgreen];
+
+    // Connect the steps with actions
+    "freeze" -> "dev/X.Y.Z" [label="      "];
+    "dev/X.Y.Z" -> "RC" [label="      "];
+    "RC" -> "release" [label="      "];
+
+    // Date connections (freeze -> dev/X.Y.Z -> RC -> release)
+    "2026-09-22" -> "2026-10-06" -> "2026-10-20" -> "2026-11-03";
+    "2026-05-26" -> "2026-06-09" -> "2026-06-23" -> "2026-07-07";
+    "2026-01-20" -> "2026-02-03" -> "2026-02-17" -> "2026-03-03";
+    "2025-09-23" -> "2025-10-07" -> "2025-10-21" -> "2025-11-04";
+}

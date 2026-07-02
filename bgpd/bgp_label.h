@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/* BGP carrying Label information
+ * Copyright (C) 2013 Cumulus Networks, Inc.
+ */
+
+#ifndef _BGP_LABEL_H
+#define _BGP_LABEL_H
+
+#define BGP_LABEL_BYTES 3
+#define BGP_PREVENT_VRF_2_VRF_LEAK 0xFFFFFFFE
+
+struct bgp_dest;
+struct bgp_path_info;
+struct peer;
+
+/* Maximum number of labels we can process or send with a prefix. We
+ * support 10 for MPLS (BGP-LU) and need only 2 for EVPN-VxLAN.
+ *
+ * According to RFC 3107/RFC 8277 label stack is distributed in NLRI, length is given in
+ * one byte in bits! (prefix length + whole number of label stack bits), so even if
+ * prefix is 0 length, (each label takes 3 bytes) floor(256/24) = 10
+ *
+ * It is impossible to pass more than 10 labels by BGP-LU
+ */
+#define BGP_MAX_LABELS 10
+#define BGP_MAX_LABEL_DIGITS (9 * BGP_MAX_LABELS)
+
+/* MPLS label(s) - VNI(s) for EVPN-VxLAN  */
+struct bgp_labels {
+	mpls_label_t label[BGP_MAX_LABELS];
+	uint8_t num_labels;
+
+	unsigned long refcnt;
+};
+
+extern void bgp_labels_init(void);
+extern void bgp_labels_finish(void);
+extern struct bgp_labels *bgp_labels_intern(struct bgp_labels *labels);
+extern void bgp_labels_unintern(struct bgp_labels **plabels);
+extern bool bgp_labels_cmp(const struct bgp_labels *labels1,
+			   const struct bgp_labels *labels2);
+
+extern int bgp_reg_for_label_callback(mpls_label_t new_label, void *labelid,
+				    bool allocated);
+extern void bgp_reg_dereg_for_label(struct bgp_dest *dest,
+				    struct bgp_path_info *pi, bool reg);
+extern int bgp_parse_fec_update(void);
+extern void bgp_adv_label(struct bgp_dest *dest, struct bgp_path_info *pi, struct peer *to,
+			  afi_t afi, safi_t safi, mpls_label_t *labels, uint8_t *num_labels);
+
+extern int bgp_nlri_parse_label(struct peer *peer, struct attr *attr,
+				struct bgp_nlri *packet);
+extern uint32_t decode_label(mpls_label_t *label);
+extern void encode_label_bos(mpls_label_t label_in, mpls_label_t *label_out, bool bos);
+extern void encode_label(mpls_label_t label_in, mpls_label_t *label_out);
+extern bool bgp_labels_same(const mpls_label_t *tbl_a,
+			    const uint8_t num_labels_a,
+			    const mpls_label_t *tbl_b,
+			    const uint8_t num_labels_b);
+extern bool bgp_labels_is_implicit_null(struct bgp_path_info *pi);
+/* Write labels to str of format "prefixLABEL1/LABEL2/.../LABELN", prefix may be NULL */
+extern char *mpls_labels2str(mpls_label_t *labels, uint8_t num_labels, const char *prefix,
+			     char *buf, int size);
+
+static inline int bgp_labeled_safi(safi_t safi)
+{
+	/* NOTE: This API really says a label (tag) MAY be present. Not all EVPN
+	 * routes will have a label.
+	 */
+	if ((safi == SAFI_LABELED_UNICAST) || (safi == SAFI_MPLS_VPN)
+	    || (safi == SAFI_EVPN))
+		return 1;
+	return 0;
+}
+
+static inline int bgp_is_withdraw_label(mpls_label_t *label)
+{
+	uint8_t *pkt = (uint8_t *)label;
+
+	/* The check on pkt[2] for 0x00 or 0x02 is in case bgp_set_valid_label()
+	 * was called on the withdraw label */
+	if (((pkt[0] == 0x80) || (pkt[0] == 0x00)) && (pkt[1] == 0x00)
+	    && ((pkt[2] == 0x00) || (pkt[2] == 0x02)))
+		return 1;
+	return 0;
+}
+
+static inline int bgp_is_valid_label(const mpls_label_t *label)
+{
+	uint8_t *t = (uint8_t *)label;
+	if (!t)
+		return 0;
+	return (t[2] & 0x02);
+}
+
+static inline void bgp_set_valid_label(mpls_label_t *label)
+{
+	uint8_t *t = (uint8_t *)label;
+	if (t)
+		t[2] |= 0x02;
+}
+
+static inline void bgp_unset_valid_label(mpls_label_t *label)
+{
+	uint8_t *t = (uint8_t *)label;
+	if (t)
+		t[2] &= ~0x02;
+}
+
+static inline void bgp_register_for_label(struct bgp_dest *dest,
+					  struct bgp_path_info *pi)
+{
+	bgp_reg_dereg_for_label(dest, pi, true);
+}
+
+static inline void bgp_unregister_for_label(struct bgp_dest *dest)
+{
+	bgp_reg_dereg_for_label(dest, NULL, false);
+}
+
+/* Return BOS value of label stream */
+static inline uint8_t label_bos(mpls_label_t *label)
+{
+	uint8_t *t = (uint8_t *)label;
+	return (t[2] & 0x01);
+};
+
+/* Set BOS to 1 */
+static inline void label_set_bos(mpls_label_t *label)
+{
+	uint8_t *t = (uint8_t *)label;
+
+	if (t)
+		t[2] |= 0x01;
+}
+
+#endif /* _BGP_LABEL_H */

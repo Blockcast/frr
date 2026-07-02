@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * OSPF Neighbor functions.
+ * Copyright (C) 1999, 2000 Toshiaki Takada
+ */
+
+#ifndef _ZEBRA_OSPF_NEIGHBOR_H
+#define _ZEBRA_OSPF_NEIGHBOR_H
+
+#include <ospfd/ospf_gr.h>
+#include <ospfd/ospf_packet.h>
+#include <ospfd/ospf_flood.h>
+
+/* Neighbor Data Structure */
+struct ospf_neighbor {
+	/* This neighbor's parent ospf interface. */
+	struct ospf_interface *oi;
+
+	/* OSPF neighbor Information */
+	uint8_t state;      /* NSM status. */
+	uint8_t dd_flags;   /* DD bit flags. */
+	uint32_t dd_seqnum; /* DD Sequence Number. */
+
+	/* Neighbor Information from Hello. */
+	struct prefix address; /* Neighbor Interface Address. */
+
+	struct in_addr src;       /* Src address. */
+	struct in_addr router_id; /* Router ID. */
+	uint8_t options;	  /* Options. */
+	int priority;		  /* Router Priority. */
+	struct in_addr d_router;  /* Designated Router. */
+	struct in_addr bd_router; /* Backup Designated Router. */
+
+	/* Last sent Database Description packet. */
+	struct ospf_packet *last_send;
+	/* Timestamp when last Database Description packet was sent */
+	struct timeval last_send_ts;
+
+	/* Last received Database Description packet. */
+	struct {
+		uint8_t options;
+		uint8_t flags;
+		uint32_t dd_seqnum;
+	} last_recv;
+
+	/* LSA data. */
+	struct ospf_lsdb ls_rxmt;
+	struct ospf_lsa_list_head ls_rxmt_list;
+	struct ospf_lsdb db_sum;
+	struct ospf_lsdb ls_req;
+	struct ospf_lsa *ls_req_last;
+
+	uint32_t crypt_seqnum; /* Cryptographic Sequence Number. */
+
+	/* Timer values. */
+	uint32_t v_inactivity;
+	uint32_t v_db_desc;
+	uint32_t v_ls_req;
+	uint32_t v_ls_rxmt;
+
+	/* Threads. */
+	struct event *t_inactivity;
+	struct event *t_db_desc;
+	struct event *t_ls_req;
+	struct event *t_ls_rxmt;
+	struct event *t_hello_reply;
+
+	/* NBMA configured neighbour */
+	struct ospf_nbr_nbma *nbr_nbma;
+
+	/* Statistics */
+	struct timeval ts_last_progress; /* last advance of NSM            */
+	struct timeval ts_last_regress;  /* last regressive NSM change     */
+	const char *last_regress_str;    /* Event which last regressed NSM */
+	uint32_t state_change;		 /* NSM state change counter       */
+	uint32_t ls_rxmt_lsa;		 /* Number of LSAs retransmitted.  */
+	uint64_t dead_timer_resets;	 /* Number of times dead-timer was reset RFC4222 rec 2*/
+
+	/* BFD information */
+	struct bfd_session_params *bfd_session;
+
+	/* ospf graceful restart HELPER info */
+	struct ospf_helper_info gr_helper_info;
+};
+
+/* Macros. */
+#define NBR_IS_DR(n)	IPV4_ADDR_SAME (&n->address.u.prefix4, &n->d_router)
+#define NBR_IS_BDR(n)   IPV4_ADDR_SAME (&n->address.u.prefix4, &n->bd_router)
+
+/* Prototypes. */
+extern struct ospf_neighbor *ospf_nbr_new(struct ospf_interface *oi);
+extern void ospf_nbr_free(struct ospf_neighbor *nbr);
+extern void ospf_nbr_delete(struct ospf_neighbor *nbr);
+extern void ospf_nbr_bring_down(struct ospf_neighbor *nbr);
+extern int ospf_nbr_bidirectional(struct in_addr *router_id, struct in_addr *dr, int idx);
+extern void ospf_nbr_self_reset(struct ospf_interface *oi, struct in_addr router_id);
+extern void ospf_nbr_add_self(struct ospf_interface *oi, struct in_addr router_id);
+extern int ospf_nbr_count(struct ospf_interface *oi, int state);
+extern int ospf_nbr_count_opaque_capable(struct ospf_interface *oi);
+extern struct ospf_neighbor *ospf_nbr_get(struct ospf_interface *oi, struct ospf_header *ospfh,
+					  struct ip *iph, struct prefix *p);
+extern struct ospf_neighbor *ospf_qnbr_get(struct ospf_interface *oi, struct in_addr *src);
+extern struct ospf_neighbor *ospf_nbr_lookup(struct ospf_interface *oi, struct ip *iph,
+					     struct ospf_header *ospfh);
+extern struct ospf_neighbor *ospf_nbr_lookup_by_addr(struct route_table *nbrs,
+						     struct in_addr *addr);
+extern struct ospf_neighbor *ospf_nbr_lookup_by_routerid(struct route_table *nbrs,
+							 struct in_addr *id);
+extern void ospf_renegotiate_optional_capabilities(struct ospf *top);
+#endif /* _ZEBRA_OSPF_NEIGHBOR_H */

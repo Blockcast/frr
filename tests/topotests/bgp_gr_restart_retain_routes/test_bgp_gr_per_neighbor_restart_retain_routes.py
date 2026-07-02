@@ -1,0 +1,152 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: ISC
+
+#
+# Copyright (c) 2024 by
+# Donatas Abraitis <donatas@opensourcerouting.org>
+#
+
+"""
+Test if routes are retained during BGP restarts using
+ Graceful Restart per-neighbor.
+"""
+
+import os
+import sys
+import json
+import pytest
+import functools
+
+CWD = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.path.join(CWD, "../"))
+
+# pylint: disable=C0413
+from lib import topotest
+from lib.topogen import Topogen, get_topogen
+from lib.common_config import start_router, step, stop_router
+
+pytestmark = [pytest.mark.bgpd]
+
+
+def build_topo(tgen):
+    for routern in range(1, 5):
+        tgen.add_router("r{}".format(routern))
+
+    switch = tgen.add_switch("s1")
+    switch.add_link(tgen.gears["r3"])
+    switch.add_link(tgen.gears["r4"])
+
+
+def setup_module(mod):
+    tgen = Topogen(build_topo, mod.__name__)
+    tgen.start_topology()
+
+    router_list = tgen.routers()
+
+    for router in router_list.values():
+        router.load_frr_config()
+
+    tgen.start_router()
+
+
+def teardown_module(mod):
+    tgen = get_topogen()
+    tgen.stop_topology()
+
+
+def test_bgp_gr_restart_retain_routes():
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r4 = tgen.gears["r4"]
+    r3 = tgen.gears["r3"]
+
+    def _bgp_converge():
+        output = json.loads(r4.vtysh_cmd("show bgp ipv4 neighbors 192.168.34.3 json"))
+        expected = {
+            "192.168.34.3": {
+                "bgpState": "Established",
+                "addressFamilyInfo": {"ipv4Unicast": {"acceptedPrefixCounter": 2}},
+            }
+        }
+        return topotest.json_cmp(output, expected)
+
+    def _bgp_check_bgp_retained_routes():
+        output = json.loads(r4.vtysh_cmd("show bgp ipv4 unicast 172.16.255.3/32 json"))
+        expected = {"paths": [{"stale": True}]}
+        return topotest.json_cmp(output, expected)
+
+    def _bgp_check_kernel_retained_routes():
+        output = json.loads(
+            r4.cmd("ip -j route show 172.16.255.3/32 proto bgp dev r4-eth0")
+        )
+        expected = [{"dst": "172.16.255.3", "gateway": "192.168.34.3", "metric": 20}]
+        return topotest.json_cmp(output, expected)
+
+    step("Initial BGP converge")
+    test_func = functools.partial(_bgp_converge)
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=0.5)
+    assert result is None, "Failed to see BGP convergence on R4"
+
+    step("Check GR fields in show bgp vrfs json before restart")
+
+    def _gr_vrfs_json_check():
+        output = json.loads(r3.vtysh_cmd("show bgp vrfs default json"))
+        expected = {
+            "default": {
+                "as": 65003,
+                "grRestartTime": 120,
+                "grStalePathTime": 360,
+                "grSelectDeferTime": 120,
+                "grMode": "Helper",
+                "waitForFibSet": False,
+                "gShutEnabled": False,
+            }
+        }
+        return topotest.json_cmp(output, expected)
+
+    test_func = functools.partial(_gr_vrfs_json_check)
+    _, result = topotest.run_and_expect(test_func, None, count=20, wait=3)
+    assert result is None, "GR VRF JSON fields check failed on R3 before restart"
+
+    step("Restart R3")
+    stop_router(tgen, "r3")
+
+    step("Check if routes (BGP) are retained at R4")
+    test_func = functools.partial(_bgp_check_bgp_retained_routes)
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=0.5)
+    assert result is None, "Failed to see BGP retained routes on R4"
+
+    step("Check if routes (Kernel) are retained at R4")
+    assert (
+        _bgp_check_kernel_retained_routes() is None
+    ), "Failed to retain BGP routes in kernel on R4"
+
+    # Start r3 back for other tests
+    start_router(tgen, "r3")
+
+
+def test_bgp_gr_restart_present_in_write_terminal():
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    step("Check if graceful-restart is present in 'write terminal' output")
+    r3 = tgen.gears["r3"]
+
+    def check_convergence():
+        output = r3.vtysh_cmd("write terminal")
+        if "neighbor PG graceful-restart" not in output:
+            return f"graceful-restart is missing in 'neighbor PG' configuration output. Full output: {output}"
+        return None
+
+    _, result = topotest.run_and_expect(check_convergence, None, count=60, wait=1)
+    assert result is None, f"r3 failed to converge, result: {result}"
+
+
+if __name__ == "__main__":
+    args = ["-s"] + sys.argv[1:]
+    sys.exit(pytest.main(args))

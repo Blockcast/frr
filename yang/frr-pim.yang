@@ -1,0 +1,856 @@
+// SPDX-License-Identifier: BSD-2-Clause
+module frr-pim {
+  yang-version "1.1";
+  namespace "http://frrouting.org/yang/pim";
+
+  prefix frr-pim;
+
+  import frr-filter {
+    prefix frr-filter;
+  }
+
+  import frr-interface {
+    prefix frr-interface;
+  }
+
+  import frr-route-map {
+    prefix frr-route-map;
+  }
+
+  import frr-routing {
+    prefix "frr-rt";
+  }
+
+  import ietf-routing-types {
+    prefix "rt-types";
+  }
+
+  import ietf-inet-types {
+    prefix "inet";
+  }
+
+  organization
+    "FRRouting";
+
+  contact
+    "FRR Users List:       <mailto:frog@lists.frrouting.org>
+     FRR Development List: <mailto:dev@lists.frrouting.org>";
+
+  description
+    "The module defines a collection of YANG definitions common for
+     PIM (Protocol Independent Multicast) model.
+
+     Copyright 2020 FRRouting
+
+     Redistribution and use in source and binary forms, with or without
+     modification, are permitted provided that the following conditions
+     are met:
+
+     1. Redistributions of source code must retain the above copyright notice,
+     this list of conditions and the following disclaimer.
+
+     2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in the
+     documentation and/or other materials provided with the distribution.
+
+     THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+     \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+     LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+     A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+     HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+     SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+     LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+     DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+     THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+     (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+     OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.";
+
+  revision 2021-11-22 {
+    description
+      "Initial revision.";
+    reference
+      "RFC XXXX: A YANG Data Model for PIM";
+  }
+
+  identity pimd {
+    base frr-rt:routing-protocol;
+    description
+      "'Pim' routing pseudo-protocol.";
+  }
+
+  typedef plist-ref {
+    type string;
+    description
+      "Reference to a policy list.";
+  }
+
+  typedef access-list-ref {
+    type string;
+    description
+      "Reference to an access list.";
+  }
+
+  /*
+   * Multicast RPF mode configurable type
+   */
+
+  typedef mcast-rpf-lookup-mode {
+    type enumeration {
+      enum "none" {
+        value 0;
+        description
+          "No mode set.";
+      }
+      enum "mrib-only" {
+        value 1;
+        description
+          "Lookup in multicast RIB only.";
+      }
+      enum "urib-only" {
+        value 2;
+        description
+          "Lookup in unicast RIB only.";
+      }
+      enum "mrib-then-urib" {
+        value 3;
+        description
+          "Try multicast RIB first, fall back to unicast RIB.";
+      }
+      enum "lower-distance" {
+        value 4;
+        description
+          "Lookup both unicast and mcast, use entry with lower distance.";
+      }
+      enum "longer-prefix" {
+        value 5;
+        description
+          "Lookup both unicast and mcast, use entry with longer prefix.";
+      }
+    }
+    description
+      "Multicast RPF lookup behavior";
+  }
+
+  /*
+   * Groupings
+   */
+
+  grouping msdp-timers {
+    description
+      "Grouping for MSDP timer configurations.";
+
+    leaf hold-time {
+      type uint16 {
+        range "1..max";
+      }
+      units seconds;
+      default 75;
+      description
+        "Hold period is started at the MSDP peer connection establishment
+         and is reset every new message. When the period expires the
+         connection is closed. This value should be greater than the
+         remote keep-alive time.";
+    }
+
+    leaf keep-alive {
+      type uint16 {
+        range "1..max";
+      }
+      units seconds;
+      default 60;
+      description
+        "To maintain a connection established it is necessary to send
+         keep alive messages in a certain frequency and this allows its
+         configuration. This value should be less than the remote
+         hold time.";
+    }
+
+    leaf connection-retry {
+      type uint16 {
+        range "1..max";
+      }
+      units seconds;
+      default 30;
+      description
+        "This period is used in the MSDP peer with the highest IP value
+         in the pair and configures the interval between TCP connection
+         attempts.";
+    }
+  }
+
+  grouping msdp-authentication {
+    description
+      "MSDP authentication options.";
+
+    leaf authentication-type {
+      type enumeration {
+        enum None {
+          value 0;
+          description
+            "No authentication.";
+        }
+        enum MD5 {
+          value 1;
+          description
+            "Use MD5 digest.";
+        }
+      }
+      default None;
+      description
+        "Authentication method.";
+    }
+
+    leaf authentication-key {
+      when "../authentication-type = 'MD5'";
+      type string;
+      mandatory true;
+      description
+        "Authentication key.";
+    }
+  }
+
+  grouping global-pim-config-attributes {
+    description
+      "A grouping defining per address family pim global attributes";
+
+    list mcast-rpf-lookup {
+      key "group-list source-list";
+      description
+        "RPF lookup modes.";
+
+      leaf group-list {
+        type plist-ref;
+        description
+          "Multicast group prefix list.";
+      }
+
+      leaf source-list {
+        type plist-ref;
+        description
+          "Unicast source address prefix list.";
+      }
+
+      leaf mode {
+        type mcast-rpf-lookup-mode;
+        default "none";
+        description
+          "Multicast RPF lookup behavior.";
+      }
+    }
+
+    leaf ecmp {
+      type boolean;
+      default "false";
+      description
+        "Enable PIM ECMP.";
+    }
+
+    leaf ecmp-rebalance {
+      type boolean;
+      default "false";
+      description
+        "Enable PIM ECMP Rebalance.";
+    }
+
+    leaf keep-alive-timer {
+      type uint16 {
+        range "1..max";
+      }
+      default "210";
+      description
+        "Keep alive Timer in seconds.";
+    }
+
+    leaf rp-keep-alive-timer {
+      type uint16 {
+        range "1..max";
+      }
+      default "210";
+      description
+        "RP keep alive Timer in seconds.";
+    }
+
+    leaf gm-watermark-limit {
+      type uint16 {
+        range "1..max";
+      }
+      description
+        "Group count threshold for IGMP/MLD watermark warnings.";
+    }
+
+    leaf shutdown {
+      type boolean;
+      default "false";
+      description
+        "Disable PIM operation";
+    }
+
+    leaf send-v6-secondary {
+      when "../frr-pim:address-family = 'frr-rt:ipv4'" {
+        description
+          "Only applicable to IPv4 address family.";
+      }
+      type boolean;
+      default "true";
+      description
+        "Send v6 secondary addresses.";
+    }
+
+    container spt-switchover {
+      description
+        "SPT-Switchover.";
+
+      leaf spt-action {
+        type enumeration {
+          enum "PIM_SPT_IMMEDIATE" {
+            value 0;
+            description
+              "Immediate switch to SPT Tree.";
+          }
+          enum "PIM_SPT_INFINITY" {
+            value 1;
+            description
+              "Never switch to SPT Tree.";
+          }
+        }
+        default "PIM_SPT_IMMEDIATE";
+        description
+          "SPT-Switchover action";
+      }
+
+      leaf spt-infinity-prefix-list {
+        when "../spt-action = 'PIM_SPT_INFINITY'" {
+          description
+            "This leaf is only valid when the spt action
+             is PIM_SPT_INFINITY.";
+        }
+        type plist-ref;
+        description
+          "Prefix-List to control which groups to switch.";
+      }
+    }
+
+    leaf ssm-prefix-list {
+        type plist-ref;
+        description
+          "Prefix-list used to define Source-Specific Multicast address range.";
+    }
+
+    leaf dm-prefix-list {
+        type plist-ref;
+        description
+          "Prefix-list used to define Dense Mode Multicast address range.";
+    }
+
+
+    leaf-list ssm-pingd-source-ip {
+      type inet:ip-address;
+      description
+        "Enable ssmpingd operation.";
+    }
+
+    /* Global timers configuration. */
+    container msdp {
+      description "Global MSDP configuration.";
+      uses msdp-timers;
+
+      leaf log-neighbor-events {
+        type boolean;
+        default "false";
+        description
+          "Log all MSDP neighbor related events.";
+      }
+
+      leaf log-sa-events {
+        type boolean;
+        default "false";
+        description
+          "Log all MSDP SA related events.";
+      }
+
+      leaf originator-id {
+        type inet:ip-address;
+        description
+          "Configure the RP address for the SAs.
+
+           By default the local system RP address will be used.";
+      }
+
+      leaf shutdown {
+        type boolean;
+        default "false";
+        description
+          "Shutdown MSDP functionality.";
+      }
+    }
+
+    list msdp-mesh-groups {
+      key "name";
+      description
+        "RFC 3618 Section 10.2. MSDP mesh-group semantics
+
+         Groups multiple MSDP peers to reduce SA flooding typically used
+         in intra-domain settings.";
+
+      leaf name {
+        type string {
+          length 1..64;
+        }
+        description
+          "The mesh group name.";
+      }
+
+      leaf source {
+        type inet:ip-address;
+        description
+          "Source IP address for the TCP connections.";
+      }
+
+      list members {
+        key "address";
+
+        description
+          "List of peer members associated with the configuration.";
+
+        leaf address {
+          type inet:ip-address;
+          description
+            "Peer member IP address.";
+        }
+      }
+    }
+
+    list msdp-peer {
+      key "peer-ip";
+      description
+        "Configure MSDP peer.";
+
+      leaf peer-ip {
+        type inet:ip-address;
+        description
+          "MSDP peer IP address.";
+      }
+
+      leaf source-ip {
+        type inet:ip-address;
+        mandatory true;
+        description
+          "MSDP source IP address.";
+      }
+
+      leaf sa-filter-in {
+        type frr-filter:access-list-name;
+        description
+          "Access list name used to filter the incoming SAs exchanged.";
+      }
+
+      leaf sa-filter-out {
+        type frr-filter:access-list-name;
+        description
+          "Access list name used to filter the outgoing SAs exchanged.";
+      }
+
+      uses msdp-authentication;
+
+      leaf sa-limit {
+        type uint32;
+        description
+          "Peer SA maximum limit.";
+      }
+
+      leaf as {
+        type inet:as-number;
+        description
+          "BGP Autonomous System number.";
+      }
+    }
+
+    container mlag {
+     presence
+       "Multi-chassis link aggregation.";
+
+     description
+       "Configuration for mlag on the interface.";
+
+     leaf peerlink-rif {
+        type frr-interface:interface-ref;
+        description
+         "Outgoing interface name.";
+      }
+
+      leaf reg-address {
+        type inet:ip-address;
+        description
+          "reg address.";
+      }
+
+      leaf my-role {
+        type enumeration {
+          enum "MLAG_ROLE_NONE" {
+            value 0;
+            description
+              "MLAG role none.";
+          }
+          enum "MLAG_ROLE_PRIMARY" {
+            value 1;
+            description
+              "MLAG role primary.";
+          }
+
+          enum "MLAG_ROLE_SECONDARY" {
+            value 2;
+            description
+              "MLAG role secondary.";
+          }
+        }
+        default "MLAG_ROLE_NONE";
+        description
+          "Mlag role.";
+      }
+
+      leaf peer-state {
+       type boolean;
+       default "false";
+       description
+         "Peer state";
+      }
+    }
+
+    leaf register-accept-list {
+        type plist-ref;
+        description
+          "Only accept registers from a specific source prefix list.";
+    }
+
+    leaf pim-join-route-map {
+      type frr-route-map:route-map-ref;
+      description
+        "Pass PIM joins through specified route-map.";
+    }
+  } // global-pim-config-attributes
+
+  grouping interface-pim-config-attributes {
+    description
+      "A grouping defining pim interface attributes per address family.";
+
+    leaf pim-enable {
+      type boolean;
+      default "false";
+      description
+        "Enable PIM flag on the interface.";
+    }
+    leaf pim-passive-enable {
+      type boolean;
+      default "false";
+      description
+        "Disable exchange of protocol packets.";
+    }
+    leaf pim-mode {
+      type enumeration {
+        enum "SPARSE" {
+          value 0;
+          description
+            "Sparse mode.";
+        }
+        enum "DENSE" {
+          value 1;
+          description
+            "Dense mode.";
+        }
+        enum "SPARSE_DENSE" {
+          value 2;
+          description
+            "Sparse-Dense mode.";
+        }
+        enum "SSM" {
+          value 3;
+          description
+            "Source Specific Multicast only.";
+        }
+      }
+      default "SPARSE";
+      description
+        "PIM interface mode";
+    }
+
+    leaf hello-interval {
+      type uint16 {
+        range "1..max";
+      }
+      default "30";
+      description
+        "Hello interval";
+    }
+
+    leaf hello-holdtime {
+      type uint16 {
+        range "1..max";
+      }
+      must ". > ./../hello-interval" {
+      error-message "HoldTime must be greater than Hello";
+      }
+      description
+        "Hello holdtime";
+    }
+
+    leaf neighbor-filter-prefix-list {
+      type plist-ref;
+      description
+        "Optional prefix list restricting which IP source addresses may act as PIM
+         neighbors on this interface (evaluated for Hello, Join/Prune, and Assert
+         processing alongside other PIM interface checks). This is an additional
+         operator filter only; it does not independently enforce IPv6 link-local or
+         IPv4 connected-subnet requirements on the packet source.";
+    }
+
+    leaf join-prune-interval {
+      type uint16 {
+        range "5..600";
+      }
+      description
+        "Join Prune Send Interval in seconds (defaults to global value).";
+    }
+
+    leaf assert-interval {
+      type uint32 {
+        range "1000..86400000";
+      }
+      default "180000";
+      description
+        "Assert interval in milliseconds. (defaults to 180s)";
+    }
+
+    leaf assert-override-interval {
+      type uint32 {
+        range "1000..86400000";
+      }
+      must ". < ./../assert-interval - 100" {
+        error-message "Assert override interval must be at least 0.1s smaller than assert interval.";
+      }
+      description
+        "Assert override interval in milliseconds. (calculated from assert interval by default)";
+    }
+
+    leaf override-interval {
+      type uint16 {
+        range "0..65535";
+      }
+      default "2500";
+      description
+        "LAN prune delay override interval in milliseconds.";
+    }
+
+    container bfd {
+      presence
+        "Enable BFD support on the interface.";
+
+      description
+        "Configuration for BFD on the interface.";
+
+      leaf min-rx-interval {
+        type uint16 {
+          range "1..max";
+        }
+        default "300";
+          description
+            "Required min receive interval";
+      }
+
+      leaf min-tx-interval {
+        type uint16 {
+          range "1..max";
+        }
+        default "300";
+        description
+          "Desired min transmit interval";
+      }
+
+      leaf detect_mult {
+        type uint8 {
+          range "2..255";
+        }
+        default "3";
+        description
+          "Detect Multiplier";
+      }
+
+      leaf profile {
+        type string;
+        description
+          "Use a preconfigure BFD profile.";
+      }
+    }
+
+    leaf bsm {
+      type boolean;
+      default "true";
+      description
+        "Enables BSM support on the interface.";
+    }
+
+    leaf unicast-bsm {
+      type boolean;
+      default "true";
+      description
+        "Accept/Send unicast BSM on the interface.";
+    }
+
+    leaf active-active {
+      type boolean;
+      default "false";
+      description
+        "Mark interface as Active-Active for MLAG operations.";
+    }
+
+    leaf allow-rp {
+      type boolean;
+      default "false";
+      description
+        "Ignore mismatched RP addresses when processing (*,G) Joins.";
+    }
+
+    leaf allow-rp-rp-list {
+      type plist-ref;
+      description
+        "Prefix-list which the RP address must match to be accepted.";
+    }
+
+    leaf dr-priority {
+      type uint32;
+      default 1;
+      description
+        "DR (Designated Router) priority";
+    }
+
+    leaf use-source {
+      type inet:ip-address;
+      description
+        "Primary address of the interface set by user.";
+    }
+
+    leaf multicast-boundary-oil {
+      type plist-ref;
+      description
+        "Prefix-List to define multicast boundary by group";
+    }
+
+    leaf multicast-boundary-acl {
+      type access-list-ref;
+      description
+        "Access-list to define multicast boundary by source and group";
+    }
+
+    list mroute {
+      key "source-addr group-addr";
+      description
+        "Add multicast route.";
+
+      leaf-list oif {
+        type frr-interface:interface-ref;
+        description
+          "List of Outgoing interface names.";
+      }
+
+      leaf source-addr {
+        type inet:ip-address;
+        description
+          "Multicast source address.";
+      }
+
+      leaf group-addr {
+        type rt-types:ip-multicast-group-address;
+        description
+          "Multicast group address.";
+      }
+    }
+  } // interface-pim-config-attributes
+
+  grouping router-pim-config-attributes {
+    description
+      "A grouping defining pim router attributes per address family.";
+    leaf packets {
+      type uint8 {
+        range "1..max";
+      }
+      default "3";
+      description
+        "Number of packets to process at one time per fd.";
+    }
+    leaf join-prune-interval {
+      type uint16 {
+        range "1..max";
+      }
+      default "60";
+      description
+        "Join Prune Send Interval in seconds.";
+    }
+    leaf register-suppress-time {
+      type uint16 {
+        range "1..max";
+      }
+      default "60";
+      description
+        "Register Suppress Timer.";
+    }
+  }
+
+  /*
+   * Global Configuration data nodes
+   */
+  augment "/frr-rt:routing/frr-rt:control-plane-protocols/"
+        + "frr-rt:control-plane-protocol" {
+    description
+      "Augments the control plane protocol configuration to support pim configuration.";
+    container pim {
+      when "../frr-rt:type = 'frr-pim:pimd'" {
+        description
+          "This container is only valid for the 'pim' routing
+           protocol.";
+      }
+      description
+        "PIM configuration data.";
+      list address-family {
+        key "address-family";
+        description
+          "Each list entry for one address family.";
+        uses frr-rt:address-family;
+        uses global-pim-config-attributes;
+
+      } //address-family
+    } // pim
+  } // augment
+
+  /*
+   * Per-interface configuration data
+   */
+  augment "/frr-interface:lib/frr-interface:interface" {
+    description
+      "Augments the interface configuration to support pim configuration.";
+    container pim {
+      description
+        "Configuration for pim on the interface.";
+      list address-family {
+        key "address-family";
+        description
+          "Each list entry for one address family.";
+        uses frr-rt:address-family;
+        uses interface-pim-config-attributes;
+      }
+    }
+  }
+
+  /*
+   * Router configuration data
+   */
+  container pim {
+    description
+      "PIM router parameters.";
+    list address-family {
+      key "address-family";
+      description
+        "Each list entry for one address family.";
+      uses frr-rt:address-family;
+      uses router-pim-config-attributes;
+    }
+  }
+}

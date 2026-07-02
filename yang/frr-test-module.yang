@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: BSD-2-Clause
+module frr-test-module {
+  yang-version 1.1;
+  namespace "urn:frr-test-module";
+  prefix frr-test-module;
+
+  import ietf-inet-types {
+    prefix inet;
+  }
+  import frr-interface {
+    prefix frr-interface;
+  }
+
+  organization "placeholder for lint";
+
+  contact "placeholder for lint";
+
+  description
+    "FRRouting internal testing module.
+
+     Copyright 2020 FRRouting
+
+     Redistribution and use in source and binary forms, with or without
+     modification, are permitted provided that the following conditions
+     are met:
+
+     1. Redistributions of source code must retain the above copyright notice,
+     this list of conditions and the following disclaimer.
+
+     2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in the
+     documentation and/or other materials provided with the distribution.
+
+     THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+     \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+     LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+     A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+     HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+     SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+     LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+     DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+     THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+     (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+     OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.";
+
+  revision 2018-11-26 {
+    description
+      "Initial revision.";
+    reference "placeholder for lint";
+  }
+
+  container frr-test-module {
+    config false;
+    description "a container for test module data";
+    container vrfs {
+      description "a container of vrfs";
+      list vrf {
+        key "name";
+        description "a keyed vrf list object";
+
+        leaf name {
+          type string;
+          description "name of vrf";
+        }
+        container interfaces {
+          description "container of leaf-list interfaces";
+          leaf-list interface {
+            type frr-interface:interface-ref;
+            description "leaf list interface object";
+          }
+          leaf-list interface-new {
+            type frr-interface:interface-ref;
+            description "second leaf list interface object";
+          }
+        }
+        container routes {
+          description "container of key-less route objects";
+          list route {
+            description "a key-less route object";
+            leaf prefix {
+              type inet:ipv4-prefix;
+              description "prefix of the route object";
+            }
+            leaf next-hop {
+              type inet:ipv4-address;
+              description "nexthop of the route object";
+            }
+            leaf interface {
+              type frr-interface:interface-ref;
+              description "interface of the route object";
+            }
+            leaf metric {
+              type uint8;
+              description "metric of the route object";
+            }
+            leaf active {
+              type empty;
+              description "active status of the route object";
+            }
+          }
+        }
+        action ping {
+          input {
+            leaf data {
+              type string;
+              description "data input to ping action.";
+            }
+          }
+          output {
+            leaf vrf {
+              type string;
+              description "vrf returned from ping action.";
+            }
+            // can't use the same name in input and output
+            // because of a bug in libyang < 2.1.148
+            leaf data-out {
+              type string;
+              description "data return from ping action.";
+            }
+          }
+        }
+      }
+    }
+    choice achoice {
+      description "a choice statement";
+      case case1 {
+        leaf c1value {
+          type uint8;
+          description "A uint8 value for case 1";
+        }
+      }
+      case case2 {
+        container c2cont {
+          description "case 2 container";
+          leaf c2value {
+            type uint32;
+            description "A uint32 value for case 2";
+          }
+        }
+      }
+    }
+    choice bchoice {
+      description "a choice statement";
+      case case3 {
+        leaf c3value {
+          type uint8;
+          description "A uint8 value for case 3";
+        }
+      }
+      case case4 {
+        container c4cont {
+          description "case 2 container";
+          leaf c4value {
+            type uint32;
+            description "A uint32 value for case 4";
+          }
+        }
+      }
+    }
+  }
+  rpc rpc-no-args {
+    description "An rpc with no arguments.";
+  }
+  rpc rpc-both-args {
+    description "A rpc with both input and output arguments.";
+    input {
+      leaf data {
+        type string;
+        description "data input to rpc_no_output.";
+      }
+    }
+    output {
+      leaf result {
+        type string;
+        description "result of RPC.";
+      }
+    }
+  }
+}

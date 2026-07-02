@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Zebra connect library for OSPFd
+ * Copyright (C) 1997, 98, 99, 2000 Kunihiro Ishiguro, Toshiaki Takada
+ */
+
+#ifndef _ZEBRA_OSPF_ZEBRA_H
+#define _ZEBRA_OSPF_ZEBRA_H
+
+#include "vty.h"
+#include "hook.h"
+
+#define EXTERNAL_METRIC_TYPE_1      0
+#define EXTERNAL_METRIC_TYPE_2      1
+
+#define DEFAULT_ROUTE		    ZEBRA_ROUTE_MAX
+#define DEFAULT_ROUTE_TYPE(T) ((T) == DEFAULT_ROUTE)
+
+/* OSPF distance. */
+struct ospf_distance {
+	/* Distance value for the IP source prefix. */
+	uint8_t distance;
+
+	/* Name of the access-list to be matched. */
+	char *access_list;
+};
+
+/* Prototypes */
+struct ospf_route;
+extern void ospf_zebra_add(struct ospf *ospf, struct prefix_ipv4 *p, struct ospf_route *or);
+extern void ospf_zebra_delete(struct ospf *ospf, struct prefix_ipv4 *p, struct ospf_route *or);
+
+extern void ospf_zebra_add_discard(struct ospf *ospf, struct prefix_ipv4 *p);
+extern void ospf_zebra_delete_discard(struct ospf *ospf, struct prefix_ipv4 *p);
+
+extern int ospf_redistribute_check(struct ospf *ospf, struct external_info *ei, int *changed);
+extern int ospf_distribute_check_connected(struct ospf *ospf, struct external_info *ei);
+extern void ospf_distribute_list_update(struct ospf *ospf, int type, unsigned short instance);
+
+extern int ospf_is_type_redistributed(struct ospf *ospf, int type, unsigned short instance);
+extern void ospf_distance_reset(struct ospf *ospf);
+extern uint8_t ospf_distance_apply(struct ospf *ospf, struct prefix_ipv4 *p,
+				   struct ospf_route *or);
+extern struct ospf_external *ospf_external_lookup(struct ospf *ospf, uint8_t type,
+						  unsigned short instance);
+
+extern struct external_info *ospf_external_info_default_lookup(struct ospf *ospf);
+
+extern struct ospf_external *ospf_external_add(struct ospf *ospf, uint8_t type,
+					       unsigned short instance);
+
+struct sr_prefix;
+struct sr_nhlfe;
+extern void ospf_zebra_update_prefix_sid(const struct sr_prefix *srp);
+extern void ospf_zebra_delete_prefix_sid(const struct sr_prefix *srp);
+extern void ospf_zebra_send_adjacency_sid(int cmd, struct sr_nhlfe nhlfe);
+
+extern void ospf_external_del(struct ospf *ospf, uint8_t type, unsigned short instance);
+extern struct ospf_redist *ospf_redist_lookup(struct ospf *ospf, uint8_t type,
+					      unsigned short instance);
+extern struct ospf_redist *ospf_redist_add(struct ospf *ospf, uint8_t type,
+					   unsigned short instance);
+extern void ospf_redist_del(struct ospf *ospf, uint8_t type, unsigned short instance);
+
+extern int ospf_redistribute_update(struct ospf *ospf, struct ospf_redist *red, int type,
+				    unsigned short instance, int mtype, int mvalue);
+extern int ospf_redistribute_set(struct ospf *ospf, struct ospf_redist *red, int type,
+				 unsigned short instance, int mtype, int mvalue);
+extern int ospf_redistribute_unset(struct ospf *ospf, int type, unsigned short instance);
+extern int ospf_redistribute_default_set(struct ospf *ospf, int originate, int mtype, int mvalue);
+extern void ospf_zebra_import_default_route(struct ospf *ospf, bool unreg);
+extern int ospf_distribute_list_out_set(struct ospf *ospf, int type, const char *name);
+extern int ospf_distribute_list_out_unset(struct ospf *ospf, int type, const char *name);
+extern void ospf_routemap_set(struct ospf_redist *red, const char *name);
+extern void ospf_routemap_unset(struct ospf_redist *red);
+extern int ospf_zebra_gr_enable(struct ospf *ospf, uint32_t stale_time);
+extern int ospf_zebra_gr_disable(struct ospf *ospf);
+extern void ospf_zebra_init(struct event_loop *m, unsigned short instance);
+extern void ospf_zebra_vrf_register(struct ospf *ospf);
+extern void ospf_zebra_vrf_deregister(struct ospf *ospf);
+bool ospf_external_default_routemap_apply_walk(
+	struct ospf *ospf, struct list *ext_list,
+	struct external_info *default_ei);
+int ospf_external_info_apply_default_routemap(struct ospf *ospf,
+					      struct external_info *ei,
+					      struct external_info *default_ei);
+
+extern void ospf_zebra_send_arp(const struct interface *ifp,
+				const struct prefix *p);
+bool ospf_zebra_label_manager_ready(void);
+int ospf_zebra_label_manager_connect(void);
+int ospf_zebra_request_label_range(uint32_t base, uint32_t chunk_size);
+int ospf_zebra_release_label_range(uint32_t start, uint32_t end);
+#endif /* _ZEBRA_OSPF_ZEBRA_H */

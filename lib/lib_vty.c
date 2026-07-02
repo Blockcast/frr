@@ -1,0 +1,441 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Assorted library VTY commands
+ *
+ * Copyright (C) 1998 Kunihiro Ishiguro
+ * Copyright (C) 2016-2017  David Lamparter for NetDEF, Inc.
+ */
+
+#include <zebra.h>
+/* malloc.h is generally obsolete, however GNU Libc mallinfo wants it. */
+#ifdef HAVE_MALLOC_H
+#include <malloc.h>
+#endif
+#ifdef HAVE_MALLOC_MALLOC_H
+#include <malloc/malloc.h>
+#endif
+#include <dlfcn.h>
+#ifdef HAVE_LINK_H
+#include <link.h>
+#endif
+
+#include "log.h"
+#include "memory.h"
+#include "seqlock.h"
+#include "module.h"
+#include "defaults.h"
+#include "lib_vty.h"
+#include "northbound_cli.h"
+#include "json.h"
+
+/* Looking up memory status from vty interface. */
+#include "vector.h"
+#include "vty.h"
+#include "command.h"
+
+#if defined(HAVE_MALLINFO2) || defined(HAVE_MALLINFO)
+static int show_memory_mallinfo(struct vty *vty)
+{
+	char buf[MTYPE_MEMSTR_LEN];
+#if defined(HAVE_MALLINFO2)
+	struct mallinfo2 minfo = mallinfo2();
+#elif defined(HAVE_MALLINFO)
+	struct mallinfo minfo = mallinfo();
+
+	/* If any 'int' values have rolled over, coerce them back */
+	if (minfo.arena < 0)
+		minfo.arena = 0x7fffffff;
+	if (minfo.hblkhd < 0)
+		minfo.hblkhd = 0x7fffffff;
+	if (minfo.usmblks < 0)
+		minfo.usmblks = 0x7fffffff;
+	if (minfo.uordblks < 0)
+		minfo.uordblks = 0x7fffffff;
+	if (minfo.fsmblks < 0)
+		minfo.fsmblks = 0x7fffffff;
+	if (minfo.fordblks < 0)
+		minfo.fordblks = 0x7fffffff;
+#endif
+
+	vty_out(vty, "System allocator statistics:\n");
+	vty_out(vty, "  Total heap allocated:  %s\n",
+		mtype_memstr(buf, MTYPE_MEMSTR_LEN, minfo.arena));
+	vty_out(vty, "  Holding block headers: %s\n",
+		mtype_memstr(buf, MTYPE_MEMSTR_LEN, minfo.hblkhd));
+	vty_out(vty, "  Used small blocks:     %s\n",
+		mtype_memstr(buf, MTYPE_MEMSTR_LEN, minfo.usmblks));
+	vty_out(vty, "  Used ordinary blocks:  %s\n",
+		mtype_memstr(buf, MTYPE_MEMSTR_LEN, minfo.uordblks));
+	vty_out(vty, "  Free small blocks:     %s\n",
+		mtype_memstr(buf, MTYPE_MEMSTR_LEN, minfo.fsmblks));
+	vty_out(vty, "  Free ordinary blocks:  %s\n",
+		mtype_memstr(buf, MTYPE_MEMSTR_LEN, minfo.fordblks));
+	vty_out(vty, "  Ordinary blocks:       %ld\n",
+		(unsigned long)minfo.ordblks);
+	vty_out(vty, "  Small blocks:          %ld\n",
+		(unsigned long)minfo.smblks);
+	vty_out(vty, "  Holding blocks:        %ld\n",
+		(unsigned long)minfo.hblks);
+	vty_out(vty, "(see system documentation for 'mallinfo' for meaning)\n");
+	return 1;
+}
+#endif /* HAVE_MALLINFO */
+
+struct qmem_walk_json_arg {
+	struct json_object *json;
+	struct json_object *current_group;
+};
+
+static int qmem_walker(void *arg, struct memgroup *mg, struct memtype *mt)
+{
+	struct vty *vty = arg;
+	if (!mt) {
+		vty_out(vty, "--- qmem %s ---\n", mg->name);
+		vty_out(vty, "%-30s: %8s %-8s%s %8s %9s\n",
+			"Type", "Current#", "  Size",
+#ifdef HAVE_MALLOC_USABLE_SIZE
+			"     Total",
+#else
+			"",
+#endif
+			"Max#",
+#ifdef HAVE_MALLOC_USABLE_SIZE
+			"MaxBytes"
+#else
+			""
+#endif
+			);
+	} else {
+		if (mt->n_max != 0) {
+			char size[32];
+			snprintf(size, sizeof(size), "%6zu", mt->size);
+#ifdef HAVE_MALLOC_USABLE_SIZE
+#define TSTR " %9zu"
+#define TARG , mt->total
+#define TARG2 , mt->max_size
+#else
+#define TSTR ""
+#define TARG
+#define TARG2
+#endif
+			vty_out(vty, "%-30s: %8zu %-8s"TSTR" %8zu"TSTR"\n",
+				mt->name,
+				mt->n_alloc,
+				mt->size == 0 ? ""
+					      : mt->size == SIZE_VAR
+							? "variable"
+							: size
+				TARG,
+				mt->n_max
+				TARG2);
+		}
+	}
+	return 0;
+}
+
+static int qmem_walker_json(void *arg, struct memgroup *mg, struct memtype *mt)
+{
+	struct qmem_walk_json_arg *jarg = arg;
+
+	if (!mt) {
+		jarg->current_group = json_object_new_array();
+		json_object_object_add(jarg->json, mg->name, jarg->current_group);
+	} else {
+		if (mt->n_max != 0) {
+			struct json_object *jmt = json_object_new_object();
+
+			json_object_string_add(jmt, "name", mt->name);
+			json_object_int_add(jmt, "currentAllocations", mt->n_alloc);
+			json_object_boolean_add(jmt, "sizeVariable", mt->size == SIZE_VAR);
+			json_object_int_add(jmt, "size", mt->size);
+
+#ifdef HAVE_MALLOC_USABLE_SIZE
+			json_object_int_add(jmt, "totalBytes", mt->total);
+#endif
+			json_object_int_add(jmt, "maxAllocations", mt->n_max);
+#ifdef HAVE_MALLOC_USABLE_SIZE
+			json_object_int_add(jmt, "maxBytes", mt->max_size);
+#endif
+
+			json_object_array_add(jarg->current_group, jmt);
+		}
+	}
+	return 0;
+}
+
+
+DEFUN_NOSH (show_memory,
+	    show_memory_cmd,
+	    "show memory [json]",
+	    "Show running system information\n"
+	    "Memory statistics\n"
+	    JSON_STR)
+{
+	bool uj = use_json(argc, argv);
+	struct json_object *json = NULL;
+	struct qmem_walk_json_arg jarg;
+
+	if (uj) {
+		json = json_object_new_object();
+
+		jarg.json = json;
+		jarg.current_group = NULL;
+		qmem_walk(qmem_walker_json, &jarg);
+
+		vty_json(vty, json);
+	} else {
+#ifdef HAVE_MALLINFO
+		show_memory_mallinfo(vty);
+#endif /* HAVE_MALLINFO */
+
+		qmem_walk(qmem_walker, vty);
+	}
+
+	return CMD_SUCCESS;
+}
+
+DEFUN_NOSH (show_modules,
+	    show_modules_cmd,
+	    "show modules",
+	    "Show running system information\n"
+	    "Loaded modules\n")
+{
+	struct frrmod_runtime *plug = frrmod_list;
+
+	vty_out(vty, "%-12s %-25s %s\n\n", "Module Name", "Version",
+		"Description");
+	while (plug) {
+		const struct frrmod_info *i = plug->info;
+
+		vty_out(vty, "%-12s %-25s %s\n", i->name, i->version,
+			i->description);
+		if (plug->dl_handle) {
+#ifdef HAVE_DLINFO_ORIGIN
+			char origin[MAXPATHLEN] = "";
+			dlinfo(plug->dl_handle, RTLD_DI_ORIGIN, &origin);
+#ifdef HAVE_DLINFO_LINKMAP
+			const char *name;
+			struct link_map *lm = NULL;
+			dlinfo(plug->dl_handle, RTLD_DI_LINKMAP, &lm);
+			if (lm) {
+				name = strrchr(lm->l_name, '/');
+				name = name ? name + 1 : lm->l_name;
+				vty_out(vty, "\tfrom: %s/%s\n", origin, name);
+			}
+#else
+			vty_out(vty, "\tfrom: %s \n", origin, plug->load_name);
+#endif
+#else
+			vty_out(vty, "\tfrom: %s\n", plug->load_name);
+#endif
+		}
+		plug = plug->next;
+	}
+
+	vty_out(vty, "pid: %u\n", (uint32_t)(getpid()));
+
+	return CMD_SUCCESS;
+}
+
+DEFUN_NOSH (show_rcu,
+	    show_rcu_cmd,
+	    "show rcu [json]",
+	    "Show running system information\n"
+	    "RCU (read-copy-update) statistics\n"
+	    JSON_STR)
+{
+	bool uj = use_json(argc, argv);
+	struct json_object *json = NULL;
+	struct rcu_stats stats;
+
+	rcu_stats(&stats);
+
+	if (uj) {
+		json = json_object_new_object();
+
+		json_object_boolean_add(json, "rcuActive", stats.rcu_active);
+		if (!stats.rcu_active) {
+			vty_json(vty, json);
+			return CMD_SUCCESS;
+		}
+
+		json_object_int_add(json, "seqHead", stats.seq_head / SEQLOCK_INCR);
+		json_object_int_add(json, "seqLag", stats.seq_delta / (int)SEQLOCK_INCR);
+		json_object_int_add(json, "nThreadsHolding", stats.holding);
+		json_object_int_add(json, "queueLength", stats.qlen);
+		json_object_int_add(json, "totalCallsExecuted", stats.completed);
+
+		vty_json(vty, json);
+	} else {
+		if (!stats.rcu_active) {
+			vty_out(vty, "%% RCU not in use by this daemon\n");
+			return CMD_SUCCESS;
+		}
+
+		vty_out(vty, "RCU sequence counter: 0x%08x\n", stats.seq_head / SEQLOCK_INCR);
+		vty_out(vty, "RCU sequence lag:     %d\n", stats.seq_delta / (int)SEQLOCK_INCR);
+		vty_out(vty, "Threads holding RCU:  %zu\n", stats.holding);
+		vty_out(vty, "Queue length:         %zu\n", stats.qlen);
+		vty_out(vty, "Total calls executed: %zu\n", stats.completed);
+	}
+
+	return CMD_SUCCESS;
+}
+
+DEFUN (frr_defaults,
+       frr_defaults_cmd,
+       "frr defaults PROFILE...",
+       "FRRouting global parameters\n"
+       "set of configuration defaults used\n"
+       "profile string\n")
+{
+	char *profile = argv_concat(argv, argc, 2);
+	int rv = CMD_SUCCESS;
+
+	if (!frr_defaults_profile_valid(profile)) {
+		vty_out(vty, "%% WARNING: profile %s is not known in this version\n",
+			profile);
+		rv = CMD_WARNING;
+	}
+	frr_defaults_profile_set(profile);
+	XFREE(MTYPE_TMP, profile);
+	return rv;
+}
+
+DEFUN (frr_version,
+       frr_version_cmd,
+       "frr version VERSION...",
+       "FRRouting global parameters\n"
+       "version configuration was written by\n"
+       "version string\n")
+{
+	char *version = argv_concat(argv, argc, 2);
+
+	frr_defaults_version_set(version);
+	XFREE(MTYPE_TMP, version);
+	return CMD_SUCCESS;
+}
+
+static struct call_back {
+	time_t readin_time;
+
+	void (*start_config)(struct vty *vty);
+	void (*end_config)(struct vty *vty);
+} callback;
+
+
+DEFUN_NOSH(start_config, start_config_cmd, "XFRR_start_configuration",
+	   "The Beginning of Configuration\n")
+{
+	callback.readin_time = monotime(NULL);
+
+	vty->pending_allowed = 1;
+
+	if (callback.start_config)
+		(*callback.start_config)(vty);
+
+	return CMD_SUCCESS;
+}
+
+DEFUN_NOSH(end_config, end_config_cmd, "XFRR_end_configuration",
+	   "The End of Configuration\n")
+{
+	time_t readin_time;
+	char readin_time_str[MONOTIME_STRLEN];
+	int ret;
+
+	readin_time = monotime(NULL);
+	readin_time -= callback.readin_time;
+
+	frrtime_to_interval(readin_time, readin_time_str,
+			    sizeof(readin_time_str));
+
+	/* This is also getting cleared in the config node exit */
+	vty->pending_allowed = 0;
+	ret = nb_cli_pending_commit_check(vty);
+
+	zlog_info("Configuration Read in Took: %s", readin_time_str);
+	zlog_debug("%s: VTY:%p, pending SET-CFG: %u", __func__, vty,
+		   (uint32_t)vty->mgmt_num_pending_setcfg);
+
+	if (callback.end_config)
+		(*callback.end_config)(vty);
+
+	return ret;
+}
+
+void cmd_init_config_callbacks(void (*start_config_cb)(struct vty *vty),
+			       void (*end_config_cb)(struct vty *vty))
+{
+	callback.start_config = start_config_cb;
+	callback.end_config = end_config_cb;
+}
+
+
+static void defaults_autocomplete(vector comps, struct cmd_token *token)
+{
+	const char **p;
+
+	for (p = frr_defaults_profiles; *p; p++)
+		vector_set(comps, XSTRDUP(MTYPE_COMPLETION, *p));
+}
+
+static const struct cmd_variable_handler default_var_handlers[] = {
+	{.tokenname = "PROFILE", .completions = defaults_autocomplete},
+	{.completions = NULL},
+};
+
+void lib_cmd_init(void)
+{
+	cmd_variable_handler_register(default_var_handlers);
+
+	install_element(CONFIG_NODE, &frr_defaults_cmd);
+	install_element(CONFIG_NODE, &frr_version_cmd);
+
+	install_element(VIEW_NODE, &show_memory_cmd);
+	install_element(VIEW_NODE, &show_modules_cmd);
+	install_element(VIEW_NODE, &show_rcu_cmd);
+
+	install_element(CONFIG_NODE, &start_config_cmd);
+	install_element(CONFIG_NODE, &end_config_cmd);
+}
+
+/* Stats querying from users */
+/* Return a pointer to a human friendly string describing
+ * the byte count passed in. E.g:
+ * "0 bytes", "2048 bytes", "110kB", "500MiB", "11GiB", etc.
+ * Up to 4 significant figures will be given.
+ * The pointer returned may be NULL (indicating an error)
+ * or point to the given buffer, or point to static storage.
+ */
+const char *mtype_memstr(char *buf, size_t len, unsigned long bytes)
+{
+	unsigned int g, m, k;
+
+	/* easy cases */
+	if (!bytes)
+		return "0 bytes";
+	if (bytes == 1)
+		return "1 byte";
+
+	g = bytes >> 30;
+	m = bytes >> 20;
+	k = bytes >> 10;
+
+	if (g > 10) {
+		if (bytes & (1 << 29))
+			g++;
+		snprintf(buf, len, "%d GB", g);
+	} else if (m > 10) {
+		if (bytes & (1 << 19))
+			m++;
+		snprintf(buf, len, "%d MiB", m);
+	} else if (k > 10) {
+		if (bytes & (1 << 9))
+			k++;
+		snprintf(buf, len, "%d KiB", k);
+	} else
+		snprintf(buf, len, "%ld bytes", bytes);
+
+	return buf;
+}

@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * MGMTD message definition header.
+ *
+ * Copyright (C) 2021  Vmware, Inc.
+ *		       Pushpasis Sarkar <spushpasis@vmware.com>
+ */
+
+#ifndef _FRR_MGMTD_H
+#define _FRR_MGMTD_H
+
+#include "debug.h"
+#include "vrf.h"
+#include "defaults.h"
+#include "stream.h"
+#include "mgmt_defines.h"
+
+#include "mgmtd/mgmt_memory.h"
+#include "mgmtd/mgmt_history.h"
+#include "mgmtd/mgmt_txn.h"
+#include "mgmtd/mgmt_ds.h"
+
+#define MGMTD_SOCKET_BUF_SIZE 65535
+#define MGMTD_MAX_COMMIT_LIST 10
+
+extern struct debug mgmt_debug_be;
+extern struct debug mgmt_debug_ds;
+extern struct debug mgmt_debug_fe;
+extern struct debug mgmt_debug_txn;
+
+#define MGMT_DEBUG_BE_CHECK() DEBUG_MODE_CHECK(&mgmt_debug_be, DEBUG_MODE_ALL)
+#define MGMT_DEBUG_DS_CHECK() DEBUG_MODE_CHECK(&mgmt_debug_ds, DEBUG_MODE_ALL)
+#define MGMT_DEBUG_FE_CHECK() DEBUG_MODE_CHECK(&mgmt_debug_fe, DEBUG_MODE_ALL)
+#define MGMT_DEBUG_TXN_CHECK() DEBUG_MODE_CHECK(&mgmt_debug_tx, DEBUG_MODE_ALL)
+
+/* The first 1000 session IDs are reserved for backend clients IDs */
+#define MGMT_FE_SESSION_ID_MIN 1001
+#define MGMT_FE_SESSION_ID_MAX UINTPTR_MAX
+
+#define MGMT_BE_CLIENT_TO_SESSION_ID(client_id)	 ((client_id) + 1)
+#define MGMT_FE_SESSION_TO_CLIENT_ID(session_id) (assert((session_id) > 0), ((session_id)-1))
+
+struct mgmt_txn;
+
+/*
+ * MGMTD master for system wide configurations and variables.
+ */
+struct mgmt_master {
+	struct event_loop *master;
+
+	/* How big should we set the socket buffer size */
+	uint32_t socket_buffer;
+
+	/* Datastores */
+	struct mgmt_ds_ctx *running_ds;
+	struct mgmt_ds_ctx *candidate_ds;
+	struct mgmt_ds_ctx *oper_ds;
+
+	bool terminating;   /* global flag that sigint terminate seen */
+	bool perf_stats_en; /* to enable performance stats measurement */
+
+	/* List of commit infos */
+	struct mgmt_cmt_infos_head cmts; /* List of last 10 commits executed. */
+};
+
+extern struct frr_daemon_info *mgmt_daemon_info;
+extern struct mgmt_master *mm;
+
+/* Inline functions */
+
+/*
+ * Remove trailing separator from a string.
+ *
+ * str
+ *    A null terminated string.
+ *
+ * sep
+ *    Trailing character that needs to be removed.
+ */
+static inline void mgmt_remove_trailing_separator(char *str, char sep)
+{
+	size_t len;
+
+	len = strlen(str);
+	if (len && str[len - 1] == sep)
+		str[len - 1] = '\0';
+}
+
+/* Prototypes. */
+extern void mgmt_terminate(void);
+extern void mgmt_reset(void);
+extern time_t mgmt_clock(void);
+
+extern int mgmt_config_write(struct vty *vty);
+extern struct vty *mgmt_vty_read_config(const char *config_file,
+					char *config_default_dir);
+extern void mgmt_master_init(struct event_loop *master, const int buffer_size);
+
+extern void mgmt_init(void);
+extern void mgmt_vty_init(void);
+
+/*
+ * mgmt vty
+ */
+extern void vty_mgmt_init(void);
+extern void vty_mgmt_terminate(void);
+
+extern int vty_mgmt_send_commit_config(struct vty *vty, bool validate_only, bool abort,
+				       bool unlock);
+extern int vty_mgmt_send_get_data_req(struct vty *vty, uint8_t datastore, LYD_FORMAT result_type,
+				      uint8_t flags, uint8_t defaults, const char *xpath);
+extern int vty_mgmt_send_edit_req(struct vty *vty, uint8_t datastore, LYD_FORMAT request_type,
+				  uint8_t flags, uint8_t operation, const char *xpath,
+				  const char *data);
+extern void vty_mgmt_resume_response(struct vty *vty, int ret);
+
+
+extern int vty_mgmt_send_config_data(struct vty *vty, const char *xpath_base, bool implicit_commit);
+extern int vty_mgmt_send_rpc_req(struct vty *vty, LYD_FORMAT request_type, const char *xpath,
+				 const char *data);
+
+// clang-format off
+#ifdef _FRR_ATTRIBUTE_PRINTFRR
+#pragma FRR printfrr_ext "%pMBI" (mgmt_be_client_id_t *)
+#pragma FRR printfrr_ext "%pMBM" (uint64_t *)
+#endif
+// clang-format on
+
+#endif /* _FRR_MGMTD_H */
