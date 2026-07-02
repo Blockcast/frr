@@ -43,6 +43,25 @@ void bgp_mvpn_build_prefix_type5(struct prefix_mvpn *p, struct in_addr src, stru
 }
 
 /*
+ * Fill a prefix_mvpn for a Type-7 (C-multicast Source Tree Join) route. Like
+ * the Type-5 builder, the struct is memset-zeroed first so that padding is
+ * deterministic and the radix key / prefix_same() memcmp are stable. The
+ * Source AS is stored in host order in the RIB key so distinct upstream ASes
+ * key to distinct routes and the value is renderable from the prefix.
+ */
+void bgp_mvpn_build_prefix_type7(struct prefix_mvpn *p, uint32_t source_as, struct in_addr src,
+				 struct in_addr grp)
+{
+	memset(p, 0, sizeof(*p));
+	p->family = AF_MVPN;
+	p->prefixlen = BGP_MVPN_PREFIXLEN;
+	p->prefix.route_type = BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN;
+	p->prefix.source_as = source_as;
+	p->prefix.src = src;
+	p->prefix.grp = grp;
+}
+
+/*
  * RFC 6514 Section 4.5 Source Active A-D route (IPv4). The RD is emitted as 8
  * zero octets per RFC 7716 Global Table Multicast.
  */
@@ -57,6 +76,29 @@ void bgp_mvpn_encode_type5(struct stream *s, const struct prefix *p, bool addpat
 	stream_putc(s, m->route_type);		    /* Route Type = 5 */
 	stream_putc(s, BGP_MVPN_TYPE5_V4_SPEC_LEN); /* Length */
 	stream_put(s, NULL, 8);			    /* RD = 0 (GTM) */
+	stream_putc(s, IPV4_MAX_BITLEN);	    /* Multicast Source Length */
+	stream_put_in_addr(s, &m->src);		    /* Multicast Source (C-S) */
+	stream_putc(s, IPV4_MAX_BITLEN);	    /* Multicast Group Length */
+	stream_put_in_addr(s, &m->grp);		    /* Multicast Group (C-G) */
+}
+
+/*
+ * RFC 6514 Section 4.6 C-multicast Source Tree Join route (IPv4). Adds a
+ * 4-octet Source AS after the (zero, GTM) RD relative to Type-5. Source AS is
+ * held in host order in the prefix and emitted network order via stream_putl.
+ */
+void bgp_mvpn_encode_type7(struct stream *s, const struct prefix *p, bool addpath_capable,
+			   uint32_t addpath_tx_id)
+{
+	const struct mvpn_addr *m = &p->u.prefix_mvpn;
+
+	if (addpath_capable)
+		stream_putl(s, addpath_tx_id);
+
+	stream_putc(s, m->route_type);		    /* Route Type = 7 */
+	stream_putc(s, BGP_MVPN_TYPE7_V4_SPEC_LEN); /* Length */
+	stream_put(s, NULL, 8);			    /* RD = 0 (GTM) */
+	stream_putl(s, m->source_as);		    /* Source AS */
 	stream_putc(s, IPV4_MAX_BITLEN);	    /* Multicast Source Length */
 	stream_put_in_addr(s, &m->src);		    /* Multicast Source (C-S) */
 	stream_putc(s, IPV4_MAX_BITLEN);	    /* Multicast Group Length */
@@ -131,8 +173,9 @@ static void bgp_mvpn_route_remove(struct bgp *bgp, struct peer *peer, const stru
 
 /*
  * Parse a received MCAST-VPN NLRI. Each NLRI is Route Type(1) + Length(1) +
- * route-type-specific. Only Type 5 (Source Active) is decoded; other types are
- * skipped using the on-wire Length so the stream stays framed.
+ * route-type-specific. Type 5 (Source Active) and Type 7 (C-multicast Source
+ * Tree Join) are decoded; other types are skipped using the on-wire Length so
+ * the stream stays framed.
  */
 int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *packet,
 			bool mp_withdraw)
@@ -145,6 +188,7 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 	uint8_t grp_len;
 	struct in_addr src;
 	struct in_addr grp;
+	uint32_t source_as;
 	bool addpath_capable;
 	uint32_t addpath_id;
 	int ret = BGP_NLRI_PARSE_OK;
@@ -172,37 +216,70 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			goto done;
 		}
 
-		if (route_type != BGP_MVPN_ROUTE_TYPE_SOURCE_ACTIVE) {
+		switch (route_type) {
+		case BGP_MVPN_ROUTE_TYPE_SOURCE_ACTIVE:
+			if (length != BGP_MVPN_TYPE5_V4_SPEC_LEN) {
+				flog_err(EC_BGP_UPDATE_RCV,
+					 "%s [Error] MVPN Type-5 bad length %u (expected %u)",
+					 peer->host, length, BGP_MVPN_TYPE5_V4_SPEC_LEN);
+				ret = BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
+				goto done;
+			}
+
+			/* RD (8 octets) is always zero under GTM; read and ignore. */
+			stream_forward_getp(data, 8);
+
+			STREAM_GETC(data, src_len);
+			STREAM_GET(&src, data, IPV4_MAX_BYTELEN);
+			STREAM_GETC(data, grp_len);
+			STREAM_GET(&grp, data, IPV4_MAX_BYTELEN);
+
+			if (src_len != IPV4_MAX_BITLEN || grp_len != IPV4_MAX_BITLEN) {
+				flog_err(EC_BGP_UPDATE_RCV,
+					 "%s [Error] MVPN Type-5 non-v4 addr lengths (src %u grp %u)",
+					 peer->host, src_len, grp_len);
+				ret = BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
+				goto done;
+			}
+
+			bgp_mvpn_build_prefix_type5(&p, src, grp);
+			break;
+
+		case BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN:
+			if (length != BGP_MVPN_TYPE7_V4_SPEC_LEN) {
+				flog_err(EC_BGP_UPDATE_RCV,
+					 "%s [Error] MVPN Type-7 bad length %u (expected %u)",
+					 peer->host, length, BGP_MVPN_TYPE7_V4_SPEC_LEN);
+				ret = BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
+				goto done;
+			}
+
+			/* RD (8 octets) is always zero under GTM; read and ignore. */
+			stream_forward_getp(data, 8);
+
+			STREAM_GET(&source_as, data, 4);
+			source_as = ntohl(source_as);
+			STREAM_GETC(data, src_len);
+			STREAM_GET(&src, data, IPV4_MAX_BYTELEN);
+			STREAM_GETC(data, grp_len);
+			STREAM_GET(&grp, data, IPV4_MAX_BYTELEN);
+
+			if (src_len != IPV4_MAX_BITLEN || grp_len != IPV4_MAX_BITLEN) {
+				flog_err(EC_BGP_UPDATE_RCV,
+					 "%s [Error] MVPN Type-7 non-v4 addr lengths (src %u grp %u)",
+					 peer->host, src_len, grp_len);
+				ret = BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
+				goto done;
+			}
+
+			bgp_mvpn_build_prefix_type7(&p, source_as, src, grp);
+			break;
+
+		default:
 			/* Unsupported route type: skip its body, stay framed. */
 			stream_forward_getp(data, length);
 			continue;
 		}
-
-		if (length != BGP_MVPN_TYPE5_V4_SPEC_LEN) {
-			flog_err(EC_BGP_UPDATE_RCV,
-				 "%s [Error] MVPN Type-5 bad length %u (expected %u)", peer->host,
-				 length, BGP_MVPN_TYPE5_V4_SPEC_LEN);
-			ret = BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
-			goto done;
-		}
-
-		/* RD (8 octets) is always zero under GTM; read and ignore. */
-		stream_forward_getp(data, 8);
-
-		STREAM_GETC(data, src_len);
-		STREAM_GET(&src, data, IPV4_MAX_BYTELEN);
-		STREAM_GETC(data, grp_len);
-		STREAM_GET(&grp, data, IPV4_MAX_BYTELEN);
-
-		if (src_len != IPV4_MAX_BITLEN || grp_len != IPV4_MAX_BITLEN) {
-			flog_err(EC_BGP_UPDATE_RCV,
-				 "%s [Error] MVPN Type-5 non-v4 addr lengths (src %u grp %u)",
-				 peer->host, src_len, grp_len);
-			ret = BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
-			goto done;
-		}
-
-		bgp_mvpn_build_prefix_type5(&p, src, grp);
 
 		if (mp_withdraw)
 			bgp_mvpn_route_remove(peer->bgp, peer, &p, BGP_ROUTE_NORMAL);
@@ -231,6 +308,37 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, struct in_addr src, struct in_ad
 	struct attr attr;
 
 	bgp_mvpn_build_prefix_type5(&p, src, grp);
+
+	if (negate) {
+		bgp_mvpn_route_remove(bgp, bgp->peer_self, &p, BGP_ROUTE_STATIC);
+		return CMD_SUCCESS;
+	}
+
+	bgp_attr_default_set(&attr, bgp, BGP_ORIGIN_IGP);
+	bgp_attr_set(&attr, BGP_ATTR_NEXT_HOP);
+	attr.nexthop = bgp->router_id;
+	attr.mp_nexthop_global_in = bgp->router_id;
+	attr.mp_nexthop_len = IPV4_MAX_BYTELEN;
+
+	bgp_mvpn_route_install(bgp, bgp->peer_self, &p, &attr, BGP_ROUTE_STATIC);
+
+	aspath_unintern(&attr.aspath);
+	return CMD_SUCCESS;
+}
+
+/*
+ * TEST-ONLY scaffold: originate or withdraw a local Type-7 (C-multicast Source
+ * Tree Join) route, mirroring bgp_mvpn_source_active_set(). Plan 3 replaces
+ * this with real pimd-driven origination; the CLI that drives it is likewise
+ * test-only.
+ */
+int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, struct in_addr src,
+				  struct in_addr grp, bool negate)
+{
+	struct prefix_mvpn p;
+	struct attr attr;
+
+	bgp_mvpn_build_prefix_type7(&p, source_as, src, grp);
 
 	if (negate) {
 		bgp_mvpn_route_remove(bgp, bgp->peer_self, &p, BGP_ROUTE_STATIC);
@@ -305,6 +413,8 @@ void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_
 				json_object_int_add(jr, "routeType", m->route_type);
 				json_object_string_addf(jr, "source", "%pI4", &m->src);
 				json_object_string_addf(jr, "group", "%pI4", &m->grp);
+				if (m->route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN)
+					json_object_int_add(jr, "sourceAs", m->source_as);
 				json_object_boolean_add(jr, "selfOriginated", self);
 				json_object_array_add(json_routes, jr);
 			} else {

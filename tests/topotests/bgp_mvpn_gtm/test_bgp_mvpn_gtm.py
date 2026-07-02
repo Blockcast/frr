@@ -158,6 +158,53 @@ def test_type5_source_active_propagates():
     _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
     assert result is None, "r2 did not learn r1's MVPN Type-5 Source Active route"
 
+
+def test_type7_source_tree_join_propagates():
+    """A local GTM Source Tree Join (Type 7) route on r2 must reach r1 via BGP.
+
+    r2 injects a C-multicast Source Tree Join (Type 7, RFC 6514 Section 4.6) via
+    the TEST-ONLY `bgp mvpn test-join <S> group <G> source-as <asn>` scaffold
+    (Plan 3 replaces this with pimd-driven origination). r1 must learn it and
+    expose it via `show bgp ipv4 mvpn json` with routeType 7, the matching
+    (S,G), and the carried Source AS.
+
+    AUTHORED-NOT-RUN: this repo has no network namespaces, so the topotest is
+    authored and py_compile-checked but not executed here.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+router bgp 65001
+ address-family ipv4 mvpn
+  bgp mvpn test-join 10.10.10.1 group 232.1.1.1 source-as 65001
+"""
+    )
+
+    def _type7_present(router):
+        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv4 mvpn json"))
+        routes = out.get("routes", [])
+        for r in routes:
+            if (
+                r.get("routeType") == 7
+                and r.get("source") == "10.10.10.1"
+                and r.get("group") == "232.1.1.1"
+                and r.get("sourceAs") == 65001
+            ):
+                return None
+        return "Type-7 (10.10.10.1, 232.1.1.1, AS 65001) not found in {}".format(
+            routes
+        )
+
+    test_func = functools.partial(_type7_present, "r1")
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, "r1 did not learn r2's MVPN Type-7 Source Tree Join route"
+
+
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
     sys.exit(pytest.main(args))

@@ -5202,7 +5202,10 @@ void bgp_packet_mpattr_prefix(struct stream *s, afi_t afi, safi_t safi, const st
 		assert(!"Dev escape usage of SAFI_UNSPEC or MAX");
 		break;
 	case SAFI_MCAST_VPN:
-		bgp_mvpn_encode_type5(s, p, addpath_capable, addpath_tx_id);
+		if (p->u.prefix_mvpn.route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN)
+			bgp_mvpn_encode_type7(s, p, addpath_capable, addpath_tx_id);
+		else
+			bgp_mvpn_encode_type5(s, p, addpath_capable, addpath_tx_id);
 		break;
 	case SAFI_MPLS_VPN:
 		if (addpath_capable)
@@ -5330,8 +5333,15 @@ size_t bgp_packet_mpattr_prefix_size(afi_t afi, safi_t safi,
 		assert(!"Attempting to figure size for a SAFI_UNSPEC/SAFI_MAX this is a DEV ESCAPE");
 		break;
 	case SAFI_MCAST_VPN:
-		/* RFC 6514 Type-5 (IPv4): RouteType(1) + Length(1) + spec(18). */
-		size = BGP_MVPN_TYPE5_V4_NLRI_LEN;
+		/*
+		 * RFC 6514: RouteType(1) + Length(1) + route-type-specific.
+		 * Reserve per route type: Type-7 (24) is larger than Type-5
+		 * (20). Under-reserving a Type-7 here would overrun the stream.
+		 */
+		if (p->u.prefix_mvpn.route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN)
+			size = BGP_MVPN_TYPE7_V4_NLRI_LEN;
+		else
+			size = BGP_MVPN_TYPE5_V4_NLRI_LEN;
 		break;
 	case SAFI_UNICAST:
 	case SAFI_MULTICAST:

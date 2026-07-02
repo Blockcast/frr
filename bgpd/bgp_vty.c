@@ -23315,6 +23315,36 @@ DEFPY (bgp_mvpn_source_active,
 	return bgp_mvpn_source_active_set(bgp, source, group, !!no);
 }
 
+/*
+ * TEST-ONLY scaffold: inject a C-multicast Source Tree Join (Type 7) route so
+ * the receive/propagation path can be exercised without pimd. Plan 3 replaces
+ * this with real pimd-driven origination and this command is removed.
+ */
+DEFPY (bgp_mvpn_test_join,
+       bgp_mvpn_test_join_cmd,
+       "[no] bgp mvpn test-join A.B.C.D$source group A.B.C.D$group source-as (1-4294967295)$source_as",
+       NO_STR
+       BGP_STR
+       "Multicast VPN (MCAST-VPN) commands\n"
+       "TEST-ONLY: originate a C-multicast Source Tree Join (Type 7) route\n"
+       "Multicast source address (C-S)\n"
+       "Multicast group\n"
+       "Multicast group address (C-G), SSM range 232.0.0.0/8\n"
+       "Upstream Source AS carried in the Type-7 NLRI\n"
+       "Source Autonomous System number\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+
+	/* GTM is SSM-only: enforce group in 232.0.0.0/8. */
+	if ((ntohl(group.s_addr) & 0xff000000U) != 0xe8000000U) {
+		vty_out(vty, "%% MCAST-VPN group %pI4 is not in the SSM range 232.0.0.0/8\n",
+			&group);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	return bgp_mvpn_source_tree_join_set(bgp, source_as, source, group, !!no);
+}
+
 DEFPY (show_bgp_ipv4_mvpn,
        show_bgp_ipv4_mvpn_cmd,
        "show bgp ipv4 mvpn [json$uj]",
@@ -23798,6 +23828,7 @@ void bgp_vty_init(void)
 
 	/* MCAST-VPN (RFC 6514 GTM) config + show commands. */
 	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_source_active_cmd);
+	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_test_join_cmd);
 	install_element(VIEW_NODE, &show_bgp_ipv4_mvpn_cmd);
 	install_element(ENABLE_NODE, &show_bgp_ipv4_mvpn_cmd);
 
