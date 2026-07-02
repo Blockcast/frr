@@ -23305,7 +23305,7 @@ DEFPY (bgp_mvpn_source_active,
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
 
 	/* GTM is SSM-only: enforce group in 232.0.0.0/8. */
-	if ((ntohl(group.s_addr) & 0xff000000U) != 0xe8000000U) {
+	if (!bgp_mvpn_group_is_ssm(group)) {
 		vty_out(vty, "%% MCAST-VPN group %pI4 is not in the SSM range 232.0.0.0/8\n",
 			&group);
 		return CMD_WARNING_CONFIG_FAILED;
@@ -23331,7 +23331,7 @@ DEFPY_HIDDEN (bgp_mvpn_test_join,
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
 
 	/* GTM is SSM-only: enforce group in 232.0.0.0/8. */
-	if ((ntohl(group.s_addr) & 0xff000000U) != 0xe8000000U) {
+	if (!bgp_mvpn_group_is_ssm(group)) {
 		vty_out(vty, "%% MCAST-VPN group %pI4 is not in the SSM range 232.0.0.0/8\n",
 			&group);
 		return CMD_WARNING_CONFIG_FAILED;

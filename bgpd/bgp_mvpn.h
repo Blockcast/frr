@@ -61,6 +61,18 @@
  */
 #define BGP_MVPN_TYPE7_V4_NLRI_LEN (2 + BGP_MVPN_TYPE7_V4_SPEC_LEN)
 
+/*
+ * Global Table Multicast is SSM-only: the customer group (C-G) must fall in the
+ * IPv4 SSM range 232.0.0.0/8 (RFC 4607, 0xe8 == 232). Enforced on both
+ * origination (VTY) and on receipt of a peer's Type-5/7 NLRI, so a
+ * non-conforming peer cannot inject an ASM/unicast/bogon group into the global
+ * table.
+ */
+static inline bool bgp_mvpn_group_is_ssm(struct in_addr grp)
+{
+	return (ntohl(grp.s_addr) & 0xff000000U) == 0xe8000000U;
+}
+
 /* Fill a prefix_mvpn for a Type-5 (Source Active) route. */
 extern void bgp_mvpn_build_prefix_type5(struct prefix_mvpn *p, struct in_addr src,
 					struct in_addr grp);

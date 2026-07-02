@@ -32,6 +32,19 @@
  */
 #define BGP_MVPN_PREFIXLEN (sizeof(struct mvpn_addr) * 8)
 
+/*
+ * True if the 8-octet Route Distinguisher is all zero. Under Global Table
+ * Multicast (RFC 7716) the RD is always zero (single global table). A non-zero
+ * RD denotes a VPN-scoped route this codec cannot represent -- mvpn_addr has no
+ * RD field, so two routes differing only in RD would alias to one RIB key.
+ */
+static bool mvpn_rd_is_zero(const uint8_t rd[8])
+{
+	static const uint8_t zero[8] = { 0 };
+
+	return memcmp(rd, zero, 8) == 0;
+}
+
 void bgp_mvpn_build_prefix_type5(struct prefix_mvpn *p, struct in_addr src, struct in_addr grp)
 {
 	memset(p, 0, sizeof(*p));
@@ -234,12 +247,25 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 	uint8_t length;
 	uint8_t src_len;
 	uint8_t grp_len;
+	uint8_t rd[8];
 	struct in_addr src;
 	struct in_addr grp;
 	uint32_t source_as;
 	bool addpath_capable;
 	uint32_t addpath_id;
 	int ret = BGP_NLRI_PARSE_OK;
+
+	/*
+	 * A withdraw carrying only AFI/SAFI (empty NLRI, packet->length == 0) is
+	 * valid and means "nothing to withdraw here". stream_new(0) asserts, so
+	 * return success without allocating. The EVPN parser tolerates this
+	 * implicitly by iterating pnt..lim; this codec wraps the NLRI in a stream
+	 * sized by the (untrusted) length, so it must guard explicitly -- a peer
+	 * sending a 3-octet MP_UNREACH (AFI+SAFI, no NLRI) would otherwise abort
+	 * every bgpd in the AS with SAFI-5 active.
+	 */
+	if (packet->length == 0)
+		return BGP_NLRI_PARSE_OK;
 
 	data = stream_new(packet->length);
 	stream_put(data, packet->nlri, packet->length);
@@ -274,8 +300,9 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 				goto done;
 			}
 
-			/* RD (8 octets) is always zero under GTM; read and ignore. */
-			stream_forward_getp(data, 8);
+			/* RD (8 octets): read for validation after the body is
+			 * fully consumed (GTM requires RD == 0). */
+			STREAM_GET(rd, data, 8);
 
 			/* Originating Router's IP Address -> src slot. */
 			STREAM_GET(&src, data, IPV4_MAX_BYTELEN);
@@ -292,8 +319,9 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 				goto done;
 			}
 
-			/* RD (8 octets) is always zero under GTM; read and ignore. */
-			stream_forward_getp(data, 8);
+			/* RD (8 octets): read for validation after the body is
+			 * fully consumed (GTM requires RD == 0). */
+			STREAM_GET(rd, data, 8);
 
 			STREAM_GETC(data, src_len);
 			STREAM_GET(&src, data, IPV4_MAX_BYTELEN);
@@ -320,8 +348,9 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 				goto done;
 			}
 
-			/* RD (8 octets) is always zero under GTM; read and ignore. */
-			stream_forward_getp(data, 8);
+			/* RD (8 octets): read for validation after the body is
+			 * fully consumed (GTM requires RD == 0). */
+			STREAM_GET(rd, data, 8);
 
 			STREAM_GET(&source_as, data, 4);
 			source_as = ntohl(source_as);
@@ -344,6 +373,46 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		default:
 			/* Unsupported route type: skip its body, stay framed. */
 			stream_forward_getp(data, length);
+			continue;
+		}
+
+		/*
+		 * Semantic validation on a fully-decoded, correctly-framed NLRI.
+		 * Unlike the length checks above (which abort because the framing
+		 * is untrustworthy), a valid-framing/bad-value NLRI is dropped and
+		 * parsing continues (RFC 7606 treat-as-discard spirit) -- refusing
+		 * to install without letting a misbehaving peer weaponize a
+		 * session reset. getp is already at the next NLRI here.
+		 */
+		if (!mvpn_rd_is_zero(rd)) {
+			flog_err(EC_BGP_UPDATE_RCV,
+				 "%s [Error] MVPN Type-%u non-zero RD under GTM (RFC 7716); dropping route",
+				 peer->host, route_type);
+			continue;
+		}
+
+		if ((route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_ACTIVE ||
+		     route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN) &&
+		    !bgp_mvpn_group_is_ssm(grp)) {
+			flog_err(EC_BGP_UPDATE_RCV,
+				 "%s [Error] MVPN Type-%u group %pI4 outside SSM range 232.0.0.0/8; dropping route",
+				 peer->host, route_type, &grp);
+			continue;
+		}
+
+		/*
+		 * A GTM Type-1 (Intra-AS I-PMSI A-D) is only meaningful with an
+		 * Ingress-Replication PMSI Tunnel attribute (RFC 6514 Section 5).
+		 * Checked on install only (the !mp_withdraw guard is load-bearing:
+		 * a withdraw matches on the NLRI key alone, so its PMSI is
+		 * irrelevant). The !attr term is defensive; the install path
+		 * always carries an attr.
+		 */
+		if (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI && !mp_withdraw &&
+		    (!attr || bgp_attr_get_pmsi_tnl_type(attr) != PMSI_TNLTYPE_INGR_REPL)) {
+			flog_err(EC_BGP_UPDATE_RCV,
+				 "%s [Error] MVPN Type-1 without Ingress-Replication PMSI Tunnel; dropping route",
+				 peer->host);
 			continue;
 		}
 
