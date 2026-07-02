@@ -1444,6 +1444,14 @@ static struct cmd_node bgp_ipv4m_node = {
 	.no_xpath = true,
 };
 
+static struct cmd_node bgp_ipv4_mvpn_node = {
+	.name = "bgp ipv4 mvpn",
+	.node = BGP_IPV4_MVPN_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
+
 static struct cmd_node bgp_ipv4l_node = {
 	.name = "bgp ipv4 labeled unicast",
 	.node = BGP_IPV4L_NODE,
@@ -1893,6 +1901,16 @@ DEFUNSH(VTYSH_BGPD, address_family_ipv4_multicast,
 	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_IPV4M_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_BGPD, address_family_ipv4_mvpn, address_family_ipv4_mvpn_cmd,
+	"address-family ipv4 mvpn",
+	"Enter Address Family command mode\n"
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
+{
+	vty->node = BGP_IPV4_MVPN_NODE;
 	return CMD_SUCCESS;
 }
 
@@ -2641,16 +2659,13 @@ DEFUNSH(VTYSH_REALLYALL, vtysh_quit_all, vtysh_quit_all_cmd, "quit",
 DEFUNSH(VTYSH_BGPD, exit_address_family, exit_address_family_cmd,
 	"exit-address-family", "Exit from Address Family configuration mode\n")
 {
-	if (vty->node == BGP_IPV4_NODE || vty->node == BGP_IPV4M_NODE
-	    || vty->node == BGP_IPV4L_NODE || vty->node == BGP_VPNV4_NODE
-	    || vty->node == BGP_VPNV6_NODE || vty->node == BGP_IPV6_NODE
-	    || vty->node == BGP_IPV6L_NODE || vty->node == BGP_IPV6M_NODE
-	    || vty->node == BGP_EVPN_NODE
-	    || vty->node == BGP_FLOWSPECV4_NODE
-	    || vty->node == BGP_FLOWSPECV6_NODE
-	    || vty->node == BGP_LS_NODE
-	    || vty->node == BGP_IPV4U_NODE
-	    || vty->node == BGP_IPV6U_NODE)
+	if (vty->node == BGP_IPV4_NODE || vty->node == BGP_IPV4M_NODE ||
+	    vty->node == BGP_IPV4L_NODE || vty->node == BGP_VPNV4_NODE ||
+	    vty->node == BGP_VPNV6_NODE || vty->node == BGP_IPV6_NODE ||
+	    vty->node == BGP_IPV6L_NODE || vty->node == BGP_IPV6M_NODE ||
+	    vty->node == BGP_EVPN_NODE || vty->node == BGP_IPV4_MVPN_NODE ||
+	    vty->node == BGP_FLOWSPECV4_NODE || vty->node == BGP_FLOWSPECV6_NODE ||
+	    vty->node == BGP_LS_NODE || vty->node == BGP_IPV4U_NODE || vty->node == BGP_IPV6U_NODE)
 		vty->node = BGP_NODE;
 	return CMD_SUCCESS;
 }
@@ -5337,6 +5352,7 @@ void vtysh_init_vty(void)
 	install_node(&bgp_flowspecv6_node);
 	install_node(&bgp_ipv4_node);
 	install_node(&bgp_ipv4m_node);
+	install_node(&bgp_ipv4_mvpn_node);
 	install_node(&bgp_ipv4l_node);
 	install_node(&bgp_ipv6_node);
 	install_node(&bgp_ipv6m_node);
@@ -5468,6 +5484,12 @@ void vtysh_init_vty(void)
 	install_element(BGP_IPV4M_NODE, &vtysh_quit_bgpd_cmd);
 	install_element(BGP_IPV4M_NODE, &vtysh_end_all_cmd);
 	install_element(BGP_IPV4M_NODE, &exit_address_family_cmd);
+
+	install_element(BGP_NODE, &address_family_ipv4_mvpn_cmd);
+	install_element(BGP_IPV4_MVPN_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_IPV4_MVPN_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_IPV4_MVPN_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_IPV4_MVPN_NODE, &exit_address_family_cmd);
 
 	install_element(BGP_NODE, &address_family_ipv4_labeled_unicast_cmd);
 	install_element(BGP_IPV4L_NODE, &vtysh_exit_bgpd_cmd);
