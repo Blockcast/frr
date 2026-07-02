@@ -23315,12 +23315,8 @@ DEFPY (bgp_mvpn_source_active,
 	return bgp_mvpn_source_active_set(bgp, source, group, !!no);
 }
 
-/*
- * TEST-ONLY scaffold: inject a C-multicast Source Tree Join (Type 7) route so
- * the receive/propagation path can be exercised without pimd. Plan 3 replaces
- * this with real pimd-driven origination and this command is removed.
- */
-DEFPY (bgp_mvpn_test_join,
+/* TEST-ONLY scaffold to exercise the Type-7 codec before pimd exists; Plan 3 (pimd glue) removes it. Hidden from the CLI so it is not a user-facing command. */
+DEFPY_HIDDEN (bgp_mvpn_test_join,
        bgp_mvpn_test_join_cmd,
        "[no] bgp mvpn test-join A.B.C.D$source group A.B.C.D$group source-as (1-4294967295)$source_as",
        NO_STR

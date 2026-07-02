@@ -1198,7 +1198,13 @@ const char *prefix2str(union prefixconstptr pu, char *str, int size)
 
 		inet_ntop(AF_INET, &m->src, srcbuf, sizeof(srcbuf));
 		inet_ntop(AF_INET, &m->grp, grpbuf, sizeof(grpbuf));
-		snprintf(str, size, "[%u]:[%s]:[%s]", m->route_type, srcbuf, grpbuf);
+		/* Type-7 (Source Tree Join) also renders the Source AS so two
+		 * routes differing only in Source AS get distinct strings.
+		 */
+		if (m->route_type == 7)
+			snprintf(str, size, "[7]:[%u]:[%s]:[%s]", m->source_as, srcbuf, grpbuf);
+		else
+			snprintf(str, size, "[%u]:[%s]:[%s]", m->route_type, srcbuf, grpbuf);
 		break;
 	}
 

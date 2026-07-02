@@ -4482,7 +4482,9 @@ not yet implemented.
    (Route Type 1) carrying an Ingress Replication PMSI tunnel attribute
    with the router-id as the tunnel endpoint is automatically originated.
    The IPv6 address family currently only negotiates the capability; route
-   origination commands are IPv4-only.
+   origination commands are IPv4-only. A router-id change may transiently
+   leave a stale Intra-AS I-PMSI A-D route keyed by the old router-id until
+   the session or address family refreshes.
 
 .. clicmd:: bgp mvpn source-active A.B.C.D group A.B.C.D
 

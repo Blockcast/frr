@@ -154,6 +154,9 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, const str
 	struct bgp_path_info *pi;
 	struct attr *attr_new;
 
+	/* AFI_IP is hardcoded: GTM MVPN is IPv4-only in this milestone (the v6-plan
+	 * anchor; see bgp_nlri_parse_mvpn).
+	 */
 	dest = bgp_afi_node_get(bgp->rib[AFI_IP][SAFI_MCAST_VPN], AFI_IP, SAFI_MCAST_VPN,
 				(const struct prefix *)p, NULL);
 
@@ -189,6 +192,9 @@ static void bgp_mvpn_route_remove(struct bgp *bgp, struct peer *peer, const stru
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
 
+	/* AFI_IP is hardcoded: GTM MVPN is IPv4-only in this milestone (see
+	 * bgp_nlri_parse_mvpn).
+	 */
 	dest = bgp_safi_node_lookup(bgp->rib[AFI_IP][SAFI_MCAST_VPN], SAFI_MCAST_VPN,
 				    (const struct prefix *)p, NULL);
 	if (!dest)
@@ -212,6 +218,12 @@ static void bgp_mvpn_route_remove(struct bgp *bgp, struct peer *peer, const stru
  * route-type-specific. Type 5 (Source Active) and Type 7 (C-multicast Source
  * Tree Join) are decoded; other types are skipped using the on-wire Length so
  * the stream stays framed.
+ *
+ * GTM MVPN is IPv4-only in this milestone. The IPv6 MCAST-VPN AF negotiates the
+ * capability (dual-stack SAFI-5 sessions per the design DoD) but v6 NLRI
+ * encode/decode is a later plan; a received v6-shaped MVPN NLRI is rejected by
+ * the v4 SPEC_LEN checks (fails safe, no corruption). The v4 prefixes built
+ * below regardless of packet->afi are the v6-plan anchor.
  */
 int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *packet,
 			bool mp_withdraw)
@@ -408,6 +420,13 @@ static bool bgp_mvpn_gtm_af_active(struct bgp *bgp)
  * active and the router-id (Originating Router's IP) is known; whichever of the
  * two lifecycle hooks (peer AF activate / router-id set) satisfies both first
  * installs the route, and re-invocation deduplicates via attrhash_cmp.
+ *
+ * KNOWN LIMITATION (GTM MVP): on a router-id X->Y change this originates the new
+ * Type-1 keyed by Y but does not withdraw the stale one keyed by X, so the PE
+ * briefly advertises two I-PMSI A-D routes until the session/AF refreshes. The
+ * startup 0.0.0.0->addr path is clean (no prior route). Follow-up: withdraw the
+ * old-router-id Type-1 before re-originating, as
+ * bgp_evpn_handle_router_id_update does.
  */
 void bgp_mvpn_originate_type1(struct bgp *bgp)
 {
