@@ -11794,9 +11794,8 @@ DEFUN_NOSH(address_family_ipv4_safi, address_family_ipv4_safi_cmd,
 }
 
 DEFUN_NOSH(address_family_ipv6_safi, address_family_ipv6_safi_cmd,
-	   "address-family ipv6 [<unicast|multicast|vpn|labeled-unicast|flowspec|unreachability|mvpn>]",
-	   "Enter Address Family command mode\n" BGP_AF_STR BGP_SAFI_WITH_LABEL_HELP_STR
-		   "Address Family modifier\n")
+	   "address-family ipv6 [<unicast|multicast|vpn|labeled-unicast|flowspec|unreachability>]",
+	   "Enter Address Family command mode\n" BGP_AF_STR BGP_SAFI_WITH_LABEL_HELP_STR)
 {
 	if (argc == 3) {
 		VTY_DECLVAR_CONTEXT(bgp, bgp);
@@ -23384,7 +23383,13 @@ void bgp_vty_init(void)
 	install_node(&bgp_evpn_node);
 	install_node(&bgp_evpn_vni_node);
 	install_node(&bgp_ipv4_mvpn_node);
-	install_node(&bgp_ipv6_mvpn_node);
+	/* IPv6 MCAST-VPN AF gated until the v6 NLRI codec lands (Plan 5):
+	 * definitions retained, install withheld so the v6 capability is never
+	 * negotiated; re-enable by restoring these installs + the ipv6 mvpn
+	 * token. The struct is referenced (but not installed) to keep it
+	 * compiled without tripping -Wunused-variable.
+	 */
+	(void)&bgp_ipv6_mvpn_node;
 	install_node(&bgp_flowspecv4_node);
 	install_node(&bgp_flowspecv6_node);
 	install_node(&bgp_ipv4_unreachability_node);
@@ -23409,7 +23414,7 @@ void bgp_vty_init(void)
 	install_default(BGP_EVPN_NODE);
 	install_default(BGP_EVPN_VNI_NODE);
 	install_default(BGP_IPV4_MVPN_NODE);
-	install_default(BGP_IPV6_MVPN_NODE);
+	/* BGP_IPV6_MVPN_NODE install gated (Plan 5) — see install_node above. */
 	install_default(BGP_SRV6_NODE);
 	install_default(BGP_LS_NODE);
 
@@ -23819,7 +23824,7 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV6U_NODE, &neighbor_activate_cmd);
 	install_element(BGP_EVPN_NODE, &neighbor_activate_cmd);
 	install_element(BGP_IPV4_MVPN_NODE, &neighbor_activate_cmd);
-	install_element(BGP_IPV6_MVPN_NODE, &neighbor_activate_cmd);
+	/* BGP_IPV6_MVPN_NODE activate gated (Plan 5) — see install_node above. */
 	install_element(BGP_LS_NODE, &neighbor_activate_cmd);
 
 	/* MCAST-VPN (RFC 6514 GTM) config + show commands. */
@@ -23844,7 +23849,7 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV6U_NODE, &no_neighbor_activate_cmd);
 	install_element(BGP_EVPN_NODE, &no_neighbor_activate_cmd);
 	install_element(BGP_IPV4_MVPN_NODE, &no_neighbor_activate_cmd);
-	install_element(BGP_IPV6_MVPN_NODE, &no_neighbor_activate_cmd);
+	/* BGP_IPV6_MVPN_NODE no-activate gated (Plan 5) — see install_node above. */
 	install_element(BGP_LS_NODE, &no_neighbor_activate_cmd);
 
 	/* "neighbor peer-group" set commands. */
@@ -24939,7 +24944,7 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV6U_NODE, &exit_address_family_cmd);
 	install_element(BGP_EVPN_NODE, &exit_address_family_cmd);
 	install_element(BGP_IPV4_MVPN_NODE, &exit_address_family_cmd);
-	install_element(BGP_IPV6_MVPN_NODE, &exit_address_family_cmd);
+	/* BGP_IPV6_MVPN_NODE exit-af gated (Plan 5) — see install_node above. */
 	install_element(BGP_LS_NODE, &exit_address_family_cmd);
 
 	/* BGP retain all route-target */

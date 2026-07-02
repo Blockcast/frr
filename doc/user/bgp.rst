@@ -4473,7 +4473,7 @@ RIB-level control plane: MCAST-VPN routes are originated, propagated and
 displayed, but multicast data-plane forwarding driven by these routes is
 not yet implemented.
 
-.. clicmd:: address-family <ipv4|ipv6> mvpn
+.. clicmd:: address-family ipv4 mvpn
 
    Enter the MCAST-VPN address family under ``router bgp``. Neighbors must
    be activated in this address family with ``neighbor PEER activate`` for
@@ -4481,8 +4481,9 @@ not yet implemented.
    MCAST-VPN address family is enabled, an Intra-AS I-PMSI A-D route
    (Route Type 1) carrying an Ingress Replication PMSI tunnel attribute
    with the router-id as the tunnel endpoint is automatically originated.
-   The IPv6 address family currently only negotiates the capability; route
-   origination commands are IPv4-only. A router-id change may transiently
+   Only the IPv4 MCAST-VPN address family is currently available;
+   ``address-family ipv6 mvpn`` is gated until the IPv6 NLRI codec lands
+   (a later plan). A router-id change may transiently
    leave a stale Intra-AS I-PMSI A-D route keyed by the old router-id until
    the session or address family refreshes.
 
