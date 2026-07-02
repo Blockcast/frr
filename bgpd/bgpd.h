@@ -109,6 +109,8 @@ enum bgp_af_index {
 	BGP_AF_BGP_LS,
 	BGP_AF_IPV4_UNREACH,
 	BGP_AF_IPV6_UNREACH,
+	BGP_AF_IPV4_MVPN,
+	BGP_AF_IPV6_MVPN,
 	BGP_AF_MAX
 };
 
@@ -3022,6 +3024,8 @@ static inline int afindex(afi_t afi, safi_t safi)
 			return BGP_AF_BGP_LS;
 		case SAFI_UNREACH:
 			return BGP_AF_IPV4_UNREACH;
+		case SAFI_MCAST_VPN:
+			return BGP_AF_IPV4_MVPN;
 		case SAFI_EVPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
@@ -3046,6 +3050,8 @@ static inline int afindex(afi_t afi, safi_t safi)
 			return BGP_AF_BGP_LS;
 		case SAFI_UNREACH:
 			return BGP_AF_IPV6_UNREACH;
+		case SAFI_MCAST_VPN:
+			return BGP_AF_IPV6_MVPN;
 		case SAFI_EVPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
@@ -3064,6 +3070,7 @@ static inline int afindex(afi_t afi, safi_t safi)
 		case SAFI_ENCAP:
 		case SAFI_FLOWSPEC:
 		case SAFI_UNREACH:
+		case SAFI_MCAST_VPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			return BGP_AF_MAX;
@@ -3081,6 +3088,7 @@ static inline int afindex(afi_t afi, safi_t safi)
 		case SAFI_EVPN:
 		case SAFI_FLOWSPEC:
 		case SAFI_UNREACH:
+		case SAFI_MCAST_VPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			return BGP_AF_MAX;

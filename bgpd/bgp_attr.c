@@ -4965,6 +4965,7 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 		case SAFI_UNREACH:
 			stream_putc(s, 0); /* no nexthop for unreachability */
 			break;
+		case SAFI_MCAST_VPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			assert(!"SAFI's UNSPEC or MAX being specified are a DEV ESCAPE");
@@ -5028,6 +5029,7 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 		case SAFI_UNREACH:
 			stream_putc(s, 0); /* no nexthop for unreachability */
 			break;
+		case SAFI_MCAST_VPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			assert(!"SAFI's UNSPEC or MAX being specified are a DEV ESCAPE");
@@ -5188,6 +5190,7 @@ void bgp_packet_mpattr_prefix(struct stream *s, afi_t afi, safi_t safi, const st
 	switch (safi) {
 	case SAFI_UNSPEC:
 	case SAFI_MAX:
+	case SAFI_MCAST_VPN:
 		assert(!"Dev escape usage of SAFI_UNSPEC or MAX");
 		break;
 	case SAFI_MPLS_VPN:
@@ -5313,6 +5316,7 @@ size_t bgp_packet_mpattr_prefix_size(afi_t afi, safi_t safi,
 	switch (safi) {
 	case SAFI_UNSPEC:
 	case SAFI_MAX:
+	case SAFI_MCAST_VPN:
 		assert(!"Attempting to figure size for a SAFI_UNSPEC/SAFI_MAX this is a DEV ESCAPE");
 		break;
 	case SAFI_UNICAST:

@@ -224,6 +224,11 @@ void bgp_capability_vty_out(struct vty *vty, struct peer *peer, bool use_json,
 							       "capabilityErrorMultiProtocolSafi",
 							       "unreachability");
 					break;
+				case SAFI_MCAST_VPN:
+					json_object_string_add(json_cap,
+							       "capabilityErrorMultiProtocolSafi",
+							       "MCAST-VPN");
+					break;
 				case SAFI_UNSPEC:
 				case SAFI_MAX:
 					json_object_int_add(
@@ -281,6 +286,9 @@ void bgp_capability_vty_out(struct vty *vty, struct peer *peer, bool use_json,
 					break;
 				case SAFI_UNREACH:
 					vty_out(vty, "SAFI Unreachability");
+					break;
+				case SAFI_MCAST_VPN:
+					vty_out(vty, "SAFI MCAST-VPN");
 					break;
 				case SAFI_UNSPEC:
 				case SAFI_MAX:
