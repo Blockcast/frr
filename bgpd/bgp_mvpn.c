@@ -43,6 +43,23 @@ void bgp_mvpn_build_prefix_type5(struct prefix_mvpn *p, struct in_addr src, stru
 }
 
 /*
+ * Fill a prefix_mvpn for a Type-1 (Intra-AS I-PMSI A-D) route. Memset-zeroed
+ * first like the other builders so padding is deterministic and the radix key /
+ * prefix_same() memcmp are stable. Type-1 (RFC 6514 Section 4.1) carries no
+ * C-S/C-G: the Originating Router's IP Address is overloaded into the src slot
+ * (route_type=1 in key byte 0 keeps it distinct from Type-5/7); grp and
+ * source_as remain zero.
+ */
+void bgp_mvpn_build_prefix_type1(struct prefix_mvpn *p, struct in_addr orig_ip)
+{
+	memset(p, 0, sizeof(*p));
+	p->family = AF_MVPN;
+	p->prefixlen = BGP_MVPN_PREFIXLEN;
+	p->prefix.route_type = BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI;
+	p->prefix.src = orig_ip;
+}
+
+/*
  * Fill a prefix_mvpn for a Type-7 (C-multicast Source Tree Join) route. Like
  * the Type-5 builder, the struct is memset-zeroed first so that padding is
  * deterministic and the radix key / prefix_same() memcmp are stable. The
@@ -103,6 +120,25 @@ void bgp_mvpn_encode_type7(struct stream *s, const struct prefix *p, bool addpat
 	stream_put_in_addr(s, &m->src);		    /* Multicast Source (C-S) */
 	stream_putc(s, IPV4_MAX_BITLEN);	    /* Multicast Group Length */
 	stream_put_in_addr(s, &m->grp);		    /* Multicast Group (C-G) */
+}
+
+/*
+ * RFC 6514 Section 4.1 Intra-AS I-PMSI A-D route (IPv4): RD (8, zero under GTM)
+ * + Originating Router's IP Address (4). Carries no C-S/C-G; the endpoint is
+ * conveyed out-of-band in the PMSI Tunnel path attribute (Section 5).
+ */
+void bgp_mvpn_encode_type1(struct stream *s, const struct prefix *p, bool addpath_capable,
+			   uint32_t addpath_tx_id)
+{
+	const struct mvpn_addr *m = &p->u.prefix_mvpn;
+
+	if (addpath_capable)
+		stream_putl(s, addpath_tx_id);
+
+	stream_putc(s, m->route_type);		    /* Route Type = 1 */
+	stream_putc(s, BGP_MVPN_TYPE1_V4_SPEC_LEN); /* Length */
+	stream_put(s, NULL, 8);			    /* RD = 0 (GTM) */
+	stream_put_in_addr(s, &m->src);		    /* Originating Router's IP */
 }
 
 /*
@@ -217,6 +253,24 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		}
 
 		switch (route_type) {
+		case BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI:
+			if (length != BGP_MVPN_TYPE1_V4_SPEC_LEN) {
+				flog_err(EC_BGP_UPDATE_RCV,
+					 "%s [Error] MVPN Type-1 bad length %u (expected %u)",
+					 peer->host, length, BGP_MVPN_TYPE1_V4_SPEC_LEN);
+				ret = BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
+				goto done;
+			}
+
+			/* RD (8 octets) is always zero under GTM; read and ignore. */
+			stream_forward_getp(data, 8);
+
+			/* Originating Router's IP Address -> src slot. */
+			STREAM_GET(&src, data, IPV4_MAX_BYTELEN);
+
+			bgp_mvpn_build_prefix_type1(&p, src);
+			break;
+
 		case BGP_MVPN_ROUTE_TYPE_SOURCE_ACTIVE:
 			if (length != BGP_MVPN_TYPE5_V4_SPEC_LEN) {
 				flog_err(EC_BGP_UPDATE_RCV,
@@ -326,6 +380,69 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, struct in_addr src, struct in_ad
 	return CMD_SUCCESS;
 }
 
+/* True if any peer on this instance has the GTM MVPN AF (AFI_IP, SAFI 5)
+ * configured/activated. afc[] is set the moment a peer is activated for the AF,
+ * so this is a valid "GTM MVPN in use" predicate for both lifecycle hooks.
+ */
+static bool bgp_mvpn_gtm_af_active(struct bgp *bgp)
+{
+	struct peer *peer;
+	struct listnode *node;
+
+	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer))
+		if (peer->afc[AFI_IP][SAFI_MCAST_VPN])
+			return true;
+
+	return false;
+}
+
+/*
+ * Auto-originate this PE's Intra-AS I-PMSI A-D (Type-1) route (RFC 6514 Section
+ * 4.1) with a PMSI Tunnel attribute (Section 5) advertising Ingress Replication
+ * and this PE's unicast address (the router-id) as the tunnel endpoint. The
+ * PMSI attribute reuses the existing EVPN ingress-replication encode path: the
+ * generic path-attribute writer emits attr type 22 whenever the attr carries a
+ * PMSI tunnel type, so no new encoder is needed.
+ *
+ * Self-guarding and idempotent. It is a no-op until BOTH the GTM MVPN AF is
+ * active and the router-id (Originating Router's IP) is known; whichever of the
+ * two lifecycle hooks (peer AF activate / router-id set) satisfies both first
+ * installs the route, and re-invocation deduplicates via attrhash_cmp.
+ */
+void bgp_mvpn_originate_type1(struct bgp *bgp)
+{
+	struct prefix_mvpn p;
+	struct attr attr;
+	struct in6_addr tunn_id = {};
+
+	if (bgp->router_id.s_addr == INADDR_ANY)
+		return;
+	if (!bgp_mvpn_gtm_af_active(bgp))
+		return;
+
+	bgp_mvpn_build_prefix_type1(&p, bgp->router_id);
+
+	bgp_attr_default_set(&attr, bgp, BGP_ORIGIN_IGP);
+	bgp_attr_set(&attr, BGP_ATTR_NEXT_HOP);
+	attr.nexthop = bgp->router_id;
+	attr.mp_nexthop_global_in = bgp->router_id;
+	attr.mp_nexthop_len = IPV4_MAX_BYTELEN;
+
+	/* Attach the Ingress-Replication PMSI Tunnel attribute (endpoint = this
+	 * PE). Mirrors the EVPN type-3 IMET path (bgp_evpn.c); the setter claims
+	 * an attr_extra slot for the tunnel id, discarded below after intern.
+	 */
+	bgp_attr_set(&attr, BGP_ATTR_PMSI_TUNNEL);
+	bgp_attr_set_pmsi_tnl_type(&attr, PMSI_TNLTYPE_INGR_REPL);
+	ipv4_to_ipv4_mapped_ipv6(&tunn_id, bgp->router_id);
+	bgp_attr_set_tunn_id(&attr, &tunn_id);
+
+	bgp_mvpn_route_install(bgp, bgp->peer_self, &p, &attr, BGP_ROUTE_STATIC);
+
+	aspath_unintern(&attr.aspath);
+	bgp_attr_extra_discard(&attr);
+}
+
 /*
  * TEST-ONLY scaffold: originate or withdraw a local Type-7 (C-multicast Source
  * Tree Join) route, mirroring bgp_mvpn_source_active_set(). Plan 3 replaces
@@ -411,12 +528,43 @@ void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_
 				json_object *jr = json_object_new_object();
 
 				json_object_int_add(jr, "routeType", m->route_type);
-				json_object_string_addf(jr, "source", "%pI4", &m->src);
-				json_object_string_addf(jr, "group", "%pI4", &m->grp);
-				if (m->route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN)
-					json_object_int_add(jr, "sourceAs", m->source_as);
+				if (m->route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI) {
+					json_object_string_addf(jr, "originator", "%pI4", &m->src);
+					if (bgp_attr_get_pmsi_tnl_type(pi->attr) ==
+					    PMSI_TNLTYPE_INGR_REPL) {
+						json_object *jp = json_object_new_object();
+						const struct in6_addr *tid =
+							bgp_attr_get_tunn_id(pi->attr);
+
+						json_object_string_add(jp, "type",
+								       "ingressReplication");
+						if (IS_MAPPED_IPV6(tid)) {
+							struct in_addr ep;
+
+							ipv4_mapped_ipv6_to_ipv4(tid, &ep);
+							json_object_string_addf(jp, "endpoint",
+										"%pI4", &ep);
+						} else {
+							json_object_string_addf(jp, "endpoint",
+										"%pI6", tid);
+						}
+						json_object_object_add(jr, "pmsiTunnel", jp);
+					}
+				} else {
+					json_object_string_addf(jr, "source", "%pI4", &m->src);
+					json_object_string_addf(jr, "group", "%pI4", &m->grp);
+					if (m->route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN)
+						json_object_int_add(jr, "sourceAs", m->source_as);
+				}
 				json_object_boolean_add(jr, "selfOriginated", self);
 				json_object_array_add(json_routes, jr);
+			} else if (m->route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI) {
+				vty_out(vty, " [%u] originator %pI4 %s%s\n", m->route_type, &m->src,
+					bgp_attr_get_pmsi_tnl_type(pi->attr) ==
+							PMSI_TNLTYPE_INGR_REPL
+						? "IR "
+						: "",
+					self ? "(local)" : "");
 			} else {
 				vty_out(vty, " [%u] source %pI4 group %pI4 %s\n", m->route_type,
 					&m->src, &m->grp, self ? "(local)" : "");

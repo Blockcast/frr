@@ -205,6 +205,45 @@ router bgp 65001
     assert result is None, "r1 did not learn r2's MVPN Type-7 Source Tree Join route"
 
 
+def test_type1_ipmsi_with_ir_pmsi():
+    """On MVPN AF enable, r1 auto-originates its Intra-AS I-PMSI A-D route.
+
+    RFC 6514 Section 4.1 Route Type 1 (Intra-AS I-PMSI A-D) is originated by
+    each PE when the MCAST-VPN AF is enabled. r1's Type-1 carries a PMSI Tunnel
+    attribute (RFC 6514 Section 5) with Tunnel Type = Ingress Replication (6)
+    and r1's own unicast address (10.0.0.1, the auto-derived router-id) as the
+    tunnel endpoint. r2 must learn it via `show bgp ipv4 mvpn json` with
+    routeType 1 and the matching pmsiTunnel object.
+
+    AUTHORED-NOT-RUN: this repo has no network namespaces, so the topotest is
+    authored and py_compile-checked but not executed here.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _type1_present(router):
+        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv4 mvpn json"))
+        routes = out.get("routes", [])
+        for r in routes:
+            if r.get("routeType") != 1:
+                continue
+            pmsi = r.get("pmsiTunnel", {})
+            if (
+                pmsi.get("type") == "ingressReplication"
+                and pmsi.get("endpoint") == "10.0.0.1"
+            ):
+                return None
+        return "Type-1 I-PMSI with IR PMSI endpoint 10.0.0.1 not found in {}".format(
+            routes
+        )
+
+    test_func = functools.partial(_type1_present, "r2")
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, "r2 did not learn r1's MVPN Type-1 Intra-AS I-PMSI route"
+
+
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
     sys.exit(pytest.main(args))

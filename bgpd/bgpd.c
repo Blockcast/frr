@@ -58,6 +58,7 @@
 #include "bgpd/rfapi/rfapi_backend.h"
 #endif
 #include "bgpd/bgp_evpn.h"
+#include "bgpd/bgp_mvpn.h"
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_vty.h"
@@ -362,6 +363,12 @@ static int bgp_router_id_set(struct bgp *bgp, const struct in_addr *id,
 		bgp_evpn_handle_router_id_update(bgp, false);
 
 	vpn_handle_router_id_update(bgp, false, is_config);
+
+	/* GTM MCAST-VPN: (re)originate this PE's Intra-AS I-PMSI (Type-1) route
+	 * now that the router-id (Originating Router's IP) is known/changed.
+	 * No-op unless the GTM MVPN AF is active (RFC 6514 Section 4.1).
+	 */
+	bgp_mvpn_originate_type1(bgp);
 
 	if (bgp && bgp->ls_info && bgp->ls_info->enable_distribution)
 		bgp_ls_export_bgp_topology(bgp);
@@ -2935,6 +2942,17 @@ int peer_activate(struct peer *peer, afi_t afi, safi_t safi)
 			zlog_debug("BGP-LS: Registered with link-state database for instance %s (first peer with BGP-LS activated: %s)",
 				   bgp->name_pretty, peer->host);
 	}
+
+	/*
+	 * GTM MCAST-VPN: activating the AF makes this PE a participant, so
+	 * auto-originate its Intra-AS I-PMSI A-D (Type-1) route carrying an
+	 * Ingress-Replication PMSI tunnel attribute (RFC 6514 Section 4.1 + 5).
+	 * Idempotent and self-guarding; a no-op if the router-id is not yet
+	 * known (config-read ordering), in which case bgp_router_id_set()'s
+	 * hook originates it once zebra reports the router-id.
+	 */
+	if (afi == AFI_IP && safi == SAFI_MCAST_VPN)
+		bgp_mvpn_originate_type1(bgp);
 
 	return ret;
 }
