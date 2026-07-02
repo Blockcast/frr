@@ -253,6 +253,7 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 	uint32_t source_as;
 	bool addpath_capable;
 	uint32_t addpath_id;
+	bool is_withdraw;
 	int ret = BGP_NLRI_PARSE_OK;
 
 	/*
@@ -271,6 +272,15 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 	stream_put(data, packet->nlri, packet->length);
 
 	addpath_capable = bgp_addpath_encode_rx(peer, packet->afi, packet->safi);
+
+	/*
+	 * A NULL attr on the reachable path is BGP's treat-as-withdraw signal
+	 * (RFC 7606): the UPDATE carried malformed attributes, so its NLRI must
+	 * be withdrawn rather than installed. bgp_mvpn_route_install() would
+	 * dereference the NULL attr (bgp_attr_intern), so fold it into the
+	 * withdraw decision here. Both mp_withdraw and attr are loop-invariant.
+	 */
+	is_withdraw = mp_withdraw || attr == NULL;
 
 	while (STREAM_READABLE(data) > 0) {
 		addpath_id = 0;
@@ -403,20 +413,18 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		/*
 		 * A GTM Type-1 (Intra-AS I-PMSI A-D) is only meaningful with an
 		 * Ingress-Replication PMSI Tunnel attribute (RFC 6514 Section 5).
-		 * Checked on install only (the !mp_withdraw guard is load-bearing:
-		 * a withdraw matches on the NLRI key alone, so its PMSI is
-		 * irrelevant). The !attr term is defensive; the install path
-		 * always carries an attr.
+		 * Checked on install only; a withdraw (including the NULL-attr
+		 * treat-as-withdraw case) matches on the NLRI key alone.
 		 */
-		if (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI && !mp_withdraw &&
-		    (!attr || bgp_attr_get_pmsi_tnl_type(attr) != PMSI_TNLTYPE_INGR_REPL)) {
+		if (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI && !is_withdraw &&
+		    bgp_attr_get_pmsi_tnl_type(attr) != PMSI_TNLTYPE_INGR_REPL) {
 			flog_err(EC_BGP_UPDATE_RCV,
 				 "%s [Error] MVPN Type-1 without Ingress-Replication PMSI Tunnel; dropping route",
 				 peer->host);
 			continue;
 		}
 
-		if (mp_withdraw)
+		if (is_withdraw)
 			bgp_mvpn_route_remove(peer->bgp, peer, &p, BGP_ROUTE_NORMAL);
 		else
 			bgp_mvpn_route_install(peer->bgp, peer, &p, attr, BGP_ROUTE_NORMAL);
