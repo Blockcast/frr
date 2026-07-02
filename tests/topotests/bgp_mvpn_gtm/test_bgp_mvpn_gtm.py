@@ -115,7 +115,7 @@ def test_mvpn_af_negotiated():
             peer: {
                 "neighborCapabilities": {
                     "multiprotocolExtensions": {
-                        "ipv4Mvpn": "advertisedAndReceived"
+                        "ipv4Mvpn": {"advertisedAndReceived": True}
                     }
                 }
             }
