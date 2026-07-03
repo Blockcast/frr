@@ -49,6 +49,13 @@
 #define ECOMMUNITY_TRAFFIC_MARKING          0x09
 #define ECOMMUNITY_REDIRECT_IP_NH           0x00
 #define ECOMMUNITY_COLOR 0x0b /* RFC9012 - color */
+/* RFC 6514 - VRF Route Import. IP-address-specific only (high-order octet
+ * ECOMMUNITY_ENCODE_IP); shares the 0x0b sub-type value with COLOR, which lives
+ * in the OPAQUE space, so there is no collision (see the note above: the
+ * low-order octet is scoped by the high-order octet). Carried on a
+ * (GTM: global-table) unicast source route to identify the upstream PE; a
+ * C-multicast (Type-6/7) join echoes its Global Administrator as a Route Target. */
+#define ECOMMUNITY_VRF_ROUTE_IMPORT         0x0b
 
 /* from IANA: bgp-extended-communities/bgp-extended-communities.xhtml
  * 0x0c Flow-spec Redirect to IPv4 - draft-ietf-idr-flowspec-redirect

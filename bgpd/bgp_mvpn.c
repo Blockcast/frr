@@ -488,16 +488,23 @@ static void bgp_mvpn_attach_gtm_rt(struct attr *attr)
  *
  * RFC 6514 Section 5.1 / RFC 7716: that RT MUST equal the value of the VRF Route
  * Import extended community carried by the UMH-eligible *unicast* route toward
- * C-S. Junos GTM attaches this as an IPv4-address-specific Route Target
- * target:<PE-loopback>:0 on the source's global-table unicast route, and its
- * auto-generated __vrf-mvpn-import-cmcast-*-internal__ policy imports Type-7
- * routes only on exactly that RT (empirically: MX204 22.2R3 keys it on the lo0
- * PE address, e.g. target:10.255.255.254:0). So the correct upstream identifier
- * is the Global Administrator of that RT.
+ * C-S. A conformant MVPN source attaches that community (IP-address-specific,
+ * sub-type 0x0b; Junos "rt-import") with its PE address as the Global
+ * Administrator. The receiver echoes that address as a Route Target on the
+ * C-multicast (Type-7) join; the source's auto-generated
+ * __vrf-mvpn-import-cmcast-*-internal__ policy imports the Type-7 only on
+ * exactly that RT (empirically confirmed on MX204 22.2R3: it keys the cmcast
+ * import on the lo0 PE address, e.g. target:10.255.255.254:0). So the correct
+ * upstream identifier is the Global Administrator of the source route's
+ * route-import community.
+ *
+ * NB: the sub-type a live Junos GTM source stamps on the *unicast* route
+ * (VRF Route Import 0x0b vs a plain Route Target 0x02) is not yet wire-captured;
+ * the lookup below tries 0x0b first then 0x02, so it is correct either way.
  *
  * Lookup order:
- *   1. RFC-canonical: the IPv4-address-specific Route Target on the unicast
- *      route to C-S (the route-import RT).
+ *   1. RFC-canonical: the IP-address-specific route-import community on the
+ *      unicast route to C-S -- VRF Route Import (0x0b), else Route Target (0x02).
  *   2. Fallback: the next hop of the received Source Active route. This is only
  *      correct when the SA originator's address is preserved end to end (iBGP,
  *      or a peer that attaches no route-import RT such as FRR<->FRR); eBGP
@@ -530,11 +537,24 @@ static bool bgp_mvpn_resolve_upstream_pe(struct bgp *bgp, struct in_addr src, st
 			ecom = bgp_attr_get_ecommunity(pi->attr);
 			if (!ecom)
 				continue;
+			/*
+			 * RFC 6514 Section 5.1: prefer the VRF Route Import EC
+			 * (IP-address-specific, sub-type 0x0b) -- what a
+			 * conformant MVPN source attaches to the unicast route
+			 * toward C-S (Junos "rt-import"). Fall back to a plain
+			 * IP-address-specific Route Target (0x02): this covers
+			 * an FRR<->FRR source that tags its route with
+			 * "set extcommunity rt <PE>:0", and any peer that keys
+			 * the upstream on a Route Target rather than rt-import.
+			 */
 			eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP,
-						 ECOMMUNITY_ROUTE_TARGET);
+						 ECOMMUNITY_VRF_ROUTE_IMPORT);
+			if (!eval)
+				eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP,
+							 ECOMMUNITY_ROUTE_TARGET);
 			if (!eval)
 				continue;
-			/* IPv4-address-specific RT wire layout: type, subtype,
+			/* IP-address-specific EC wire layout: type, subtype,
 			 * Global Administrator (4 bytes), Local Administrator (2). */
 			memcpy(&upstream->s_addr, &eval->val[2], IPV4_MAX_BYTELEN);
 			bgp_dest_unlock_node(dest);
