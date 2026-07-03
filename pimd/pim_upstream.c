@@ -215,6 +215,10 @@ struct pim_upstream *pim_upstream_del(struct pim_instance *pim,
 		zlog_debug("pim_upstream free vrf:%s %s flags 0x%x",
 			   pim->vrf->name, up->sg_str, up->flags);
 
+	/* GTM glue: withdraw any BGP MVPN route announced for this (S,G) before
+	 * it is torn down (delete may not pass through NOTJOINED first). */
+	pim_gtm_upstream_update(pim, up, true);
+
 	if (pim_up_mlag_is_local(up))
 		pim_mlag_up_local_del(pim, up);
 
@@ -1160,6 +1164,10 @@ void pim_upstream_switch(struct pim_instance *pim, struct pim_upstream *up,
 		}
 		join_timer_stop(up);
 	}
+
+	/* GTM glue: the join_state just changed -- reconcile whether this
+	 * local SSM (S,G) should have a BGP MVPN route announced. */
+	pim_gtm_upstream_update(pim, up, false);
 }
 
 int pim_upstream_compare(const struct pim_upstream *up1,
@@ -1738,6 +1746,10 @@ static void pim_upstream_fhr_kat_start(struct pim_upstream *up)
 		if (!PIM_UPSTREAM_DM_TEST_INTERFACE(up->flags))
 			pim_upstream_update_use_rpt(up, true /*update_mroute*/);
 	}
+
+	/* GTM glue: a local source stream is now active on this FHR (S,G) --
+	 * reconcile the Source Active (Type 5) announcement. */
+	pim_gtm_upstream_update(up->pim, up, false);
 }
 
 /*

@@ -4130,6 +4130,53 @@ static void zserv_error_invalid_msg_type(ZAPI_HANDLER_ARGS)
 	zsend_error_msg(client, ZEBRA_INVALID_MSG_TYPE, hdr);
 }
 
+/*
+ * Global-Table Multicast (RFC 7716) pimd<->bgpd glue relay.
+ *
+ * zebra keeps NO MVPN SG state: pimd owns the authoritative set. On an
+ * ADD/DEL from pimd, forward it verbatim to the BGP client iff bgpd has
+ * subscribed (ZEBRA_BGP_WANTS_MVPN_SG). On a REPLAY from bgpd, set the
+ * subscribe flag and ask pimd to re-dump. Mirrors the VXLAN SG relay with
+ * producer/consumer reversed.
+ */
+static void zread_mvpn_sg(ZAPI_HANDLER_ARGS)
+{
+	struct zapi_mvpn_sg sg;
+	struct zserv *bgp_client;
+	struct stream *s;
+
+	if (zapi_mvpn_sg_decode(msg, &sg) < 0)
+		return;
+
+	if (!CHECK_FLAG(zvrf->flags, ZEBRA_BGP_WANTS_MVPN_SG))
+		return;
+
+	bgp_client = zserv_find_client(ZEBRA_ROUTE_BGP, 0);
+	if (!bgp_client)
+		return;
+
+	s = stream_new(ZEBRA_SMALL_PACKET_SIZE);
+	zapi_mvpn_sg_encode(s, hdr->command, zvrf_id(zvrf), &sg);
+	zserv_send_message(bgp_client, s);
+}
+
+static void zread_mvpn_sg_replay(ZAPI_HANDLER_ARGS)
+{
+	struct zserv *pim_client;
+	struct stream *s;
+
+	SET_FLAG(zvrf->flags, ZEBRA_BGP_WANTS_MVPN_SG);
+
+	pim_client = zserv_find_client(ZEBRA_ROUTE_PIM, 0);
+	if (!pim_client)
+		return;
+
+	s = stream_new(ZEBRA_SMALL_PACKET_SIZE);
+	zclient_create_header(s, ZEBRA_MVPN_SG_REPLAY, zvrf_id(zvrf));
+	stream_putw_at(s, 0, stream_get_endp(s));
+	zserv_send_message(pim_client, s);
+}
+
 void (*const zserv_handlers[])(ZAPI_HANDLER_ARGS) = {
 	[ZEBRA_ROUTER_ID_ADD] = zread_router_id_add,
 	[ZEBRA_ROUTER_ID_DELETE] = zread_router_id_delete,
@@ -4198,6 +4245,9 @@ void (*const zserv_handlers[])(ZAPI_HANDLER_ARGS) = {
 	[ZEBRA_IPTABLE_DELETE] = zread_iptable,
 	[ZEBRA_VXLAN_FLOOD_CONTROL] = zebra_vxlan_flood_control,
 	[ZEBRA_VXLAN_SG_REPLAY] = zebra_vxlan_sg_replay,
+	[ZEBRA_MVPN_SG_ADD] = zread_mvpn_sg,
+	[ZEBRA_MVPN_SG_DEL] = zread_mvpn_sg,
+	[ZEBRA_MVPN_SG_REPLAY] = zread_mvpn_sg_replay,
 	[ZEBRA_MLAG_CLIENT_REGISTER] = zebra_mlag_client_register,
 	[ZEBRA_MLAG_CLIENT_UNREGISTER] = zebra_mlag_client_unregister,
 	[ZEBRA_MLAG_FORWARD_MSG] = zebra_mlag_forward_client_msg,

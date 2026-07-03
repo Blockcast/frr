@@ -23316,37 +23316,6 @@ DEFPY (bgp_mvpn_source_active,
 	return bgp_mvpn_source_active_set(bgp, &src, &grp, !!no);
 }
 
-/* TEST-ONLY scaffold to exercise the Type-7 codec before pimd exists; Plan 3 (pimd glue) removes it. Hidden from the CLI so it is not a user-facing command. */
-DEFPY_HIDDEN (bgp_mvpn_test_join,
-       bgp_mvpn_test_join_cmd,
-       "[no] bgp mvpn test-join A.B.C.D$source group A.B.C.D$group source-as (1-4294967295)$source_as [upstream A.B.C.D$upstream]",
-       NO_STR
-       BGP_STR
-       "Multicast VPN (MCAST-VPN) commands\n"
-       "TEST-ONLY: originate a C-multicast Source Tree Join (Type 7) route\n"
-       "Multicast source address (C-S)\n"
-       "Multicast group\n"
-       "Multicast group address (C-G), SSM range 232.0.0.0/8\n"
-       "Upstream Source AS carried in the Type-7 NLRI\n"
-       "Source Autonomous System number\n"
-       "Upstream PE for the upstream-node Route Target (else resolved from the SA route)\n"
-       "Upstream PE address\n")
-{
-	VTY_DECLVAR_CONTEXT(bgp, bgp);
-	struct in_addr up = upstream_str ? upstream : (struct in_addr){ .s_addr = INADDR_ANY };
-	struct ipaddr src = { .ipa_type = IPADDR_V4, .ip._v4_addr = source };
-	struct ipaddr grp = { .ipa_type = IPADDR_V4, .ip._v4_addr = group };
-
-	/* GTM is SSM-only: enforce group in 232.0.0.0/8. */
-	if (!bgp_mvpn_group_is_ssm(group)) {
-		vty_out(vty, "%% MCAST-VPN group %pI4 is not in the SSM range 232.0.0.0/8\n",
-			&group);
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-
-	return bgp_mvpn_source_tree_join_set(bgp, source_as, &src, &grp, up, !!no);
-}
-
 DEFPY (bgp_mvpn_ipmsi_label,
        bgp_mvpn_ipmsi_label_cmd,
        "[no] bgp mvpn ipmsi-label (16-1048575)$label",
@@ -23388,37 +23357,6 @@ DEFPY (bgp_mvpn_source_active6,
 	}
 
 	return bgp_mvpn_source_active_set(bgp, &src, &grp, !!no);
-}
-
-/* TEST-ONLY scaffold to exercise the IPv6 Type-7 codec before pimd exists; Plan 3 (pimd glue) removes it. Hidden from the CLI so it is not a user-facing command. */
-DEFPY_HIDDEN (bgp_mvpn_test_join6,
-       bgp_mvpn_test_join6_cmd,
-       "[no] bgp mvpn test-join X:X::X:X$source6 group X:X::X:X$group6 source-as (1-4294967295)$source_as [upstream A.B.C.D$upstream]",
-       NO_STR
-       BGP_STR
-       "Multicast VPN (MCAST-VPN) commands\n"
-       "TEST-ONLY: originate a C-multicast Source Tree Join (Type 7) route\n"
-       "Multicast source address (C-S)\n"
-       "Multicast group\n"
-       "Multicast group address (C-G), IPv6 SSM range ff3x::/32\n"
-       "Upstream Source AS carried in the Type-7 NLRI\n"
-       "Source Autonomous System number\n"
-       "Upstream PE for the upstream-node Route Target (else resolved from the SA route)\n"
-       "Upstream PE address (v4, the v4-core PE identity)\n")
-{
-	VTY_DECLVAR_CONTEXT(bgp, bgp);
-	struct in_addr up = upstream_str ? upstream : (struct in_addr){ .s_addr = INADDR_ANY };
-	struct ipaddr src = { .ipa_type = IPADDR_V6, .ip._v6_addr = source6 };
-	struct ipaddr grp = { .ipa_type = IPADDR_V6, .ip._v6_addr = group6 };
-
-	/* GTM is SSM-only: enforce the IPv6 SSM range ff3x::/32 (RFC 4607). */
-	if (!ipv6_mcast_ssm(&group6)) {
-		vty_out(vty, "%% MCAST-VPN group %pI6 is not in the IPv6 SSM range ff3x::/32\n",
-			&group6);
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-
-	return bgp_mvpn_source_tree_join_set(bgp, source_as, &src, &grp, up, !!no);
 }
 
 DEFPY (show_bgp_ipv4_mvpn,
@@ -23930,10 +23868,8 @@ void bgp_vty_init(void)
 
 	/* MCAST-VPN (RFC 6514 GTM) config + show commands. */
 	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_source_active_cmd);
-	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_test_join_cmd);
 	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_ipmsi_label_cmd);
 	install_element(BGP_IPV6_MVPN_NODE, &bgp_mvpn_source_active6_cmd);
-	install_element(BGP_IPV6_MVPN_NODE, &bgp_mvpn_test_join6_cmd);
 	install_element(VIEW_NODE, &show_bgp_ipv4_mvpn_cmd);
 	install_element(ENABLE_NODE, &show_bgp_ipv4_mvpn_cmd);
 	install_element(VIEW_NODE, &show_bgp_ipv6_mvpn_cmd);

@@ -47,6 +47,10 @@
 #define ECOMMUNITY_TRAFFIC_ACTION           0x07
 #define ECOMMUNITY_REDIRECT_VRF             0x08
 #define ECOMMUNITY_TRAFFIC_MARKING          0x09
+/* RFC 6514 Section 5: Source AS Extended Community (Four-Octet-AS-Specific,
+ * encode 0x02). GTM receiver reads it off the source unicast route to fill the
+ * Type-7 Source-AS NLRI field. */
+#define ECOMMUNITY_SOURCE_AS                0x09
 #define ECOMMUNITY_REDIRECT_IP_NH           0x00
 #define ECOMMUNITY_COLOR 0x0b /* RFC9012 - color */
 /* RFC 6514 - VRF Route Import. IP-address-specific only (high-order octet

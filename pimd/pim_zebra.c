@@ -432,6 +432,104 @@ static void pim_zebra_capabilities(struct zclient_capabilities *cap)
 	router->multipath = cap->ecmp;
 }
 
+/*
+ * Global-Table Multicast (RFC 7716) pimd->bgpd glue.
+ *
+ * pim_gtm_upstream_update() is an idempotent reconcile: it (re-)computes
+ * whether a local SSM (S,G) should have a BGP MVPN route announced on its
+ * behalf and in which role, then emits at most one ADD/DEL to zebra (which
+ * relays to bgpd). Called from the upstream lifecycle points that can change
+ * the answer (join_state switch, source-stream KAT, delete). Role:
+ *   FHR + source stream -> Source Active (Type 5)   [local first-hop source]
+ *   else JOINED         -> C-multicast join (Type 7)[local receiver interest]
+ * bgpd fills the Type-7 upstream-PE and Source-AS from the received SA route,
+ * so pimd sends neither (source_as 0, upstream INADDR_ANY).
+ */
+static void pim_zebra_mvpn_sg_send(struct pim_upstream *up, uint8_t role, bool add)
+{
+	struct zapi_mvpn_sg sg = {};
+	struct stream *s;
+
+	if (!pim_zclient || pim_zclient->sock < 0)
+		return;
+
+#if PIM_IPV == 4
+	sg.src.ipa_type = IPADDR_V4;
+	sg.src.ipaddr_v4 = up->sg.src;
+	sg.grp.ipa_type = IPADDR_V4;
+	sg.grp.ipaddr_v4 = up->sg.grp;
+#else
+	sg.src.ipa_type = IPADDR_V6;
+	sg.src.ipaddr_v6 = up->sg.src;
+	sg.grp.ipa_type = IPADDR_V6;
+	sg.grp.ipaddr_v6 = up->sg.grp;
+#endif
+	sg.role = role;
+	sg.source_as = 0;
+	sg.upstream_pe.s_addr = INADDR_ANY;
+
+	s = pim_zclient->obuf;
+	zapi_mvpn_sg_encode(s, add ? ZEBRA_MVPN_SG_ADD : ZEBRA_MVPN_SG_DEL,
+			    VRF_DEFAULT, &sg);
+	zclient_send_message(pim_zclient);
+}
+
+void pim_gtm_upstream_update(struct pim_instance *pim, struct pim_upstream *up,
+			     bool deleting)
+{
+	bool desired;
+	uint8_t role;
+
+	if (!pim->gtm_enable)
+		return;
+	if (!pim_is_grp_ssm(pim, up->sg.grp))
+		return;
+
+	/* A local first-hop source (FHR flag + active source stream) originates
+	 * a Source Active; any other JOINED (S,G) is a local receiver pulling a
+	 * remote source and originates a C-multicast join. */
+	if (PIM_UPSTREAM_FLAG_TEST_FHR(up->flags) &&
+	    PIM_UPSTREAM_FLAG_TEST_SRC_STREAM(up->flags))
+		role = ZAPI_MVPN_SG_SOURCE;
+	else
+		role = ZAPI_MVPN_SG_JOIN;
+
+	desired = !deleting &&
+		  (role == ZAPI_MVPN_SG_SOURCE ||
+		   up->join_state == PIM_UPSTREAM_JOINED);
+
+	if (desired && !up->gtm_announced) {
+		pim_zebra_mvpn_sg_send(up, role, true);
+		up->gtm_announced = true;
+		up->gtm_role = role;
+	} else if (!desired && up->gtm_announced) {
+		pim_zebra_mvpn_sg_send(up, up->gtm_role, false);
+		up->gtm_announced = false;
+	} else if (desired && up->gtm_announced && up->gtm_role != role) {
+		/* FHR flag toggled while announced: swap the route type. */
+		pim_zebra_mvpn_sg_send(up, up->gtm_role, false);
+		pim_zebra_mvpn_sg_send(up, role, true);
+		up->gtm_role = role;
+	}
+}
+
+/* bgpd (via zebra) asked pimd to re-dump its announced MVPN SG set, e.g. after
+ * a bgpd restart re-subscribed. Re-send an ADD for every announced (S,G). */
+static int pim_zebra_mvpn_sg_replay(ZAPI_CALLBACK_ARGS)
+{
+	struct pim_instance *pim = pim_get_pim_instance(vrf_id);
+	struct pim_upstream *up;
+
+	if (!pim)
+		return 0;
+
+	frr_each (rb_pim_upstream, &pim->upstream_head, up)
+		if (up->gtm_announced)
+			pim_zebra_mvpn_sg_send(up, up->gtm_role, true);
+
+	return 0;
+}
+
 static zclient_handler *const pim_handlers[] = {
 	[ZEBRA_INTERFACE_ADDRESS_ADD] = pim_zebra_if_address_add,
 	[ZEBRA_INTERFACE_ADDRESS_DELETE] = pim_zebra_if_address_del,
@@ -441,6 +539,7 @@ static zclient_handler *const pim_handlers[] = {
 #if PIM_IPV == 4
 	[ZEBRA_VXLAN_SG_ADD] = pim_zebra_vxlan_sg_proc,
 	[ZEBRA_VXLAN_SG_DEL] = pim_zebra_vxlan_sg_proc,
+	[ZEBRA_MVPN_SG_REPLAY] = pim_zebra_mvpn_sg_replay,
 
 	[ZEBRA_MLAG_PROCESS_UP] = pim_zebra_mlag_process_up,
 	[ZEBRA_MLAG_PROCESS_DOWN] = pim_zebra_mlag_process_down,

@@ -194,6 +194,9 @@ typedef enum {
 	ZEBRA_VXLAN_SG_ADD,
 	ZEBRA_VXLAN_SG_DEL,
 	ZEBRA_VXLAN_SG_REPLAY,
+	ZEBRA_MVPN_SG_ADD,
+	ZEBRA_MVPN_SG_DEL,
+	ZEBRA_MVPN_SG_REPLAY,
 	ZEBRA_MLAG_PROCESS_UP,
 	ZEBRA_MLAG_PROCESS_DOWN,
 	ZEBRA_MLAG_CLIENT_REGISTER,
@@ -678,6 +681,30 @@ struct zapi_sr_policy {
 	int status;
 };
 
+/*
+ * Global-Table Multicast (RFC 7716) pimd<->bgpd glue: pimd emits a local
+ * SSM (S,G) role change, zebra relays it to bgpd, bgpd (re-)originates the
+ * matching MCAST-VPN route. src/grp are struct ipaddr so this stays in lib
+ * (pim_sgaddr lives in pimd); the family byte rides in the ipaddr.
+ */
+enum zapi_mvpn_sg_role {
+	/* local receiver interest -> C-multicast Source Tree Join (Type 7) */
+	ZAPI_MVPN_SG_JOIN = 0,
+	/* local first-hop source -> Source Active A-D (Type 5) */
+	ZAPI_MVPN_SG_SOURCE = 1,
+};
+
+struct zapi_mvpn_sg {
+	struct ipaddr src;
+	struct ipaddr grp;
+	uint8_t role; /* enum zapi_mvpn_sg_role */
+	/* JOIN only: Source AS carried in the Type-7 NLRI (0 = unset). */
+	uint32_t source_as;
+	/* JOIN only: upstream PE for the UMH Route Target; INADDR_ANY = let
+	 * bgpd resolve it from the received SA route. */
+	struct in_addr upstream_pe;
+};
+
 struct zapi_pw {
 	char ifname[IFNAMSIZ];
 	ifindex_t ifindex;
@@ -1147,6 +1174,11 @@ extern int zapi_sr_policy_encode(struct stream *s, int cmd,
 extern int zapi_sr_policy_decode(struct stream *s, struct zapi_sr_policy *zp);
 extern int zapi_sr_policy_notify_status_decode(struct stream *s,
 					       struct zapi_sr_policy *zp);
+
+/* Global-Table Multicast pimd<->bgpd SG glue (see struct zapi_mvpn_sg). */
+extern int zapi_mvpn_sg_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
+			       const struct zapi_mvpn_sg *sg);
+extern int zapi_mvpn_sg_decode(struct stream *s, struct zapi_mvpn_sg *sg);
 
 extern enum zclient_send_status zebra_send_mpls_labels(struct zclient *zclient,
 						       int cmd,

@@ -251,6 +251,12 @@ struct pim_upstream {
 	enum pim_reg_state reg_state;
 	enum pim_upstream_sptbit sptbit;
 
+	/* Global-Table Multicast pimd->bgpd glue tracking: whether this (S,G)
+	 * currently has a BGP MVPN route announced on its behalf, and as which
+	 * role (enum zapi_mvpn_sg_role) so the withdraw matches the announce. */
+	bool gtm_announced;
+	uint8_t gtm_role;
+
 	int ref_count;
 
 	struct pim_rpf rpf;

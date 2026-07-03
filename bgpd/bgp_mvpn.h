@@ -143,6 +143,10 @@ extern int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as,
 /* running-config emission for `bgp mvpn source-active` under the AF node. */
 extern void bgp_mvpn_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi);
 
+/* True if the GTM MVPN AF (SAFI 5) is active on any peer of this instance, in
+ * either AFI. Gate for the pimd->bgpd SG replay subscription. */
+extern bool bgp_mvpn_gtm_active(struct bgp *bgp);
+
 /* `show bgp ipv4 mvpn [json]` printer. */
 extern void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_json);
 

@@ -756,6 +756,57 @@ static bool bgp_mvpn_resolve_upstream_pe(struct bgp *bgp, const struct ipaddr *s
 }
 
 /*
+ * RFC 6514 Section 5 Source-AS resolution for a pimd-driven Type-7. Read the
+ * Source-AS Extended Community (Four-Octet-AS-Specific, encode 0x02, subtype
+ * ECOMMUNITY_SOURCE_AS) off the unicast route toward C-S -- what a conformant
+ * MVPN source (Junos "src-as") attaches. Leaves *source_as unchanged if none
+ * is found.
+ */
+static void bgp_mvpn_resolve_source_as(struct bgp *bgp, const struct ipaddr *src,
+				       uint32_t *source_as)
+{
+	struct prefix psrc = {};
+	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi;
+	struct ecommunity *ecom;
+	struct ecommunity_val *eval;
+
+	if (IS_IPADDR_V6(src)) {
+		psrc.family = AF_INET6;
+		psrc.prefixlen = IPV6_MAX_BITLEN;
+		psrc.u.prefix6 = src->ipaddr_v6;
+	} else {
+		psrc.family = AF_INET;
+		psrc.prefixlen = IPV4_MAX_BITLEN;
+		psrc.u.prefix4 = src->ipaddr_v4;
+	}
+
+	dest = bgp_node_match(bgp->rib[afi][SAFI_UNICAST], &psrc);
+	if (!dest)
+		return;
+
+	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+		if (pi->type != ZEBRA_ROUTE_BGP)
+			continue;
+		ecom = bgp_attr_get_ecommunity(pi->attr);
+		if (!ecom)
+			continue;
+		eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_AS4,
+					 ECOMMUNITY_SOURCE_AS);
+		if (!eval)
+			continue;
+		/* Four-Octet-AS-Specific wire layout: type, subtype, Global
+		 * Administrator (4-octet AS), Local Administrator (2). */
+		*source_as = (uint32_t)eval->val[2] << 24 |
+			     (uint32_t)eval->val[3] << 16 |
+			     (uint32_t)eval->val[4] << 8 | (uint32_t)eval->val[5];
+		break;
+	}
+	bgp_dest_unlock_node(dest);
+}
+
+/*
  * Configure or withdraw a locally-originated GTM Source Active route. Attr is a
  * self-sourced IGP route with the router-id as next hop.
  */
@@ -816,6 +867,12 @@ static bool bgp_mvpn_gtm_af_active(struct bgp *bgp, afi_t afi)
 			return true;
 
 	return false;
+}
+
+bool bgp_mvpn_gtm_active(struct bgp *bgp)
+{
+	return bgp_mvpn_gtm_af_active(bgp, AFI_IP) ||
+	       bgp_mvpn_gtm_af_active(bgp, AFI_IP6);
 }
 
 /*
@@ -940,6 +997,14 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, const str
 	struct prefix_mvpn p;
 	struct attr attr;
 	struct in_addr umh = upstream;
+
+	/* pimd-driven join carries no Source-AS (0). RFC 6514 Section 5: read it
+	 * off the Source-AS EC on the source's unicast route (Junos "src-as") so
+	 * the Type-7 NLRI Source-AS matches what the upstream PE expects. Done
+	 * before build_prefix so add and withdraw key the same NLRI (the source
+	 * route is present while a receiver is joined). */
+	if (source_as == 0)
+		bgp_mvpn_resolve_source_as(bgp, src, &source_as);
 
 	bgp_mvpn_build_prefix_type7(&p, source_as, src, grp);
 
