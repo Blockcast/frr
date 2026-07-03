@@ -137,12 +137,13 @@ def test_type5_source_active_propagates():
     under `address-family ipv4 mvpn`. r2 must learn it and expose it via
     `show bgp ipv4 mvpn json` with routeType 5 and the matching (S,G).
 
-    The SA route must also carry the RFC 7716 Section 2.8.2 group-address Route
-    Target (an IP-address-specific RT with Global Administrator = the group
-    address and Local Administrator = 0), so r2 sees an extendedCommunity of
-    "RT:232.1.1.1:0". This is the RT an interested (case-2) receiver imports on;
-    without it a receiver that auto-derives an import RT from its join state
-    rejects the route "due to the lack of a valid target community".
+    The SA route must also carry the GTM global-table Route Target (an
+    IP-address-specific RT with Global Administrator = 0.0.0.0 and Local
+    Administrator = 0), so r2 sees an extendedCommunity of "RT:0.0.0.0:0". This
+    is the fixed import/export target a GTM receiver (e.g. Junos
+    mpls-internet-multicast) matches on; without it -- or with a group-address
+    RT -- the receiver rejects the route "due to the lack of a valid target
+    community".
     """
     tgen = get_topogen()
 
@@ -157,10 +158,10 @@ def test_type5_source_active_propagates():
                 r.get("routeType") == 5
                 and r.get("source") == "10.10.10.1"
                 and r.get("group") == "232.1.1.1"
-                and r.get("extendedCommunity", {}).get("string") == "RT:232.1.1.1:0"
+                and r.get("extendedCommunity", {}).get("string") == "RT:0.0.0.0:0"
             ):
                 return None
-        return "Type-5 (10.10.10.1, 232.1.1.1) with RT:232.1.1.1:0 not found in {}".format(
+        return "Type-5 (10.10.10.1, 232.1.1.1) with RT:0.0.0.0:0 not found in {}".format(
             routes
         )
 
@@ -229,8 +230,10 @@ def test_type1_ipmsi_with_ir_pmsi():
     each PE when the MCAST-VPN AF is enabled. r1's Type-1 carries a PMSI Tunnel
     attribute (RFC 6514 Section 5) with Tunnel Type = Ingress Replication (6)
     and r1's own unicast address (10.0.0.1, the auto-derived router-id) as the
-    tunnel endpoint. r2 must learn it via `show bgp ipv4 mvpn json` with
-    routeType 1 and the matching pmsiTunnel object.
+    tunnel endpoint. It also carries the GTM global-table Route Target
+    "RT:0.0.0.0:0" (the fixed import/export target for non-C-multicast GTM
+    routes). r2 must learn it via `show bgp ipv4 mvpn json` with routeType 1, the
+    matching pmsiTunnel object, and that extendedCommunity.
 
     AUTHORED-NOT-RUN: this repo has no network namespaces, so the topotest is
     authored and py_compile-checked but not executed here.
@@ -250,9 +253,10 @@ def test_type1_ipmsi_with_ir_pmsi():
             if (
                 pmsi.get("type") == "ingressReplication"
                 and pmsi.get("endpoint") == "10.0.0.1"
+                and r.get("extendedCommunity", {}).get("string") == "RT:0.0.0.0:0"
             ):
                 return None
-        return "Type-1 I-PMSI with IR PMSI endpoint 10.0.0.1 not found in {}".format(
+        return "Type-1 I-PMSI with IR PMSI endpoint 10.0.0.1 + RT:0.0.0.0:0 not found in {}".format(
             routes
         )
 
@@ -321,6 +325,7 @@ router bgp 65001
             if (
                 pmsi.get("type") == "ingressReplication"
                 and pmsi.get("endpoint") == endpoint
+                and r.get("extendedCommunity", {}).get("string") == "RT:0.0.0.0:0"
             ):
                 return True
         return False
@@ -331,8 +336,7 @@ router bgp 65001
                 r.get("routeType") == 5
                 and r.get("source") == source
                 and r.get("group") == group
-                and r.get("extendedCommunity", {}).get("string")
-                == "RT:{}:0".format(group)
+                and r.get("extendedCommunity", {}).get("string") == "RT:0.0.0.0:0"
             ):
                 return True
         return False

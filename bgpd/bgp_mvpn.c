@@ -447,10 +447,11 @@ stream_failure:
  * Administrator = 0, transitive) to a locally-originated route. Both GTM RTs
  * this codec emits share this shape and differ only by which address fills the
  * Global Administrator and by which route type carries them (RFC 7716): the
- * Type-5 SA route carries the group address (Section 2.8.2); the Type-7
- * C-multicast join carries the upstream PE address (Sections 2.2 / 2.9). The
- * ecommunity is left un-interned; the caller's route_install() interns it and a
- * later bgp_attr_flush() releases this stack reference.
+ * Type-7 C-multicast join carries the upstream PE address (Sections 2.2 / 2.9),
+ * while the Intra-AS AD (Type-1) and Source Active (Type-5) routes carry the GTM
+ * global-table RT (bgp_mvpn_attach_gtm_rt). The ecommunity is left un-interned;
+ * the caller's route_install() interns it and a later bgp_attr_flush() releases
+ * this stack reference.
  */
 static void bgp_mvpn_attach_ip_rt(struct attr *attr, struct in_addr ga)
 {
@@ -461,6 +462,23 @@ static void bgp_mvpn_attach_ip_rt(struct attr *attr, struct in_addr ga)
 	ecom = ecommunity_new();
 	ecommunity_add_val(ecom, &eval, false, false);
 	bgp_attr_set_ecommunity(attr, ecom);
+}
+
+/*
+ * Attach the GTM global-table Route Target to a locally-originated
+ * non-C-multicast MVPN route (Intra-AS AD Type-1, Source Active Type-5). Global
+ * Table Multicast has no VRF and thus no configured RT; the import/export target
+ * is a fixed IPv4-address-specific RT whose Global Administrator is 0.0.0.0 (the
+ * global-table sentinel) and Local Administrator is 0. A GTM receiver imports the
+ * route only on this exact RT -- it rejects an RT-less route and a group-address
+ * RT alike. (Verified against Junos mpls-internet-multicast, whose auto-generated
+ * __vrf-mvpn-import-target-*-internal__ policy matches exactly [target:0.0.0.0:0].)
+ */
+static void bgp_mvpn_attach_gtm_rt(struct attr *attr)
+{
+	struct in_addr gtm_global_table = { .s_addr = INADDR_ANY };
+
+	bgp_mvpn_attach_ip_rt(attr, gtm_global_table);
 }
 
 /*
@@ -524,14 +542,12 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, struct in_addr src, struct in_ad
 	attr.mp_nexthop_len = IPV4_MAX_BYTELEN;
 
 	/*
-	 * RFC 7716 Section 2.8.2 group-address Route Target (Global Administrator
-	 * = the multicast group C-G, Local Administrator = 0). A GTM receiver
-	 * interested in G auto-derives this same RT as an import target from its
-	 * join state and imports the SA route on it (RFC 7716 Section 2.2,
-	 * "import RTs configured" case); such a receiver rejects an RT-less SA
-	 * route for lack of a matching target community.
+	 * GTM global-table Route Target (target:0.0.0.0:0). A GTM receiver imports
+	 * the Source Active route only on this fixed target; it rejects an RT-less
+	 * SA route and a group-address RT alike (RFC 7716 Section 2.2, verified
+	 * against Junos mpls-internet-multicast).
 	 */
-	bgp_mvpn_attach_ip_rt(&attr, grp);
+	bgp_mvpn_attach_gtm_rt(&attr);
 
 	bgp_mvpn_route_install(bgp, bgp->peer_self, &p, &attr, BGP_ROUTE_STATIC);
 
@@ -614,10 +630,22 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 	ipv4_to_ipv4_mapped_ipv6(&tunn_id, bgp->router_id);
 	bgp_attr_set_tunn_id(&attr, &tunn_id);
 
+	/*
+	 * GTM global-table Route Target (target:0.0.0.0:0), the import/export target
+	 * a GTM receiver (e.g. Junos mpls-internet-multicast) matches on the Intra-AS
+	 * AD route; without it the route is rejected for want of a target community.
+	 */
+	bgp_mvpn_attach_gtm_rt(&attr);
+
 	bgp_mvpn_route_install(bgp, bgp->peer_self, &p, &attr, BGP_ROUTE_STATIC);
 
+	/*
+	 * bgp_attr_flush releases the borrowed ecommunity ref (refcnt-aware) and the
+	 * PMSI attr_extra, mirroring bgp_mvpn_source_active_set; aspath was interned
+	 * by bgp_attr_default_set, so drop that local ref separately.
+	 */
+	bgp_attr_flush(&attr);
 	aspath_unintern(&attr.aspath);
-	bgp_attr_extra_discard(&attr);
 }
 
 /*
