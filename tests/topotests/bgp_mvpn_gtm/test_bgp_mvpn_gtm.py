@@ -136,6 +136,13 @@ def test_type5_source_active_propagates():
     r1 is configured with `bgp mvpn source-active 10.10.10.1 group 232.1.1.1`
     under `address-family ipv4 mvpn`. r2 must learn it and expose it via
     `show bgp ipv4 mvpn json` with routeType 5 and the matching (S,G).
+
+    The SA route must also carry the RFC 7716 Section 2.8.2 group-address Route
+    Target (an IP-address-specific RT with Global Administrator = the group
+    address and Local Administrator = 0), so r2 sees an extendedCommunity of
+    "RT:232.1.1.1:0". This is the RT an interested (case-2) receiver imports on;
+    without it a receiver that auto-derives an import RT from its join state
+    rejects the route "due to the lack of a valid target community".
     """
     tgen = get_topogen()
 
@@ -150,9 +157,12 @@ def test_type5_source_active_propagates():
                 r.get("routeType") == 5
                 and r.get("source") == "10.10.10.1"
                 and r.get("group") == "232.1.1.1"
+                and r.get("extendedCommunity", {}).get("string") == "RT:232.1.1.1:0"
             ):
                 return None
-        return "Type-5 (10.10.10.1, 232.1.1.1) not found in {}".format(routes)
+        return "Type-5 (10.10.10.1, 232.1.1.1) with RT:232.1.1.1:0 not found in {}".format(
+            routes
+        )
 
     test_func = functools.partial(_type5_present, "r2")
     _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
@@ -314,6 +324,8 @@ router bgp 65001
                 r.get("routeType") == 5
                 and r.get("source") == source
                 and r.get("group") == group
+                and r.get("extendedCommunity", {}).get("string")
+                == "RT:{}:0".format(group)
             ):
                 return True
         return False

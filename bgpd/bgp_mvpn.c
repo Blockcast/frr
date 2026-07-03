@@ -23,6 +23,7 @@
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_aspath.h"
+#include "bgpd/bgp_ecommunity.h"
 #include "bgpd/bgp_packet.h"
 #include "bgpd/bgp_nht.h"
 #include "bgpd/bgp_mvpn.h"
@@ -449,6 +450,8 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, struct in_addr src, struct in_ad
 {
 	struct prefix_mvpn p;
 	struct attr attr;
+	struct ecommunity_val eval;
+	struct ecommunity *ecom;
 
 	bgp_mvpn_build_prefix_type5(&p, src, grp);
 
@@ -463,8 +466,31 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, struct in_addr src, struct in_ad
 	attr.mp_nexthop_global_in = bgp->router_id;
 	attr.mp_nexthop_len = IPV4_MAX_BYTELEN;
 
+	/*
+	 * Attach the RFC 7716 Section 2.8.2 group-address Route Target: an
+	 * IP-address-specific RT whose Global Administrator is the multicast
+	 * group (C-G) and Local Administrator is zero. A GTM receiver interested
+	 * in G auto-derives this same RT as an import target from its join state
+	 * and imports the SA route on it (RFC 7716 Section 2.2, "import RTs
+	 * configured" case); such a receiver rejects an RT-less SA route for lack
+	 * of a matching target community. The RT is transitive so it survives
+	 * propagation to the receiver.
+	 */
+	encode_route_target_ip(&grp, 0, &eval, true);
+	ecom = ecommunity_new();
+	ecommunity_add_val(ecom, &eval, false, false);
+	bgp_attr_set_ecommunity(&attr, ecom);
+
 	bgp_mvpn_route_install(bgp, bgp->peer_self, &p, &attr, BGP_ROUTE_STATIC);
 
+	/*
+	 * route_install interned the attr (and with it the ecommunity, refcnt
+	 * 0->1 held by the stored path). bgp_attr_flush is refcnt-aware: it frees
+	 * the ecommunity only if it was never interned, so here it just releases
+	 * this stack attr's borrowed pointer without a double free. aspath was
+	 * interned by bgp_attr_default_set, so drop that local ref too.
+	 */
+	bgp_attr_flush(&attr);
 	aspath_unintern(&attr.aspath);
 	return CMD_SUCCESS;
 }
@@ -622,6 +648,15 @@ void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_
 
 		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
 			bool self = (pi->peer == bgp->peer_self);
+			struct ecommunity *ecom = bgp_attr_get_ecommunity(pi->attr);
+
+			/* Populate the cached display string once (RFC 7716
+			 * Section 2.8.2 group-address RT on Type-5, and any RT a
+			 * later route type carries), mirroring the generic route
+			 * detail path.
+			 */
+			if (ecom && !ecom->str)
+				ecommunity_str(ecom);
 
 			if (use_json) {
 				json_object *jr = json_object_new_object();
@@ -655,18 +690,27 @@ void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_
 					if (m->route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN)
 						json_object_int_add(jr, "sourceAs", m->source_as);
 				}
+				if (ecom) {
+					json_object *je = json_object_new_object();
+
+					json_object_string_add(je, "string", ecom->str);
+					json_object_object_add(jr, "extendedCommunity", je);
+				}
 				json_object_boolean_add(jr, "selfOriginated", self);
 				json_object_array_add(json_routes, jr);
 			} else if (m->route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI) {
-				vty_out(vty, " [%u] originator %pI4 %s%s\n", m->route_type, &m->src,
+				vty_out(vty, " [%u] originator %pI4 %s%s%s%s\n", m->route_type,
+					&m->src,
 					bgp_attr_get_pmsi_tnl_type(pi->attr) ==
 							PMSI_TNLTYPE_INGR_REPL
 						? "IR "
 						: "",
-					self ? "(local)" : "");
+					self ? "(local)" : "", ecom ? " " : "",
+					ecom ? ecom->str : "");
 			} else {
-				vty_out(vty, " [%u] source %pI4 group %pI4 %s\n", m->route_type,
-					&m->src, &m->grp, self ? "(local)" : "");
+				vty_out(vty, " [%u] source %pI4 group %pI4 %s%s%s\n", m->route_type,
+					&m->src, &m->grp, self ? "(local)" : "", ecom ? " " : "",
+					ecom ? ecom->str : "");
 			}
 		}
 	}
