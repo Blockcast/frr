@@ -56,9 +56,13 @@ static struct ipaddr mvpn_ipaddr_v4(struct in_addr a)
 	return ip;
 }
 
-/* The AFI a GTM MVPN route lives under is that of its C-S/C-G (Type-1 uses its
- * originator slot): a v6 address keys the AFI_IP6 MCAST-VPN RIB, v4 the AFI_IP
- * one. The RD is always zero (GTM), so the AFI is the only table discriminator. */
+/* The AFI a C-multicast-bearing GTM route (Type-5/7) lives under is that of
+ * its C-S/C-G: a v6 address keys the AFI_IP6 MCAST-VPN RIB, v4 the AFI_IP one.
+ * The RD is always zero (GTM), so the AFI is the only table discriminator.
+ * NOT valid for Type-1: its plane is the NLRI's AFI, not the originator's
+ * family — RFC 6515 allows a v4 Originating Router address inside the IPv6
+ * MCAST-VPN AF (Junos advertises exactly that), so callers must pass the
+ * packet AFI for Type-1 instead of deriving it from the address. */
 static afi_t bgp_mvpn_prefix_afi(const struct prefix_mvpn *p)
 {
 	return IS_IPADDR_V6(&p->prefix.src) ? AFI_IP6 : AFI_IP;
@@ -201,13 +205,12 @@ void bgp_mvpn_encode_type1(struct stream *s, const struct prefix *p, bool addpat
  * (sub_type = NORMAL). GTM SA routes are control-plane markers, so they are
  * marked valid without next-hop resolution, mirroring EVPN imported routes.
  */
-static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, const struct prefix_mvpn *p,
-				   struct attr *attr, int sub_type)
+static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, afi_t afi,
+				   const struct prefix_mvpn *p, struct attr *attr, int sub_type)
 {
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
 	struct attr *attr_new;
-	afi_t afi = bgp_mvpn_prefix_afi(p);
 
 	dest = bgp_afi_node_get(bgp->rib[afi][SAFI_MCAST_VPN], afi, SAFI_MCAST_VPN,
 				(const struct prefix *)p, NULL);
@@ -238,12 +241,11 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, const str
 }
 
 /* Withdraw a Type-5 route matching (peer, sub_type) from the table. */
-static void bgp_mvpn_route_remove(struct bgp *bgp, struct peer *peer, const struct prefix_mvpn *p,
-				  int sub_type)
+static void bgp_mvpn_route_remove(struct bgp *bgp, struct peer *peer, afi_t afi,
+				  const struct prefix_mvpn *p, int sub_type)
 {
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
-	afi_t afi = bgp_mvpn_prefix_afi(p);
 
 	dest = bgp_safi_node_lookup(bgp->rib[afi][SAFI_MCAST_VPN], SAFI_MCAST_VPN,
 				    (const struct prefix *)p, NULL);
@@ -563,10 +565,18 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			continue;
 		}
 
+		/* Type-1's plane is the AF the NLRI arrived on (RFC 6515 permits a
+		 * v4 originator inside the IPv6 AF); Type-5/7 key off the C-S/C-G
+		 * family, which the length checks above already tied to the body.
+		 */
+		afi_t rib_afi = (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI)
+					? packet->afi
+					: bgp_mvpn_prefix_afi(&p);
+
 		if (is_withdraw)
-			bgp_mvpn_route_remove(peer->bgp, peer, &p, BGP_ROUTE_NORMAL);
+			bgp_mvpn_route_remove(peer->bgp, peer, rib_afi, &p, BGP_ROUTE_NORMAL);
 		else
-			bgp_mvpn_route_install(peer->bgp, peer, &p, attr, BGP_ROUTE_NORMAL);
+			bgp_mvpn_route_install(peer->bgp, peer, rib_afi, &p, attr, BGP_ROUTE_NORMAL);
 	}
 
 done:
@@ -757,7 +767,8 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, const struct ipaddr *src, const 
 	bgp_mvpn_build_prefix_type5(&p, src, grp);
 
 	if (negate) {
-		bgp_mvpn_route_remove(bgp, bgp->peer_self, &p, BGP_ROUTE_STATIC);
+		bgp_mvpn_route_remove(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p), &p,
+				      BGP_ROUTE_STATIC);
 		return CMD_SUCCESS;
 	}
 
@@ -775,7 +786,8 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, const struct ipaddr *src, const 
 	 */
 	bgp_mvpn_attach_gtm_rt(&attr);
 
-	bgp_mvpn_route_install(bgp, bgp->peer_self, &p, &attr, BGP_ROUTE_STATIC);
+	bgp_mvpn_route_install(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p), &p, &attr,
+			       BGP_ROUTE_STATIC);
 
 	/*
 	 * route_install interned the attr (and with it the ecommunity, refcnt
@@ -789,17 +801,17 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, const struct ipaddr *src, const 
 	return CMD_SUCCESS;
 }
 
-/* True if any peer on this instance has the GTM MVPN AF (AFI_IP, SAFI 5)
+/* True if any peer on this instance has the GTM MVPN AF (afi, SAFI 5)
  * configured/activated. afc[] is set the moment a peer is activated for the AF,
  * so this is a valid "GTM MVPN in use" predicate for both lifecycle hooks.
  */
-static bool bgp_mvpn_gtm_af_active(struct bgp *bgp)
+static bool bgp_mvpn_gtm_af_active(struct bgp *bgp, afi_t afi)
 {
 	struct peer *peer;
 	struct listnode *node;
 
 	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer))
-		if (peer->afc[AFI_IP][SAFI_MCAST_VPN])
+		if (peer->afc[afi][SAFI_MCAST_VPN])
 			return true;
 
 	return false;
@@ -836,7 +848,7 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 
 	if (bgp->router_id.s_addr == INADDR_ANY)
 		return;
-	if (!bgp_mvpn_gtm_af_active(bgp))
+	if (!bgp_mvpn_gtm_af_active(bgp, AFI_IP) && !bgp_mvpn_gtm_af_active(bgp, AFI_IP6))
 		return;
 
 	struct ipaddr orig = mvpn_ipaddr_v4(bgp->router_id);
@@ -876,7 +888,15 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 	 */
 	bgp_mvpn_attach_gtm_rt(&attr);
 
-	bgp_mvpn_route_install(bgp, bgp->peer_self, &p, &attr, BGP_ROUTE_STATIC);
+	/* One Intra-AS I-PMSI A-D per active GTM plane: the v4 originator is
+	 * legal in both AFs (RFC 6515), and a peer that negotiated only one of
+	 * them must still learn this PE as an IR leaf for that plane. Junos
+	 * mirrors this (its v6-AF Type-1 carries the v4 lo0 originator).
+	 */
+	if (bgp_mvpn_gtm_af_active(bgp, AFI_IP))
+		bgp_mvpn_route_install(bgp, bgp->peer_self, AFI_IP, &p, &attr, BGP_ROUTE_STATIC);
+	if (bgp_mvpn_gtm_af_active(bgp, AFI_IP6))
+		bgp_mvpn_route_install(bgp, bgp->peer_self, AFI_IP6, &p, &attr, BGP_ROUTE_STATIC);
 
 	/*
 	 * bgp_attr_flush releases the borrowed ecommunity ref (refcnt-aware) and the
@@ -903,7 +923,8 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, const str
 	bgp_mvpn_build_prefix_type7(&p, source_as, src, grp);
 
 	if (negate) {
-		bgp_mvpn_route_remove(bgp, bgp->peer_self, &p, BGP_ROUTE_STATIC);
+		bgp_mvpn_route_remove(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p), &p,
+				      BGP_ROUTE_STATIC);
 		return CMD_SUCCESS;
 	}
 
@@ -931,7 +952,8 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, const str
 		zlog_debug("MVPN Type-7 (%pIA, %pIA): no upstream PE resolved; originating without upstream RT",
 			   src, grp);
 
-	bgp_mvpn_route_install(bgp, bgp->peer_self, &p, &attr, BGP_ROUTE_STATIC);
+	bgp_mvpn_route_install(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p), &p, &attr,
+			       BGP_ROUTE_STATIC);
 
 	bgp_attr_flush(&attr);
 	aspath_unintern(&attr.aspath);

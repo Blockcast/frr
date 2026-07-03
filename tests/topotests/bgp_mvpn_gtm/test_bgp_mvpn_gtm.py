@@ -398,6 +398,48 @@ def test_type5_v6_source_active_propagates():
     assert result is None, "r2 did not learn r1's IPv6 MVPN Type-5 Source Active route"
 
 
+def test_type1_v6_plane_with_v4_originator():
+    """r1's Intra-AS I-PMSI A-D must also appear in r2's IPv6 MVPN table.
+
+    A Type-1's plane is the AF the NLRI is advertised in, not the originator
+    address family: RFC 6515 permits a v4 Originating Router address inside
+    the IPv6 MCAST-VPN AF (Junos mpls-internet-multicast advertises exactly
+    that shape). r1 originates one Type-1 per active GTM plane, both carrying
+    the v4 router-id originator; r2 must hold the v6-plane copy in the
+    AFI_IP6 MCAST-VPN RIB. Regression: rib selection previously keyed off the
+    originator family, silently collapsing the v6-plane Type-1 into the v4
+    table (found live against Junos 22.2R3: MX advertised 1 prefix on
+    bgp.mvpn-inet6.0, FRR's ipv6 mvpn table stayed empty).
+
+    AUTHORED-NOT-RUN: this repo has no network namespaces; authored and
+    py_compile-checked.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _type1_v6_present(router):
+        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv6 mvpn json"))
+        routes = out.get("routes", [])
+        for r in routes:
+            if r.get("routeType") != 1:
+                continue
+            pmsi = r.get("pmsiTunnel", {})
+            if (
+                pmsi.get("type") == "ingressReplication"
+                and pmsi.get("endpoint") == "10.0.0.1"
+                and pmsi.get("label") == 0
+                and r.get("extendedCommunity", {}).get("string") == "RT:0.0.0.0:0"
+            ):
+                return None
+        return "v6-plane Type-1 with v4 originator 10.0.0.1 not found in {}".format(routes)
+
+    test_func = functools.partial(_type1_v6_present, "r2")
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, "r2 did not hold r1's Type-1 in the IPv6 MCAST-VPN RIB"
+
+
 def test_type7_v6_umh_from_vrf_route_import():
     """IPv6 Type-7 upstream RT resolves from the v6 source route's VRF Route
     Import EC (RFC 6514 Section 5.1 / RFC 6515), exercising the AFI_IP6 unicast
