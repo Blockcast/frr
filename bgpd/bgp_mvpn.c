@@ -636,9 +636,11 @@ static void bgp_mvpn_attach_gtm_rt(struct attr *attr)
  * upstream identifier is the Global Administrator of the source route's
  * route-import community.
  *
- * NB: the sub-type a live Junos GTM source stamps on the *unicast* route
- * (VRF Route Import 0x0b vs a plain Route Target 0x02) is not yet wire-captured;
- * the lookup below tries 0x0b first then 0x02, so it is correct either way.
+ * NB: confirmed on MX204 22.2R3 -- a live Junos GTM source's auto-export policy
+ * (__vrf-mvpn-export-inet-*-internal__) attaches rt-import:<PE>:0, i.e. the VRF
+ * Route Import community (0x0b), to the source's unicast route; the lookup below
+ * therefore reads 0x0b first (0x02 kept as a fallback for FRR<->FRR sources that
+ * tag a plain Route Target).
  *
  * Lookup order:
  *   1. RFC-canonical: the IP-address-specific route-import community on the
