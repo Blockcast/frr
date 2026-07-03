@@ -23347,6 +23347,24 @@ DEFPY_HIDDEN (bgp_mvpn_test_join,
 	return bgp_mvpn_source_tree_join_set(bgp, source_as, &src, &grp, up, !!no);
 }
 
+DEFPY (bgp_mvpn_ipmsi_label,
+       bgp_mvpn_ipmsi_label_cmd,
+       "[no] bgp mvpn ipmsi-label (16-1048575)$label",
+       NO_STR
+       BGP_STR
+       "Multicast VPN (MCAST-VPN) commands\n"
+       "MPLS label for the Intra-AS I-PMSI A-D PMSI Tunnel attribute (default 0: unlabeled)\n"
+       "Label value\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+
+	bgp->mvpn_ipmsi_label = no ? 0 : label;
+	/* Re-originate so the new label replaces the installed Type-1 attr. */
+	bgp_mvpn_originate_type1(bgp);
+
+	return CMD_SUCCESS;
+}
+
 DEFPY (bgp_mvpn_source_active6,
        bgp_mvpn_source_active6_cmd,
        "[no] bgp mvpn source-active X:X::X:X$source6 group X:X::X:X$group6",
@@ -23913,6 +23931,7 @@ void bgp_vty_init(void)
 	/* MCAST-VPN (RFC 6514 GTM) config + show commands. */
 	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_source_active_cmd);
 	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_test_join_cmd);
+	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_ipmsi_label_cmd);
 	install_element(BGP_IPV6_MVPN_NODE, &bgp_mvpn_source_active6_cmd);
 	install_element(BGP_IPV6_MVPN_NODE, &bgp_mvpn_test_join6_cmd);
 	install_element(VIEW_NODE, &show_bgp_ipv4_mvpn_cmd);

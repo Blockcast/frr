@@ -880,6 +880,13 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 	 * unable to instantiate an IR leaf against the bogus label.
 	 */
 	attr.label = 0;
+	if (bgp->mvpn_ipmsi_label)
+		/* Interop: Junos 22.2R3 tracks a label-0 (unlabeled) IR leaf but
+		 * never instantiates a replication leg toward it, so a real
+		 * downstream-assigned label is configurable. RFC 6514 Section 5
+		 * places the label in the high-order 20 bits of the 3-octet field.
+		 */
+		vni2label(bgp->mvpn_ipmsi_label << 4, &attr.label);
 
 	/*
 	 * GTM global-table Route Target (target:0.0.0.0:0), the import/export target
@@ -978,6 +985,12 @@ void bgp_mvpn_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t s
 	struct bgp_table *table = bgp->rib[afi][safi];
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
+
+	/* The I-PMSI label knob lives under the ipv4 mvpn AF only (one Type-1
+	 * serves both planes); write it once.
+	 */
+	if (afi == AFI_IP && bgp->mvpn_ipmsi_label)
+		vty_out(vty, "  bgp mvpn ipmsi-label %u\n", bgp->mvpn_ipmsi_label);
 
 	if (!table)
 		return;

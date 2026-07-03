@@ -966,6 +966,11 @@ struct bgp {
 
 	struct bgp_evpn_info *evpn_info;
 
+	/* GTM MCAST-VPN: MPLS label advertised in the Intra-AS I-PMSI A-D
+	 * PMSI Tunnel attribute (0 = unlabeled tunnel, RFC 6514 Section 5).
+	 */
+	uint32_t mvpn_ipmsi_label;
+
 	/* EVPN - use RFC 8365 to auto-derive RT */
 	int advertise_autort_rfc8365;
 
