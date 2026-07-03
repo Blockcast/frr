@@ -1142,6 +1142,7 @@ bool attrhash_cmp(const void *p1, const void *p2)
 		    attr1->aggregator_addr.s_addr == attr2->aggregator_addr.s_addr &&
 		    attr1->weight == attr2->weight && attr1->tag == attr2->tag &&
 		    attr1->label_index == attr2->label_index &&
+		    attr1->label == attr2->label &&
 		    attr1->mp_nexthop_len == attr2->mp_nexthop_len &&
 		    bgp_attr_get_ecommunity(attr1) == bgp_attr_get_ecommunity(attr2) &&
 		    bgp_attr_get_ipv6_ecommunity(attr1) == bgp_attr_get_ipv6_ecommunity(attr2) &&

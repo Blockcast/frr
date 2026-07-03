@@ -230,6 +230,7 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, afi_t afi
 		bgp_attr_unintern(&pi->attr);
 		pi->attr = attr_new;
 		pi->uptime = monotime(NULL);
+		bgp_path_info_set_flag(dest, pi, BGP_PATH_ATTR_CHANGED);
 	} else {
 		pi = info_make(ZEBRA_ROUTE_BGP, sub_type, 0, peer, attr_new, dest);
 		SET_FLAG(pi->flags, BGP_PATH_VALID);
