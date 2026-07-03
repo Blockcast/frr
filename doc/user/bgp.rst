@@ -4466,42 +4466,66 @@ MCAST-VPN Global Table Multicast
 (:rfc:`6514`, SAFI 5) operating in Global Table Multicast mode
 (:rfc:`7716`): multicast state is exchanged for the global routing table,
 with the Route Distinguisher always set to 0. Only Source-Specific
-Multicast groups (232.0.0.0/8) are supported, and the PMSI tunnel type is
-Ingress Replication. Route Types 1 (Intra-AS I-PMSI A-D), 5 (Source Active
-A-D) and 7 (C-Multicast Source Tree Join) are exchanged. This is a
-RIB-level control plane: MCAST-VPN routes are originated, propagated and
-displayed, but multicast data-plane forwarding driven by these routes is
-not yet implemented.
+Multicast groups are supported (IPv4 232.0.0.0/8, IPv6 ff3x::/32), and the
+PMSI tunnel type is Ingress Replication. Route Types 1 (Intra-AS I-PMSI
+A-D), 5 (Source Active A-D) and 7 (C-Multicast Source Tree Join) are
+exchanged, dual-stack (both the IPv4 and IPv6 MCAST-VPN address families,
+:rfc:`6515`). This is a RIB-level control plane: MCAST-VPN routes are
+originated, propagated and displayed, but multicast data-plane forwarding
+driven by these routes is not yet implemented.
 
 .. clicmd:: address-family ipv4 mvpn
+.. clicmd:: address-family ipv6 mvpn
 
    Enter the MCAST-VPN address family under ``router bgp``. Neighbors must
    be activated in this address family with ``neighbor PEER activate`` for
    the MVPN multiprotocol capability to be negotiated. When the IPv4
    MCAST-VPN address family is enabled, an Intra-AS I-PMSI A-D route
    (Route Type 1) carrying an Ingress Replication PMSI tunnel attribute
-   with the router-id as the tunnel endpoint is automatically originated.
-   Only the IPv4 MCAST-VPN address family is currently available;
-   ``address-family ipv6 mvpn`` is gated until the IPv6 NLRI codec lands
-   (a later plan). Two transient staleness cases exist in this MVP: a
-   router-id change leaves a stale Intra-AS I-PMSI A-D route keyed by the
+   with the router-id as the tunnel endpoint is automatically originated;
+   the IPv6 address family carries v6 (S,G) Type-5/7 routes over the same
+   PE set (Type-1 auto-origination remains IPv4, as the Ingress Replication
+   tunnel endpoints are the IPv4 PEs). Two transient staleness cases exist:
+   a router-id change leaves a stale Intra-AS I-PMSI A-D route keyed by the
    old router-id, and deactivating the MCAST-VPN address family (or tearing
    down the BGP instance) does not withdraw this PE's self-originated
    Intra-AS I-PMSI A-D route. Both clear when the session or address family
    refreshes.
 
 .. clicmd:: bgp mvpn source-active A.B.C.D group A.B.C.D
+.. clicmd:: bgp mvpn source-active X:X::X:X group X:X::X:X
 
-   Under ``address-family ipv4 mvpn``, originate a Source Active A-D route
-   (Route Type 5) for the given (S,G). The group address must be in the
-   SSM range 232.0.0.0/8; other groups are rejected. The Route
-   Distinguisher is always 0 (Global Table Multicast).
+   Under ``address-family ipv4 mvpn`` (or ``ipv6 mvpn`` for the v6 form),
+   originate a Source Active A-D route (Route Type 5) for the given (S,G).
+   The group address must be in the SSM range (232.0.0.0/8 for IPv4,
+   ff3x::/32 for IPv6); other groups are rejected. The Route Distinguisher
+   is always 0 (Global Table Multicast).
+
+.. clicmd:: set extcommunity vrf-route-import ASN:NN_OR_IP-ADDRESS:NN
+
+   Route-map set action attaching a VRF Route Import extended community
+   (:rfc:`6514` Section 4.1, IP-address-specific sub-type 0x0b) to a route.
+   Applied to the unicast route toward a multicast source, it names the
+   upstream PE so a receiver keys its C-multicast (Type-7) join's Route
+   Target on that PE. A GTM receiver reads this community to resolve the
+   Upstream Multicast Hop (:rfc:`6514` Section 5.1).
 
 .. clicmd:: show bgp ipv4 mvpn [json]
+.. clicmd:: show bgp ipv6 mvpn [json]
 
-   Display the MCAST-VPN table of the default BGP instance. Each entry
-   reports its route type, originator, (S,G) where applicable, and, for
-   Route Type 1 routes, the PMSI tunnel type and endpoint.
+   Display the MCAST-VPN table of the default BGP instance for the IPv4 or
+   IPv6 address family. Each entry reports its route type, originator,
+   (S,G) where applicable, and, for Route Type 1 routes, the PMSI tunnel
+   type and endpoint.
+
+.. note::
+
+   Follow-up: a conformant source (e.g. Junos GTM) also attaches a Source
+   AS extended community (:rfc:`6514` Section 4.3) alongside the VRF Route
+   Import on the source's unicast route. The Type-7 join's Source AS is
+   currently taken from the origination request rather than derived from a
+   received Source AS community; a pimd-driven origination should read it
+   from the unicast route toward the source.
 
 .. _bgp-conditional-advertisement:
 
