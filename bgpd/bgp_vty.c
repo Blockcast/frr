@@ -11794,7 +11794,7 @@ DEFUN_NOSH(address_family_ipv4_safi, address_family_ipv4_safi_cmd,
 }
 
 DEFUN_NOSH(address_family_ipv6_safi, address_family_ipv6_safi_cmd,
-	   "address-family ipv6 [<unicast|multicast|vpn|labeled-unicast|flowspec|unreachability>]",
+	   "address-family ipv6 [<unicast|multicast|vpn|labeled-unicast|flowspec|unreachability|mvpn>]",
 	   "Enter Address Family command mode\n" BGP_AF_STR BGP_SAFI_WITH_LABEL_HELP_STR)
 {
 	if (argc == 3) {
@@ -23303,6 +23303,8 @@ DEFPY (bgp_mvpn_source_active,
        "Multicast group address (C-G), SSM range 232.0.0.0/8\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct ipaddr src = { .ipa_type = IPADDR_V4, .ip._v4_addr = source };
+	struct ipaddr grp = { .ipa_type = IPADDR_V4, .ip._v4_addr = group };
 
 	/* GTM is SSM-only: enforce group in 232.0.0.0/8. */
 	if (!bgp_mvpn_group_is_ssm(group)) {
@@ -23311,7 +23313,7 @@ DEFPY (bgp_mvpn_source_active,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	return bgp_mvpn_source_active_set(bgp, source, group, !!no);
+	return bgp_mvpn_source_active_set(bgp, &src, &grp, !!no);
 }
 
 /* TEST-ONLY scaffold to exercise the Type-7 codec before pimd exists; Plan 3 (pimd glue) removes it. Hidden from the CLI so it is not a user-facing command. */
@@ -23332,6 +23334,8 @@ DEFPY_HIDDEN (bgp_mvpn_test_join,
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
 	struct in_addr up = upstream_str ? upstream : (struct in_addr){ .s_addr = INADDR_ANY };
+	struct ipaddr src = { .ipa_type = IPADDR_V4, .ip._v4_addr = source };
+	struct ipaddr grp = { .ipa_type = IPADDR_V4, .ip._v4_addr = group };
 
 	/* GTM is SSM-only: enforce group in 232.0.0.0/8. */
 	if (!bgp_mvpn_group_is_ssm(group)) {
@@ -23340,7 +23344,63 @@ DEFPY_HIDDEN (bgp_mvpn_test_join,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	return bgp_mvpn_source_tree_join_set(bgp, source_as, source, group, up, !!no);
+	return bgp_mvpn_source_tree_join_set(bgp, source_as, &src, &grp, up, !!no);
+}
+
+DEFPY (bgp_mvpn_source_active6,
+       bgp_mvpn_source_active6_cmd,
+       "[no] bgp mvpn source-active X:X::X:X$source6 group X:X::X:X$group6",
+       NO_STR
+       BGP_STR
+       "Multicast VPN (MCAST-VPN) commands\n"
+       "Originate a Global Table Multicast Source Active (Type 5) route\n"
+       "Multicast source address (C-S)\n"
+       "Multicast group\n"
+       "Multicast group address (C-G), IPv6 SSM range ff3x::/32\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct ipaddr src = { .ipa_type = IPADDR_V6, .ip._v6_addr = source6 };
+	struct ipaddr grp = { .ipa_type = IPADDR_V6, .ip._v6_addr = group6 };
+
+	/* GTM is SSM-only: enforce the IPv6 SSM range ff3x::/32 (RFC 4607). */
+	if (!ipv6_mcast_ssm(&group6)) {
+		vty_out(vty, "%% MCAST-VPN group %pI6 is not in the IPv6 SSM range ff3x::/32\n",
+			&group6);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	return bgp_mvpn_source_active_set(bgp, &src, &grp, !!no);
+}
+
+/* TEST-ONLY scaffold to exercise the IPv6 Type-7 codec before pimd exists; Plan 3 (pimd glue) removes it. Hidden from the CLI so it is not a user-facing command. */
+DEFPY_HIDDEN (bgp_mvpn_test_join6,
+       bgp_mvpn_test_join6_cmd,
+       "[no] bgp mvpn test-join X:X::X:X$source6 group X:X::X:X$group6 source-as (1-4294967295)$source_as [upstream A.B.C.D$upstream]",
+       NO_STR
+       BGP_STR
+       "Multicast VPN (MCAST-VPN) commands\n"
+       "TEST-ONLY: originate a C-multicast Source Tree Join (Type 7) route\n"
+       "Multicast source address (C-S)\n"
+       "Multicast group\n"
+       "Multicast group address (C-G), IPv6 SSM range ff3x::/32\n"
+       "Upstream Source AS carried in the Type-7 NLRI\n"
+       "Source Autonomous System number\n"
+       "Upstream PE for the upstream-node Route Target (else resolved from the SA route)\n"
+       "Upstream PE address (v4, the v4-core PE identity)\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct in_addr up = upstream_str ? upstream : (struct in_addr){ .s_addr = INADDR_ANY };
+	struct ipaddr src = { .ipa_type = IPADDR_V6, .ip._v6_addr = source6 };
+	struct ipaddr grp = { .ipa_type = IPADDR_V6, .ip._v6_addr = group6 };
+
+	/* GTM is SSM-only: enforce the IPv6 SSM range ff3x::/32 (RFC 4607). */
+	if (!ipv6_mcast_ssm(&group6)) {
+		vty_out(vty, "%% MCAST-VPN group %pI6 is not in the IPv6 SSM range ff3x::/32\n",
+			&group6);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	return bgp_mvpn_source_tree_join_set(bgp, source_as, &src, &grp, up, !!no);
 }
 
 DEFPY (show_bgp_ipv4_mvpn,
@@ -23366,6 +23426,29 @@ DEFPY (show_bgp_ipv4_mvpn,
 	return CMD_SUCCESS;
 }
 
+DEFPY (show_bgp_ipv6_mvpn,
+       show_bgp_ipv6_mvpn_cmd,
+       "show bgp ipv6 mvpn [json$uj]",
+       SHOW_STR
+       BGP_STR
+       "Address Family\n"
+       "Display MCAST-VPN (Source Active) routes\n"
+       JSON_STR)
+{
+	struct bgp *bgp = bgp_get_default();
+
+	if (!bgp) {
+		if (uj)
+			vty_out(vty, "{}\n");
+		else
+			vty_out(vty, "%% No BGP process configured\n");
+		return CMD_SUCCESS;
+	}
+
+	bgp_mvpn_show_routes(vty, bgp, AFI_IP6, !!uj);
+	return CMD_SUCCESS;
+}
+
 void bgp_vty_init(void)
 {
 	cmd_variable_handler_register(bgp_var_neighbor);
@@ -23386,13 +23469,10 @@ void bgp_vty_init(void)
 	install_node(&bgp_evpn_node);
 	install_node(&bgp_evpn_vni_node);
 	install_node(&bgp_ipv4_mvpn_node);
-	/* IPv6 MCAST-VPN AF gated until the v6 NLRI codec lands (Plan 5):
-	 * definitions retained, install withheld so the v6 capability is never
-	 * negotiated; re-enable by restoring these installs + the ipv6 mvpn
-	 * token. The struct is referenced (but not installed) to keep it
-	 * compiled without tripping -Wunused-variable.
-	 */
-	(void)&bgp_ipv6_mvpn_node;
+	/* IPv6 MCAST-VPN AF (RFC 6515): the v6 NLRI codec and dual-stack GTM
+	 * origination have landed, so the node is installed and the v6
+	 * capability is negotiable. */
+	install_node(&bgp_ipv6_mvpn_node);
 	install_node(&bgp_flowspecv4_node);
 	install_node(&bgp_flowspecv6_node);
 	install_node(&bgp_ipv4_unreachability_node);
@@ -23417,7 +23497,7 @@ void bgp_vty_init(void)
 	install_default(BGP_EVPN_NODE);
 	install_default(BGP_EVPN_VNI_NODE);
 	install_default(BGP_IPV4_MVPN_NODE);
-	/* BGP_IPV6_MVPN_NODE install gated (Plan 5) — see install_node above. */
+	install_default(BGP_IPV6_MVPN_NODE);
 	install_default(BGP_SRV6_NODE);
 	install_default(BGP_LS_NODE);
 
@@ -23827,14 +23907,18 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV6U_NODE, &neighbor_activate_cmd);
 	install_element(BGP_EVPN_NODE, &neighbor_activate_cmd);
 	install_element(BGP_IPV4_MVPN_NODE, &neighbor_activate_cmd);
-	/* BGP_IPV6_MVPN_NODE activate gated (Plan 5) — see install_node above. */
+	install_element(BGP_IPV6_MVPN_NODE, &neighbor_activate_cmd);
 	install_element(BGP_LS_NODE, &neighbor_activate_cmd);
 
 	/* MCAST-VPN (RFC 6514 GTM) config + show commands. */
 	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_source_active_cmd);
 	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_test_join_cmd);
+	install_element(BGP_IPV6_MVPN_NODE, &bgp_mvpn_source_active6_cmd);
+	install_element(BGP_IPV6_MVPN_NODE, &bgp_mvpn_test_join6_cmd);
 	install_element(VIEW_NODE, &show_bgp_ipv4_mvpn_cmd);
 	install_element(ENABLE_NODE, &show_bgp_ipv4_mvpn_cmd);
+	install_element(VIEW_NODE, &show_bgp_ipv6_mvpn_cmd);
+	install_element(ENABLE_NODE, &show_bgp_ipv6_mvpn_cmd);
 
 	/* "no neighbor activate" commands. */
 	install_element(BGP_NODE, &no_neighbor_activate_hidden_cmd);
@@ -23852,7 +23936,7 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV6U_NODE, &no_neighbor_activate_cmd);
 	install_element(BGP_EVPN_NODE, &no_neighbor_activate_cmd);
 	install_element(BGP_IPV4_MVPN_NODE, &no_neighbor_activate_cmd);
-	/* BGP_IPV6_MVPN_NODE no-activate gated (Plan 5) — see install_node above. */
+	install_element(BGP_IPV6_MVPN_NODE, &no_neighbor_activate_cmd);
 	install_element(BGP_LS_NODE, &no_neighbor_activate_cmd);
 
 	/* "neighbor peer-group" set commands. */
@@ -24947,7 +25031,7 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV6U_NODE, &exit_address_family_cmd);
 	install_element(BGP_EVPN_NODE, &exit_address_family_cmd);
 	install_element(BGP_IPV4_MVPN_NODE, &exit_address_family_cmd);
-	/* BGP_IPV6_MVPN_NODE exit-af gated (Plan 5) — see install_node above. */
+	install_element(BGP_IPV6_MVPN_NODE, &exit_address_family_cmd);
 	install_element(BGP_LS_NODE, &exit_address_family_cmd);
 
 	/* BGP retain all route-target */

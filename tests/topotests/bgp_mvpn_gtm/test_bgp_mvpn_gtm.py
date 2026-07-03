@@ -358,6 +358,107 @@ router bgp 65001
     assert result is None, "Type-7 upstream RT was not resolved from the VRF Route Import (0x0b) EC"
 
 
+def test_type5_v6_source_active_propagates():
+    """A local IPv6 GTM Source Active (Type 5) route on r1 must reach r2 (RFC 6515).
+
+    r1 is configured under `address-family ipv6 mvpn` with
+    `bgp mvpn source-active 2001:db8::1 group ff3e::1`. r2 must learn it and
+    expose it via `show bgp ipv6 mvpn json` with routeType 5, the v6 (S,G), and
+    the GTM global-table Route Target RT:0.0.0.0:0 -- exercising the AFI_IP6
+    MCAST-VPN AF (capability negotiated over the shared session, the v6 NLRI
+    codec, and the v6 RIB).
+
+    AUTHORED-NOT-RUN: this repo has no network namespaces; authored and
+    py_compile-checked. Verified live on a dev-build bgpd: the v6 source-active
+    installs into the AFI_IP6 MCAST-VPN RIB and renders source 2001:db8::1 group
+    ff3e::1 under `show bgp ipv6 mvpn`.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _type5_v6_present(router):
+        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv6 mvpn json"))
+        routes = out.get("routes", [])
+        for r in routes:
+            if (
+                r.get("routeType") == 5
+                and r.get("source") == "2001:db8::1"
+                and r.get("group") == "ff3e::1"
+                and r.get("extendedCommunity", {}).get("string") == "RT:0.0.0.0:0"
+            ):
+                return None
+        return "IPv6 Type-5 (2001:db8::1, ff3e::1) with RT:0.0.0.0:0 not found in {}".format(
+            routes
+        )
+
+    test_func = functools.partial(_type5_v6_present, "r2")
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, "r2 did not learn r1's IPv6 MVPN Type-5 Source Active route"
+
+
+def test_type7_v6_umh_from_vrf_route_import():
+    """IPv6 Type-7 upstream RT resolves from the v6 source route's VRF Route
+    Import EC (RFC 6514 Section 5.1 / RFC 6515), exercising the AFI_IP6 unicast
+    RIB lookup in the resolver.
+
+    r2 originates 2001:db8:99::1/128 tagged with vrf-route-import 10.255.0.3:0
+    (the upstream PE is a v4-core identity even for a v6 C-S) and a v6 Source
+    Active for (2001:db8:99::1, ff3e::9), then test-joins it. The Type-7 must
+    carry RT:10.255.0.3:0 (the route-import Global Administrator).
+
+    AUTHORED-NOT-RUN: authored and py_compile-checked. The v6 resolver arm and
+    origination were exercised on a dev-build bgpd (v6 routes install into the
+    AFI_IP6 RIB and the join resolves the v4-core upstream from the v6 source
+    route's route-import EC).
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+route-map set-vri6 permit 10
+ set extcommunity vrf-route-import 10.255.0.3:0
+exit
+router bgp 65001
+ no bgp network import-check
+ address-family ipv6 unicast
+  network 2001:db8:99::1/128 route-map set-vri6
+ exit-address-family
+ address-family ipv6 mvpn
+  bgp mvpn source-active 2001:db8:99::1 group ff3e::9
+  bgp mvpn test-join 2001:db8:99::1 group ff3e::9 source-as 65001
+"""
+    )
+
+    def _type7_v6_vri(router):
+        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv6 mvpn json"))
+        routes = out.get("routes", [])
+        for r in routes:
+            if (
+                r.get("routeType") == 7
+                and r.get("source") == "2001:db8:99::1"
+                and r.get("group") == "ff3e::9"
+            ):
+                rt = r.get("extendedCommunity", {}).get("string")
+                if rt == "RT:10.255.0.3:0":
+                    return None
+                return "IPv6 Type-7 (2001:db8:99::1, ff3e::9) carries {} (want RT:10.255.0.3:0)".format(
+                    rt
+                )
+        return "IPv6 Type-7 (2001:db8:99::1, ff3e::9) not found in {}".format(routes)
+
+    test_func = functools.partial(_type7_v6_vri, "r2")
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert (
+        result is None
+    ), "IPv6 Type-7 upstream RT was not resolved from the v6 route's VRF Route Import EC"
+
+
 def test_type1_ipmsi_with_ir_pmsi():
     """On MVPN AF enable, r1 auto-originates its Intra-AS I-PMSI A-D route.
 

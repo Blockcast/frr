@@ -116,9 +116,10 @@ extern void bgp_mvpn_encode_type7(struct stream *s, const struct prefix *p, bool
 extern int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *packet,
 			       bool mp_withdraw);
 
-/* Configure/withdraw a locally-originated GTM Source Active route. */
-extern int bgp_mvpn_source_active_set(struct bgp *bgp, struct in_addr src, struct in_addr grp,
-				      bool negate);
+/* Configure/withdraw a locally-originated GTM Source Active route. C-S/C-G may
+ * be v4 or v6 but must share a family. */
+extern int bgp_mvpn_source_active_set(struct bgp *bgp, const struct ipaddr *src,
+				      const struct ipaddr *grp, bool negate);
 
 /*
  * Auto-originate this PE's Intra-AS I-PMSI A-D (Type-1) route with an
@@ -135,8 +136,9 @@ extern void bgp_mvpn_originate_type1(struct bgp *bgp);
  * RT) is taken explicitly when non-zero, else resolved from the Source Active
  * route's UMH. Plan 3 replaces this with pimd-driven origination.
  */
-extern int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, struct in_addr src,
-					 struct in_addr grp, struct in_addr upstream, bool negate);
+extern int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as,
+					 const struct ipaddr *src, const struct ipaddr *grp,
+					 struct in_addr upstream, bool negate);
 
 /* running-config emission for `bgp mvpn source-active` under the AF node. */
 extern void bgp_mvpn_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi);

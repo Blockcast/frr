@@ -56,6 +56,14 @@ static struct ipaddr mvpn_ipaddr_v4(struct in_addr a)
 	return ip;
 }
 
+/* The AFI a GTM MVPN route lives under is that of its C-S/C-G (Type-1 uses its
+ * originator slot): a v6 address keys the AFI_IP6 MCAST-VPN RIB, v4 the AFI_IP
+ * one. The RD is always zero (GTM), so the AFI is the only table discriminator. */
+static afi_t bgp_mvpn_prefix_afi(const struct prefix_mvpn *p)
+{
+	return IS_IPADDR_V6(&p->prefix.src) ? AFI_IP6 : AFI_IP;
+}
+
 void bgp_mvpn_build_prefix_type5(struct prefix_mvpn *p, const struct ipaddr *src,
 				 const struct ipaddr *grp)
 {
@@ -199,11 +207,9 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, const str
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
 	struct attr *attr_new;
+	afi_t afi = bgp_mvpn_prefix_afi(p);
 
-	/* AFI_IP is hardcoded: GTM MVPN is IPv4-only in this milestone (the v6-plan
-	 * anchor; see bgp_nlri_parse_mvpn).
-	 */
-	dest = bgp_afi_node_get(bgp->rib[AFI_IP][SAFI_MCAST_VPN], AFI_IP, SAFI_MCAST_VPN,
+	dest = bgp_afi_node_get(bgp->rib[afi][SAFI_MCAST_VPN], afi, SAFI_MCAST_VPN,
 				(const struct prefix *)p, NULL);
 
 	attr_new = bgp_attr_intern(attr);
@@ -227,7 +233,7 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, const str
 		bgp_path_info_add(dest, pi);
 	}
 
-	bgp_process(bgp, dest, pi, AFI_IP, SAFI_MCAST_VPN);
+	bgp_process(bgp, dest, pi, afi, SAFI_MCAST_VPN);
 	bgp_dest_unlock_node(dest);
 }
 
@@ -237,11 +243,9 @@ static void bgp_mvpn_route_remove(struct bgp *bgp, struct peer *peer, const stru
 {
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
+	afi_t afi = bgp_mvpn_prefix_afi(p);
 
-	/* AFI_IP is hardcoded: GTM MVPN is IPv4-only in this milestone (see
-	 * bgp_nlri_parse_mvpn).
-	 */
-	dest = bgp_safi_node_lookup(bgp->rib[AFI_IP][SAFI_MCAST_VPN], SAFI_MCAST_VPN,
+	dest = bgp_safi_node_lookup(bgp->rib[afi][SAFI_MCAST_VPN], SAFI_MCAST_VPN,
 				    (const struct prefix *)p, NULL);
 	if (!dest)
 		return;
@@ -253,7 +257,7 @@ static void bgp_mvpn_route_remove(struct bgp *bgp, struct peer *peer, const stru
 	if (pi) {
 		bgp_unlink_nexthop(pi);
 		bgp_path_info_mark_for_delete(dest, pi);
-		bgp_process(bgp, dest, pi, AFI_IP, SAFI_MCAST_VPN);
+		bgp_process(bgp, dest, pi, afi, SAFI_MCAST_VPN);
 	}
 
 	bgp_dest_unlock_node(dest);
@@ -648,11 +652,12 @@ static void bgp_mvpn_attach_gtm_rt(struct attr *attr)
  *
  * Returns true and fills *upstream on a hit; false when neither is available.
  */
-static bool bgp_mvpn_resolve_upstream_pe(struct bgp *bgp, struct in_addr src, struct in_addr grp,
-					 struct in_addr *upstream)
+static bool bgp_mvpn_resolve_upstream_pe(struct bgp *bgp, const struct ipaddr *src,
+					 const struct ipaddr *grp, struct in_addr *upstream)
 {
 	struct prefix_mvpn sa;
-	struct prefix psrc = { .family = AF_INET, .prefixlen = IPV4_MAX_BITLEN };
+	struct prefix psrc = {};
+	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
 	struct ecommunity *ecom;
@@ -660,10 +665,20 @@ static bool bgp_mvpn_resolve_upstream_pe(struct bgp *bgp, struct in_addr src, st
 
 	/*
 	 * (1) RFC 6514 5.1: UMH from the route-import RT on the unicast route
-	 * toward C-S. AFI_IP: GTM MVPN is IPv4-only in this milestone.
+	 * toward C-S. The route lives in the v4 or v6 unicast RIB per the C-S
+	 * family; the route-import community is IP-address-specific with a
+	 * (v4-core) PE Global Administrator either way.
 	 */
-	psrc.u.prefix4 = src;
-	dest = bgp_node_match(bgp->rib[AFI_IP][SAFI_UNICAST], &psrc);
+	if (IS_IPADDR_V6(src)) {
+		psrc.family = AF_INET6;
+		psrc.prefixlen = IPV6_MAX_BITLEN;
+		psrc.u.prefix6 = src->ipaddr_v6;
+	} else {
+		psrc.family = AF_INET;
+		psrc.prefixlen = IPV4_MAX_BITLEN;
+		psrc.u.prefix4 = src->ipaddr_v4;
+	}
+	dest = bgp_node_match(bgp->rib[afi][SAFI_UNICAST], &psrc);
 	if (dest) {
 		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
 			if (pi->type != ZEBRA_ROUTE_BGP)
@@ -697,13 +712,17 @@ static bool bgp_mvpn_resolve_upstream_pe(struct bgp *bgp, struct in_addr src, st
 		bgp_dest_unlock_node(dest);
 	}
 
-	/* (2) Fallback: next hop of the received Source Active route. */
-	{
-		struct ipaddr isrc = mvpn_ipaddr_v4(src);
-		struct ipaddr igrp = mvpn_ipaddr_v4(grp);
+	/*
+	 * (2) Fallback: next hop of the received Source Active route. Best-
+	 * effort and v4 only -- the SA next hop identifies the PE only when
+	 * preserved end to end, and a v4-core upstream PE address is v4. A v6
+	 * (C-S,C-G) with no route-import community resolves no upstream, so the
+	 * join is originated RT-less (logged by the caller).
+	 */
+	if (IS_IPADDR_V6(src))
+		return false;
 
-		bgp_mvpn_build_prefix_type5(&sa, &isrc, &igrp);
-	}
+	bgp_mvpn_build_prefix_type5(&sa, src, grp);
 	dest = bgp_safi_node_lookup(bgp->rib[AFI_IP][SAFI_MCAST_VPN], SAFI_MCAST_VPN,
 				    (const struct prefix *)&sa, NULL);
 	if (!dest)
@@ -727,14 +746,13 @@ static bool bgp_mvpn_resolve_upstream_pe(struct bgp *bgp, struct in_addr src, st
  * Configure or withdraw a locally-originated GTM Source Active route. Attr is a
  * self-sourced IGP route with the router-id as next hop.
  */
-int bgp_mvpn_source_active_set(struct bgp *bgp, struct in_addr src, struct in_addr grp, bool negate)
+int bgp_mvpn_source_active_set(struct bgp *bgp, const struct ipaddr *src, const struct ipaddr *grp,
+			       bool negate)
 {
 	struct prefix_mvpn p;
 	struct attr attr;
-	struct ipaddr isrc = mvpn_ipaddr_v4(src);
-	struct ipaddr igrp = mvpn_ipaddr_v4(grp);
 
-	bgp_mvpn_build_prefix_type5(&p, &isrc, &igrp);
+	bgp_mvpn_build_prefix_type5(&p, src, grp);
 
 	if (negate) {
 		bgp_mvpn_route_remove(bgp, bgp->peer_self, &p, BGP_ROUTE_STATIC);
@@ -862,16 +880,14 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
  * this with real pimd-driven origination; the CLI that drives it is likewise
  * test-only.
  */
-int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, struct in_addr src,
-				  struct in_addr grp, struct in_addr upstream, bool negate)
+int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, const struct ipaddr *src,
+				  const struct ipaddr *grp, struct in_addr upstream, bool negate)
 {
 	struct prefix_mvpn p;
 	struct attr attr;
 	struct in_addr umh = upstream;
-	struct ipaddr isrc = mvpn_ipaddr_v4(src);
-	struct ipaddr igrp = mvpn_ipaddr_v4(grp);
 
-	bgp_mvpn_build_prefix_type7(&p, source_as, &isrc, &igrp);
+	bgp_mvpn_build_prefix_type7(&p, source_as, src, grp);
 
 	if (negate) {
 		bgp_mvpn_route_remove(bgp, bgp->peer_self, &p, BGP_ROUTE_STATIC);
@@ -899,8 +915,8 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, struct in
 	if (umh.s_addr != INADDR_ANY)
 		bgp_mvpn_attach_ip_rt(&attr, umh);
 	else
-		zlog_debug("MVPN Type-7 (%pI4, %pI4): no upstream PE resolved; originating without upstream RT",
-			   &src, &grp);
+		zlog_debug("MVPN Type-7 (%pIA, %pIA): no upstream PE resolved; originating without upstream RT",
+			   src, grp);
 
 	bgp_mvpn_route_install(bgp, bgp->peer_self, &p, &attr, BGP_ROUTE_STATIC);
 
