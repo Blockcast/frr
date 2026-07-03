@@ -290,6 +290,74 @@ router bgp 65001
     assert result is None, "Type-7 upstream RT was not resolved from the source route's route-import RT"
 
 
+def test_type7_umh_from_vrf_route_import_ec():
+    """The Type-7 upstream RT resolves from a VRF Route Import EC (sub-type 0x0b),
+    exercising the RFC 6514 Section 4.1 route-import community and the FRR-source
+    export path (`set extcommunity vrf-route-import`).
+
+    This is the export half of rt-import: an FRR source PE tags the unicast route
+    toward C-S with a VRF Route Import extended community (IP-address-specific,
+    sub-type 0x0b) naming itself. A PE joining (C-S, C-G) reads that community and
+    echoes its Global Administrator as the Type-7 upstream-node Route Target, so a
+    conformant source (FRR or Junos "rt-import") imports the join. The resolver
+    prefers 0x0b over a plain Route Target (0x02); this test drives the 0x0b
+    branch, complementing test_type7_umh_from_route_import which drives 0x02.
+
+    r2 originates 10.99.99.2/32 carrying vrf-route-import 10.255.0.3:0 and a Source
+    Active for (10.99.99.2, 232.9.9.10), then test-joins it. The Type-7 must carry
+    RT:10.255.0.3:0 (the route-import Global Administrator), NOT RT:10.0.0.2:0 (the
+    SA next hop).
+
+    AUTHORED-NOT-RUN: this repo has no network namespaces, so the topotest is
+    authored and py_compile-checked but not executed here. The clause and resolver
+    branch were exercised live on a single dev-build bgpd: the source route tagged
+    with vrf-route-import 10.255.0.3:0 round-tripped through running-config, and
+    the locally-originated Type-7 carried RT:10.255.0.3:0.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+route-map set-vri permit 10
+ set extcommunity vrf-route-import 10.255.0.3:0
+exit
+router bgp 65001
+ no bgp network import-check
+ address-family ipv4 unicast
+  network 10.99.99.2/32 route-map set-vri
+ exit-address-family
+ address-family ipv4 mvpn
+  bgp mvpn source-active 10.99.99.2 group 232.9.9.10
+  bgp mvpn test-join 10.99.99.2 group 232.9.9.10 source-as 65001
+"""
+    )
+
+    def _type7_vri(router):
+        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv4 mvpn json"))
+        routes = out.get("routes", [])
+        for r in routes:
+            if (
+                r.get("routeType") == 7
+                and r.get("source") == "10.99.99.2"
+                and r.get("group") == "232.9.9.10"
+            ):
+                rt = r.get("extendedCommunity", {}).get("string")
+                if rt == "RT:10.255.0.3:0":
+                    return None
+                return "Type-7 (10.99.99.2, 232.9.9.10) carries {} (want RT:10.255.0.3:0 from vrf-route-import)".format(
+                    rt
+                )
+        return "Type-7 (10.99.99.2, 232.9.9.10) not found in {}".format(routes)
+
+    test_func = functools.partial(_type7_vri, "r2")
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, "Type-7 upstream RT was not resolved from the VRF Route Import (0x0b) EC"
+
+
 def test_type1_ipmsi_with_ir_pmsi():
     """On MVPN AF enable, r1 auto-originates its Intra-AS I-PMSI A-D route.
 

@@ -3471,6 +3471,34 @@ static const struct route_map_rule_cmd route_set_ecommunity_soo_cmd = {
 	route_set_ecommunity_free,
 };
 
+/* `set extcommunity vrf-route-import COMMUNITY' -- RFC 6514 VRF Route Import
+ * (IP-address-specific, sub-type 0x0b). A (GTM: global-table) multicast source
+ * PE attaches this to the unicast route toward C-S so a receiver can key the
+ * C-multicast (Type-7) join's Route Target on this PE. */
+static void *route_set_ecommunity_vri_compile(const char *arg)
+{
+	struct rmap_ecom_set *rcs;
+	struct ecommunity *ecom;
+
+	ecom = ecommunity_str2com(arg, ECOMMUNITY_VRF_ROUTE_IMPORT, 0);
+	if (!ecom)
+		return NULL;
+
+	rcs = XCALLOC(MTYPE_ROUTE_MAP_COMPILED, sizeof(struct rmap_ecom_set));
+	rcs->ecom = ecommunity_intern(ecom);
+	rcs->none = false;
+
+	return rcs;
+}
+
+/* Set community rule structure. */
+static const struct route_map_rule_cmd route_set_ecommunity_vri_cmd = {
+	"extcommunity vrf-route-import",
+	route_set_ecommunity,
+	route_set_ecommunity_vri_compile,
+	route_set_ecommunity_free,
+};
+
 static void *route_set_ecommunity_nt_compile(const char *arg)
 {
 	struct rmap_ecom_set *rcs;
@@ -7422,6 +7450,56 @@ ALIAS_YANG (no_set_ecommunity_soo,
             "GP extended community attribute\n"
             "Site-of-Origin extended community\n")
 
+DEFUN_YANG (set_ecommunity_vri,
+	    set_ecommunity_vri_cmd,
+	    "set extcommunity vrf-route-import ASN:NN_OR_IP-ADDRESS:NN...",
+	    SET_STR
+	   "BGP extended community attribute\n"
+	   "VRF Route Import extended community (RFC 6514)\n"
+	   "VPN extended community\n")
+{
+	int idx_asn_nn = 3;
+	char *str;
+	int ret;
+	const char *xpath =
+		"./set-action[action='frr-bgp-route-map:set-extcommunity-vrf-route-import']";
+	char xpath_value[XPATH_MAXLEN];
+
+	nb_cli_enqueue_change(vty, xpath, NB_OP_CREATE, NULL);
+
+	snprintf(xpath_value, sizeof(xpath_value),
+		 "%s/rmap-set-action/frr-bgp-route-map:extcommunity-vrf-route-import",
+		 xpath);
+	str = argv_concat(argv, argc, idx_asn_nn);
+	nb_cli_enqueue_change(vty, xpath_value, NB_OP_MODIFY, str);
+	ret = nb_cli_apply_changes(vty, NULL);
+	XFREE(MTYPE_TMP, str);
+	return ret;
+}
+
+DEFUN_YANG (no_set_ecommunity_vri,
+	    no_set_ecommunity_vri_cmd,
+	    "no set extcommunity vrf-route-import ASN:NN_OR_IP-ADDRESS:NN...",
+	    NO_STR
+	    SET_STR
+	    "BGP extended community attribute\n"
+	    "VRF Route Import extended community (RFC 6514)\n"
+	    "VPN extended community\n")
+{
+	const char *xpath =
+		"./set-action[action='frr-bgp-route-map:set-extcommunity-vrf-route-import']";
+	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
+	return nb_cli_apply_changes(vty, NULL);
+}
+
+ALIAS_YANG (no_set_ecommunity_vri,
+            no_set_ecommunity_vri_short_cmd,
+            "no set extcommunity vrf-route-import",
+            NO_STR
+            SET_STR
+            "BGP extended community attribute\n"
+            "VRF Route Import extended community (RFC 6514)\n")
+
 DEFUN_YANG(set_ecommunity_none, set_ecommunity_none_cmd,
 	   "set extcommunity none",
 	   SET_STR
@@ -8437,6 +8515,7 @@ void bgp_route_map_init(void)
 	route_map_install_set(&route_set_ecommunity_rt_cmd);
 	route_map_install_set(&route_set_ecommunity_nt_cmd);
 	route_map_install_set(&route_set_ecommunity_soo_cmd);
+	route_map_install_set(&route_set_ecommunity_vri_cmd);
 	route_map_install_set(&route_set_ecommunity_lb_cmd);
 	route_map_install_set(&route_set_ecommunity_color_cmd);
 	route_map_install_set(&route_set_ecommunity_none_cmd);
@@ -8546,6 +8625,9 @@ void bgp_route_map_init(void)
 	install_element(RMAP_NODE, &set_ecommunity_soo_cmd);
 	install_element(RMAP_NODE, &no_set_ecommunity_soo_cmd);
 	install_element(RMAP_NODE, &no_set_ecommunity_soo_short_cmd);
+	install_element(RMAP_NODE, &set_ecommunity_vri_cmd);
+	install_element(RMAP_NODE, &no_set_ecommunity_vri_cmd);
+	install_element(RMAP_NODE, &no_set_ecommunity_vri_short_cmd);
 	install_element(RMAP_NODE, &set_ecommunity_lb_cmd);
 	install_element(RMAP_NODE, &no_set_ecommunity_lb_cmd);
 	install_element(RMAP_NODE, &no_set_ecommunity_lb_short_cmd);
