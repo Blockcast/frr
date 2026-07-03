@@ -482,24 +482,69 @@ static void bgp_mvpn_attach_gtm_rt(struct attr *attr)
 }
 
 /*
- * Resolve the Upstream Multicast Hop (upstream PE) for (C-S, C-G): the PE that
- * originated the Type-5 Source Active route for this source is the upstream
- * toward it (RFC 7716 Section 2.9 / RFC 6514 Section 5.1). Look the SA route up
- * in the local MCAST-VPN RIB and take its next hop -- which the origination
- * side sets to the originating PE's address and the receive side decodes into
- * mp_nexthop_global_in. Returns true and fills *upstream on a hit; false when no
- * SA route is known yet (no targetable upstream).
+ * Resolve the Upstream Multicast Hop (upstream PE) for (C-S, C-G) -- the address
+ * that identifies the PE toward C-S, used as the Global Administrator of the
+ * upstream-node-identifying Route Target on the C-multicast (Type-7) join.
+ *
+ * RFC 6514 Section 5.1 / RFC 7716: that RT MUST equal the value of the VRF Route
+ * Import extended community carried by the UMH-eligible *unicast* route toward
+ * C-S. Junos GTM attaches this as an IPv4-address-specific Route Target
+ * target:<PE-loopback>:0 on the source's global-table unicast route, and its
+ * auto-generated __vrf-mvpn-import-cmcast-*-internal__ policy imports Type-7
+ * routes only on exactly that RT (empirically: MX204 22.2R3 keys it on the lo0
+ * PE address, e.g. target:10.255.255.254:0). So the correct upstream identifier
+ * is the Global Administrator of that RT.
+ *
+ * Lookup order:
+ *   1. RFC-canonical: the IPv4-address-specific Route Target on the unicast
+ *      route to C-S (the route-import RT).
+ *   2. Fallback: the next hop of the received Source Active route. This is only
+ *      correct when the SA originator's address is preserved end to end (iBGP,
+ *      or a peer that attaches no route-import RT such as FRR<->FRR); eBGP
+ *      rewrites the SA next hop to the peering address, so relying on it there
+ *      produces a non-matching RT. Kept as best-effort so the test-join scaffold
+ *      still resolves an upstream when no route-import RT is present.
+ *
+ * Returns true and fills *upstream on a hit; false when neither is available.
  */
 static bool bgp_mvpn_resolve_upstream_pe(struct bgp *bgp, struct in_addr src, struct in_addr grp,
 					 struct in_addr *upstream)
 {
 	struct prefix_mvpn sa;
+	struct prefix psrc = { .family = AF_INET, .prefixlen = IPV4_MAX_BITLEN };
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
+	struct ecommunity *ecom;
+	struct ecommunity_val *eval;
 
+	/*
+	 * (1) RFC 6514 5.1: UMH from the route-import RT on the unicast route
+	 * toward C-S. AFI_IP: GTM MVPN is IPv4-only in this milestone.
+	 */
+	psrc.u.prefix4 = src;
+	dest = bgp_node_match(bgp->rib[AFI_IP][SAFI_UNICAST], &psrc);
+	if (dest) {
+		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+			if (pi->type != ZEBRA_ROUTE_BGP)
+				continue;
+			ecom = bgp_attr_get_ecommunity(pi->attr);
+			if (!ecom)
+				continue;
+			eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP,
+						 ECOMMUNITY_ROUTE_TARGET);
+			if (!eval)
+				continue;
+			/* IPv4-address-specific RT wire layout: type, subtype,
+			 * Global Administrator (4 bytes), Local Administrator (2). */
+			memcpy(&upstream->s_addr, &eval->val[2], IPV4_MAX_BYTELEN);
+			bgp_dest_unlock_node(dest);
+			return true;
+		}
+		bgp_dest_unlock_node(dest);
+	}
+
+	/* (2) Fallback: next hop of the received Source Active route. */
 	bgp_mvpn_build_prefix_type5(&sa, src, grp);
-
-	/* AFI_IP: GTM MVPN is IPv4-only in this milestone. */
 	dest = bgp_safi_node_lookup(bgp->rib[AFI_IP][SAFI_MCAST_VPN], SAFI_MCAST_VPN,
 				    (const struct prefix *)&sa, NULL);
 	if (!dest)

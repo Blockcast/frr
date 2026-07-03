@@ -223,6 +223,73 @@ router bgp 65001
     assert result is None, "r1 did not learn r2's MVPN Type-7 Source Tree Join route"
 
 
+def test_type7_umh_from_route_import():
+    """The Type-7 upstream-node RT must come from the source route's route-import
+    RT (RFC 6514 Section 5.1), not the Source Active next hop.
+
+    A GTM source PE advertises the unicast route toward C-S carrying a route-
+    import Route Target target:<PE>:0; a PE that joins (C-S, C-G) must set the
+    C-multicast (Type-7) join's upstream-node RT to that value so the source PE's
+    __vrf-mvpn-import-cmcast-*-internal__ policy imports it. Over eBGP the Source
+    Active next hop is rewritten to the peering address, so resolving the
+    upstream from the SA next hop yields a non-matching RT -- the bug this guards.
+    Verified against Junos MX204 22.2R3, whose cmcast import keys on the lo0 PE
+    address.
+
+    r2 originates 10.99.99.1/32 with route-import RT 10.255.0.2:0 and a Source
+    Active for (10.99.99.1, 232.9.9.9) whose next hop is r2's router-id 10.0.0.2,
+    then test-joins it. The Type-7 must carry RT:10.255.0.2:0 (the route-import
+    Global Administrator), NOT RT:10.0.0.2:0 (the SA next hop).
+
+    AUTHORED-NOT-RUN: this repo has no network namespaces, so the topotest is
+    authored and py_compile-checked but not executed here. The resolver path was
+    exercised live on a single dev-build bgpd: with the source route carrying
+    RT:10.255.0.2:0, the locally-originated Type-7 carried RT:10.255.0.2:0.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+route-map set-rtimport permit 10
+ set extcommunity rt 10.255.0.2:0
+exit
+router bgp 65001
+ no bgp network import-check
+ address-family ipv4 unicast
+  network 10.99.99.1/32 route-map set-rtimport
+ exit-address-family
+ address-family ipv4 mvpn
+  bgp mvpn source-active 10.99.99.1 group 232.9.9.9
+  bgp mvpn test-join 10.99.99.1 group 232.9.9.9 source-as 65001
+"""
+    )
+
+    def _type7_rtimport(router):
+        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv4 mvpn json"))
+        routes = out.get("routes", [])
+        for r in routes:
+            if (
+                r.get("routeType") == 7
+                and r.get("source") == "10.99.99.1"
+                and r.get("group") == "232.9.9.9"
+            ):
+                rt = r.get("extendedCommunity", {}).get("string")
+                if rt == "RT:10.255.0.2:0":
+                    return None
+                return "Type-7 (10.99.99.1, 232.9.9.9) carries {} (want RT:10.255.0.2:0 from route-import)".format(
+                    rt
+                )
+        return "Type-7 (10.99.99.1, 232.9.9.9) not found in {}".format(routes)
+
+    test_func = functools.partial(_type7_rtimport, "r2")
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, "Type-7 upstream RT was not resolved from the source route's route-import RT"
+
+
 def test_type1_ipmsi_with_ir_pmsi():
     """On MVPN AF enable, r1 auto-originates its Intra-AS I-PMSI A-D route.
 
