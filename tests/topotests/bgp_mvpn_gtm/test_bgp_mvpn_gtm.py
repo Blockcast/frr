@@ -489,10 +489,14 @@ def test_type1_ipmsi_with_ir_pmsi():
             if (
                 pmsi.get("type") == "ingressReplication"
                 and pmsi.get("endpoint") == "10.0.0.1"
+                # RFC 6514 Section 5: zero label = unlabeled tunnel (GTM
+                # label-free IR). A stray MPLS_INVALID_LABEL leaks 0xFFFFF
+                # onto the wire and Junos hides the A-D route.
+                and pmsi.get("label") == 0
                 and r.get("extendedCommunity", {}).get("string") == "RT:0.0.0.0:0"
             ):
                 return None
-        return "Type-1 I-PMSI with IR PMSI endpoint 10.0.0.1 + RT:0.0.0.0:0 not found in {}".format(
+        return "Type-1 I-PMSI with IR PMSI endpoint 10.0.0.1 (label 0) + RT:0.0.0.0:0 not found in {}".format(
             routes
         )
 
@@ -561,6 +565,7 @@ router bgp 65001
             if (
                 pmsi.get("type") == "ingressReplication"
                 and pmsi.get("endpoint") == endpoint
+                and pmsi.get("label") == 0
                 and r.get("extendedCommunity", {}).get("string") == "RT:0.0.0.0:0"
             ):
                 return True

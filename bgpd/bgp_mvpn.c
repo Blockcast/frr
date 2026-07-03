@@ -859,6 +859,17 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 	bgp_attr_set_tunn_id(&attr, &tunn_id);
 
 	/*
+	 * RFC 6514 Section 5: a zero MPLS Label in the PMSI Tunnel attribute
+	 * means the tunnel is unlabeled — which GTM label-free IP ingress
+	 * replication is. The PMSI encoder emits attr->label's first three
+	 * bytes verbatim, so bgp_attr_default_set's MPLS_INVALID_LABEL
+	 * (0xFFFDFFFF) would otherwise go out as label 0xFFFFF; a Junos
+	 * 22.2R3 GTM receiver imports such an A-D route but keeps it hidden,
+	 * unable to instantiate an IR leaf against the bogus label.
+	 */
+	attr.label = 0;
+
+	/*
 	 * GTM global-table Route Target (target:0.0.0.0:0), the import/export target
 	 * a GTM receiver (e.g. Junos mpls-internet-multicast) matches on the Intra-AS
 	 * AD route; without it the route is rejected for want of a target community.
