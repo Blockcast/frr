@@ -2951,7 +2951,7 @@ int peer_activate(struct peer *peer, afi_t afi, safi_t safi)
 	 * known (config-read ordering), in which case bgp_router_id_set()'s
 	 * hook originates it once zebra reports the router-id.
 	 */
-	if (afi == AFI_IP && safi == SAFI_MCAST_VPN)
+	if ((afi == AFI_IP || afi == AFI_IP6) && safi == SAFI_MCAST_VPN)
 		bgp_mvpn_originate_type1(bgp);
 
 	return ret;

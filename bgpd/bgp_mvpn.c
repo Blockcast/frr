@@ -895,8 +895,21 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 	 */
 	if (bgp_mvpn_gtm_af_active(bgp, AFI_IP))
 		bgp_mvpn_route_install(bgp, bgp->peer_self, AFI_IP, &p, &attr, BGP_ROUTE_STATIC);
-	if (bgp_mvpn_gtm_af_active(bgp, AFI_IP6))
+	if (bgp_mvpn_gtm_af_active(bgp, AFI_IP6)) {
+		/* bgp_attr_intern's hash-miss path (bgp_attr_hash_alloc) takes
+		 * ownership of a caller-owned attr->extra and NULLs it here
+		 * (bgp_attr_owns_extra), so a first-plane install can strip the
+		 * PMSI tunnel info from this stack attr. Re-claim the slot or
+		 * the second plane interns a PMSI-flagged attr with no tunnel
+		 * info, announced as a len-5 NO_INFO PMSI that a Junos GTM
+		 * peer rejects as malformed (NOTIFICATION loop).
+		 */
+		if (!attr.extra) {
+			bgp_attr_set_pmsi_tnl_type(&attr, PMSI_TNLTYPE_INGR_REPL);
+			bgp_attr_set_tunn_id(&attr, &tunn_id);
+		}
 		bgp_mvpn_route_install(bgp, bgp->peer_self, AFI_IP6, &p, &attr, BGP_ROUTE_STATIC);
+	}
 
 	/*
 	 * bgp_attr_flush releases the borrowed ecommunity ref (refcnt-aware) and the

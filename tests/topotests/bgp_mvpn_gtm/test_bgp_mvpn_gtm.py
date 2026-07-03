@@ -406,10 +406,17 @@ def test_type1_v6_plane_with_v4_originator():
     the IPv6 MCAST-VPN AF (Junos mpls-internet-multicast advertises exactly
     that shape). r1 originates one Type-1 per active GTM plane, both carrying
     the v4 router-id originator; r2 must hold the v6-plane copy in the
-    AFI_IP6 MCAST-VPN RIB. Regression: rib selection previously keyed off the
-    originator family, silently collapsing the v6-plane Type-1 into the v4
-    table (found live against Junos 22.2R3: MX advertised 1 prefix on
-    bgp.mvpn-inet6.0, FRR's ipv6 mvpn table stayed empty).
+    AFI_IP6 MCAST-VPN RIB. Regressions guarded (all found live against Junos
+    22.2R3):
+    - rib selection previously keyed off the originator family, silently
+      collapsing the v6-plane Type-1 into the v4 table (MX advertised 1
+      prefix on bgp.mvpn-inet6.0, FRR's ipv6 mvpn table stayed empty).
+    - the AF-activation hook only fired for AFI_IP, so the v6-plane copy was
+      never originated at boot (this test would see the route ABSENT).
+    - bgp_attr_intern's hash-miss path steals a caller-owned attr->extra, so
+      the second per-plane install interned a PMSI-flagged attr with no
+      tunnel info, announced as a malformed len-5 NO_INFO PMSI (Junos
+      NOTIFICATION loop; this test would see pmsiTunnel absent/noInfo).
 
     AUTHORED-NOT-RUN: this repo has no network namespaces; authored and
     py_compile-checked.
