@@ -443,6 +443,65 @@ stream_failure:
 }
 
 /*
+ * Attach an IP-address-specific Route Target (Global Administrator = ga, Local
+ * Administrator = 0, transitive) to a locally-originated route. Both GTM RTs
+ * this codec emits share this shape and differ only by which address fills the
+ * Global Administrator and by which route type carries them (RFC 7716): the
+ * Type-5 SA route carries the group address (Section 2.8.2); the Type-7
+ * C-multicast join carries the upstream PE address (Sections 2.2 / 2.9). The
+ * ecommunity is left un-interned; the caller's route_install() interns it and a
+ * later bgp_attr_flush() releases this stack reference.
+ */
+static void bgp_mvpn_attach_ip_rt(struct attr *attr, struct in_addr ga)
+{
+	struct ecommunity_val eval;
+	struct ecommunity *ecom;
+
+	encode_route_target_ip(&ga, 0, &eval, true);
+	ecom = ecommunity_new();
+	ecommunity_add_val(ecom, &eval, false, false);
+	bgp_attr_set_ecommunity(attr, ecom);
+}
+
+/*
+ * Resolve the Upstream Multicast Hop (upstream PE) for (C-S, C-G): the PE that
+ * originated the Type-5 Source Active route for this source is the upstream
+ * toward it (RFC 7716 Section 2.9 / RFC 6514 Section 5.1). Look the SA route up
+ * in the local MCAST-VPN RIB and take its next hop -- which the origination
+ * side sets to the originating PE's address and the receive side decodes into
+ * mp_nexthop_global_in. Returns true and fills *upstream on a hit; false when no
+ * SA route is known yet (no targetable upstream).
+ */
+static bool bgp_mvpn_resolve_upstream_pe(struct bgp *bgp, struct in_addr src, struct in_addr grp,
+					 struct in_addr *upstream)
+{
+	struct prefix_mvpn sa;
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi;
+
+	bgp_mvpn_build_prefix_type5(&sa, src, grp);
+
+	/* AFI_IP: GTM MVPN is IPv4-only in this milestone. */
+	dest = bgp_safi_node_lookup(bgp->rib[AFI_IP][SAFI_MCAST_VPN], SAFI_MCAST_VPN,
+				    (const struct prefix *)&sa, NULL);
+	if (!dest)
+		return false;
+
+	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+		if (pi->type != ZEBRA_ROUTE_BGP)
+			continue;
+		if (pi->attr->mp_nexthop_global_in.s_addr == INADDR_ANY)
+			continue;
+		*upstream = pi->attr->mp_nexthop_global_in;
+		bgp_dest_unlock_node(dest);
+		return true;
+	}
+
+	bgp_dest_unlock_node(dest);
+	return false;
+}
+
+/*
  * Configure or withdraw a locally-originated GTM Source Active route. Attr is a
  * self-sourced IGP route with the router-id as next hop.
  */
@@ -450,8 +509,6 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, struct in_addr src, struct in_ad
 {
 	struct prefix_mvpn p;
 	struct attr attr;
-	struct ecommunity_val eval;
-	struct ecommunity *ecom;
 
 	bgp_mvpn_build_prefix_type5(&p, src, grp);
 
@@ -467,19 +524,14 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, struct in_addr src, struct in_ad
 	attr.mp_nexthop_len = IPV4_MAX_BYTELEN;
 
 	/*
-	 * Attach the RFC 7716 Section 2.8.2 group-address Route Target: an
-	 * IP-address-specific RT whose Global Administrator is the multicast
-	 * group (C-G) and Local Administrator is zero. A GTM receiver interested
-	 * in G auto-derives this same RT as an import target from its join state
-	 * and imports the SA route on it (RFC 7716 Section 2.2, "import RTs
-	 * configured" case); such a receiver rejects an RT-less SA route for lack
-	 * of a matching target community. The RT is transitive so it survives
-	 * propagation to the receiver.
+	 * RFC 7716 Section 2.8.2 group-address Route Target (Global Administrator
+	 * = the multicast group C-G, Local Administrator = 0). A GTM receiver
+	 * interested in G auto-derives this same RT as an import target from its
+	 * join state and imports the SA route on it (RFC 7716 Section 2.2,
+	 * "import RTs configured" case); such a receiver rejects an RT-less SA
+	 * route for lack of a matching target community.
 	 */
-	encode_route_target_ip(&grp, 0, &eval, true);
-	ecom = ecommunity_new();
-	ecommunity_add_val(ecom, &eval, false, false);
-	bgp_attr_set_ecommunity(&attr, ecom);
+	bgp_mvpn_attach_ip_rt(&attr, grp);
 
 	bgp_mvpn_route_install(bgp, bgp->peer_self, &p, &attr, BGP_ROUTE_STATIC);
 
@@ -575,10 +627,11 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
  * test-only.
  */
 int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, struct in_addr src,
-				  struct in_addr grp, bool negate)
+				  struct in_addr grp, struct in_addr upstream, bool negate)
 {
 	struct prefix_mvpn p;
 	struct attr attr;
+	struct in_addr umh = upstream;
 
 	bgp_mvpn_build_prefix_type7(&p, source_as, src, grp);
 
@@ -593,8 +646,27 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, struct in
 	attr.mp_nexthop_global_in = bgp->router_id;
 	attr.mp_nexthop_len = IPV4_MAX_BYTELEN;
 
+	/*
+	 * RFC 7716 Section 2.2 / Section 2.9 upstream-node-identifying Route
+	 * Target: an IP-address-specific RT whose Global Administrator is the
+	 * upstream PE (the PE toward C-S) and Local Administrator is 0. Only that
+	 * PE imports the C-multicast join -- it matches "an upstream-node-
+	 * identifying RT whose Global Administrator identifies that PBR". When no
+	 * upstream is passed explicitly, derive it from the Source Active route's
+	 * UMH. A join with no resolvable upstream is originated RT-less (not yet
+	 * targetable) and logged.
+	 */
+	if (umh.s_addr == INADDR_ANY)
+		bgp_mvpn_resolve_upstream_pe(bgp, src, grp, &umh);
+	if (umh.s_addr != INADDR_ANY)
+		bgp_mvpn_attach_ip_rt(&attr, umh);
+	else
+		zlog_debug("MVPN Type-7 (%pI4, %pI4): no upstream PE resolved; originating without upstream RT",
+			   &src, &grp);
+
 	bgp_mvpn_route_install(bgp, bgp->peer_self, &p, &attr, BGP_ROUTE_STATIC);
 
+	bgp_attr_flush(&attr);
 	aspath_unintern(&attr.aspath);
 	return CMD_SUCCESS;
 }

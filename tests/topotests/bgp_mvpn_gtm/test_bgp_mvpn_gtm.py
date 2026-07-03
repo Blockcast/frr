@@ -178,6 +178,12 @@ def test_type7_source_tree_join_propagates():
     expose it via `show bgp ipv4 mvpn json` with routeType 7, the matching
     (S,G), and the carried Source AS.
 
+    The Type-7 must also carry the RFC 7716 Section 2.2 / 2.9 upstream-node RT
+    (Global Administrator = the upstream PE, Local Administrator = 0). r2
+    auto-resolves the upstream from r1's Source Active route (next hop 10.0.0.1),
+    so r1 sees extendedCommunity "RT:10.0.0.1:0" -- the RT that identifies r1 as
+    the upstream PBR that must import the join.
+
     AUTHORED-NOT-RUN: this repo has no network namespaces, so the topotest is
     authored and py_compile-checked but not executed here.
     """
@@ -204,9 +210,10 @@ router bgp 65001
                 and r.get("source") == "10.10.10.1"
                 and r.get("group") == "232.1.1.1"
                 and r.get("sourceAs") == 65001
+                and r.get("extendedCommunity", {}).get("string") == "RT:10.0.0.1:0"
             ):
                 return None
-        return "Type-7 (10.10.10.1, 232.1.1.1, AS 65001) not found in {}".format(
+        return "Type-7 (10.10.10.1, 232.1.1.1, AS 65001) with RT:10.0.0.1:0 not found in {}".format(
             routes
         )
 
@@ -337,6 +344,7 @@ router bgp 65001
                 and r.get("source") == source
                 and r.get("group") == group
                 and r.get("sourceAs") == source_as
+                and r.get("extendedCommunity", {}).get("string") == "RT:10.0.0.1:0"
             ):
                 return True
         return False

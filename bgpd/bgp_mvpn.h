@@ -119,10 +119,12 @@ extern void bgp_mvpn_originate_type1(struct bgp *bgp);
 
 /*
  * TEST-ONLY scaffold: originate/withdraw a local Type-7 (C-multicast Source
- * Tree Join) route. Plan 3 replaces this with pimd-driven origination.
+ * Tree Join) route. The upstream PE (Global Administrator of the upstream-node
+ * RT) is taken explicitly when non-zero, else resolved from the Source Active
+ * route's UMH. Plan 3 replaces this with pimd-driven origination.
  */
 extern int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, struct in_addr src,
-					 struct in_addr grp, bool negate);
+					 struct in_addr grp, struct in_addr upstream, bool negate);
 
 /* running-config emission for `bgp mvpn source-active` under the AF node. */
 extern void bgp_mvpn_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi);
