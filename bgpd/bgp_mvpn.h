@@ -29,6 +29,9 @@
  */
 #define BGP_MVPN_TYPE1_V4_SPEC_LEN 12
 
+/* IPv6 (RFC 6515): RD(8) + OriginatingRouterIP(16) = 24 octets. */
+#define BGP_MVPN_TYPE1_V6_SPEC_LEN 24
+
 /*
  * Full on-wire NLRI length for a Type-1 IPv4 route:
  *   Route Type(1) + Length(1) + route-type-specific(12) = 14 octets.
@@ -42,6 +45,10 @@
  */
 #define BGP_MVPN_TYPE5_V4_SPEC_LEN 18
 
+/* IPv6 (RFC 6515): RD(8) + McastSrcLen(1) + McastSrc(16) + McastGrpLen(1)
+ *               + McastGrp(16) = 42 octets. */
+#define BGP_MVPN_TYPE5_V6_SPEC_LEN 42
+
 /*
  * Full on-wire NLRI length for a Type-5 IPv4 route:
  *   Route Type(1) + Length(1) + route-type-specific(18) = 20 octets.
@@ -54,6 +61,10 @@
  *                  + McastGrpLen(1) + McastGrp(4) = 22 octets.
  */
 #define BGP_MVPN_TYPE7_V4_SPEC_LEN 22
+
+/* IPv6 (RFC 6515): RD(8) + SourceAS(4) + McastSrcLen(1) + McastSrc(16)
+ *               + McastGrpLen(1) + McastGrp(16) = 46 octets. */
+#define BGP_MVPN_TYPE7_V6_SPEC_LEN 46
 
 /*
  * Full on-wire NLRI length for a Type-7 IPv4 route:
@@ -73,20 +84,21 @@ static inline bool bgp_mvpn_group_is_ssm(struct in_addr grp)
 	return (ntohl(grp.s_addr) & 0xff000000U) == 0xe8000000U;
 }
 
-/* Fill a prefix_mvpn for a Type-5 (Source Active) route. */
-extern void bgp_mvpn_build_prefix_type5(struct prefix_mvpn *p, struct in_addr src,
-					struct in_addr grp);
+/* Fill a prefix_mvpn for a Type-5 (Source Active) route. C-S/C-G may be v4 or
+ * v6 but must share a family. */
+extern void bgp_mvpn_build_prefix_type5(struct prefix_mvpn *p, const struct ipaddr *src,
+					const struct ipaddr *grp);
 
 /*
  * Fill a prefix_mvpn for a Type-1 (Intra-AS I-PMSI A-D) route. The route has no
  * C-S/C-G; the Originating Router's IP Address (RFC 6514 Section 4.1) is stored
  * in the src slot (route_type keeps it distinct from Type-5/7).
  */
-extern void bgp_mvpn_build_prefix_type1(struct prefix_mvpn *p, struct in_addr orig_ip);
+extern void bgp_mvpn_build_prefix_type1(struct prefix_mvpn *p, const struct ipaddr *orig_ip);
 
 /* Fill a prefix_mvpn for a Type-7 (C-multicast Source Tree Join) route. */
 extern void bgp_mvpn_build_prefix_type7(struct prefix_mvpn *p, uint32_t source_as,
-					struct in_addr src, struct in_addr grp);
+					const struct ipaddr *src, const struct ipaddr *grp);
 
 /* Encode a Type-5 NLRI into the MP_REACH stream (RFC 6514 Section 4.5). */
 extern void bgp_mvpn_encode_type5(struct stream *s, const struct prefix *p, bool addpath_capable,

@@ -134,8 +134,8 @@ struct evpn_addr {
  */
 struct mvpn_addr {
 	uint8_t route_type;
-	struct in_addr src; /* C-S (multicast source) */
-	struct in_addr grp; /* C-G (multicast group)  */
+	struct ipaddr src; /* C-S (multicast source) -- v4 or v6 */
+	struct ipaddr grp; /* C-G (multicast group)  -- v4 or v6 */
 	uint32_t source_as; /* Type-7 Source AS (host order); 0 for Type-5 */
 };
 
