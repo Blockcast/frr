@@ -11795,7 +11795,8 @@ DEFUN_NOSH(address_family_ipv4_safi, address_family_ipv4_safi_cmd,
 
 DEFUN_NOSH(address_family_ipv6_safi, address_family_ipv6_safi_cmd,
 	   "address-family ipv6 [<unicast|multicast|vpn|labeled-unicast|flowspec|unreachability|mvpn>]",
-	   "Enter Address Family command mode\n" BGP_AF_STR BGP_SAFI_WITH_LABEL_HELP_STR)
+	   "Enter Address Family command mode\n" BGP_AF_STR BGP_SAFI_WITH_LABEL_HELP_STR
+		   "Address Family modifier\n")
 {
 	if (argc == 3) {
 		VTY_DECLVAR_CONTEXT(bgp, bgp);
@@ -23871,9 +23872,7 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_ipmsi_label_cmd);
 	install_element(BGP_IPV6_MVPN_NODE, &bgp_mvpn_source_active6_cmd);
 	install_element(VIEW_NODE, &show_bgp_ipv4_mvpn_cmd);
-	install_element(ENABLE_NODE, &show_bgp_ipv4_mvpn_cmd);
 	install_element(VIEW_NODE, &show_bgp_ipv6_mvpn_cmd);
-	install_element(ENABLE_NODE, &show_bgp_ipv6_mvpn_cmd);
 
 	/* "no neighbor activate" commands. */
 	install_element(BGP_NODE, &no_neighbor_activate_hidden_cmd);
