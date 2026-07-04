@@ -488,10 +488,18 @@ void pim_gtm_upstream_update(struct pim_instance *pim, struct pim_upstream *up,
 	bool desired;
 	uint8_t role;
 
-	if (!pim->gtm_enable)
+	if (!pim->gtm_enable) {
+		if (PIM_DEBUG_ZEBRA)
+			zlog_debug("GTM reconcile %pSG: mvpn-gtm disabled",
+				   &up->sg);
 		return;
-	if (!pim_is_grp_ssm(pim, up->sg.grp))
+	}
+	if (!pim_is_grp_ssm(pim, up->sg.grp)) {
+		if (PIM_DEBUG_ZEBRA)
+			zlog_debug("GTM reconcile %pSG: group not in SSM range",
+				   &up->sg);
 		return;
+	}
 
 	/* A local first-hop source originates a Source Active; any other
 	 * JOINED (S,G) is a local receiver pulling a remote source and
