@@ -34,6 +34,7 @@ typedef enum {
 	IANA_SAFI_UNICAST = 1,
 	IANA_SAFI_MULTICAST = 2,
 	IANA_SAFI_LABELED_UNICAST = 4,
+	IANA_SAFI_MCAST_VPN = 5, /* MCAST-VPN per RFC 6514 */
 	IANA_SAFI_ENCAP = 7,
 	IANA_SAFI_EVPN = 70,
 	IANA_SAFI_BGP_LS = 71, /* BGP-LS per RFC 9552 */
@@ -91,6 +92,8 @@ static inline safi_t safi_iana2int(iana_safi_t safi)
 		return SAFI_UNICAST;
 	case IANA_SAFI_MULTICAST:
 		return SAFI_MULTICAST;
+	case IANA_SAFI_MCAST_VPN:
+		return SAFI_MCAST_VPN;
 	case IANA_SAFI_MPLS_VPN:
 		return SAFI_MPLS_VPN;
 	case IANA_SAFI_ENCAP:
@@ -119,6 +122,8 @@ static inline iana_safi_t safi_int2iana(safi_t safi)
 		return IANA_SAFI_UNICAST;
 	case SAFI_MULTICAST:
 		return IANA_SAFI_MULTICAST;
+	case SAFI_MCAST_VPN:
+		return IANA_SAFI_MCAST_VPN;
 	case SAFI_MPLS_VPN:
 		return IANA_SAFI_MPLS_VPN;
 	case SAFI_ENCAP:

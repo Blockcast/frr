@@ -119,6 +119,8 @@ enum node_type {
 	BGP_VNC_NVE_GROUP_NODE,  /* BGP VNC nve group */
 	BGP_VNC_L2_GROUP_NODE,   /* BGP VNC L2 group */
 	BGP_EVPN_NODE,		 /* BGP EVPN node. */
+	BGP_IPV4_MVPN_NODE,	 /* BGP IPv4 MCAST-VPN node. */
+	BGP_IPV6_MVPN_NODE,	 /* BGP IPv6 MCAST-VPN node. */
 	BGP_SRV6_NODE,		 /* BGP SRv6 node. */
 	BGP_LS_NODE,		 /* BGP Link-State node. */
 	OSPF_NODE,		 /* OSPF protocol mode */

@@ -4192,6 +4192,36 @@ stream_failure:
 	return -1;
 }
 
+int zapi_mvpn_sg_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
+			const struct zapi_mvpn_sg *sg)
+{
+	stream_reset(s);
+
+	zclient_create_header(s, cmd, vrf_id);
+	stream_put_ipaddr(s, &sg->src);
+	stream_put_ipaddr(s, &sg->grp);
+	stream_putc(s, sg->role);
+
+	/* Put length at the first point of the stream. */
+	stream_putw_at(s, 0, stream_get_endp(s));
+
+	return 0;
+}
+
+int zapi_mvpn_sg_decode(struct stream *s, struct zapi_mvpn_sg *sg)
+{
+	memset(sg, 0, sizeof(*sg));
+
+	STREAM_GET_IPADDR(s, &sg->src);
+	STREAM_GET_IPADDR(s, &sg->grp);
+	STREAM_GETC(s, sg->role);
+
+	return 0;
+
+stream_failure:
+	return -1;
+}
+
 enum zclient_send_status zebra_send_mpls_labels(struct zclient *zclient,
 						int cmd, struct zapi_labels *zl)
 {
