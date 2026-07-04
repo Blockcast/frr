@@ -909,6 +909,11 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 	if (!bgp_mvpn_gtm_af_active(bgp, AFI_IP) && !bgp_mvpn_gtm_af_active(bgp, AFI_IP6))
 		return;
 
+	/* GTM just became (or remains) active: make sure the pimd SG relay
+	 * subscription exists (no-op if zebra is not yet connected; the
+	 * zebra-connect hook covers that ordering). */
+	bgp_zebra_mvpn_sg_subscribe();
+
 	struct ipaddr orig = mvpn_ipaddr_v4(bgp->router_id);
 
 	bgp_mvpn_build_prefix_type1(&p, &orig);

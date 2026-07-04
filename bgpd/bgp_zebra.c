@@ -3341,18 +3341,32 @@ static void bgp_zebra_connected(struct zclient *zclient)
 	/* Global-Table Multicast pimd->bgpd glue: if the GTM MVPN AF is active,
 	 * (re-)subscribe to zebra's SG relay so a local receiver join / source
 	 * detect from pimd (re-)originates the matching Type-7 / Type-5. */
-	if (bgp_mvpn_gtm_active(bgp)) {
-		struct stream *s = zclient->obuf;
-
-		if (BGP_DEBUG(zebra, ZEBRA))
-			zlog_debug("MVPN_SG: subscribing to zebra SG relay (GTM active)");
-		stream_reset(s);
-		zclient_create_header(s, ZEBRA_MVPN_SG_REPLAY, VRF_DEFAULT);
-		stream_putw_at(s, 0, stream_get_endp(s));
-		zclient_send_message(zclient);
-	} else if (BGP_DEBUG(zebra, ZEBRA)) {
+	if (bgp_mvpn_gtm_active(bgp))
+		bgp_zebra_mvpn_sg_subscribe();
+	else if (BGP_DEBUG(zebra, ZEBRA))
 		zlog_debug("MVPN_SG: GTM not active at zebra connect; no subscription");
-	}
+}
+
+/* Subscribe to zebra's pimd MVPN SG relay and request a replay of pimd's
+ * announced set.  Idempotent; called at zebra connect (zebra restart) and
+ * whenever the GTM MVPN AF state is (re-)activated -- at daemon startup the
+ * zebra session connects before "router bgp" exists, so the connect-time
+ * hook alone never fires on a normal boot. */
+void bgp_zebra_mvpn_sg_subscribe(void)
+{
+	struct stream *s;
+
+	if (!bgp_zclient || bgp_zclient->sock < 0)
+		return;
+
+	if (BGP_DEBUG(zebra, ZEBRA))
+		zlog_debug("MVPN_SG: subscribing to zebra SG relay (GTM active)");
+
+	s = bgp_zclient->obuf;
+	stream_reset(s);
+	zclient_create_header(s, ZEBRA_MVPN_SG_REPLAY, VRF_DEFAULT);
+	stream_putw_at(s, 0, stream_get_endp(s));
+	zclient_send_message(bgp_zclient);
 }
 
 void bgp_zebra_process_remote_routes_for_l2vni(struct event *e)
