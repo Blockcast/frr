@@ -711,6 +711,29 @@ int routing_control_plane_protocols_control_plane_protocol_pim_address_family_ec
 }
 
 /*
+ * XPath: /frr-routing:routing/control-plane-protocols/control-plane-protocol/frr-pim:pim/address-family/mvpn-gtm
+ */
+int routing_control_plane_protocols_control_plane_protocol_pim_address_family_mvpn_gtm_modify(
+	struct nb_cb_modify_args *args)
+{
+	struct vrf *vrf;
+	struct pim_instance *pim;
+
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		vrf = nb_running_get_entry(args->dnode, NULL, true);
+		pim = vrf->info;
+		pim->gtm_enable = yang_dnode_get_bool(args->dnode, NULL);
+	}
+
+	return NB_OK;
+}
+
+/*
  * XPath: /frr-routing:routing/control-plane-protocols/control-plane-protocol/frr-pim:pim/address-family/keep-alive-timer
  */
 int routing_control_plane_protocols_control_plane_protocol_pim_address_family_keep_alive_timer_modify(

@@ -5154,27 +5154,16 @@ DEFPY_YANG (no_pim_ecmp,
 	return nb_cli_apply_changes(vty, NULL);
 }
 
-DEFPY (pim_mvpn_gtm,
+DEFPY_YANG (pim_mvpn_gtm,
        pim_mvpn_gtm_cmd,
        "[no] mvpn-gtm",
        NO_STR
        "Global-Table Multicast (RFC 7716): originate BGP MCAST-VPN Type-7/Type-5 from local SSM join/source\n")
 {
-	const char *vrfname = pim_cli_get_vrf_name(vty);
-	struct vrf *vrf;
+	nb_cli_enqueue_change(vty, "./mvpn-gtm", NB_OP_MODIFY,
+			      no ? "false" : "true");
 
-	if (!vrfname) {
-		vty_out(vty, "%% Failed to determine vrf name\n");
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-	vrf = vrf_lookup_by_name(vrfname);
-	if (!vrf || !vrf->info) {
-		vty_out(vty, "%% PIM not enabled on vrf %s\n", vrfname);
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-
-	((struct pim_instance *)vrf->info)->gtm_enable = !no;
-	return CMD_SUCCESS;
+	return nb_cli_apply_changes(vty, NULL);
 }
 DEFPY_ATTR(no_ip_pim_ecmp,
 			  no_ip_pim_ecmp_cmd,
