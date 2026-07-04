@@ -66,6 +66,8 @@ struct zebra_vrf {
 	uint16_t flags;
 #define ZEBRA_VRF_RETAIN          (1 << 0)
 #define ZEBRA_PIM_SEND_VXLAN_SG   (1 << 1)
+/* bgpd has subscribed to the Global-Table Multicast pimd->bgpd SG relay. */
+#define ZEBRA_BGP_WANTS_MVPN_SG   (1 << 2)
 
 	uint32_t table_id;
 
