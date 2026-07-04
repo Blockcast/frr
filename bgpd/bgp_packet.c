@@ -2227,10 +2227,12 @@ static int bgp_open_receive(struct peer_connection *connection, bgp_size_t size)
 	}
 
 	/* Verify valid local address present based on negotiated
-	 * address-families. */
+	 * address-families. The MCAST-VPN AFs both sit in the v4 group: GTM
+	 * next hops are v4 in a v4 core for either NLRI AFI (RFC 6515). */
 	if (peer->afc_nego[AFI_IP][SAFI_UNICAST] || peer->afc_nego[AFI_IP][SAFI_LABELED_UNICAST] ||
 	    peer->afc_nego[AFI_IP][SAFI_MULTICAST] || peer->afc_nego[AFI_IP][SAFI_MPLS_VPN] ||
-	    peer->afc_nego[AFI_IP][SAFI_MCAST_VPN] || peer->afc_nego[AFI_IP][SAFI_ENCAP]) {
+	    peer->afc_nego[AFI_IP][SAFI_MCAST_VPN] ||
+	    peer->afc_nego[AFI_IP6][SAFI_MCAST_VPN] || peer->afc_nego[AFI_IP][SAFI_ENCAP]) {
 		if (peer->nexthop.v4.s_addr == INADDR_ANY) {
 #if defined(HAVE_CUMULUS)
 			zlog_warn("%s: No local IPv4 addr, BGP routing may not work",
