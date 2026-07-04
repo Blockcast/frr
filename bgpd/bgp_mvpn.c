@@ -1005,6 +1005,11 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, const str
 	 * route is present while a receiver is joined). */
 	if (source_as == 0)
 		bgp_mvpn_resolve_source_as(bgp, src, &source_as);
+	/* RFC 6514 4.6: the Source AS is the AS of the PE the source attaches
+	 * to.  With no Source-AS extended community on the source route
+	 * (single-AS GTM over iBGP), that is the local AS. */
+	if (source_as == 0)
+		source_as = bgp->as;
 
 	bgp_mvpn_build_prefix_type7(&p, source_as, src, grp);
 
