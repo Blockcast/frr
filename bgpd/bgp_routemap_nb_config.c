@@ -1984,6 +1984,61 @@ lib_route_map_entry_set_action_rmap_set_action_extcommunity_soo_destroy(
 
 /*
  * XPath:
+ * /frr-route-map:lib/route-map/entry/set-action/rmap-set-action/frr-bgp-route-map:extcommunity-vrf-route-import
+ */
+int
+lib_route_map_entry_set_action_rmap_set_action_extcommunity_vrf_route_import_modify(
+	struct nb_cb_modify_args *args)
+{
+	struct routemap_hook_context *rhc;
+	const char *type;
+	int rv;
+
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		/* Add configuration. */
+		rhc = nb_running_get_entry(args->dnode, NULL, true);
+		type = yang_dnode_get_string(args->dnode, NULL);
+
+		/* Set destroy information. */
+		rhc->rhc_shook = generic_set_delete;
+		rhc->rhc_rule = "extcommunity vrf-route-import";
+		rhc->rhc_event = RMAP_EVENT_SET_DELETED;
+
+		rv = generic_set_add(rhc->rhc_rmi,
+				     "extcommunity vrf-route-import", type,
+				     args->errmsg, args->errmsg_len);
+		if (rv != CMD_SUCCESS) {
+			rhc->rhc_shook = NULL;
+			return NB_ERR_INCONSISTENCY;
+		}
+	}
+
+	return NB_OK;
+}
+
+int
+lib_route_map_entry_set_action_rmap_set_action_extcommunity_vrf_route_import_destroy(
+	struct nb_cb_destroy_args *args)
+{
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		return lib_route_map_entry_set_destroy(args);
+	}
+
+	return NB_OK;
+}
+
+/*
+ * XPath:
  * /frr-route-map:lib/route-map/entry/set-action/rmap-set-action/frr-bgp-route-map:ipv4-address
  */
 int lib_route_map_entry_set_action_rmap_set_action_ipv4_address_modify(
