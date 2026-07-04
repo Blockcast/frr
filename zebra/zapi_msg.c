@@ -4145,15 +4145,28 @@ static void zread_mvpn_sg(ZAPI_HANDLER_ARGS)
 	struct zserv *bgp_client;
 	struct stream *s;
 
-	if (zapi_mvpn_sg_decode(msg, &sg) < 0)
+	if (zapi_mvpn_sg_decode(msg, &sg) < 0) {
+		if (IS_ZEBRA_DEBUG_EVENT)
+			zlog_debug("MVPN_SG relay: decode failed");
 		return;
+	}
 
-	if (!CHECK_FLAG(zvrf->flags, ZEBRA_BGP_WANTS_MVPN_SG))
+	if (!CHECK_FLAG(zvrf->flags, ZEBRA_BGP_WANTS_MVPN_SG)) {
+		if (IS_ZEBRA_DEBUG_EVENT)
+			zlog_debug("MVPN_SG relay: dropped, bgpd not subscribed");
 		return;
+	}
 
 	bgp_client = zserv_find_client(ZEBRA_ROUTE_BGP, 0);
-	if (!bgp_client)
+	if (!bgp_client) {
+		if (IS_ZEBRA_DEBUG_EVENT)
+			zlog_debug("MVPN_SG relay: no bgp client");
 		return;
+	}
+
+	if (IS_ZEBRA_DEBUG_EVENT)
+		zlog_debug("MVPN_SG relay: forwarding cmd %u to bgpd",
+			   hdr->command);
 
 	s = stream_new(ZEBRA_SMALL_PACKET_SIZE);
 	zapi_mvpn_sg_encode(s, hdr->command, zvrf_id(zvrf), &sg);
@@ -4166,6 +4179,8 @@ static void zread_mvpn_sg_replay(ZAPI_HANDLER_ARGS)
 	struct stream *s;
 
 	SET_FLAG(zvrf->flags, ZEBRA_BGP_WANTS_MVPN_SG);
+	if (IS_ZEBRA_DEBUG_EVENT)
+		zlog_debug("MVPN_SG replay: bgpd subscribed; relaying replay to pimd");
 
 	pim_client = zserv_find_client(ZEBRA_ROUTE_PIM, 0);
 	if (!pim_client)

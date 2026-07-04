@@ -3344,10 +3344,14 @@ static void bgp_zebra_connected(struct zclient *zclient)
 	if (bgp_mvpn_gtm_active(bgp)) {
 		struct stream *s = zclient->obuf;
 
+		if (BGP_DEBUG(zebra, ZEBRA))
+			zlog_debug("MVPN_SG: subscribing to zebra SG relay (GTM active)");
 		stream_reset(s);
 		zclient_create_header(s, ZEBRA_MVPN_SG_REPLAY, VRF_DEFAULT);
 		stream_putw_at(s, 0, stream_get_endp(s));
 		zclient_send_message(zclient);
+	} else if (BGP_DEBUG(zebra, ZEBRA)) {
+		zlog_debug("MVPN_SG: GTM not active at zebra connect; no subscription");
 	}
 }
 
