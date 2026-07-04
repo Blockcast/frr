@@ -352,12 +352,8 @@ static void pim_zebra_vxlan_replay(void)
 	struct stream *s = NULL;
 
 	/* Check socket. */
-	if (!pim_zclient || pim_zclient->sock < 0) {
-		if (PIM_DEBUG_ZEBRA)
-			zlog_debug("MVPN_SG %pSG: zclient not connected, dropping",
-				   &up->sg);
+	if (!pim_zclient || pim_zclient->sock < 0)
 		return;
-	}
 
 	s = pim_zclient->obuf;
 	stream_reset(s);
