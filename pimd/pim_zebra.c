@@ -442,8 +442,8 @@ static void pim_zebra_capabilities(struct zclient_capabilities *cap)
  * the answer (join_state switch, source-stream KAT, delete). Role:
  *   FHR + source stream -> Source Active (Type 5)   [local first-hop source]
  *   else JOINED         -> C-multicast join (Type 7)[local receiver interest]
- * bgpd fills the Type-7 upstream-PE and Source-AS from the received SA route,
- * so pimd sends neither (source_as 0, upstream INADDR_ANY).
+ * bgpd resolves the Type-7 Source-AS and upstream-PE itself, from the unicast
+ * route toward the source and the received SA route (RFC 6514 Section 5).
  */
 static void pim_zebra_mvpn_sg_send(struct pim_upstream *up, uint8_t role, bool add)
 {
@@ -465,8 +465,6 @@ static void pim_zebra_mvpn_sg_send(struct pim_upstream *up, uint8_t role, bool a
 	sg.grp.ipaddr_v6 = up->sg.grp;
 #endif
 	sg.role = role;
-	sg.source_as = 0;
-	sg.upstream_pe.s_addr = INADDR_ANY;
 
 	if (PIM_DEBUG_ZEBRA)
 		zlog_debug("MVPN_SG %s %pSG role=%u to zebra",
@@ -484,18 +482,10 @@ void pim_gtm_upstream_update(struct pim_instance *pim, struct pim_upstream *up,
 	bool desired;
 	uint8_t role;
 
-	if (!pim->gtm_enable) {
-		if (PIM_DEBUG_ZEBRA)
-			zlog_debug("GTM reconcile %pSG: mvpn-gtm disabled",
-				   &up->sg);
+	if (!pim->gtm_enable)
 		return;
-	}
-	if (!pim_is_grp_ssm(pim, up->sg.grp)) {
-		if (PIM_DEBUG_ZEBRA)
-			zlog_debug("GTM reconcile %pSG: group not in SSM range",
-				   &up->sg);
+	if (!pim_is_grp_ssm(pim, up->sg.grp))
 		return;
-	}
 
 	/* A local first-hop source originates a Source Active; any other
 	 * JOINED (S,G) is a local receiver pulling a remote source and
@@ -559,10 +549,13 @@ static zclient_handler *const pim_handlers[] = {
 
 	[ZEBRA_ROUTER_ID_UPDATE] = pim_router_id_update_zebra,
 
+	/* AF-agnostic: each of pimd/pim6d re-dumps its own announced GTM SG
+	 * set (v4 resp. v6) when bgpd re-subscribes. */
+	[ZEBRA_MVPN_SG_REPLAY] = pim_zebra_mvpn_sg_replay,
+
 #if PIM_IPV == 4
 	[ZEBRA_VXLAN_SG_ADD] = pim_zebra_vxlan_sg_proc,
 	[ZEBRA_VXLAN_SG_DEL] = pim_zebra_vxlan_sg_proc,
-	[ZEBRA_MVPN_SG_REPLAY] = pim_zebra_mvpn_sg_replay,
 
 	[ZEBRA_MLAG_PROCESS_UP] = pim_zebra_mlag_process_up,
 	[ZEBRA_MLAG_PROCESS_DOWN] = pim_zebra_mlag_process_down,

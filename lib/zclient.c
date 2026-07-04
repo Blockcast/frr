@@ -4201,8 +4201,6 @@ int zapi_mvpn_sg_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
 	stream_put_ipaddr(s, &sg->src);
 	stream_put_ipaddr(s, &sg->grp);
 	stream_putc(s, sg->role);
-	stream_putl(s, sg->source_as);
-	stream_put_in_addr(s, &sg->upstream_pe);
 
 	/* Put length at the first point of the stream. */
 	stream_putw_at(s, 0, stream_get_endp(s));
@@ -4217,15 +4215,12 @@ int zapi_mvpn_sg_decode(struct stream *s, struct zapi_mvpn_sg *sg)
 	STREAM_GET_IPADDR(s, &sg->src);
 	STREAM_GET_IPADDR(s, &sg->grp);
 	STREAM_GETC(s, sg->role);
-	STREAM_GETL(s, sg->source_as);
-	STREAM_GET(&sg->upstream_pe, s, IPV4_MAX_BYTELEN);
 
 	return 0;
 
 stream_failure:
 	return -1;
 }
-
 
 enum zclient_send_status zebra_send_mpls_labels(struct zclient *zclient,
 						int cmd, struct zapi_labels *zl)

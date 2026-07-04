@@ -4146,23 +4146,16 @@ static void zread_mvpn_sg(ZAPI_HANDLER_ARGS)
 	struct stream *s;
 
 	if (zapi_mvpn_sg_decode(msg, &sg) < 0) {
-		if (IS_ZEBRA_DEBUG_EVENT)
-			zlog_debug("MVPN_SG relay: decode failed");
+		zlog_warn("MVPN_SG relay: decode failed");
 		return;
 	}
 
-	if (!CHECK_FLAG(zvrf->flags, ZEBRA_BGP_WANTS_MVPN_SG)) {
-		if (IS_ZEBRA_DEBUG_EVENT)
-			zlog_debug("MVPN_SG relay: dropped, bgpd not subscribed");
+	if (!CHECK_FLAG(zvrf->flags, ZEBRA_BGP_WANTS_MVPN_SG))
 		return;
-	}
 
 	bgp_client = zserv_find_client(ZEBRA_ROUTE_BGP, 0);
-	if (!bgp_client) {
-		if (IS_ZEBRA_DEBUG_EVENT)
-			zlog_debug("MVPN_SG relay: no bgp client");
+	if (!bgp_client)
 		return;
-	}
 
 	if (IS_ZEBRA_DEBUG_EVENT)
 		zlog_debug("MVPN_SG relay: forwarding cmd %u to bgpd",
@@ -4182,14 +4175,30 @@ static void zread_mvpn_sg_replay(ZAPI_HANDLER_ARGS)
 	if (IS_ZEBRA_DEBUG_EVENT)
 		zlog_debug("MVPN_SG replay: bgpd subscribed; relaying replay to pimd");
 
-	pim_client = zserv_find_client(ZEBRA_ROUTE_PIM, 0);
-	if (!pim_client)
-		return;
+	/* pimd and pim6d both register as ZEBRA_ROUTE_PIM; each owns one AF's
+	 * announced GTM SG set, so the replay must reach every PIM client. */
+	frr_each (zserv_client_list, &zrouter.client_list, pim_client) {
+		if (pim_client->proto != ZEBRA_ROUTE_PIM)
+			continue;
 
-	s = stream_new(ZEBRA_SMALL_PACKET_SIZE);
-	zclient_create_header(s, ZEBRA_MVPN_SG_REPLAY, zvrf_id(zvrf));
-	stream_putw_at(s, 0, stream_get_endp(s));
-	zserv_send_message(pim_client, s);
+		s = stream_new(ZEBRA_SMALL_PACKET_SIZE);
+		zclient_create_header(s, ZEBRA_MVPN_SG_REPLAY, zvrf_id(zvrf));
+		stream_putw_at(s, 0, stream_get_endp(s));
+		zserv_send_message(pim_client, s);
+	}
+}
+
+/* The MVPN SG subscription dies with the BGP client; a restarted bgpd
+ * re-subscribes via ZEBRA_MVPN_SG_REPLAY (mirrors the VXLAN SG relay's
+ * flag lifecycle in zebra_evpn_pim_cfg_clean_up). */
+int zapi_mvpn_sg_client_close_cleanup(struct zserv *client)
+{
+	struct zebra_vrf *zvrf = zebra_vrf_lookup_by_id(VRF_DEFAULT);
+
+	if (client->proto == ZEBRA_ROUTE_BGP && zvrf)
+		UNSET_FLAG(zvrf->flags, ZEBRA_BGP_WANTS_MVPN_SG);
+
+	return 0;
 }
 
 void (*const zserv_handlers[])(ZAPI_HANDLER_ARGS) = {

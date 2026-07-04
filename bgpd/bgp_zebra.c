@@ -3343,8 +3343,6 @@ static void bgp_zebra_connected(struct zclient *zclient)
 	 * detect from pimd (re-)originates the matching Type-7 / Type-5. */
 	if (bgp_mvpn_gtm_active(bgp))
 		bgp_zebra_mvpn_sg_subscribe();
-	else if (BGP_DEBUG(zebra, ZEBRA))
-		zlog_debug("MVPN_SG: GTM not active at zebra connect; no subscription");
 }
 
 /* Subscribe to zebra's pimd MVPN SG relay and request a replay of pimd's
@@ -3477,8 +3475,7 @@ static int bgp_zebra_process_mvpn_sg(ZAPI_CALLBACK_ARGS)
 
 	switch (sg.role) {
 	case ZAPI_MVPN_SG_JOIN:
-		bgp_mvpn_source_tree_join_set(bgp, sg.source_as, &sg.src, &sg.grp,
-					      sg.upstream_pe, negate);
+		bgp_mvpn_source_tree_join_set(bgp, &sg.src, &sg.grp, negate);
 		break;
 	case ZAPI_MVPN_SG_SOURCE:
 		bgp_mvpn_source_active_set(bgp, &sg.src, &sg.grp, negate);

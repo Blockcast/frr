@@ -698,11 +698,6 @@ struct zapi_mvpn_sg {
 	struct ipaddr src;
 	struct ipaddr grp;
 	uint8_t role; /* enum zapi_mvpn_sg_role */
-	/* JOIN only: Source AS carried in the Type-7 NLRI (0 = unset). */
-	uint32_t source_as;
-	/* JOIN only: upstream PE for the UMH Route Target; INADDR_ANY = let
-	 * bgpd resolve it from the received SA route. */
-	struct in_addr upstream_pe;
 };
 
 struct zapi_pw {

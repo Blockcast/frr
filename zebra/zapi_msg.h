@@ -36,6 +36,9 @@ extern "C" {
 extern void zserv_handle_commands(struct zserv *client,
 				  struct stream_fifo *fifo);
 
+/* MVPN SG relay: drop bgpd's subscription when its client closes. */
+extern int zapi_mvpn_sg_client_close_cleanup(struct zserv *client);
+
 extern int zsend_vrf_add(struct zserv *zclient, struct zebra_vrf *zvrf);
 extern int zsend_vrf_delete(struct zserv *zclient, struct zebra_vrf *zvrf);
 extern int zsend_interface_add(struct zserv *zclient, struct interface *ifp);
