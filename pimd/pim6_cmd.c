@@ -610,6 +610,15 @@ DEFPY_YANG (no_pim6_keep_alive,
 {
 	return pim_process_no_keepalivetimer_cmd(vty);
 }
+
+DEFPY_YANG (pim6_mvpn_gtm,
+	    pim6_mvpn_gtm_cmd,
+	    "[no] mvpn-gtm",
+	    NO_STR
+	    "Global-Table Multicast (RFC 7716): originate BGP MCAST-VPN Type-7/Type-5 from local SSM join/source\n")
+{
+	return pim_process_mvpn_gtm_cmd(vty, !no);
+}
 DEFPY_ATTR(no_ipv6_pim_keep_alive,
            no_ipv6_pim_keep_alive_cmd,
            "no ipv6 pim keep-alive-timer [(1-65535)]",
@@ -3144,6 +3153,7 @@ void pim_cmd_init(void)
 	install_element(PIM6_NODE, &no_pim6_packets_cmd);
 	install_element(PIM6_NODE, &pim6_keep_alive_cmd);
 	install_element(PIM6_NODE, &no_pim6_keep_alive_cmd);
+	install_element(PIM6_NODE, &pim6_mvpn_gtm_cmd);
 	install_element(PIM6_NODE, &pim6_rp_keep_alive_cmd);
 	install_element(PIM6_NODE, &no_pim6_rp_keep_alive_cmd);
 	install_element(PIM6_NODE, &pim6_register_suppress_cmd);

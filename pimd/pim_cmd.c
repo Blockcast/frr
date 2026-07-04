@@ -5160,10 +5160,7 @@ DEFPY_YANG (pim_mvpn_gtm,
        NO_STR
        "Global-Table Multicast (RFC 7716): originate BGP MCAST-VPN Type-7/Type-5 from local SSM join/source\n")
 {
-	nb_cli_enqueue_change(vty, "./mvpn-gtm", NB_OP_MODIFY,
-			      no ? "false" : "true");
-
-	return nb_cli_apply_changes(vty, NULL);
+	return pim_process_mvpn_gtm_cmd(vty, !no);
 }
 DEFPY_ATTR(no_ip_pim_ecmp,
 			  no_ip_pim_ecmp_cmd,
