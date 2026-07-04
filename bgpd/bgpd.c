@@ -58,6 +58,7 @@
 #include "bgpd/rfapi/rfapi_backend.h"
 #endif
 #include "bgpd/bgp_evpn.h"
+#include "bgpd/bgp_mvpn.h"
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_vty.h"
@@ -362,6 +363,12 @@ static int bgp_router_id_set(struct bgp *bgp, const struct in_addr *id,
 		bgp_evpn_handle_router_id_update(bgp, false);
 
 	vpn_handle_router_id_update(bgp, false, is_config);
+
+	/* GTM MCAST-VPN: (re)originate this PE's Intra-AS I-PMSI (Type-1) route
+	 * now that the router-id (Originating Router's IP) is known/changed.
+	 * No-op unless the GTM MVPN AF is active (RFC 6514 Section 4.1).
+	 */
+	bgp_mvpn_originate_type1(bgp);
 
 	if (bgp && bgp->ls_info && bgp->ls_info->enable_distribution)
 		bgp_ls_export_bgp_topology(bgp);
@@ -2936,6 +2943,17 @@ int peer_activate(struct peer *peer, afi_t afi, safi_t safi)
 				   bgp->name_pretty, peer->host);
 	}
 
+	/*
+	 * GTM MCAST-VPN: activating the AF makes this PE a participant, so
+	 * auto-originate its Intra-AS I-PMSI A-D (Type-1) route carrying an
+	 * Ingress-Replication PMSI tunnel attribute (RFC 6514 Section 4.1 + 5).
+	 * Idempotent and self-guarding; a no-op if the router-id is not yet
+	 * known (config-read ordering), in which case bgp_router_id_set()'s
+	 * hook originates it once zebra reports the router-id.
+	 */
+	if ((afi == AFI_IP || afi == AFI_IP6) && safi == SAFI_MCAST_VPN)
+		bgp_mvpn_originate_type1(bgp);
+
 	return ret;
 }
 
@@ -5381,18 +5399,14 @@ enum bgp_peer_active peer_active(struct peer_connection *connection)
 		}
 	}
 
-	if (peer->afc[AFI_IP][SAFI_UNICAST] || peer->afc[AFI_IP][SAFI_MULTICAST]
-	    || peer->afc[AFI_IP][SAFI_LABELED_UNICAST]
-	    || peer->afc[AFI_IP][SAFI_MPLS_VPN] || peer->afc[AFI_IP][SAFI_ENCAP]
-	    || peer->afc[AFI_IP][SAFI_FLOWSPEC]
-	    || peer->afc[AFI_IP6][SAFI_UNICAST]
-	    || peer->afc[AFI_IP6][SAFI_MULTICAST]
-	    || peer->afc[AFI_IP6][SAFI_LABELED_UNICAST]
-	    || peer->afc[AFI_IP6][SAFI_MPLS_VPN]
-	    || peer->afc[AFI_IP6][SAFI_ENCAP]
-	    || peer->afc[AFI_IP6][SAFI_FLOWSPEC]
-	    || peer->afc[AFI_L2VPN][SAFI_EVPN]
-	    || peer->afc[AFI_BGP_LS][SAFI_BGP_LS])
+	if (peer->afc[AFI_IP][SAFI_UNICAST] || peer->afc[AFI_IP][SAFI_MULTICAST] ||
+	    peer->afc[AFI_IP][SAFI_LABELED_UNICAST] || peer->afc[AFI_IP][SAFI_MPLS_VPN] ||
+	    peer->afc[AFI_IP][SAFI_ENCAP] || peer->afc[AFI_IP][SAFI_FLOWSPEC] ||
+	    peer->afc[AFI_IP][SAFI_MCAST_VPN] || peer->afc[AFI_IP6][SAFI_UNICAST] ||
+	    peer->afc[AFI_IP6][SAFI_MULTICAST] || peer->afc[AFI_IP6][SAFI_LABELED_UNICAST] ||
+	    peer->afc[AFI_IP6][SAFI_MPLS_VPN] || peer->afc[AFI_IP6][SAFI_ENCAP] ||
+	    peer->afc[AFI_IP6][SAFI_FLOWSPEC] || peer->afc[AFI_IP6][SAFI_MCAST_VPN] ||
+	    peer->afc[AFI_L2VPN][SAFI_EVPN] || peer->afc[AFI_BGP_LS][SAFI_BGP_LS])
 		return BGP_PEER_ACTIVE;
 
 	return BGP_PEER_AF_UNCONFIGURED;
@@ -5401,20 +5415,16 @@ enum bgp_peer_active peer_active(struct peer_connection *connection)
 /* If peer is negotiated at least one address family return 1. */
 bool peer_active_nego(struct peer *peer)
 {
-	if (peer->afc_nego[AFI_IP][SAFI_UNICAST]
-	    || peer->afc_nego[AFI_IP][SAFI_MULTICAST]
-	    || peer->afc_nego[AFI_IP][SAFI_LABELED_UNICAST]
-	    || peer->afc_nego[AFI_IP][SAFI_MPLS_VPN]
-	    || peer->afc_nego[AFI_IP][SAFI_ENCAP]
-	    || peer->afc_nego[AFI_IP][SAFI_FLOWSPEC]
-	    || peer->afc_nego[AFI_IP6][SAFI_UNICAST]
-	    || peer->afc_nego[AFI_IP6][SAFI_MULTICAST]
-	    || peer->afc_nego[AFI_IP6][SAFI_LABELED_UNICAST]
-	    || peer->afc_nego[AFI_IP6][SAFI_MPLS_VPN]
-	    || peer->afc_nego[AFI_IP6][SAFI_ENCAP]
-	    || peer->afc_nego[AFI_IP6][SAFI_FLOWSPEC]
-	    || peer->afc_nego[AFI_L2VPN][SAFI_EVPN]
-	    || peer->afc_nego[AFI_BGP_LS][SAFI_BGP_LS])
+	if (peer->afc_nego[AFI_IP][SAFI_UNICAST] || peer->afc_nego[AFI_IP][SAFI_MULTICAST] ||
+	    peer->afc_nego[AFI_IP][SAFI_LABELED_UNICAST] ||
+	    peer->afc_nego[AFI_IP][SAFI_MPLS_VPN] || peer->afc_nego[AFI_IP][SAFI_ENCAP] ||
+	    peer->afc_nego[AFI_IP][SAFI_FLOWSPEC] || peer->afc_nego[AFI_IP][SAFI_MCAST_VPN] ||
+	    peer->afc_nego[AFI_IP6][SAFI_UNICAST] || peer->afc_nego[AFI_IP6][SAFI_MULTICAST] ||
+	    peer->afc_nego[AFI_IP6][SAFI_LABELED_UNICAST] ||
+	    peer->afc_nego[AFI_IP6][SAFI_MPLS_VPN] || peer->afc_nego[AFI_IP6][SAFI_ENCAP] ||
+	    peer->afc_nego[AFI_IP6][SAFI_FLOWSPEC] ||
+	    peer->afc_nego[AFI_IP6][SAFI_MCAST_VPN] || peer->afc_nego[AFI_L2VPN][SAFI_EVPN] ||
+	    peer->afc_nego[AFI_BGP_LS][SAFI_BGP_LS])
 		return true;
 	return false;
 }

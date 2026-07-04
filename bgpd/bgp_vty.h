@@ -36,8 +36,8 @@ FRR_CFG_DEFAULT_ULONG(BGP_CONNECT_RETRY,
 
 #define BGP_SAFI_WITH_LABEL_CMD_STR                                                                \
 	"<unicast|multicast|vpn|labeled-unicast|flowspec|unreachability>"
-#define BGP_SAFI_WITH_LABEL_HELP_STR                                                               \
-	BGP_AF_MODIFIER_STR BGP_AF_MODIFIER_STR BGP_AF_MODIFIER_STR BGP_AF_MODIFIER_STR            \
+#define BGP_SAFI_WITH_LABEL_HELP_STR                                                              \
+	BGP_AF_MODIFIER_STR BGP_AF_MODIFIER_STR BGP_AF_MODIFIER_STR BGP_AF_MODIFIER_STR           \
 		BGP_AF_MODIFIER_STR BGP_AF_MODIFIER_STR
 
 #define BGP_SELF_ORIG_CMD_STR       "self-originate"

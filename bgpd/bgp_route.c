@@ -15027,6 +15027,7 @@ const struct prefix_rd *bgp_rd_from_dest(const struct bgp_dest *dest,
 	case SAFI_LABELED_UNICAST:
 	case SAFI_FLOWSPEC:
 	case SAFI_UNREACH:
+	case SAFI_MCAST_VPN:
 	case SAFI_MAX:
 		return NULL;
 	}
