@@ -738,6 +738,48 @@ interface r2-eth1
     assert result is None, "r1 still holds the Type-7 after the IGMP leave"
 
 
+def test_type7_v6_withdraw_on_mld_leave():
+    """Removing the MLD join must withdraw the IPv6 Type-7 from r1.
+
+    The v6 mirror of test_type7_withdraw_on_igmp_leave: the MLD leave drives
+    tib_sg_gm_prune() -> pim_ifchannel_local_membership_del -> pim6d upstream
+    leaves JOINED -> ZEBRA_MVPN_SG DEL -> bgpd withdraws the Type-7.  Guards
+    the teardown ordering in tib_sg_gm_prune(): the local-membership delete
+    must run even when the kernel MFC update fails (a pim6d on a kernel
+    without CONFIG_IPV6_PIMSM_V2 has no mroute socket at all; an early return
+    on that failure was observed to strand the membership -- and the announced
+    Type-7 -- forever).  Runs LAST among the v6 tests: earlier ones rely on
+    the standing MLD join.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ no ipv6 mld join-group ff3e::1 2001:db8::1
+"""
+    )
+
+    def _type7_v6_absent(router):
+        routes = _mvpn_routes(router, v6=True)
+        for r in routes:
+            if (
+                r.get("routeType") == 7
+                and r.get("source") == "2001:db8::1"
+                and r.get("group") == "ff3e::1"
+            ):
+                return "IPv6 Type-7 (2001:db8::1, ff3e::1) still present after MLD leave"
+        return None
+
+    test_func = functools.partial(_type7_v6_absent, "r1")
+    _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
+    assert result is None, "r1 still holds the IPv6 Type-7 after the MLD leave"
+
+
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
     sys.exit(pytest.main(args))

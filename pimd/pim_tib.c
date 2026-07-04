@@ -238,11 +238,17 @@ void tib_sg_gm_prune(struct pim_instance *pim, pim_sgaddr sg,
 	result = pim_channel_del_oif(*oilp, oif, PIM_OIF_FLAG_PROTO_GM,
 				     __func__);
 	if (result) {
+		/* Only the kernel MFC update can fail here (e.g. the v6 mroute
+		 * socket never came up because the kernel lacks
+		 * CONFIG_IPV6_PIMSM_V2); the GM OIF flag is already cleared.
+		 * Do NOT abort: returning before local_membership_del below
+		 * strands the ifchannel INCLUDE state (and with it the
+		 * upstream) forever, long after the last listener left.
+		 */
 		if (PIM_DEBUG_GM_TRACE)
 			zlog_debug(
 				"%s: pim_channel_del_oif() failed with return=%d",
 				__func__, result);
-		return;
 	}
 
 	/* dm: check if we need to send a prune message */
