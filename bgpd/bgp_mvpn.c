@@ -728,16 +728,14 @@ static bool bgp_mvpn_resolve_upstream_pe(struct bgp *bgp, const struct ipaddr *s
 
 	/*
 	 * (2) Fallback: next hop of the received Source Active route. Best-
-	 * effort and v4 only -- the SA next hop identifies the PE only when
-	 * preserved end to end, and a v4-core upstream PE address is v4. A v6
-	 * (C-S,C-G) with no route-import community resolves no upstream, so the
-	 * join is originated RT-less (logged by the caller).
+	 * effort -- the SA next hop identifies the PE only when preserved end
+	 * to end. The upstream PE address is v4 in a v4 core for either C-S
+	 * family: the SA carries mp_nexthop_global_in = the originating PE's
+	 * router-id (see bgp_mvpn_source_active_set). This arm therefore serves
+	 * both planes -- look up the SA in the (C-S)-family MCAST-VPN RIB.
 	 */
-	if (IS_IPADDR_V6(src))
-		return false;
-
 	bgp_mvpn_build_prefix_type5(&sa, src, grp);
-	dest = bgp_safi_node_lookup(bgp->rib[AFI_IP][SAFI_MCAST_VPN], SAFI_MCAST_VPN,
+	dest = bgp_safi_node_lookup(bgp->rib[afi][SAFI_MCAST_VPN], SAFI_MCAST_VPN,
 				    (const struct prefix *)&sa, NULL);
 	if (!dest)
 		return false;
