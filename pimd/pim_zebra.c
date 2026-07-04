@@ -352,8 +352,12 @@ static void pim_zebra_vxlan_replay(void)
 	struct stream *s = NULL;
 
 	/* Check socket. */
-	if (!pim_zclient || pim_zclient->sock < 0)
+	if (!pim_zclient || pim_zclient->sock < 0) {
+		if (PIM_DEBUG_ZEBRA)
+			zlog_debug("MVPN_SG %pSG: zclient not connected, dropping",
+				   &up->sg);
 		return;
+	}
 
 	s = pim_zclient->obuf;
 	stream_reset(s);
@@ -468,6 +472,10 @@ static void pim_zebra_mvpn_sg_send(struct pim_upstream *up, uint8_t role, bool a
 	sg.source_as = 0;
 	sg.upstream_pe.s_addr = INADDR_ANY;
 
+	if (PIM_DEBUG_ZEBRA)
+		zlog_debug("MVPN_SG %s %pSG role=%u to zebra",
+			   add ? "ADD" : "DEL", &up->sg, role);
+
 	s = pim_zclient->obuf;
 	zapi_mvpn_sg_encode(s, add ? ZEBRA_MVPN_SG_ADD : ZEBRA_MVPN_SG_DEL,
 			    VRF_DEFAULT, &sg);
@@ -503,6 +511,11 @@ void pim_gtm_upstream_update(struct pim_instance *pim, struct pim_upstream *up,
 	desired = !deleting &&
 		  (role == ZAPI_MVPN_SG_SOURCE ||
 		   up->join_state == PIM_UPSTREAM_JOINED);
+
+	if (PIM_DEBUG_ZEBRA)
+		zlog_debug("GTM reconcile %pSG: role=%u desired=%d announced=%d join_state=%d flags=0x%x",
+			   &up->sg, role, desired, up->gtm_announced,
+			   up->join_state, up->flags);
 
 	if (desired && !up->gtm_announced) {
 		pim_zebra_mvpn_sg_send(up, role, true);

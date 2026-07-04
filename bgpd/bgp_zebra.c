@@ -3446,6 +3446,10 @@ static int bgp_zebra_process_mvpn_sg(ZAPI_CALLBACK_ARGS)
 	struct zapi_mvpn_sg sg;
 	bool negate = (cmd == ZEBRA_MVPN_SG_DEL);
 
+	if (BGP_DEBUG(zebra, ZEBRA))
+		zlog_debug("rx MVPN_SG %s from zebra",
+			   cmd == ZEBRA_MVPN_SG_DEL ? "DEL" : "ADD");
+
 	bgp = bgp_lookup_by_vrf_id(vrf_id);
 	if (!bgp)
 		return 0;
