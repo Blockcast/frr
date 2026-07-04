@@ -12,21 +12,27 @@
 """
 test_bgp_mvpn_gtm.py:
 
-Verify that the BGP MCAST-VPN address family (AFI 1, SAFI 5 / IANA SAFI 5,
-RFC 6514) registers and negotiates the multiprotocol capability between two
-iBGP speakers.
+Verify the BGP MCAST-VPN address family (AFI 1/2, SAFI 5 / IANA SAFI 5,
+RFC 6514) in its Global-Table Multicast form (RFC 7716), including the
+pimd<->bgpd glue: a real IGMPv3 (S,G) join originates a C-multicast Source
+Tree Join (Type 7), and a real directly-connected multicast sender
+originates a Source Active A-D (Type 5).
 
 Topology:
 
-    +----+   10.0.0.0/24   +----+
-    | r1 |-----------------| r2 |
-    +----+                 +----+
+    h1 --- s2 --- r1 --- s1 --- r2 --- s3 (receiver stub)
+  (source)      (FHR PE)      (receiver PE)
 
-Both routers run `router bgp 65001`, peer over the shared subnet, and enable
-`address-family ipv4 mvpn` with `neighbor <peer> activate`. The test asserts
-the MVPN AF is advertised and received in the multiprotocol capability, and
-that a locally-originated Route Type 5 (Source Active A-D, RFC 6514 / GTM
-RFC 7716) route on r1 propagates to r2.
+Both routers run `router bgp 65001` (iBGP over s1) with the MVPN AF, and
+pimd with `router pim` / `mvpn-gtm`.  There is deliberately NO PIM
+adjacency between r1 and r2 -- the BGP MCAST-VPN AF is the inter-PE
+multicast control plane (r2-eth0 runs pim for RPF machinery, r1-eth0 does
+not, so no neighbor can form).
+
+h1 is a multicast sender on r1's PIM-passive segment (drives FHR source
+detection -> Type-5).  r2's stub interface takes runtime
+`ip igmp join-group <G> <S>` static joins (drives local SSM membership ->
+Type-7).
 """
 
 import os
@@ -43,15 +49,36 @@ from lib import topotest
 from lib.topogen import Topogen, TopoRouter, get_topogen
 from lib.topolog import logger
 
-pytestmark = [pytest.mark.bgpd]
+pytestmark = [pytest.mark.bgpd, pytest.mark.pimd]
+
+# The (S, G) driven end-to-end by real pimd state: h1 sends to GROUP,
+# r2 IGMP-joins (SOURCE, GROUP).
+SOURCE = "10.10.10.10"
+GROUP = "232.1.1.10"
+
+# Module-scoped sender process (h1 -> GROUP), started by the Type-5 test,
+# left running so the SA route stays up for the Type-7 tests, reaped in
+# teardown_module.
+SENDER = None
 
 
 def build_topo(tgen):
     for routern in range(1, 3):
         tgen.add_router("r{}".format(routern))
 
+    # s1: inter-PE (BGP-only, no PIM adjacency)
     switch = tgen.add_switch("s1")
     switch.add_link(tgen.gears["r1"])
+    switch.add_link(tgen.gears["r2"])
+
+    # s2: r1's source segment with host h1
+    tgen.add_host("h1", "10.10.10.10/24", "via 10.10.10.1")
+    switch = tgen.add_switch("s2")
+    switch.add_link(tgen.gears["r1"])
+    switch.add_link(tgen.gears["h1"])
+
+    # s3: r2's receiver stub (static IGMP joins are placed here)
+    switch = tgen.add_switch("s3")
     switch.add_link(tgen.gears["r2"])
 
 
@@ -66,6 +93,9 @@ def setup_module(mod):
             TopoRouter.RD_ZEBRA, os.path.join(CWD, "{}/zebra.conf".format(rname))
         )
         router.load_config(
+            TopoRouter.RD_PIM, os.path.join(CWD, "{}/pimd.conf".format(rname))
+        )
+        router.load_config(
             TopoRouter.RD_BGP, os.path.join(CWD, "{}/bgpd.conf".format(rname))
         )
 
@@ -73,8 +103,18 @@ def setup_module(mod):
 
 
 def teardown_module(mod):
+    global SENDER
+    if SENDER is not None:
+        SENDER.terminate()
+        SENDER = None
     tgen = get_topogen()
     tgen.stop_topology()
+
+
+def _mvpn_routes(router, v6=False):
+    tgen = get_topogen()
+    cmd = "show bgp ipv6 mvpn json" if v6 else "show bgp ipv4 mvpn json"
+    return json.loads(tgen.gears[router].vtysh_cmd(cmd)).get("routes", [])
 
 
 def test_bgp_mvpn_converge():
@@ -131,7 +171,7 @@ def test_mvpn_af_negotiated():
 
 
 def test_type5_source_active_propagates():
-    """A local GTM Source Active (Type 5) route on r1 must reach r2 via BGP.
+    """A static GTM Source Active (Type 5) route on r1 must reach r2 via BGP.
 
     r1 is configured with `bgp mvpn source-active 10.10.10.1 group 232.1.1.1`
     under `address-family ipv4 mvpn`. r2 must learn it and expose it via
@@ -151,8 +191,7 @@ def test_type5_source_active_propagates():
         pytest.skip(tgen.errors)
 
     def _type5_present(router):
-        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv4 mvpn json"))
-        routes = out.get("routes", [])
+        routes = _mvpn_routes(router)
         for r in routes:
             if (
                 r.get("routeType") == 5
@@ -170,23 +209,69 @@ def test_type5_source_active_propagates():
     assert result is None, "r2 did not learn r1's MVPN Type-5 Source Active route"
 
 
-def test_type7_source_tree_join_propagates():
-    """A local GTM Source Tree Join (Type 7) route on r2 must reach r1 via BGP.
+def test_type5_from_pimd_source_detect():
+    """A real multicast sender behind r1 must originate a Type-5 via pimd.
 
-    r2 injects a C-multicast Source Tree Join (Type 7, RFC 6514 Section 4.6) via
-    the TEST-ONLY `bgp mvpn test-join <S> group <G> source-as <asn>` scaffold
-    (Plan 3 replaces this with pimd-driven origination). r1 must learn it and
-    expose it via `show bgp ipv4 mvpn json` with routeType 7, the matching
-    (S,G), and the carried Source AS.
+    h1 (10.10.10.10, directly connected to r1's PIM-passive interface) sends
+    UDP to 232.1.1.10.  r1's pimd detects the directly-connected source (FHR,
+    kernel NOCACHE upcall -> upstream with SRC_STREAM, keep-alive running) and,
+    with `mvpn-gtm` enabled, signals bgpd over ZEBRA_MVPN_SG; bgpd originates
+    the Source Active A-D.  r2 must learn Type-5 (10.10.10.10, 232.1.1.10)
+    with the GTM global-table RT.
 
-    The Type-7 must also carry the RFC 7716 Section 2.2 / 2.9 upstream-node RT
-    (Global Administrator = the upstream PE, Local Administrator = 0). r2
-    auto-resolves the upstream from r1's Source Active route (next hop 10.0.0.1),
-    so r1 sees extendedCommunity "RT:10.0.0.1:0" -- the RT that identifies r1 as
-    the upstream PBR that must import the join.
+    This is the pimd->bgpd glue SOURCE leg -- no static `source-active`
+    involved.
+    """
+    global SENDER
+    tgen = get_topogen()
 
-    AUTHORED-NOT-RUN: this repo has no network namespaces, so the topotest is
-    authored and py_compile-checked but not executed here.
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    mcast_tester = os.path.join(CWD, "../lib/mcast-tester.py")
+    SENDER = tgen.gears["h1"].popen(
+        [mcast_tester, GROUP, "h1-eth0", "--send", "0.7"]
+    )
+    logger.info("started sender on h1: %s -> %s", SOURCE, GROUP)
+
+    def _type5_pimd(router):
+        routes = _mvpn_routes(router)
+        for r in routes:
+            if (
+                r.get("routeType") == 5
+                and r.get("source") == SOURCE
+                and r.get("group") == GROUP
+                and r.get("extendedCommunity", {}).get("string") == "RT:0.0.0.0:0"
+            ):
+                return None
+        return "pimd-driven Type-5 ({}, {}) not found in {}".format(
+            SOURCE, GROUP, routes
+        )
+
+    test_func = functools.partial(_type5_pimd, "r2")
+    _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
+    assert result is None, "r2 did not learn the pimd-originated Type-5 for the live source"
+
+
+def test_type7_from_igmp_join():
+    """A real IGMPv3 (S,G) join on r2 must originate a Type-7 via pimd.
+
+    r2 takes `ip igmp join-group 232.1.1.10 10.10.10.10` on its receiver stub
+    interface.  pimd builds local SSM membership -> (S,G) upstream in JOINED,
+    and with `mvpn-gtm` enabled signals bgpd over ZEBRA_MVPN_SG; bgpd
+    originates the C-multicast Source Tree Join.  r1 must learn Type-7
+    (10.10.10.10, 232.1.1.10) with:
+
+    - sourceAs 65001: no Source-AS extended community exists on the source
+      route (single-AS iBGP), so bgpd falls back to the local AS per
+      RFC 6514 Section 4.6.
+    - RT:10.0.0.1:0: the upstream PE resolved from the Source Active route's
+      next hop (r1's router-id; the covering unicast route 10.10.10.0/24
+      carries no route-import EC, driving the SA-next-hop fallback arm).
+
+    There is NO PIM adjacency between r1 and r2 -- the join crosses the
+    fabric purely as BGP.  This is the pimd->bgpd glue JOIN leg, replacing
+    the removed `bgp mvpn test-join` scaffold.
     """
     tgen = get_topogen()
 
@@ -196,31 +281,29 @@ def test_type7_source_tree_join_propagates():
     tgen.gears["r2"].vtysh_cmd(
         """
 configure terminal
-router bgp 65001
- address-family ipv4 mvpn
-  bgp mvpn test-join 10.10.10.1 group 232.1.1.1 source-as 65001
-"""
+interface r2-eth1
+ ip igmp join-group {} {}
+""".format(GROUP, SOURCE)
     )
 
     def _type7_present(router):
-        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv4 mvpn json"))
-        routes = out.get("routes", [])
+        routes = _mvpn_routes(router)
         for r in routes:
             if (
                 r.get("routeType") == 7
-                and r.get("source") == "10.10.10.1"
-                and r.get("group") == "232.1.1.1"
+                and r.get("source") == SOURCE
+                and r.get("group") == GROUP
                 and r.get("sourceAs") == 65001
                 and r.get("extendedCommunity", {}).get("string") == "RT:10.0.0.1:0"
             ):
                 return None
-        return "Type-7 (10.10.10.1, 232.1.1.1, AS 65001) with RT:10.0.0.1:0 not found in {}".format(
-            routes
+        return "Type-7 ({}, {}, AS 65001) with RT:10.0.0.1:0 not found in {}".format(
+            SOURCE, GROUP, routes
         )
 
     test_func = functools.partial(_type7_present, "r1")
-    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
-    assert result is None, "r1 did not learn r2's MVPN Type-7 Source Tree Join route"
+    _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
+    assert result is None, "r1 did not learn the pimd-originated Type-7 for the IGMP join"
 
 
 def test_type7_umh_from_route_import():
@@ -236,15 +319,11 @@ def test_type7_umh_from_route_import():
     Verified against Junos MX204 22.2R3, whose cmcast import keys on the lo0 PE
     address.
 
-    r2 originates 10.99.99.1/32 with route-import RT 10.255.0.2:0 and a Source
-    Active for (10.99.99.1, 232.9.9.9) whose next hop is r2's router-id 10.0.0.2,
-    then test-joins it. The Type-7 must carry RT:10.255.0.2:0 (the route-import
-    Global Administrator), NOT RT:10.0.0.2:0 (the SA next hop).
-
-    AUTHORED-NOT-RUN: this repo has no network namespaces, so the topotest is
-    authored and py_compile-checked but not executed here. The resolver path was
-    exercised live on a single dev-build bgpd: with the source route carrying
-    RT:10.255.0.2:0, the locally-originated Type-7 carried RT:10.255.0.2:0.
+    r1 originates 10.99.99.1/32 with route-import RT 10.255.0.2:0 (route-map at
+    config time) plus a static Source Active for (10.99.99.1, 232.9.9.9).  r2
+    IGMP-joins that (S,G) on its stub; the pimd-driven Type-7 on r2 must carry
+    RT:10.255.0.2:0 (the route-import Global Administrator), NOT RT:10.0.0.1:0
+    (the SA next hop).
     """
     tgen = get_topogen()
 
@@ -254,23 +333,13 @@ def test_type7_umh_from_route_import():
     tgen.gears["r2"].vtysh_cmd(
         """
 configure terminal
-route-map set-rtimport permit 10
- set extcommunity rt 10.255.0.2:0
-exit
-router bgp 65001
- no bgp network import-check
- address-family ipv4 unicast
-  network 10.99.99.1/32 route-map set-rtimport
- exit-address-family
- address-family ipv4 mvpn
-  bgp mvpn source-active 10.99.99.1 group 232.9.9.9
-  bgp mvpn test-join 10.99.99.1 group 232.9.9.9 source-as 65001
+interface r2-eth1
+ ip igmp join-group 232.9.9.9 10.99.99.1
 """
     )
 
     def _type7_rtimport(router):
-        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv4 mvpn json"))
-        routes = out.get("routes", [])
+        routes = _mvpn_routes(router)
         for r in routes:
             if (
                 r.get("routeType") == 7
@@ -286,7 +355,7 @@ router bgp 65001
         return "Type-7 (10.99.99.1, 232.9.9.9) not found in {}".format(routes)
 
     test_func = functools.partial(_type7_rtimport, "r2")
-    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
     assert result is None, "Type-7 upstream RT was not resolved from the source route's route-import RT"
 
 
@@ -303,16 +372,9 @@ def test_type7_umh_from_vrf_route_import_ec():
     prefers 0x0b over a plain Route Target (0x02); this test drives the 0x0b
     branch, complementing test_type7_umh_from_route_import which drives 0x02.
 
-    r2 originates 10.99.99.2/32 carrying vrf-route-import 10.255.0.3:0 and a Source
-    Active for (10.99.99.2, 232.9.9.10), then test-joins it. The Type-7 must carry
-    RT:10.255.0.3:0 (the route-import Global Administrator), NOT RT:10.0.0.2:0 (the
-    SA next hop).
-
-    AUTHORED-NOT-RUN: this repo has no network namespaces, so the topotest is
-    authored and py_compile-checked but not executed here. The clause and resolver
-    branch were exercised live on a single dev-build bgpd: the source route tagged
-    with vrf-route-import 10.255.0.3:0 round-tripped through running-config, and
-    the locally-originated Type-7 carried RT:10.255.0.3:0.
+    r1 originates 10.99.99.2/32 carrying vrf-route-import 10.255.0.3:0 plus a
+    static Source Active for (10.99.99.2, 232.9.9.10).  r2 IGMP-joins that
+    (S,G); the pimd-driven Type-7 on r2 must carry RT:10.255.0.3:0.
     """
     tgen = get_topogen()
 
@@ -322,23 +384,13 @@ def test_type7_umh_from_vrf_route_import_ec():
     tgen.gears["r2"].vtysh_cmd(
         """
 configure terminal
-route-map set-vri permit 10
- set extcommunity vrf-route-import 10.255.0.3:0
-exit
-router bgp 65001
- no bgp network import-check
- address-family ipv4 unicast
-  network 10.99.99.2/32 route-map set-vri
- exit-address-family
- address-family ipv4 mvpn
-  bgp mvpn source-active 10.99.99.2 group 232.9.9.10
-  bgp mvpn test-join 10.99.99.2 group 232.9.9.10 source-as 65001
+interface r2-eth1
+ ip igmp join-group 232.9.9.10 10.99.99.2
 """
     )
 
     def _type7_vri(router):
-        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv4 mvpn json"))
-        routes = out.get("routes", [])
+        routes = _mvpn_routes(router)
         for r in routes:
             if (
                 r.get("routeType") == 7
@@ -354,7 +406,7 @@ router bgp 65001
         return "Type-7 (10.99.99.2, 232.9.9.10) not found in {}".format(routes)
 
     test_func = functools.partial(_type7_vri, "r2")
-    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
     assert result is None, "Type-7 upstream RT was not resolved from the VRF Route Import (0x0b) EC"
 
 
@@ -367,11 +419,6 @@ def test_type5_v6_source_active_propagates():
     the GTM global-table Route Target RT:0.0.0.0:0 -- exercising the AFI_IP6
     MCAST-VPN AF (capability negotiated over the shared session, the v6 NLRI
     codec, and the v6 RIB).
-
-    AUTHORED-NOT-RUN: this repo has no network namespaces; authored and
-    py_compile-checked. Verified live on a dev-build bgpd: the v6 source-active
-    installs into the AFI_IP6 MCAST-VPN RIB and renders source 2001:db8::1 group
-    ff3e::1 under `show bgp ipv6 mvpn`.
     """
     tgen = get_topogen()
 
@@ -379,8 +426,7 @@ def test_type5_v6_source_active_propagates():
         pytest.skip(tgen.errors)
 
     def _type5_v6_present(router):
-        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv6 mvpn json"))
-        routes = out.get("routes", [])
+        routes = _mvpn_routes(router, v6=True)
         for r in routes:
             if (
                 r.get("routeType") == 5
@@ -417,9 +463,6 @@ def test_type1_v6_plane_with_v4_originator():
       the second per-plane install interned a PMSI-flagged attr with no
       tunnel info, announced as a malformed len-5 NO_INFO PMSI (Junos
       NOTIFICATION loop; this test would see pmsiTunnel absent/noInfo).
-
-    AUTHORED-NOT-RUN: this repo has no network namespaces; authored and
-    py_compile-checked.
     """
     tgen = get_topogen()
 
@@ -427,8 +470,7 @@ def test_type1_v6_plane_with_v4_originator():
         pytest.skip(tgen.errors)
 
     def _type1_v6_present(router):
-        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv6 mvpn json"))
-        routes = out.get("routes", [])
+        routes = _mvpn_routes(router, v6=True)
         for r in routes:
             if r.get("routeType") != 1:
                 continue
@@ -448,64 +490,17 @@ def test_type1_v6_plane_with_v4_originator():
 
 
 def test_type7_v6_umh_from_vrf_route_import():
-    """IPv6 Type-7 upstream RT resolves from the v6 source route's VRF Route
-    Import EC (RFC 6514 Section 5.1 / RFC 6515), exercising the AFI_IP6 unicast
-    RIB lookup in the resolver.
+    """IPv6 Type-7 origination requires MLD-driven pim6d glue.
 
-    r2 originates 2001:db8:99::1/128 tagged with vrf-route-import 10.255.0.3:0
-    (the upstream PE is a v4-core identity even for a v6 C-S) and a v6 Source
-    Active for (2001:db8:99::1, ff3e::9), then test-joins it. The Type-7 must
-    carry RT:10.255.0.3:0 (the route-import Global Administrator).
-
-    AUTHORED-NOT-RUN: authored and py_compile-checked. The v6 resolver arm and
-    origination were exercised on a dev-build bgpd (v6 routes install into the
-    AFI_IP6 RIB and the join resolves the v4-core upstream from the v6 source
-    route's route-import EC).
+    The bgpd-side v6 Type-7 codec and UMH resolver arms are implemented and
+    were exercised live on a dev-build (see git history), but organic v6
+    origination needs the pim6d `mvpn-gtm` CLI + MLD join plumbing that lands
+    with the Plan-5 v6 mirror.  The `bgp mvpn test-join` scaffold that
+    previously drove this scenario was removed with the pimd glue.
     """
-    tgen = get_topogen()
-
-    if tgen.routers_have_failure():
-        pytest.skip(tgen.errors)
-
-    tgen.gears["r2"].vtysh_cmd(
-        """
-configure terminal
-route-map set-vri6 permit 10
- set extcommunity vrf-route-import 10.255.0.3:0
-exit
-router bgp 65001
- no bgp network import-check
- address-family ipv6 unicast
-  network 2001:db8:99::1/128 route-map set-vri6
- exit-address-family
- address-family ipv6 mvpn
-  bgp mvpn source-active 2001:db8:99::1 group ff3e::9
-  bgp mvpn test-join 2001:db8:99::1 group ff3e::9 source-as 65001
-"""
+    pytest.skip(
+        "v6 Type-7 origination is pim6d-driven; lands with the Plan-5 v6 mirror"
     )
-
-    def _type7_v6_vri(router):
-        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv6 mvpn json"))
-        routes = out.get("routes", [])
-        for r in routes:
-            if (
-                r.get("routeType") == 7
-                and r.get("source") == "2001:db8:99::1"
-                and r.get("group") == "ff3e::9"
-            ):
-                rt = r.get("extendedCommunity", {}).get("string")
-                if rt == "RT:10.255.0.3:0":
-                    return None
-                return "IPv6 Type-7 (2001:db8:99::1, ff3e::9) carries {} (want RT:10.255.0.3:0)".format(
-                    rt
-                )
-        return "IPv6 Type-7 (2001:db8:99::1, ff3e::9) not found in {}".format(routes)
-
-    test_func = functools.partial(_type7_v6_vri, "r2")
-    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
-    assert (
-        result is None
-    ), "IPv6 Type-7 upstream RT was not resolved from the v6 route's VRF Route Import EC"
 
 
 def test_type1_ipmsi_with_ir_pmsi():
@@ -514,14 +509,11 @@ def test_type1_ipmsi_with_ir_pmsi():
     RFC 6514 Section 4.1 Route Type 1 (Intra-AS I-PMSI A-D) is originated by
     each PE when the MCAST-VPN AF is enabled. r1's Type-1 carries a PMSI Tunnel
     attribute (RFC 6514 Section 5) with Tunnel Type = Ingress Replication (6)
-    and r1's own unicast address (10.0.0.1, the auto-derived router-id) as the
+    and r1's own unicast address (10.0.0.1, the pinned router-id) as the
     tunnel endpoint. It also carries the GTM global-table Route Target
     "RT:0.0.0.0:0" (the fixed import/export target for non-C-multicast GTM
     routes). r2 must learn it via `show bgp ipv4 mvpn json` with routeType 1, the
     matching pmsiTunnel object, and that extendedCommunity.
-
-    AUTHORED-NOT-RUN: this repo has no network namespaces, so the topotest is
-    authored and py_compile-checked but not executed here.
     """
     tgen = get_topogen()
 
@@ -529,8 +521,7 @@ def test_type1_ipmsi_with_ir_pmsi():
         pytest.skip(tgen.errors)
 
     def _type1_present(router):
-        out = json.loads(tgen.gears[router].vtysh_cmd("show bgp ipv4 mvpn json"))
-        routes = out.get("routes", [])
+        routes = _mvpn_routes(router)
         for r in routes:
             if r.get("routeType") != 1:
                 continue
@@ -554,25 +545,23 @@ def test_type1_ipmsi_with_ir_pmsi():
     assert result is None, "r2 did not learn r1's MVPN Type-1 Intra-AS I-PMSI route"
 
 
-def test_plan1_full_mvpn_exchange():
-    """Plan-1 end-to-end: SAFI-5 session + Type-1/5/7 exchange in one scenario.
+def test_full_mvpn_exchange():
+    """End-to-end: SAFI-5 session + Type-1/5/7 exchange in one scenario.
 
-    Combined assertion over the whole Plan-1 deliverable: with the iBGP
-    session Established and the MVPN AF negotiated, BOTH peers' MVPN tables
+    Combined assertion over the whole deliverable: with the iBGP session
+    Established and the MVPN AF negotiated, BOTH peers' MVPN tables
     (`show bgp ipv4 mvpn json`) must simultaneously contain the full expected
     route mix:
 
     - r2 sees r1's Type-1 Intra-AS I-PMSI A-D with an Ingress Replication
-      PMSI tunnel and endpoint 10.0.0.1, AND r1's Type-5 Source Active for
-      (10.10.10.1, 232.1.1.1).
-    - r1 sees r2's Type-1 with endpoint 10.0.0.2, AND (after the test-only
-      Type-7 inject on r2) r2's Type-7 Source Tree Join for
-      (10.10.10.1, 232.1.1.1) carrying Source AS 65001.
+      PMSI tunnel and endpoint 10.0.0.1, AND the pimd-originated Type-5
+      Source Active for the live sender (10.10.10.10, 232.1.1.10).
+    - r1 sees r2's Type-1 with endpoint 10.0.0.2, AND the pimd-originated
+      Type-7 Source Tree Join for (10.10.10.10, 232.1.1.10) carrying
+      Source AS 65001 -- driven by the standing IGMP join, no test
+      scaffolding.
 
     All of this is RIB-level control plane; forwarding is a later milestone.
-
-    AUTHORED-NOT-RUN: this repo has no network namespaces, so the topotest is
-    authored and py_compile-checked but not executed here.
     """
     tgen = get_topogen()
 
@@ -594,17 +583,6 @@ def test_plan1_full_mvpn_exchange():
         assert result is None, "{}: session with {} not Established".format(
             router, peer
         )
-
-    # Re-assert the test-only Type-7 inject on r2. Idempotent, so this keeps
-    # the combined test self-contained regardless of per-type test ordering.
-    tgen.gears["r2"].vtysh_cmd(
-        """
-configure terminal
-router bgp 65001
- address-family ipv4 mvpn
-  bgp mvpn test-join 10.10.10.1 group 232.1.1.1 source-as 65001
-"""
-    )
 
     def _has_type1(routes, endpoint):
         for r in routes:
@@ -644,23 +622,23 @@ router bgp 65001
         return False
 
     def _full_exchange():
-        r1_routes = json.loads(
-            tgen.gears["r1"].vtysh_cmd("show bgp ipv4 mvpn json")
-        ).get("routes", [])
-        r2_routes = json.loads(
-            tgen.gears["r2"].vtysh_cmd("show bgp ipv4 mvpn json")
-        ).get("routes", [])
+        r1_routes = _mvpn_routes("r1")
+        r2_routes = _mvpn_routes("r2")
 
         missing = []
         if not _has_type1(r2_routes, "10.0.0.1"):
             missing.append("r2 lacks r1's Type-1 (IR endpoint 10.0.0.1)")
-        if not _has_type5(r2_routes, "10.10.10.1", "232.1.1.1"):
-            missing.append("r2 lacks r1's Type-5 (10.10.10.1, 232.1.1.1)")
+        if not _has_type5(r2_routes, SOURCE, GROUP):
+            missing.append(
+                "r2 lacks r1's pimd Type-5 ({}, {})".format(SOURCE, GROUP)
+            )
         if not _has_type1(r1_routes, "10.0.0.2"):
             missing.append("r1 lacks r2's Type-1 (IR endpoint 10.0.0.2)")
-        if not _has_type7(r1_routes, "10.10.10.1", "232.1.1.1", 65001):
+        if not _has_type7(r1_routes, SOURCE, GROUP, 65001):
             missing.append(
-                "r1 lacks r2's Type-7 (10.10.10.1, 232.1.1.1, AS 65001)"
+                "r1 lacks r2's pimd Type-7 ({}, {}, AS 65001)".format(
+                    SOURCE, GROUP
+                )
             )
 
         if missing:
@@ -670,9 +648,49 @@ router bgp 65001
         return None
 
     _, result = topotest.run_and_expect(_full_exchange, None, count=60, wait=1)
-    assert result is None, "Plan-1 full MVPN exchange incomplete: {}".format(
-        result
+    assert result is None, "full MVPN exchange incomplete: {}".format(result)
+
+
+def test_type7_withdraw_on_igmp_leave():
+    """Removing the IGMP join must withdraw the Type-7 from r1.
+
+    `no ip igmp join-group 232.1.1.10 10.10.10.10` on r2's stub tears down the
+    local membership -> pimd upstream leaves JOINED -> the glue sends
+    ZEBRA_MVPN_SG DEL -> bgpd withdraws the Type-7 -> it disappears from r1's
+    MVPN table.  Runs LAST: every earlier test relies on the standing join.
+
+    (The Type-5 side has no fast withdraw assert: FHR source expiry is the
+    PIM keep-alive timeout, 210s by default -- out of topotest budget.)
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ no ip igmp join-group {} {}
+""".format(GROUP, SOURCE)
     )
+
+    def _type7_absent(router):
+        routes = _mvpn_routes(router)
+        for r in routes:
+            if (
+                r.get("routeType") == 7
+                and r.get("source") == SOURCE
+                and r.get("group") == GROUP
+            ):
+                return "Type-7 ({}, {}) still present after IGMP leave".format(
+                    SOURCE, GROUP
+                )
+        return None
+
+    test_func = functools.partial(_type7_absent, "r1")
+    _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
+    assert result is None, "r1 still holds the Type-7 after the IGMP leave"
 
 
 if __name__ == "__main__":
