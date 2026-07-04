@@ -1135,6 +1135,14 @@ void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_
 
 						json_object_string_add(jp, "type",
 								       "ingressReplication");
+						/* RFC 6514 Section 5 IR label; the
+						 * origination stores ipmsi-label
+						 * << 4 (label in the high-order 20
+						 * bits), 0 for the unlabeled GTM
+						 * default. */
+						json_object_int_add(
+							jp, "label",
+							label2vni(&pi->attr->label) >> 4);
 						if (IS_MAPPED_IPV6(tid)) {
 							struct in_addr ep;
 
