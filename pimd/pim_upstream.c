@@ -1746,10 +1746,6 @@ static void pim_upstream_fhr_kat_start(struct pim_upstream *up)
 		if (!PIM_UPSTREAM_DM_TEST_INTERFACE(up->flags))
 			pim_upstream_update_use_rpt(up, true /*update_mroute*/);
 	}
-
-	/* GTM glue: a local source stream is now active on this FHR (S,G) --
-	 * reconcile the Source Active (Type 5) announcement. */
-	pim_gtm_upstream_update(up->pim, up, false);
 }
 
 /*
@@ -1797,6 +1793,9 @@ struct pim_upstream *pim_upstream_keep_alive_timer_proc(
 				"kat expired on %s[%s]; remove stream reference",
 				up->sg_str, pim->vrf->name);
 		PIM_UPSTREAM_FLAG_UNSET_SRC_STREAM(up->flags);
+		/* GTM glue: the local source stream is gone; withdraw the
+		 * Source Active before the reference is released. */
+		pim_gtm_upstream_update(pim, up, false);
 
 		/* Return if upstream entry got deleted.*/
 		if (!pim_upstream_del(pim, up, __func__))
@@ -1857,6 +1856,10 @@ void pim_upstream_keep_alive_timer_start(struct pim_upstream *up, uint32_t time)
 	 * re-evaluate our active source database */
 	pim_msdp_sa_local_update(up);
 #endif /* PIM_IPV == 4 */
+	/* GTM glue: same rule as the MSDP SA analog above -- a running KAT
+	 * on a first-hop (S,G) means an active local source; reconcile the
+	 * BGP Source Active (Type 5) announcement. */
+	pim_gtm_upstream_update(up->pim, up, false);
 	/* JoinDesired can change when KAT is started or stopped */
 	pim_upstream_update_join_desired(up->pim, up);
 }

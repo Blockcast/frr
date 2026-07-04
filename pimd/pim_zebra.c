@@ -485,11 +485,17 @@ void pim_gtm_upstream_update(struct pim_instance *pim, struct pim_upstream *up,
 	if (!pim_is_grp_ssm(pim, up->sg.grp))
 		return;
 
-	/* A local first-hop source (FHR flag + active source stream) originates
-	 * a Source Active; any other JOINED (S,G) is a local receiver pulling a
-	 * remote source and originates a C-multicast join. */
-	if (PIM_UPSTREAM_FLAG_TEST_FHR(up->flags) &&
-	    PIM_UPSTREAM_FLAG_TEST_SRC_STREAM(up->flags))
+	/* A local first-hop source originates a Source Active; any other
+	 * JOINED (S,G) is a local receiver pulling a remote source and
+	 * originates a C-multicast join.  For SSM there is no register
+	 * machinery, so the FHR flag is never set -- first-hop means an
+	 * active source stream from a directly-connected source on the
+	 * RPF interface. */
+	if (PIM_UPSTREAM_FLAG_TEST_SRC_STREAM(up->flags) &&
+	    (PIM_UPSTREAM_FLAG_TEST_FHR(up->flags) ||
+	     (up->rpf.source_nexthop.interface &&
+	      pim_if_connected_to_source(up->rpf.source_nexthop.interface,
+					 up->sg.src))))
 		role = ZAPI_MVPN_SG_SOURCE;
 	else
 		role = ZAPI_MVPN_SG_JOIN;
