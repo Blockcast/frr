@@ -27,6 +27,7 @@
 #include "bgpd/bgp_packet.h"
 #include "bgpd/bgp_nht.h"
 #include "bgpd/bgp_mvpn.h"
+#include "bgpd/bgp_zebra.h"
 
 /* Bit-length key covering the whole mvpn_addr (route_type, C-S, C-G). Padding
  * inside the struct is memset-zeroed on build, so the radix key is stable.
