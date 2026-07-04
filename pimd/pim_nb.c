@@ -39,6 +39,12 @@ const struct frr_yang_module_info frr_pim_info = {
 			}
 		},
 		{
+			.xpath = "/frr-routing:routing/control-plane-protocols/control-plane-protocol/frr-pim:pim/address-family/mvpn-gtm",
+			.cbs = {
+				.modify = routing_control_plane_protocols_control_plane_protocol_pim_address_family_mvpn_gtm_modify,
+			}
+		},
+		{
 			.xpath = "/frr-pim:pim/address-family/join-prune-interval",
 			.cbs = {
 				.modify = pim_address_family_join_prune_interval_modify,

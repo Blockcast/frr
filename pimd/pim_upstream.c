@@ -215,6 +215,10 @@ struct pim_upstream *pim_upstream_del(struct pim_instance *pim,
 		zlog_debug("pim_upstream free vrf:%s %s flags 0x%x",
 			   pim->vrf->name, up->sg_str, up->flags);
 
+	/* GTM glue: withdraw any BGP MVPN route announced for this (S,G) before
+	 * it is torn down (delete may not pass through NOTJOINED first). */
+	pim_gtm_upstream_update(pim, up, true);
+
 	if (pim_up_mlag_is_local(up))
 		pim_mlag_up_local_del(pim, up);
 
@@ -1160,6 +1164,10 @@ void pim_upstream_switch(struct pim_instance *pim, struct pim_upstream *up,
 		}
 		join_timer_stop(up);
 	}
+
+	/* GTM glue: the join_state just changed -- reconcile whether this
+	 * local SSM (S,G) should have a BGP MVPN route announced. */
+	pim_gtm_upstream_update(pim, up, false);
 }
 
 int pim_upstream_compare(const struct pim_upstream *up1,
@@ -1785,6 +1793,9 @@ struct pim_upstream *pim_upstream_keep_alive_timer_proc(
 				"kat expired on %s[%s]; remove stream reference",
 				up->sg_str, pim->vrf->name);
 		PIM_UPSTREAM_FLAG_UNSET_SRC_STREAM(up->flags);
+		/* GTM glue: the local source stream is gone; withdraw the
+		 * Source Active before the reference is released. */
+		pim_gtm_upstream_update(pim, up, false);
 
 		/* Return if upstream entry got deleted.*/
 		if (!pim_upstream_del(pim, up, __func__))
@@ -1845,6 +1856,10 @@ void pim_upstream_keep_alive_timer_start(struct pim_upstream *up, uint32_t time)
 	 * re-evaluate our active source database */
 	pim_msdp_sa_local_update(up);
 #endif /* PIM_IPV == 4 */
+	/* GTM glue: same rule as the MSDP SA analog above -- a running KAT
+	 * on a first-hop (S,G) means an active local source; reconcile the
+	 * BGP Source Active (Type 5) announcement. */
+	pim_gtm_upstream_update(up->pim, up, false);
 	/* JoinDesired can change when KAT is started or stopped */
 	pim_upstream_update_join_desired(up->pim, up);
 }

@@ -201,6 +201,14 @@ int pim_process_no_keepalivetimer_cmd(struct vty *vty)
 	return nb_cli_apply_changes(vty, NULL);
 }
 
+int pim_process_mvpn_gtm_cmd(struct vty *vty, bool enable)
+{
+	nb_cli_enqueue_change(vty, "./mvpn-gtm", NB_OP_MODIFY,
+			      enable ? "true" : "false");
+
+	return nb_cli_apply_changes(vty, NULL);
+}
+
 int pim_process_rp_kat_cmd(struct vty *vty, const char *rpkat)
 {
 	char rp_ka_timer_xpath[XPATH_MAXLEN];
