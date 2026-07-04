@@ -483,13 +483,11 @@ afi_t bgp_node_afi(struct vty *vty)
 	case BGP_VPNV6_NODE:
 	case BGP_FLOWSPECV6_NODE:
 	case BGP_IPV6U_NODE:
+	case BGP_IPV6_MVPN_NODE:
 		afi = AFI_IP6;
 		break;
 	case BGP_EVPN_NODE:
 		afi = AFI_L2VPN;
-		break;
-	case BGP_IPV6_MVPN_NODE:
-		afi = AFI_IP6;
 		break;
 	case BGP_LS_NODE:
 		afi = AFI_BGP_LS;
@@ -23308,7 +23306,7 @@ DEFPY (bgp_mvpn_source_active,
 	struct ipaddr grp = { .ipa_type = IPADDR_V4, .ip._v4_addr = group };
 
 	/* GTM is SSM-only: enforce group in 232.0.0.0/8. */
-	if (!bgp_mvpn_group_is_ssm(group)) {
+	if (!ipv4_mcast_ssm(&group)) {
 		vty_out(vty, "%% MCAST-VPN group %pI4 is not in the SSM range 232.0.0.0/8\n",
 			&group);
 		return CMD_WARNING_CONFIG_FAILED;
@@ -23360,16 +23358,18 @@ DEFPY (bgp_mvpn_source_active6,
 	return bgp_mvpn_source_active_set(bgp, &src, &grp, !!no);
 }
 
-DEFPY (show_bgp_ipv4_mvpn,
-       show_bgp_ipv4_mvpn_cmd,
-       "show bgp ipv4 mvpn [json$uj]",
+DEFPY (show_bgp_mvpn,
+       show_bgp_mvpn_cmd,
+       "show bgp <ipv4|ipv6>$afi_str mvpn [json$uj]",
        SHOW_STR
        BGP_STR
+       "Address Family\n"
        "Address Family\n"
        "Display MCAST-VPN (Source Active) routes\n"
        JSON_STR)
 {
 	struct bgp *bgp = bgp_get_default();
+	afi_t afi = strmatch(afi_str, "ipv6") ? AFI_IP6 : AFI_IP;
 
 	if (!bgp) {
 		if (uj)
@@ -23379,30 +23379,7 @@ DEFPY (show_bgp_ipv4_mvpn,
 		return CMD_SUCCESS;
 	}
 
-	bgp_mvpn_show_routes(vty, bgp, AFI_IP, !!uj);
-	return CMD_SUCCESS;
-}
-
-DEFPY (show_bgp_ipv6_mvpn,
-       show_bgp_ipv6_mvpn_cmd,
-       "show bgp ipv6 mvpn [json$uj]",
-       SHOW_STR
-       BGP_STR
-       "Address Family\n"
-       "Display MCAST-VPN (Source Active) routes\n"
-       JSON_STR)
-{
-	struct bgp *bgp = bgp_get_default();
-
-	if (!bgp) {
-		if (uj)
-			vty_out(vty, "{}\n");
-		else
-			vty_out(vty, "%% No BGP process configured\n");
-		return CMD_SUCCESS;
-	}
-
-	bgp_mvpn_show_routes(vty, bgp, AFI_IP6, !!uj);
+	bgp_mvpn_show_routes(vty, bgp, afi, !!uj);
 	return CMD_SUCCESS;
 }
 
@@ -23871,8 +23848,7 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_source_active_cmd);
 	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_ipmsi_label_cmd);
 	install_element(BGP_IPV6_MVPN_NODE, &bgp_mvpn_source_active6_cmd);
-	install_element(VIEW_NODE, &show_bgp_ipv4_mvpn_cmd);
-	install_element(VIEW_NODE, &show_bgp_ipv6_mvpn_cmd);
+	install_element(VIEW_NODE, &show_bgp_mvpn_cmd);
 
 	/* "no neighbor activate" commands. */
 	install_element(BGP_NODE, &no_neighbor_activate_hidden_cmd);

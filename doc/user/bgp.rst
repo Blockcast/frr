@@ -4501,6 +4501,18 @@ driven by these routes is not yet implemented.
    ff3x::/32 for IPv6); other groups are rejected. The Route Distinguisher
    is always 0 (Global Table Multicast).
 
+.. clicmd:: bgp mvpn ipmsi-label (16-1048575)
+
+   Under ``address-family ipv4 mvpn``, set the MPLS label advertised in the
+   Intra-AS I-PMSI A-D route's PMSI Tunnel attribute. The default (no label
+   configured) advertises label 0, i.e. an unlabeled Ingress Replication
+   tunnel per :rfc:`6514` Section 5. Some implementations track but never
+   instantiate a replication leg toward a label-0 leaf (observed on Junos
+   22.2R3), in which case a real downstream-assigned label must be
+   configured here. The value is per-instance and applies to the single
+   Type-1 route serving both MCAST-VPN address families, which is why the
+   knob lives under the IPv4 node only.
+
 .. clicmd:: set extcommunity vrf-route-import ASN:NN_OR_IP-ADDRESS:NN
 
    Route-map set action attaching a VRF Route Import extended community
@@ -4508,24 +4520,17 @@ driven by these routes is not yet implemented.
    Applied to the unicast route toward a multicast source, it names the
    upstream PE so a receiver keys its C-multicast (Type-7) join's Route
    Target on that PE. A GTM receiver reads this community to resolve the
-   Upstream Multicast Hop (:rfc:`6514` Section 5.1).
+   Upstream Multicast Hop (:rfc:`6514` Section 5.1). The Source AS of a
+   locally-originated Type-7 join is likewise resolved from the Source AS
+   extended community (:rfc:`6514` Section 4.3) on the unicast route toward
+   the source, falling back to the local AS.
 
-.. clicmd:: show bgp ipv4 mvpn [json]
-.. clicmd:: show bgp ipv6 mvpn [json]
+.. clicmd:: show bgp <ipv4|ipv6> mvpn [json]
 
    Display the MCAST-VPN table of the default BGP instance for the IPv4 or
    IPv6 address family. Each entry reports its route type, originator,
    (S,G) where applicable, and, for Route Type 1 routes, the PMSI tunnel
    type and endpoint.
-
-.. note::
-
-   Follow-up: a conformant source (e.g. Junos GTM) also attaches a Source
-   AS extended community (:rfc:`6514` Section 4.3) alongside the VRF Route
-   Import on the source's unicast route. The Type-7 join's Source AS is
-   currently taken from the origination request rather than derived from a
-   received Source AS community; a pimd-driven origination should read it
-   from the unicast route toward the source.
 
 .. _bgp-conditional-advertisement:
 

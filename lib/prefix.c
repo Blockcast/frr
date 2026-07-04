@@ -122,9 +122,10 @@ afi_t family2afi(int family)
 		return AFI_L2VPN;
 	else if (family == AF_MVPN)
 		/*
-		 * v4-only in the GTM MVP. When the IPv6 MCAST-VPN NLRI codec
-		 * lands, derive the AFI from the inner (S,G) address rather than
-		 * from AF_MVPN alone, which spans both v4 and v6.
+		 * AF_MVPN spans both v4 and v6; the true AFI comes from the
+		 * inner (S,G) family, which this family-only helper cannot
+		 * see. MVPN code derives it there and never calls this; the
+		 * arm only keeps a generic caller off the AFI_UNSPEC=0 index.
 		 */
 		return AFI_IP;
 	return 0;
@@ -1206,18 +1207,16 @@ const char *prefix2str(union prefixconstptr pu, char *str, int size)
 
 	case AF_MVPN: {
 		const struct mvpn_addr *m = &p->u.prefix_mvpn;
-		char srcbuf[INET_ADDRSTRLEN];
-		char grpbuf[INET_ADDRSTRLEN];
 
-		inet_ntop(AF_INET, &m->src, srcbuf, sizeof(srcbuf));
-		inet_ntop(AF_INET, &m->grp, grpbuf, sizeof(grpbuf));
 		/* Type-7 (Source Tree Join) also renders the Source AS so two
 		 * routes differing only in Source AS get distinct strings.
 		 */
 		if (m->route_type == 7)
-			snprintf(str, size, "[7]:[%u]:[%s]:[%s]", m->source_as, srcbuf, grpbuf);
+			snprintfrr(str, size, "[7]:[%u]:[%pIA]:[%pIA]", m->source_as, &m->src,
+				   &m->grp);
 		else
-			snprintf(str, size, "[%u]:[%s]:[%s]", m->route_type, srcbuf, grpbuf);
+			snprintfrr(str, size, "[%u]:[%pIA]:[%pIA]", m->route_type, &m->src,
+				   &m->grp);
 		break;
 	}
 

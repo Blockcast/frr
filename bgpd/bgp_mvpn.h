@@ -4,9 +4,11 @@
  *
  * Copyright (C) 2026 Blockcast, Inc.
  *
- * Implements RFC 6514 MCAST-VPN Route Type 5 (Source Active A-D) constrained
- * to Global Table Multicast (RFC 7716): the Route Distinguisher is always zero
- * (single global table) and only SSM groups (232.0.0.0/8 for IPv4) are used.
+ * Implements RFC 6514 MCAST-VPN Route Types 1 (Intra-AS I-PMSI A-D), 5
+ * (Source Active A-D) and 7 (C-multicast Source Tree Join), constrained to
+ * Global Table Multicast (RFC 7716): the Route Distinguisher is always zero
+ * (single global table) and only SSM groups are used (232.0.0.0/8 for IPv4,
+ * ff3x::/32 for IPv6).
  */
 #ifndef _FRR_BGP_MVPN_H
 #define _FRR_BGP_MVPN_H
@@ -33,12 +35,6 @@
 #define BGP_MVPN_TYPE1_V6_SPEC_LEN 24
 
 /*
- * Full on-wire NLRI length for a Type-1 IPv4 route:
- *   Route Type(1) + Length(1) + route-type-specific(12) = 14 octets.
- */
-#define BGP_MVPN_TYPE1_V4_NLRI_LEN (2 + BGP_MVPN_TYPE1_V4_SPEC_LEN)
-
-/*
  * RFC 6514 Section 4.5 Source Active A-D route, route-type-specific portion
  * for IPv4:  RD(8) + McastSrcLen(1) + McastSrc(4) + McastGrpLen(1)
  *          + McastGrp(4) = 18 octets.
@@ -48,12 +44,6 @@
 /* IPv6 (RFC 6515): RD(8) + McastSrcLen(1) + McastSrc(16) + McastGrpLen(1)
  *               + McastGrp(16) = 42 octets. */
 #define BGP_MVPN_TYPE5_V6_SPEC_LEN 42
-
-/*
- * Full on-wire NLRI length for a Type-5 IPv4 route:
- *   Route Type(1) + Length(1) + route-type-specific(18) = 20 octets.
- */
-#define BGP_MVPN_TYPE5_V4_NLRI_LEN (2 + BGP_MVPN_TYPE5_V4_SPEC_LEN)
 
 /*
  * RFC 6514 Section 4.6 C-multicast Source Tree Join route, route-type-specific
@@ -67,22 +57,11 @@
 #define BGP_MVPN_TYPE7_V6_SPEC_LEN 46
 
 /*
- * Full on-wire NLRI length for a Type-7 IPv4 route:
- *   Route Type(1) + Length(1) + route-type-specific(22) = 24 octets.
+ * Largest on-wire NLRI this codec emits: Route Type(1) + Length(1) + Type-7
+ * IPv6 body(46) = 48 octets. Used to reserve stream room ahead of
+ * bgp_mvpn_encode_prefix(); must stay >= what any encoder arm writes.
  */
-#define BGP_MVPN_TYPE7_V4_NLRI_LEN (2 + BGP_MVPN_TYPE7_V4_SPEC_LEN)
-
-/*
- * Global Table Multicast is SSM-only: the customer group (C-G) must fall in the
- * IPv4 SSM range 232.0.0.0/8 (RFC 4607, 0xe8 == 232). Enforced on both
- * origination (VTY) and on receipt of a peer's Type-5/7 NLRI, so a
- * non-conforming peer cannot inject an ASM/unicast/bogon group into the global
- * table.
- */
-static inline bool bgp_mvpn_group_is_ssm(struct in_addr grp)
-{
-	return (ntohl(grp.s_addr) & 0xff000000U) == 0xe8000000U;
-}
+#define BGP_MVPN_MAX_NLRI_LEN (2 + BGP_MVPN_TYPE7_V6_SPEC_LEN)
 
 /* Fill a prefix_mvpn for a Type-5 (Source Active) route. C-S/C-G may be v4 or
  * v6 but must share a family. */
@@ -100,17 +79,10 @@ extern void bgp_mvpn_build_prefix_type1(struct prefix_mvpn *p, const struct ipad
 extern void bgp_mvpn_build_prefix_type7(struct prefix_mvpn *p, uint32_t source_as,
 					const struct ipaddr *src, const struct ipaddr *grp);
 
-/* Encode a Type-5 NLRI into the MP_REACH stream (RFC 6514 Section 4.5). */
-extern void bgp_mvpn_encode_type5(struct stream *s, const struct prefix *p, bool addpath_capable,
-				  uint32_t addpath_tx_id);
-
-/* Encode a Type-1 NLRI into the MP_REACH stream (RFC 6514 Section 4.1). */
-extern void bgp_mvpn_encode_type1(struct stream *s, const struct prefix *p, bool addpath_capable,
-				  uint32_t addpath_tx_id);
-
-/* Encode a Type-7 NLRI into the MP_REACH stream (RFC 6514 Section 4.6). */
-extern void bgp_mvpn_encode_type7(struct stream *s, const struct prefix *p, bool addpath_capable,
-				  uint32_t addpath_tx_id);
+/* Encode any MCAST-VPN NLRI into the MP_REACH/MP_UNREACH stream, dispatching
+ * on the prefix's route type (RFC 6514 Sections 4.1 / 4.5 / 4.6). */
+extern void bgp_mvpn_encode_prefix(struct stream *s, const struct prefix *p, bool addpath_capable,
+				   uint32_t addpath_tx_id);
 
 /* Parse a received MCAST-VPN NLRI (fan-out target from bgp_nlri_parse()). */
 extern int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *packet,
@@ -131,14 +103,14 @@ extern int bgp_mvpn_source_active_set(struct bgp *bgp, const struct ipaddr *src,
 extern void bgp_mvpn_originate_type1(struct bgp *bgp);
 
 /*
- * TEST-ONLY scaffold: originate/withdraw a local Type-7 (C-multicast Source
- * Tree Join) route. The upstream PE (Global Administrator of the upstream-node
- * RT) is taken explicitly when non-zero, else resolved from the Source Active
- * route's UMH. Plan 3 replaces this with pimd-driven origination.
+ * Originate/withdraw a local Type-7 (C-multicast Source Tree Join) route for a
+ * pimd-reported receiver join, relayed through zebra (bgp_zebra_process_mvpn_sg).
+ * The Source AS and the upstream PE (Global Administrator of the upstream-node
+ * RT) are resolved from the unicast route toward C-S and the received Source
+ * Active route (RFC 6514 Section 5).
  */
-extern int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as,
-					 const struct ipaddr *src, const struct ipaddr *grp,
-					 struct in_addr upstream, bool negate);
+extern int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
+					 const struct ipaddr *grp, bool negate);
 
 /* running-config emission for `bgp mvpn source-active` under the AF node. */
 extern void bgp_mvpn_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi);

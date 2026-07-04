@@ -4,9 +4,10 @@
  *
  * Copyright (C) 2026 Blockcast, Inc.
  *
- * RFC 6514 Route Type 5 (Source Active A-D), constrained to Global Table
- * Multicast (RFC 7716): the Route Distinguisher is always zero (single global
- * table) and groups are SSM (232.0.0.0/8 for IPv4).
+ * RFC 6514 Route Types 1 (Intra-AS I-PMSI A-D), 5 (Source Active A-D) and 7
+ * (C-multicast Source Tree Join), constrained to Global Table Multicast
+ * (RFC 7716): the Route Distinguisher is always zero (single global table)
+ * and groups are SSM (232.0.0.0/8 for IPv4, ff3x::/32 for IPv6).
  */
 #include <zebra.h>
 
@@ -137,8 +138,8 @@ static void bgp_mvpn_put_caddr(struct stream *s, const struct ipaddr *a)
  * the route-type-specific Length and the per-address Length octets follow the
  * family carried in the prefix.
  */
-void bgp_mvpn_encode_type5(struct stream *s, const struct prefix *p, bool addpath_capable,
-			   uint32_t addpath_tx_id)
+static void bgp_mvpn_encode_type5(struct stream *s, const struct prefix *p, bool addpath_capable,
+				  uint32_t addpath_tx_id)
 {
 	const struct mvpn_addr *m = &p->u.prefix_mvpn;
 	bool v6 = IS_IPADDR_V6(&m->src);
@@ -159,8 +160,8 @@ void bgp_mvpn_encode_type5(struct stream *s, const struct prefix *p, bool addpat
  * host order in the prefix and emitted network order via stream_putl. C-S/C-G
  * are v4 or v6.
  */
-void bgp_mvpn_encode_type7(struct stream *s, const struct prefix *p, bool addpath_capable,
-			   uint32_t addpath_tx_id)
+static void bgp_mvpn_encode_type7(struct stream *s, const struct prefix *p, bool addpath_capable,
+				  uint32_t addpath_tx_id)
 {
 	const struct mvpn_addr *m = &p->u.prefix_mvpn;
 	bool v6 = IS_IPADDR_V6(&m->src);
@@ -182,8 +183,8 @@ void bgp_mvpn_encode_type7(struct stream *s, const struct prefix *p, bool addpat
  * no C-S/C-G; the endpoint is conveyed out-of-band in the PMSI Tunnel path
  * attribute (Section 5). The originator family is carried in the src slot.
  */
-void bgp_mvpn_encode_type1(struct stream *s, const struct prefix *p, bool addpath_capable,
-			   uint32_t addpath_tx_id)
+static void bgp_mvpn_encode_type1(struct stream *s, const struct prefix *p, bool addpath_capable,
+				  uint32_t addpath_tx_id)
 {
 	const struct mvpn_addr *m = &p->u.prefix_mvpn;
 	bool v6 = IS_IPADDR_V6(&m->src);
@@ -201,10 +202,32 @@ void bgp_mvpn_encode_type1(struct stream *s, const struct prefix *p, bool addpat
 }
 
 /*
- * Install (or refresh) a Type-5 route in the SAFI_MCAST_VPN table. Shared by
- * local origination (peer = peer_self, sub_type = STATIC) and the receive path
- * (sub_type = NORMAL). GTM SA routes are control-plane markers, so they are
- * marked valid without next-hop resolution, mirroring EVPN imported routes.
+ * Encode any MCAST-VPN NLRI, dispatching on the prefix's route type. The
+ * single entry point the generic path-attribute writer calls (mirroring
+ * bgp_evpn_encode_prefix); route-type knowledge stays inside this module.
+ */
+void bgp_mvpn_encode_prefix(struct stream *s, const struct prefix *p, bool addpath_capable,
+			    uint32_t addpath_tx_id)
+{
+	switch (p->u.prefix_mvpn.route_type) {
+	case BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI:
+		bgp_mvpn_encode_type1(s, p, addpath_capable, addpath_tx_id);
+		break;
+	case BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN:
+		bgp_mvpn_encode_type7(s, p, addpath_capable, addpath_tx_id);
+		break;
+	default:
+		bgp_mvpn_encode_type5(s, p, addpath_capable, addpath_tx_id);
+		break;
+	}
+}
+
+/*
+ * Install (or refresh) an MCAST-VPN route (Type 1/5/7) in the SAFI_MCAST_VPN
+ * table. Shared by local origination (peer = peer_self, sub_type = STATIC) and
+ * the receive path (sub_type = NORMAL). GTM routes are control-plane markers,
+ * so they are marked valid without next-hop resolution, mirroring EVPN
+ * imported routes.
  */
 static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, afi_t afi,
 				   const struct prefix_mvpn *p, struct attr *attr, int sub_type)
@@ -242,7 +265,7 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, afi_t afi
 	bgp_dest_unlock_node(dest);
 }
 
-/* Withdraw a Type-5 route matching (peer, sub_type) from the table. */
+/* Withdraw an MCAST-VPN route matching (peer, sub_type) from the table. */
 static void bgp_mvpn_route_remove(struct bgp *bgp, struct peer *peer, afi_t afi,
 				  const struct prefix_mvpn *p, int sub_type)
 {
@@ -294,6 +317,77 @@ stream_failure:
 }
 
 /*
+ * Parse the (S,G)-bearing body shared by Type-5 (Source Active) and Type-7
+ * (C-multicast Source Tree Join): RD, the Type-7-only 4-octet Source AS, then
+ * C-S and C-G each preceded by a per-address Length octet cross-checked
+ * against the route-type-specific Length (guards a lying outer Length).
+ *
+ * Returns BGP_NLRI_PARSE_OK on success, a BGP_NLRI_PARSE_ERROR_* (logged) on
+ * bad framing, or -1 on stream truncation (the caller's stream_failure path).
+ */
+static int bgp_mvpn_parse_sg_body(struct peer *peer, struct stream *data, uint8_t route_type,
+				  uint8_t length, uint8_t rd[8], struct ipaddr *src,
+				  struct ipaddr *grp, uint32_t *source_as)
+{
+	bool type7 = route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN;
+	uint8_t v4_spec_len = type7 ? BGP_MVPN_TYPE7_V4_SPEC_LEN : BGP_MVPN_TYPE5_V4_SPEC_LEN;
+	uint8_t v6_spec_len = type7 ? BGP_MVPN_TYPE7_V6_SPEC_LEN : BGP_MVPN_TYPE5_V6_SPEC_LEN;
+	uint8_t src_len;
+	uint8_t grp_len;
+
+	if (length != v4_spec_len && length != v6_spec_len) {
+		flog_err(EC_BGP_UPDATE_RCV,
+			 "%s [Error] MVPN Type-%u bad length %u (expected %u or %u)", peer->host,
+			 route_type, length, v4_spec_len, v6_spec_len);
+		return BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
+	}
+
+	/* RD (8 octets): read for validation after the body is fully consumed
+	 * (GTM requires RD == 0). */
+	STREAM_GET(rd, data, 8);
+
+	if (type7)
+		STREAM_GETL(data, *source_as);
+
+	STREAM_GETC(data, src_len);
+	switch (bgp_mvpn_read_caddr(data, src, src_len)) {
+	case MVPN_CADDR_OK:
+		break;
+	case MVPN_CADDR_TRUNC:
+		goto stream_failure;
+	case MVPN_CADDR_BADLEN:
+		flog_err(EC_BGP_UPDATE_RCV, "%s [Error] MVPN Type-%u bad source addr length %u",
+			 peer->host, route_type, src_len);
+		return BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
+	}
+
+	STREAM_GETC(data, grp_len);
+	switch (bgp_mvpn_read_caddr(data, grp, grp_len)) {
+	case MVPN_CADDR_OK:
+		break;
+	case MVPN_CADDR_TRUNC:
+		goto stream_failure;
+	case MVPN_CADDR_BADLEN:
+		flog_err(EC_BGP_UPDATE_RCV, "%s [Error] MVPN Type-%u bad group addr length %u",
+			 peer->host, route_type, grp_len);
+		return BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
+	}
+
+	/* C-S and C-G share a family, and the route Length must match it. */
+	if (src_len != grp_len ||
+	    length != (src_len == IPV6_MAX_BITLEN ? v6_spec_len : v4_spec_len)) {
+		flog_err(EC_BGP_UPDATE_RCV,
+			 "%s [Error] MVPN Type-%u addr family/length mismatch (src %u grp %u len %u)",
+			 peer->host, route_type, src_len, grp_len, length);
+		return BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
+	}
+
+	return BGP_NLRI_PARSE_OK;
+stream_failure:
+	return -1;
+}
+
+/*
  * Parse a received MCAST-VPN NLRI. Each NLRI is Route Type(1) + Length(1) +
  * route-type-specific. Type 5 (Source Active) and Type 7 (C-multicast Source
  * Tree Join) are decoded; other types are skipped using the on-wire Length so
@@ -311,8 +405,6 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 	struct prefix_mvpn p;
 	uint8_t route_type;
 	uint8_t length;
-	uint8_t src_len;
-	uint8_t grp_len;
 	uint8_t rd[8];
 	struct ipaddr src;
 	struct ipaddr grp;
@@ -350,15 +442,16 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 
 	while (STREAM_READABLE(data) > 0) {
 		addpath_id = 0;
+		source_as = 0;
 		/* Zero the C-address slots each iteration so a v4 read leaves the
 		 * ipaddr union's upper octets clear -- the whole struct feeds the
 		 * RIB key via prefix_same()/memcmp. */
 		memset(&src, 0, sizeof(src));
 		memset(&grp, 0, sizeof(grp));
-		if (addpath_capable) {
-			STREAM_GET(&addpath_id, data, BGP_ADDPATH_ID_LEN);
-			addpath_id = ntohl(addpath_id);
-		}
+		/* Consumed to stay framed; addpath is not plumbed into the MVPN
+		 * install path (bgp_mvpn_route_install keys on peer alone). */
+		if (addpath_capable)
+			STREAM_GETL(data, addpath_id);
 
 		STREAM_GETC(data, route_type);
 		STREAM_GETC(data, length);
@@ -401,122 +494,18 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			break;
 
 		case BGP_MVPN_ROUTE_TYPE_SOURCE_ACTIVE:
-			if (length != BGP_MVPN_TYPE5_V4_SPEC_LEN &&
-			    length != BGP_MVPN_TYPE5_V6_SPEC_LEN) {
-				flog_err(EC_BGP_UPDATE_RCV,
-					 "%s [Error] MVPN Type-5 bad length %u (expected %u or %u)",
-					 peer->host, length, BGP_MVPN_TYPE5_V4_SPEC_LEN,
-					 BGP_MVPN_TYPE5_V6_SPEC_LEN);
-				ret = BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
-				goto done;
-			}
-
-			/* RD (8 octets): read for validation after the body is
-			 * fully consumed (GTM requires RD == 0). */
-			STREAM_GET(rd, data, 8);
-
-			STREAM_GETC(data, src_len);
-			switch (bgp_mvpn_read_caddr(data, &src, src_len)) {
-			case MVPN_CADDR_OK:
-				break;
-			case MVPN_CADDR_TRUNC:
-				goto stream_failure;
-			case MVPN_CADDR_BADLEN:
-				flog_err(EC_BGP_UPDATE_RCV,
-					 "%s [Error] MVPN Type-5 bad source addr length %u",
-					 peer->host, src_len);
-				ret = BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
-				goto done;
-			}
-
-			STREAM_GETC(data, grp_len);
-			switch (bgp_mvpn_read_caddr(data, &grp, grp_len)) {
-			case MVPN_CADDR_OK:
-				break;
-			case MVPN_CADDR_TRUNC:
-				goto stream_failure;
-			case MVPN_CADDR_BADLEN:
-				flog_err(EC_BGP_UPDATE_RCV,
-					 "%s [Error] MVPN Type-5 bad group addr length %u",
-					 peer->host, grp_len);
-				ret = BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
-				goto done;
-			}
-
-			/* C-S and C-G share a family, and the route Length must
-			 * match it (guards a lying outer Length). */
-			if (src_len != grp_len ||
-			    length != (src_len == IPV6_MAX_BITLEN ? BGP_MVPN_TYPE5_V6_SPEC_LEN
-								  : BGP_MVPN_TYPE5_V4_SPEC_LEN)) {
-				flog_err(EC_BGP_UPDATE_RCV,
-					 "%s [Error] MVPN Type-5 addr family/length mismatch (src %u grp %u len %u)",
-					 peer->host, src_len, grp_len, length);
-				ret = BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
-				goto done;
-			}
-
-			bgp_mvpn_build_prefix_type5(&p, &src, &grp);
-			break;
-
 		case BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN:
-			if (length != BGP_MVPN_TYPE7_V4_SPEC_LEN &&
-			    length != BGP_MVPN_TYPE7_V6_SPEC_LEN) {
-				flog_err(EC_BGP_UPDATE_RCV,
-					 "%s [Error] MVPN Type-7 bad length %u (expected %u or %u)",
-					 peer->host, length, BGP_MVPN_TYPE7_V4_SPEC_LEN,
-					 BGP_MVPN_TYPE7_V6_SPEC_LEN);
-				ret = BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
-				goto done;
-			}
-
-			/* RD (8 octets): read for validation after the body is
-			 * fully consumed (GTM requires RD == 0). */
-			STREAM_GET(rd, data, 8);
-
-			STREAM_GET(&source_as, data, 4);
-			source_as = ntohl(source_as);
-
-			STREAM_GETC(data, src_len);
-			switch (bgp_mvpn_read_caddr(data, &src, src_len)) {
-			case MVPN_CADDR_OK:
-				break;
-			case MVPN_CADDR_TRUNC:
+			ret = bgp_mvpn_parse_sg_body(peer, data, route_type, length, rd, &src,
+						     &grp, &source_as);
+			if (ret == -1)
 				goto stream_failure;
-			case MVPN_CADDR_BADLEN:
-				flog_err(EC_BGP_UPDATE_RCV,
-					 "%s [Error] MVPN Type-7 bad source addr length %u",
-					 peer->host, src_len);
-				ret = BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
+			if (ret != BGP_NLRI_PARSE_OK)
 				goto done;
-			}
 
-			STREAM_GETC(data, grp_len);
-			switch (bgp_mvpn_read_caddr(data, &grp, grp_len)) {
-			case MVPN_CADDR_OK:
-				break;
-			case MVPN_CADDR_TRUNC:
-				goto stream_failure;
-			case MVPN_CADDR_BADLEN:
-				flog_err(EC_BGP_UPDATE_RCV,
-					 "%s [Error] MVPN Type-7 bad group addr length %u",
-					 peer->host, grp_len);
-				ret = BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
-				goto done;
-			}
-
-			/* C-S and C-G share a family, and the route Length must
-			 * match it (guards a lying outer Length). */
-			if (src_len != grp_len ||
-			    length != (src_len == IPV6_MAX_BITLEN ? BGP_MVPN_TYPE7_V6_SPEC_LEN
-								  : BGP_MVPN_TYPE7_V4_SPEC_LEN)) {
-				flog_err(EC_BGP_UPDATE_RCV,
-					 "%s [Error] MVPN Type-7 addr family/length mismatch (src %u grp %u len %u)",
-					 peer->host, src_len, grp_len, length);
-				ret = BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
-				goto done;
-			}
-
-			bgp_mvpn_build_prefix_type7(&p, source_as, &src, &grp);
+			if (route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN)
+				bgp_mvpn_build_prefix_type7(&p, source_as, &src, &grp);
+			else
+				bgp_mvpn_build_prefix_type5(&p, &src, &grp);
 			break;
 
 		default:
@@ -543,7 +532,7 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		if (route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_ACTIVE ||
 		    route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN) {
 			bool ssm = IS_IPADDR_V6(&grp) ? ipv6_mcast_ssm(&grp.ipaddr_v6)
-						      : bgp_mvpn_group_is_ssm(grp.ipaddr_v4);
+						      : ipv4_mcast_ssm(&grp.ipaddr_v4);
 
 			if (!ssm) {
 				flog_err(EC_BGP_UPDATE_RCV,
@@ -632,137 +621,29 @@ static void bgp_mvpn_attach_gtm_rt(struct attr *attr)
 }
 
 /*
- * Resolve the Upstream Multicast Hop (upstream PE) for (C-S, C-G) -- the address
- * that identifies the PE toward C-S, used as the Global Administrator of the
- * upstream-node-identifying Route Target on the C-multicast (Type-7) join.
+ * Resolve the RFC 6514 Section 5 communities for a pimd-driven Type-7 from the
+ * unicast route toward C-S, in one longest-match lookup and one path walk:
  *
- * RFC 6514 Section 5.1 / RFC 7716: that RT MUST equal the value of the VRF Route
- * Import extended community carried by the UMH-eligible *unicast* route toward
- * C-S. A conformant MVPN source attaches that community (IP-address-specific,
- * sub-type 0x0b; Junos "rt-import") with its PE address as the Global
- * Administrator. The receiver echoes that address as a Route Target on the
- * C-multicast (Type-7) join; the source's auto-generated
- * __vrf-mvpn-import-cmcast-*-internal__ policy imports the Type-7 only on
- * exactly that RT (empirically confirmed on MX204 22.2R3: it keys the cmcast
- * import on the lo0 PE address, e.g. target:10.255.255.254:0). So the correct
- * upstream identifier is the Global Administrator of the source route's
- * route-import community.
+ *   *upstream (Upstream Multicast Hop / upstream PE, Section 5.1): the RT on
+ *   the C-multicast join MUST equal the VRF Route Import extended community
+ *   (IP-address-specific, sub-type 0x0b; Junos "rt-import") the source PE
+ *   attaches to the unicast route toward C-S. The receiver echoes its Global
+ *   Administrator as a Route Target on the Type-7; the source's auto-generated
+ *   __vrf-mvpn-import-cmcast-*-internal__ policy imports the join only on
+ *   exactly that RT (empirically confirmed on MX204 22.2R3: it keys the cmcast
+ *   import on the lo0 PE address, e.g. target:10.255.255.254:0). A plain
+ *   IP-address-specific Route Target (0x02) is the fallback, covering an
+ *   FRR<->FRR source tagged with "set extcommunity rt <PE>:0".
  *
- * NB: confirmed on MX204 22.2R3 -- a live Junos GTM source's auto-export policy
- * (__vrf-mvpn-export-inet-*-internal__) attaches rt-import:<PE>:0, i.e. the VRF
- * Route Import community (0x0b), to the source's unicast route; the lookup below
- * therefore reads 0x0b first (0x02 kept as a fallback for FRR<->FRR sources that
- * tag a plain Route Target).
+ *   *source_as (Section 4.6): from the Source-AS Extended Community
+ *   (Four-Octet-AS-Specific, sub-type ECOMMUNITY_SOURCE_AS; Junos "src-as").
  *
- * Lookup order:
- *   1. RFC-canonical: the IP-address-specific route-import community on the
- *      unicast route to C-S -- VRF Route Import (0x0b), else Route Target (0x02).
- *   2. Fallback: the next hop of the received Source Active route. This is only
- *      correct when the SA originator's address is preserved end to end (iBGP,
- *      or a peer that attaches no route-import RT such as FRR<->FRR); eBGP
- *      rewrites the SA next hop to the peering address, so relying on it there
- *      produces a non-matching RT. Kept as best-effort so the test-join scaffold
- *      still resolves an upstream when no route-import RT is present.
- *
- * Returns true and fills *upstream on a hit; false when neither is available.
+ * The route lives in the v4 or v6 unicast RIB per the C-S family; both
+ * communities carry v4-core PE/AS values either way. Each output is written
+ * only when still unset and its community is found.
  */
-static bool bgp_mvpn_resolve_upstream_pe(struct bgp *bgp, const struct ipaddr *src,
-					 const struct ipaddr *grp, struct in_addr *upstream)
-{
-	struct prefix_mvpn sa;
-	struct prefix psrc = {};
-	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
-	struct bgp_dest *dest;
-	struct bgp_path_info *pi;
-	struct ecommunity *ecom;
-	struct ecommunity_val *eval;
-
-	/*
-	 * (1) RFC 6514 5.1: UMH from the route-import RT on the unicast route
-	 * toward C-S. The route lives in the v4 or v6 unicast RIB per the C-S
-	 * family; the route-import community is IP-address-specific with a
-	 * (v4-core) PE Global Administrator either way.
-	 */
-	if (IS_IPADDR_V6(src)) {
-		psrc.family = AF_INET6;
-		psrc.prefixlen = IPV6_MAX_BITLEN;
-		psrc.u.prefix6 = src->ipaddr_v6;
-	} else {
-		psrc.family = AF_INET;
-		psrc.prefixlen = IPV4_MAX_BITLEN;
-		psrc.u.prefix4 = src->ipaddr_v4;
-	}
-	dest = bgp_node_match(bgp->rib[afi][SAFI_UNICAST], &psrc);
-	if (dest) {
-		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
-			if (pi->type != ZEBRA_ROUTE_BGP)
-				continue;
-			ecom = bgp_attr_get_ecommunity(pi->attr);
-			if (!ecom)
-				continue;
-			/*
-			 * RFC 6514 Section 5.1: prefer the VRF Route Import EC
-			 * (IP-address-specific, sub-type 0x0b) -- what a
-			 * conformant MVPN source attaches to the unicast route
-			 * toward C-S (Junos "rt-import"). Fall back to a plain
-			 * IP-address-specific Route Target (0x02): this covers
-			 * an FRR<->FRR source that tags its route with
-			 * "set extcommunity rt <PE>:0", and any peer that keys
-			 * the upstream on a Route Target rather than rt-import.
-			 */
-			eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP,
-						 ECOMMUNITY_VRF_ROUTE_IMPORT);
-			if (!eval)
-				eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP,
-							 ECOMMUNITY_ROUTE_TARGET);
-			if (!eval)
-				continue;
-			/* IP-address-specific EC wire layout: type, subtype,
-			 * Global Administrator (4 bytes), Local Administrator (2). */
-			memcpy(&upstream->s_addr, &eval->val[2], IPV4_MAX_BYTELEN);
-			bgp_dest_unlock_node(dest);
-			return true;
-		}
-		bgp_dest_unlock_node(dest);
-	}
-
-	/*
-	 * (2) Fallback: next hop of the received Source Active route. Best-
-	 * effort -- the SA next hop identifies the PE only when preserved end
-	 * to end. The upstream PE address is v4 in a v4 core for either C-S
-	 * family: the SA carries mp_nexthop_global_in = the originating PE's
-	 * router-id (see bgp_mvpn_source_active_set). This arm therefore serves
-	 * both planes -- look up the SA in the (C-S)-family MCAST-VPN RIB.
-	 */
-	bgp_mvpn_build_prefix_type5(&sa, src, grp);
-	dest = bgp_safi_node_lookup(bgp->rib[afi][SAFI_MCAST_VPN], SAFI_MCAST_VPN,
-				    (const struct prefix *)&sa, NULL);
-	if (!dest)
-		return false;
-
-	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
-		if (pi->type != ZEBRA_ROUTE_BGP)
-			continue;
-		if (pi->attr->mp_nexthop_global_in.s_addr == INADDR_ANY)
-			continue;
-		*upstream = pi->attr->mp_nexthop_global_in;
-		bgp_dest_unlock_node(dest);
-		return true;
-	}
-
-	bgp_dest_unlock_node(dest);
-	return false;
-}
-
-/*
- * RFC 6514 Section 5 Source-AS resolution for a pimd-driven Type-7. Read the
- * Source-AS Extended Community (Four-Octet-AS-Specific, encode 0x02, subtype
- * ECOMMUNITY_SOURCE_AS) off the unicast route toward C-S -- what a conformant
- * MVPN source (Junos "src-as") attaches. Leaves *source_as unchanged if none
- * is found.
- */
-static void bgp_mvpn_resolve_source_as(struct bgp *bgp, const struct ipaddr *src,
-				       uint32_t *source_as)
+static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipaddr *src,
+					       uint32_t *source_as, struct in_addr *upstream)
 {
 	struct prefix psrc = {};
 	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
@@ -791,17 +672,70 @@ static void bgp_mvpn_resolve_source_as(struct bgp *bgp, const struct ipaddr *src
 		ecom = bgp_attr_get_ecommunity(pi->attr);
 		if (!ecom)
 			continue;
-		eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_AS4,
-					 ECOMMUNITY_SOURCE_AS);
-		if (!eval)
+
+		if (*source_as == 0) {
+			eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_AS4,
+						 ECOMMUNITY_SOURCE_AS);
+			if (eval)
+				/* Four-Octet-AS-Specific wire layout: type,
+				 * subtype, Global Administrator (4-octet AS),
+				 * Local Administrator (2). */
+				ptr_get_be32(&eval->val[2], source_as);
+		}
+
+		if (upstream->s_addr == INADDR_ANY) {
+			eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP,
+						 ECOMMUNITY_VRF_ROUTE_IMPORT);
+			if (!eval)
+				eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP,
+							 ECOMMUNITY_ROUTE_TARGET);
+			if (eval)
+				/* IP-address-specific wire layout: type, subtype,
+				 * Global Administrator (4, network order), Local
+				 * Administrator (2). */
+				memcpy(&upstream->s_addr, &eval->val[2], IPV4_MAX_BYTELEN);
+		}
+
+		if (*source_as != 0 && upstream->s_addr != INADDR_ANY)
+			break;
+	}
+	bgp_dest_unlock_node(dest);
+}
+
+/*
+ * Upstream-PE fallback when the unicast route toward C-S carries no
+ * route-import RT: the next hop of the received Source Active route. Only
+ * correct when the SA originator's address is preserved end to end (iBGP, or a
+ * peer that attaches no route-import RT such as FRR<->FRR); eBGP rewrites the
+ * SA next hop to the peering address, so relying on it there produces a
+ * non-matching RT. The upstream PE address is v4 in a v4 core for either C-S
+ * family: the SA carries mp_nexthop_global_in = the originating PE's router-id
+ * (see bgp_mvpn_source_active_set), so this arm serves both planes -- look up
+ * the SA in the (C-S)-family MCAST-VPN RIB.
+ */
+static void bgp_mvpn_resolve_upstream_from_sa(struct bgp *bgp, const struct ipaddr *src,
+					      const struct ipaddr *grp, struct in_addr *upstream)
+{
+	struct prefix_mvpn sa;
+	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi;
+
+	bgp_mvpn_build_prefix_type5(&sa, src, grp);
+	dest = bgp_safi_node_lookup(bgp->rib[afi][SAFI_MCAST_VPN], SAFI_MCAST_VPN,
+				    (const struct prefix *)&sa, NULL);
+	if (!dest)
+		return;
+
+	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+		if (pi->type != ZEBRA_ROUTE_BGP)
 			continue;
-		/* Four-Octet-AS-Specific wire layout: type, subtype, Global
-		 * Administrator (4-octet AS), Local Administrator (2). */
-		*source_as = (uint32_t)eval->val[2] << 24 |
-			     (uint32_t)eval->val[3] << 16 |
-			     (uint32_t)eval->val[4] << 8 | (uint32_t)eval->val[5];
+		if (pi->attr->mp_nexthop_global_in.s_addr == INADDR_ANY)
+			continue;
+		*upstream = pi->attr->mp_nexthop_global_in;
 		break;
 	}
+
 	bgp_dest_unlock_node(dest);
 }
 
@@ -852,26 +786,10 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, const struct ipaddr *src, const 
 	return CMD_SUCCESS;
 }
 
-/* True if any peer on this instance has the GTM MVPN AF (afi, SAFI 5)
- * configured/activated. afc[] is set the moment a peer is activated for the AF,
- * so this is a valid "GTM MVPN in use" predicate for both lifecycle hooks.
- */
-static bool bgp_mvpn_gtm_af_active(struct bgp *bgp, afi_t afi)
-{
-	struct peer *peer;
-	struct listnode *node;
-
-	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer))
-		if (peer->afc[afi][SAFI_MCAST_VPN])
-			return true;
-
-	return false;
-}
-
 bool bgp_mvpn_gtm_active(struct bgp *bgp)
 {
-	return bgp_mvpn_gtm_af_active(bgp, AFI_IP) ||
-	       bgp_mvpn_gtm_af_active(bgp, AFI_IP6);
+	return bgp_afi_safi_peer_exists(bgp, AFI_IP, SAFI_MCAST_VPN) ||
+	       bgp_afi_safi_peer_exists(bgp, AFI_IP6, SAFI_MCAST_VPN);
 }
 
 /*
@@ -902,10 +820,15 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 	struct prefix_mvpn p;
 	struct attr attr;
 	struct in6_addr tunn_id = {};
+	bool active[AFI_MAX] = {};
+	afi_t afi;
 
 	if (bgp->router_id.s_addr == INADDR_ANY)
 		return;
-	if (!bgp_mvpn_gtm_af_active(bgp, AFI_IP) && !bgp_mvpn_gtm_af_active(bgp, AFI_IP6))
+
+	active[AFI_IP] = bgp_afi_safi_peer_exists(bgp, AFI_IP, SAFI_MCAST_VPN);
+	active[AFI_IP6] = bgp_afi_safi_peer_exists(bgp, AFI_IP6, SAFI_MCAST_VPN);
+	if (!active[AFI_IP] && !active[AFI_IP6])
 		return;
 
 	/* GTM just became (or remains) active: make sure the pimd SG relay
@@ -962,22 +885,22 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 	 * them must still learn this PE as an IR leaf for that plane. Junos
 	 * mirrors this (its v6-AF Type-1 carries the v4 lo0 originator).
 	 */
-	if (bgp_mvpn_gtm_af_active(bgp, AFI_IP))
-		bgp_mvpn_route_install(bgp, bgp->peer_self, AFI_IP, &p, &attr, BGP_ROUTE_STATIC);
-	if (bgp_mvpn_gtm_af_active(bgp, AFI_IP6)) {
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++) {
+		if (!active[afi])
+			continue;
 		/* bgp_attr_intern's hash-miss path (bgp_attr_hash_alloc) takes
-		 * ownership of a caller-owned attr->extra and NULLs it here
-		 * (bgp_attr_owns_extra), so a first-plane install can strip the
-		 * PMSI tunnel info from this stack attr. Re-claim the slot or
-		 * the second plane interns a PMSI-flagged attr with no tunnel
-		 * info, announced as a len-5 NO_INFO PMSI that a Junos GTM
-		 * peer rejects as malformed (NOTIFICATION loop).
+		 * ownership of a caller-owned attr->extra and NULLs it
+		 * (bgp_attr_owns_extra), so a prior install can strip the PMSI
+		 * tunnel info from this stack attr. Re-claim the slot before
+		 * every install or a later plane interns a PMSI-flagged attr
+		 * with no tunnel info, announced as a len-5 NO_INFO PMSI that
+		 * a Junos GTM peer rejects as malformed (NOTIFICATION loop).
 		 */
 		if (!attr.extra) {
 			bgp_attr_set_pmsi_tnl_type(&attr, PMSI_TNLTYPE_INGR_REPL);
 			bgp_attr_set_tunn_id(&attr, &tunn_id);
 		}
-		bgp_mvpn_route_install(bgp, bgp->peer_self, AFI_IP6, &p, &attr, BGP_ROUTE_STATIC);
+		bgp_mvpn_route_install(bgp, bgp->peer_self, afi, &p, &attr, BGP_ROUTE_STATIC);
 	}
 
 	/*
@@ -990,25 +913,25 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 }
 
 /*
- * TEST-ONLY scaffold: originate or withdraw a local Type-7 (C-multicast Source
- * Tree Join) route, mirroring bgp_mvpn_source_active_set(). Plan 3 replaces
- * this with real pimd-driven origination; the CLI that drives it is likewise
- * test-only.
+ * Originate or withdraw a local Type-7 (C-multicast Source Tree Join) route,
+ * mirroring bgp_mvpn_source_active_set(). This is the pimd-driven join path:
+ * pimd reports local receiver interest in (C-S, C-G) through the zebra SG
+ * relay (bgp_zebra_process_mvpn_sg) and this PE originates the matching
+ * C-multicast join toward the source's upstream PE.
  */
-int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, const struct ipaddr *src,
-				  const struct ipaddr *grp, struct in_addr upstream, bool negate)
+int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
+				  const struct ipaddr *grp, bool negate)
 {
 	struct prefix_mvpn p;
 	struct attr attr;
-	struct in_addr umh = upstream;
+	uint32_t source_as = 0;
+	struct in_addr umh = { .s_addr = INADDR_ANY };
 
-	/* pimd-driven join carries no Source-AS (0). RFC 6514 Section 5: read it
-	 * off the Source-AS EC on the source's unicast route (Junos "src-as") so
-	 * the Type-7 NLRI Source-AS matches what the upstream PE expects. Done
+	/* RFC 6514 Section 5: the Source AS and the upstream PE both come off
+	 * the unicast route toward C-S (Junos "src-as" / "rt-import"). Resolved
 	 * before build_prefix so add and withdraw key the same NLRI (the source
 	 * route is present while a receiver is joined). */
-	if (source_as == 0)
-		bgp_mvpn_resolve_source_as(bgp, src, &source_as);
+	bgp_mvpn_resolve_from_source_route(bgp, src, &source_as, &umh);
 	/* RFC 6514 4.6: the Source AS is the AS of the PE the source attaches
 	 * to.  With no Source-AS extended community on the source route
 	 * (single-AS GTM over iBGP), that is the local AS. */
@@ -1034,16 +957,16 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, uint32_t source_as, const str
 	 * Target: an IP-address-specific RT whose Global Administrator is the
 	 * upstream PE (the PE toward C-S) and Local Administrator is 0. Only that
 	 * PE imports the C-multicast join -- it matches "an upstream-node-
-	 * identifying RT whose Global Administrator identifies that PBR". When no
-	 * upstream is passed explicitly, derive it from the Source Active route's
-	 * UMH. A join with no resolvable upstream is originated RT-less (not yet
-	 * targetable) and logged.
+	 * identifying RT whose Global Administrator identifies that PBR". When
+	 * the source route carries no route-import RT, fall back to the Source
+	 * Active route's next hop. A join with no resolvable upstream is
+	 * originated RT-less (not yet targetable) and logged.
 	 */
 	if (umh.s_addr == INADDR_ANY)
-		bgp_mvpn_resolve_upstream_pe(bgp, src, grp, &umh);
+		bgp_mvpn_resolve_upstream_from_sa(bgp, src, grp, &umh);
 	if (umh.s_addr != INADDR_ANY)
 		bgp_mvpn_attach_ip_rt(&attr, umh);
-	else
+	else if (BGP_DEBUG(zebra, ZEBRA))
 		zlog_debug("MVPN Type-7 (%pIA, %pIA): no upstream PE resolved; originating without upstream RT",
 			   src, grp);
 
@@ -1111,14 +1034,10 @@ void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_
 		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
 			bool self = (pi->peer == bgp->peer_self);
 			struct ecommunity *ecom = bgp_attr_get_ecommunity(pi->attr);
-
-			/* Populate the cached display string once (RFC 7716
-			 * Section 2.8.2 group-address RT on Type-5, and any RT a
-			 * later route type carries), mirroring the generic route
-			 * detail path.
-			 */
-			if (ecom && !ecom->str)
-				ecommunity_str(ecom);
+			/* ecommunity_str() lazily builds and caches the display
+			 * string (RFC 7716 Section 2.8.2 group-address RT on
+			 * Type-5, and any RT a later route type carries). */
+			const char *ecom_str = ecom ? ecommunity_str(ecom) : NULL;
 
 			if (use_json) {
 				json_object *jr = json_object_new_object();
@@ -1163,7 +1082,7 @@ void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_
 				if (ecom) {
 					json_object *je = json_object_new_object();
 
-					json_object_string_add(je, "string", ecom->str);
+					json_object_string_add(je, "string", ecom_str);
 					json_object_object_add(jr, "extendedCommunity", je);
 				}
 				json_object_boolean_add(jr, "selfOriginated", self);
@@ -1175,12 +1094,12 @@ void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_
 							PMSI_TNLTYPE_INGR_REPL
 						? "IR "
 						: "",
-					self ? "(local)" : "", ecom ? " " : "",
-					ecom ? ecom->str : "");
+					self ? "(local)" : "", ecom_str ? " " : "",
+					ecom_str ? ecom_str : "");
 			} else {
 				vty_out(vty, " [%u] source %pIA group %pIA %s%s%s\n", m->route_type,
-					&m->src, &m->grp, self ? "(local)" : "", ecom ? " " : "",
-					ecom ? ecom->str : "");
+					&m->src, &m->grp, self ? "(local)" : "",
+					ecom_str ? " " : "", ecom_str ? ecom_str : "");
 			}
 		}
 	}
