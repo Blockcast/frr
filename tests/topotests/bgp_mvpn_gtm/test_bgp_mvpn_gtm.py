@@ -49,7 +49,7 @@ from lib import topotest
 from lib.topogen import Topogen, TopoRouter, get_topogen
 from lib.topolog import logger
 
-pytestmark = [pytest.mark.bgpd, pytest.mark.pimd]
+pytestmark = [pytest.mark.bgpd, pytest.mark.pimd, pytest.mark.pim6d]
 
 # The (S, G) driven end-to-end by real pimd state: h1 sends to GROUP,
 # r2 IGMP-joins (SOURCE, GROUP).
@@ -94,6 +94,9 @@ def setup_module(mod):
         )
         router.load_config(
             TopoRouter.RD_PIM, os.path.join(CWD, "{}/pimd.conf".format(rname))
+        )
+        router.load_config(
+            TopoRouter.RD_PIM6, os.path.join(CWD, "{}/pim6d.conf".format(rname))
         )
         router.load_config(
             TopoRouter.RD_BGP, os.path.join(CWD, "{}/bgpd.conf".format(rname))
@@ -489,18 +492,60 @@ def test_type1_v6_plane_with_v4_originator():
     assert result is None, "r2 did not hold r1's Type-1 in the IPv6 MCAST-VPN RIB"
 
 
-def test_type7_v6_umh_from_vrf_route_import():
-    """IPv6 Type-7 origination requires MLD-driven pim6d glue.
+def test_type7_v6_from_mld_join():
+    """A real MLDv2 (S,G) join on r2 must originate an IPv6 Type-7 via pim6d.
 
-    The bgpd-side v6 Type-7 codec and UMH resolver arms are implemented and
-    were exercised live on a dev-build (see git history), but organic v6
-    origination needs the pim6d `mvpn-gtm` CLI + MLD join plumbing that lands
-    with the Plan-5 v6 mirror.  The `bgp mvpn test-join` scaffold that
-    previously drove this scenario was removed with the pimd glue.
+    r2 takes `ipv6 mld join-group ff3e::1 2001:db8::1` on its receiver stub.
+    pim6d builds local v6 SSM membership -> (S,G) upstream in JOINED: the
+    source RPFs via r2-eth0 to r1 (2001:db8:1::1), an interface with no v6 PIM
+    neighbor -- the GTM neigh_needed=false path, shared from pimd via
+    pim_common and reached here with the pim6d `mvpn-gtm` CLI.  With mvpn-gtm
+    enabled pim6d signals bgpd over ZEBRA_MVPN_SG (v6 (S,G) carried as
+    IPADDR_V6); bgpd originates the C-multicast Source Tree Join in the IPv6
+    MCAST-VPN AF (bgp_mvpn_prefix_afi routes it to AFI_IP6).  r1 must learn
+    Type-7 (2001:db8::1, ff3e::1) with:
+
+    - sourceAs 65001: no Source-AS EC on the source (single-AS iBGP), so bgpd
+      falls back to the local AS (RFC 6514 Section 4.6).
+    - RT:10.0.0.1:0: the upstream PE resolved from r1's static Source Active
+      route next hop (r1's v4 router-id; the MVPN originator stays v4 even in
+      the v6 plane).
+
+    This is the pim6d->bgpd glue JOIN leg driven by MLD, mirroring
+    test_type7_from_igmp_join.  There is NO PIM adjacency between r1 and r2 --
+    the join crosses the fabric purely as BGP.
     """
-    pytest.skip(
-        "v6 Type-7 origination is pim6d-driven; lands with the Plan-5 v6 mirror"
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ ipv6 mld join-group ff3e::1 2001:db8::1
+"""
     )
+
+    def _type7_v6_present(router):
+        routes = _mvpn_routes(router, v6=True)
+        for r in routes:
+            if (
+                r.get("routeType") == 7
+                and r.get("source") == "2001:db8::1"
+                and r.get("group") == "ff3e::1"
+                and r.get("sourceAs") == 65001
+                and r.get("extendedCommunity", {}).get("string") == "RT:10.0.0.1:0"
+            ):
+                return None
+        return "IPv6 Type-7 (2001:db8::1, ff3e::1, AS 65001) with RT:10.0.0.1:0 not found in {}".format(
+            routes
+        )
+
+    test_func = functools.partial(_type7_v6_present, "r1")
+    _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
+    assert result is None, "r1 did not learn the pim6d-originated IPv6 Type-7 for the MLD join"
 
 
 def test_type1_ipmsi_with_ir_pmsi():
