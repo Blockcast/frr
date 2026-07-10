@@ -2328,6 +2328,16 @@ int lib_interface_pim_address_family_pim_passive_enable_modify(struct nb_cb_modi
 
 	switch (args->event) {
 	case NB_EV_VALIDATE:
+		/* Reciprocal of the pim-light-enable check: light and passive
+		 * are contradictory in either configuration order.
+		 */
+		if (yang_dnode_get_bool(args->dnode, NULL) &&
+		    yang_dnode_get_bool(args->dnode, "../pim-light-enable")) {
+			snprintf(args->errmsg, args->errmsg_len,
+				 "pim passive cannot be combined with pim light");
+			return NB_ERR_VALIDATION;
+		}
+		break;
 	case NB_EV_ABORT:
 	case NB_EV_PREPARE:
 		break;
