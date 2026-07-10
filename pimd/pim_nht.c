@@ -1073,6 +1073,12 @@ static bool pim_nht_nexthop_accept(struct pim_instance *pim, struct interface *i
 	if (!pim_ifp || !pim_ifp->pim_enable)
 		return false;
 
+	/* RFC 9739 (PIM Light): a light interface is a valid RPF nexthop
+	 * without a hello adjacency -- Join/Prune is exchanged neighborless.
+	 */
+	if (pim_ifp->pim_light_enable)
+		neighbor_needed = false;
+
 	if (neighbor_needed && !pim_if_connected_to_source(ifp, src)) {
 		if (pim_addr_is_any(*nh_gate)) {
 			struct pim_neighbor *fresh_nbr = pim_neighbor_find_if(ifp);

@@ -539,6 +539,18 @@ keyword at the end.
 
    Disable sending and receiving PIM control packets on the interface.
 
+.. clicmd:: ip pim light
+
+   Make this a PIM Light interface (RFC 9739): Join/Prune is exchanged
+   without a PIM hello adjacency.  No hellos are sent; a Join/Prune from an
+   unknown router is accepted (materializing a synthetic neighbor that is
+   refreshed by each Join/Prune and expires on holdtime), and the interface
+   is a valid RPF nexthop without a neighbor.  Intended for point-to-point
+   tunnel interfaces toward a remote multicast island
+   (draft-zzhang-mboned-dynamic-internet-mcast-tunnel); the RPF route toward
+   the source must point out this interface via the remote router's unicast
+   address.  Cannot be combined with ``ip pim passive``.
+
 .. clicmd:: ip igmp
 
    Tell PIM to receive IGMP reports and Query on this interface. The default

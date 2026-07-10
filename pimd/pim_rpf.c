@@ -266,8 +266,23 @@ static pim_addr pim_rpf_find_rpf_addr(struct pim_upstream *up)
 				     up->rpf.source_nexthop.mrib_nexthop_addr);
 	if (neigh)
 		rpf_addr = neigh->source_addr;
-	else
-		rpf_addr = PIMADDR_ANY;
+	else {
+		struct pim_interface *pim_ifp =
+			up->rpf.source_nexthop.interface->info;
+
+		/* RFC 9739 (PIM Light): no hello adjacency on a light
+		 * interface, so there is no neighbor to name.  Address the
+		 * Join/Prune to the MRIB nexthop toward the source (the
+		 * upstream router / UMH) so its upstream-neighbor field
+		 * carries a unicast address of the upstream router.
+		 */
+		if (pim_ifp && pim_ifp->pim_light_enable &&
+		    !pim_addr_is_any(
+			    up->rpf.source_nexthop.mrib_nexthop_addr))
+			rpf_addr = up->rpf.source_nexthop.mrib_nexthop_addr;
+		else
+			rpf_addr = PIMADDR_ANY;
+	}
 
 	return rpf_addr;
 }

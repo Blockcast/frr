@@ -397,12 +397,49 @@ int pim_pim_packet(struct interface *ifp, uint8_t *buf, size_t len,
 	case PIM_MSG_TYPE_JOIN_PRUNE:
 		neigh = pim_neighbor_find(ifp, sg.src, false);
 		if (!neigh) {
-			if (PIM_DEBUG_PIM_PACKETS)
-				zlog_debug(
-					"%s %s: non-hello PIM message type=%d from non-neighbor %pPA on %s",
-					__FILE__, __func__, header->type,
-					&sg.src, ifp->name);
-			return -1;
+			pim_ifp = ifp->info;
+			if (pim_ifp->pim_light_enable) {
+				/* RFC 9739 (PIM Light): accept Join/Prune from
+				 * an unknown router -- no hello adjacency
+				 * required.  Create a synthetic neighbor so the
+				 * J/P machinery (neighbor-shaped throughout)
+				 * has a valid peer; each J/P refreshes it
+				 * below, and absence of J/P lets it expire on
+				 * holdtime like any neighbor.
+				 */
+				neigh = pim_neighbor_add(ifp, sg.src,
+							 0 /* hello_options */,
+							 PIM_IF_DEFAULT_HOLDTIME(
+								 pim_ifp),
+							 pim_ifp->pim_propagation_delay_msec,
+							 pim_ifp->pim_override_interval_msec,
+							 PIM_DEFAULT_DR_PRIORITY,
+							 0 /* generation_id */,
+							 NULL /* addr_list */,
+							 PIM_NEIGHBOR_SEND_DELAY);
+				if (neigh) {
+					/* Tag it and re-run DR election:
+					 * light neighbors are excluded from
+					 * election, and pim_neighbor_add ran
+					 * one before the tag existed.
+					 */
+					neigh->light = true;
+					pim_if_dr_election(ifp);
+					if (PIM_DEBUG_PIM_PACKETS)
+						zlog_debug("%s: PIM Light neighbor %pPA created on %s from Join/Prune",
+							   __func__, &sg.src,
+							   ifp->name);
+				}
+			}
+			if (!neigh) {
+				if (PIM_DEBUG_PIM_PACKETS)
+					zlog_debug(
+						"%s %s: non-hello PIM message type=%d from non-neighbor %pPA on %s",
+						__FILE__, __func__,
+						header->type, &sg.src,
+						ifp->name);
+				return -1;
+			}
 		}
 		pim_neighbor_timer_reset(neigh, neigh->holdtime);
 		return pim_joinprune_recv(ifp, neigh, sg.src,
@@ -920,6 +957,14 @@ int pim_hello_send(struct interface *ifp, uint16_t holdtime)
 	struct pim_interface *pim_ifp = ifp->info;
 
 	if (if_is_loopback(ifp))
+		return 0;
+
+	/* RFC 9739 (PIM Light): Join/Prune without hello adjacency --
+	 * never send hellos on a light interface.  All hello TX paths
+	 * (periodic timer, restart-now, triggered, pim_hello_require)
+	 * funnel through here.
+	 */
+	if (pim_ifp->pim_light_enable)
 		return 0;
 
 	if (hello_send(ifp, holdtime)) {

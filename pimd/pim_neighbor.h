@@ -26,6 +26,11 @@ struct pim_neighbor {
 	uint16_t override_interval_msec;
 	uint32_t dr_priority;
 	uint32_t generation_id;
+	/* RFC 9739 (PIM Light): synthetic neighbor materialized from a
+	 * neighborless Join/Prune on a light interface; no hello state,
+	 * excluded from DR election.
+	 */
+	bool light;
 	struct list *prefix_list; /* list of struct prefix */
 	struct event *t_expire_timer;
 	struct interface *interface;

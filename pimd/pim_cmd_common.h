@@ -48,6 +48,7 @@ int pim_process_autorp_send_rp_discovery_scope_int_cmd(struct vty *vty, bool no,
 						       const char *interval, const char *holdtime);
 int pim_process_no_ip_pim_cmd(struct vty *vty);
 int pim_process_ip_pim_passive_cmd(struct vty *vty, bool enable);
+int pim_process_ip_pim_light_cmd(struct vty *vty, bool enable);
 int pim_process_ip_pim_mode_cmd(struct vty *vty, bool dm, bool smdm, bool ssm);
 int pim_process_ip_pim_drprio_cmd(struct vty *vty, const char *drpriority_str);
 int pim_process_no_ip_pim_drprio_cmd(struct vty *vty);

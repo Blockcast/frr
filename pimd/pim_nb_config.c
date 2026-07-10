@@ -2347,6 +2347,41 @@ int lib_interface_pim_address_family_pim_passive_enable_modify(struct nb_cb_modi
 
 /*
  * XPath:
+ * /frr-interface:lib/interface/frr-pim:pim/address-family/pim-light-enable
+ */
+int lib_interface_pim_address_family_pim_light_enable_modify(struct nb_cb_modify_args *args)
+{
+	struct interface *ifp;
+	struct pim_interface *pim_ifp;
+
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+		/* Light (no-hello J/P exchange) and passive (no protocol
+		 * packets at all) are contradictory: passive's RX gate drops
+		 * the very Join/Prune light exists to accept.
+		 */
+		if (yang_dnode_get_bool(args->dnode, NULL) &&
+		    yang_dnode_get_bool(args->dnode, "../pim-passive-enable")) {
+			snprintf(args->errmsg, args->errmsg_len,
+				 "pim light cannot be combined with pim passive");
+			return NB_ERR_VALIDATION;
+		}
+		break;
+	case NB_EV_ABORT:
+	case NB_EV_PREPARE:
+		break;
+	case NB_EV_APPLY:
+		ifp = nb_running_get_entry(args->dnode, NULL, true);
+		pim_ifp = ifp->info;
+		pim_ifp->pim_light_enable = yang_dnode_get_bool(args->dnode, NULL);
+		break;
+	}
+
+	return NB_OK;
+}
+
+/*
+ * XPath:
  * /frr-interface:lib/interface/frr-pim:pim/address-family/pim-mode
  */
 int lib_interface_pim_address_family_pim_mode_modify(struct nb_cb_modify_args *args)
