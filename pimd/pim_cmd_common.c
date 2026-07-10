@@ -310,6 +310,26 @@ int pim_process_ip_pim_passive_cmd(struct vty *vty, bool enable)
 				    FRR_PIM_AF_XPATH_VAL);
 }
 
+int pim_process_ip_pim_light_cmd(struct vty *vty, bool enable)
+{
+	int ret;
+
+	if (enable) {
+		ret = pim_process_ip_pim_cmd(vty);
+
+		if (ret != NB_OK)
+			return ret;
+
+		nb_cli_enqueue_change(vty, "./pim-light-enable", NB_OP_MODIFY,
+				      "true");
+	} else
+		nb_cli_enqueue_change(vty, "./pim-light-enable", NB_OP_MODIFY,
+				      "false");
+
+	return nb_cli_apply_changes(vty, FRR_PIM_INTERFACE_XPATH,
+				    FRR_PIM_AF_XPATH_VAL);
+}
+
 int pim_process_ip_pim_mode_cmd(struct vty *vty, bool dm, bool smdm, bool ssm)
 {
 	int ret;
@@ -2543,6 +2563,10 @@ void pim_show_interfaces_single(struct pim_instance *pim, struct vty *vty,
 				json_object_boolean_true_add(json_row,
 							     "passive");
 
+			if (pim_ifp->pim_light_enable)
+				json_object_boolean_true_add(json_row,
+							     "light");
+
 			/* PIM neighbors */
 			if (pim_ifp->pim_neighbor_list->count) {
 				json_pim_neighbors = json_object_new_object();
@@ -2719,6 +2743,9 @@ void pim_show_interfaces_single(struct pim_instance *pim, struct vty *vty,
 
 			if (pim_ifp->pim_passive_enable)
 				vty_out(vty, "Passive    : yes\n");
+
+			if (pim_ifp->pim_light_enable)
+				vty_out(vty, "Light      : yes\n");
 
 			vty_out(vty, "\n");
 
@@ -3391,12 +3418,16 @@ void pim_show_neighbors(struct pim_instance *pim, struct vty *vty,
 						    neigh->holdtime);
 				json_object_int_add(json_row, "drPriority",
 						    neigh->dr_priority);
+				if (neigh->light)
+					json_object_boolean_true_add(json_row,
+								     "light");
 				json_object_object_add(json_ifp_rows,
 						       neigh_src_str, json_row);
 
 			} else {
-				ttable_add_row(tt, "%s|%pPAs|%s|%s|%d",
+				ttable_add_row(tt, "%s|%pPAs%s|%s|%s|%d",
 					       ifp->name, &neigh->source_addr,
+					       neigh->light ? " (L)" : "",
 					       uptime, expire,
 					       neigh->dr_priority);
 			}

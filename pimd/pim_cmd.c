@@ -5874,6 +5874,17 @@ DEFPY (interface_ip_pim_passive,
 	return pim_process_ip_pim_passive_cmd(vty, !no);
 }
 
+DEFPY (interface_ip_pim_light,
+	interface_ip_pim_light_cmd,
+	"[no] ip pim light$light",
+	NO_STR
+	IP_STR
+	PIM_STR
+	"PIM Light interface (RFC 9739): Join/Prune without hello adjacency\n")
+{
+	return pim_process_ip_pim_light_cmd(vty, !no);
+}
+
 
 DEFPY (interface_ip_pim,
        interface_ip_pim_cmd,
@@ -9459,6 +9470,7 @@ void pim_cmd_init(void)
 	install_element(INTERFACE_NODE, &interface_ip_pim_allowrp_cmd);
 	install_element(INTERFACE_NODE, &interface_ip_pim_activeactive_cmd);
 	install_element(INTERFACE_NODE, &interface_ip_pim_passive_cmd);
+	install_element(INTERFACE_NODE, &interface_ip_pim_light_cmd);
 	install_element(INTERFACE_NODE, &interface_ip_pim_cmd);
 	install_element(INTERFACE_NODE, &interface_ip_pim_drprio_cmd);
 	install_element(INTERFACE_NODE, &interface_no_ip_pim_drprio_cmd);

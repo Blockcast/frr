@@ -554,6 +554,13 @@ module frr-pim {
       description
         "Disable exchange of protocol packets.";
     }
+    leaf pim-light-enable {
+      type boolean;
+      default "false";
+      description
+        "PIM Light interface (RFC 9739): accept and send Join/Prune
+         without a PIM hello adjacency.";
+    }
     leaf pim-mode {
       type enumeration {
         enum "SPARSE" {

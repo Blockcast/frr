@@ -48,6 +48,11 @@ static void dr_election_by_addr(struct interface *ifp)
 	}
 
 	for (ALL_LIST_ELEMENTS_RO(pim_ifp->pim_neighbor_list, node, neigh)) {
+		/* RFC 9739 (PIM Light): synthetic light neighbors carry no
+		 * hello state and never participate in DR election.
+		 */
+		if (neigh->light)
+			continue;
 		if (pim_addr_cmp(neigh->source_addr, pim_ifp->pim_dr_addr) > 0)
 			pim_ifp->pim_dr_addr = neigh->source_addr;
 	}
@@ -77,6 +82,11 @@ static void dr_election_by_pri(struct interface *ifp)
 				  __func__, neigh->dr_priority,
 				  &neigh->source_addr, &pim_ifp->pim_dr_addr);
 		}
+		/* RFC 9739 (PIM Light): synthetic light neighbors carry no
+		 * hello state and never participate in DR election.
+		 */
+		if (neigh->light)
+			continue;
 		if ((neigh->dr_priority > dr_pri) ||
 		    ((neigh->dr_priority == dr_pri) &&
 		     (pim_addr_cmp(neigh->source_addr, pim_ifp->pim_dr_addr) >

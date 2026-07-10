@@ -76,6 +76,10 @@ struct pim_interface {
 	bool pim_enable : 1;
 	bool pim_can_disable_join_suppression : 1;
 	bool pim_passive_enable : 1;
+	/* PIM Light interface (RFC 9739): accept/send Join/Prune without a
+	 * hello adjacency (draft-zzhang dynamic internet multicast tunnels).
+	 */
+	bool pim_light_enable : 1;
 
 	bool gm_enable : 1;
 	bool gm_proxy : 1; /* proxy IGMP joins/prunes */
