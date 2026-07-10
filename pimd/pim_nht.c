@@ -1226,10 +1226,12 @@ static bool pim_ecmp_nexthop_search(struct pim_instance *pim, struct pim_nexthop
 			if (curr_route_valid &&
 			    !pim_if_connected_to_source(nexthop->interface,
 							src)) {
+				struct pim_interface *curr_pim_ifp =
+					nexthop->interface->info;
 				struct pim_neighbor *nbr =
 					pim_neighbor_find(nexthop->interface,
 							  nexthop->mrib_nexthop_addr, true);
-				if (!nbr
+				if (!nbr && !curr_pim_ifp->pim_light_enable
 				    && !if_is_loopback(nexthop->interface)) {
 					if (PIM_DEBUG_PIM_NHT)
 						zlog_debug(
@@ -1257,6 +1259,7 @@ static bool pim_ecmp_nexthop_search(struct pim_instance *pim, struct pim_nexthop
 	/* Count the number of neighbors for ECMP */
 	for (nh_node = rib->nexthop; nh_node; nh_node = nh_node->next) {
 		struct pim_neighbor *nbr;
+		struct pim_interface *nh_pim_ifp;
 		struct interface *ifp = if_lookup_by_index(nh_node->ifindex, pim->vrf->vrf_id);
 
 		if (!ifp)
@@ -1267,8 +1270,10 @@ static bool pim_ecmp_nexthop_search(struct pim_instance *pim, struct pim_nexthop
 #else
 		pim_addr nhaddr = nh_node->gate.ipv6;
 #endif
+		nh_pim_ifp = ifp->info;
 		nbr = pim_neighbor_find(ifp, nhaddr, true);
-		if (nbr || pim_if_connected_to_source(ifp, src))
+		if (nbr || pim_if_connected_to_source(ifp, src) ||
+		    (nh_pim_ifp && nh_pim_ifp->pim_light_enable))
 			num_nbrs++;
 	}
 
@@ -1317,7 +1322,11 @@ static bool pim_ecmp_nexthop_search(struct pim_instance *pim, struct pim_nexthop
 			continue;
 		}
 
-		if (neighbor_needed && !pim_if_connected_to_source(ifp, src)) {
+		/* RFC 9739 (PIM Light): light interfaces carry no hello
+		 * adjacency; do not require a neighbor on them.
+		 */
+		if (neighbor_needed && !pim_ifp->pim_light_enable &&
+		    !pim_if_connected_to_source(ifp, src)) {
 #if PIM_IPV == 4
 			pim_addr nhaddr = nh_node->gate.ipv4;
 #else
@@ -1444,14 +1453,17 @@ bool pim_nht_lookup_ecmp(struct pim_instance *pim, struct pim_nexthop *nexthop, 
 	/* Count the number of neighbors for ECMP computation */
 	for (i = 0; i < num_ifindex; i++) {
 		struct pim_neighbor *nbr;
+		struct pim_interface *nh_pim_ifp;
 		struct interface *ifp = if_lookup_by_index(args.next_hops[i].ifindex,
 							   pim->vrf->vrf_id);
 
 		if (!ifp)
 			continue;
 
+		nh_pim_ifp = ifp->info;
 		nbr = pim_neighbor_find(ifp, args.next_hops[i].nexthop_addr, true);
-		if (nbr || pim_if_connected_to_source(ifp, src))
+		if (nbr || pim_if_connected_to_source(ifp, src) ||
+		    (nh_pim_ifp && nh_pim_ifp->pim_light_enable))
 			num_nbrs++;
 	}
 
@@ -1501,7 +1513,8 @@ bool pim_nht_lookup_ecmp(struct pim_instance *pim, struct pim_nexthop *nexthop, 
 			continue;
 		}
 
-		if (neighbor_needed && !pim_if_connected_to_source(ifp, src)) {
+		if (neighbor_needed && !pim_ifp->pim_light_enable &&
+		    !pim_if_connected_to_source(ifp, src)) {
 			nbr = pim_neighbor_find(ifp, args.next_hops[i].nexthop_addr, true);
 			if (PIM_DEBUG_PIM_NHT_DETAIL)
 				zlog_debug("ifp name: %s(%s), pim nbr: %p", ifp->name,
@@ -1604,7 +1617,8 @@ bool pim_nht_lookup(struct pim_instance *pim, struct pim_nexthop *nexthop, pim_a
 				zlog_debug("%s: pim not enabled on input interface %s (ifindex=%d, RPF for source %pPAs)",
 					   __func__, ifp->name, first_ifindex, &addr);
 			i++;
-		} else if (neighbor_needed && !pim_if_connected_to_source(ifp, addr)) {
+		} else if (neighbor_needed && !pim_ifp->pim_light_enable &&
+			   !pim_if_connected_to_source(ifp, addr)) {
 			nbr = pim_neighbor_find(ifp, args.next_hops[i].nexthop_addr, true);
 			if (PIM_DEBUG_PIM_TRACE_DETAIL)
 				zlog_debug("ifp name: %s, pim nbr: %p", ifp->name, nbr);
