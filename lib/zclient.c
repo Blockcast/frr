@@ -4259,6 +4259,21 @@ int zapi_umh_decode(struct stream *s, struct zapi_umh *umh)
 	STREAM_GETC(s, umh->umh_type);
 	STREAM_GETC(s, umh->preference);
 
+	/* Decode is the trust boundary: garbage accepted here would become a
+	 * silent 0.0.0.0 mapping in pimd. */
+	if (umh->umh_type != ZAPI_UMH_TYPE_PIM &&
+	    umh->umh_type != ZAPI_UMH_TYPE_AMT_RELAY)
+		return -1;
+	if (umh->preference > ZAPI_UMH_PREF_MAX)
+		return -1;
+	/* The UMH address family must be consistent with the prefix family.
+	 * This also catches stream_get_ipaddr()'s no-default-case hole where
+	 * a corrupt family word yields an all-zero ipaddr that otherwise
+	 * decodes "successfully". */
+	if ((umh->prefix.family == AF_INET && !IS_IPADDR_V4(&umh->umh)) ||
+	    (umh->prefix.family == AF_INET6 && !IS_IPADDR_V6(&umh->umh)))
+		return -1;
+
 	return 0;
 
 stream_failure:

@@ -3522,9 +3522,9 @@ static void *route_set_ecommunity_umh_compile(const char *arg)
 	if (inet_pton(AF_INET, addr, &umh) != 1)
 		return NULL;
 	if (strmatch(kind, "pim"))
-		umh_type = 1;
+		umh_type = ZAPI_UMH_TYPE_PIM;
 	else if (strmatch(kind, "amt-relay"))
-		umh_type = 2;
+		umh_type = ZAPI_UMH_TYPE_AMT_RELAY;
 	else
 		return NULL;
 	if (pref > 15)
@@ -3534,7 +3534,7 @@ static void *route_set_ecommunity_umh_compile(const char *arg)
 	eval.val[1] = ECOMMUNITY_UMH;
 	memcpy(&eval.val[2], &umh.s_addr, sizeof(umh.s_addr));
 	eval.val[6] = 0;
-	eval.val[7] = (uint8_t)((pref << 4) | umh_type);
+	eval.val[7] = ECOMMUNITY_UMH_LA(pref, umh_type);
 
 	ecom = ecommunity_new();
 	ecommunity_add_val(ecom, &eval, false, false);
