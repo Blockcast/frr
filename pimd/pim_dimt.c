@@ -179,6 +179,12 @@ void pim_dimt_upstream_apply(struct pim_instance *pim,
 	if (!umh)
 		return;
 
+	/* We ARE the UMH (source-side PE: our own origination echoes back
+	 * through the loc-RIB hook) -- normal RPF toward the local source
+	 * applies, never a pin toward ourselves. */
+	if (if_lookup_address_local(&umh->umh, PIM_AF, pim->vrf->vrf_id))
+		return;
+
 	ifp = pim_dimt_light_iface(pim, umh->umh);
 	if (!ifp)
 		return;
