@@ -416,20 +416,11 @@ int pim_pim_packet(struct interface *ifp, uint8_t *buf, size_t len,
 							 PIM_DEFAULT_DR_PRIORITY,
 							 0 /* generation_id */,
 							 NULL /* addr_list */,
-							 PIM_NEIGHBOR_SEND_DELAY);
-				if (neigh) {
-					/* Tag it and re-run DR election:
-					 * light neighbors are excluded from
-					 * election, and pim_neighbor_add ran
-					 * one before the tag existed.
-					 */
-					neigh->light = true;
-					pim_if_dr_election(ifp);
-					if (PIM_DEBUG_PIM_PACKETS)
-						zlog_debug("%s: PIM Light neighbor %pPA created on %s from Join/Prune",
-							   __func__, &sg.src,
-							   ifp->name);
-				}
+							 PIM_NEIGHBOR_SEND_DELAY,
+							 true /* light */);
+				if (neigh && PIM_DEBUG_PIM_PACKETS)
+					zlog_debug("%s: PIM Light neighbor %pPA created on %s from Join/Prune",
+						   __func__, &sg.src, ifp->name);
 			}
 			if (!neigh) {
 				if (PIM_DEBUG_PIM_PACKETS)
