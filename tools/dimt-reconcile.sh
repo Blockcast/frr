@@ -137,7 +137,14 @@ frr_iface() { # <dev> <add|del>
 		out=$(vtysh -c 'configure terminal' -c "interface $1" \
 			-c 'ip pim' -c 'ip pim light' 2>&1)
 		rc=$?
-		if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -q '^%'; then
+		# vtysh reports errors on stdout with exit 0; match real
+		# error shapes only -- mgmtd's benign "% Configuration
+		# applied with notes: No changes found to be committed!"
+		# (config already present, the write-saved steady state)
+		# must NOT count as failure.
+		if [ "$rc" -ne 0 ] ||
+			printf '%s\n' "$out" |
+			grep -Eq '^% (Unknown command|Command incomplete|Ambiguous|.*[Ff]ailed|ERROR)'; then
 			log "vtysh failed for $1: $out"
 			return 1
 		fi
