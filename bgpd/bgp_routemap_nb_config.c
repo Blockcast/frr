@@ -2049,7 +2049,24 @@ int lib_route_map_entry_set_action_rmap_set_action_extcommunity_umh_modify(
 	int rv;
 
 	switch (args->event) {
-	case NB_EV_VALIDATE:
+	case NB_EV_VALIDATE: {
+		/* Parse here, not at APPLY: an apply-stage compile failure
+		 * cannot reject the transaction anymore (nb_transaction_process
+		 * swallows it), which would leave a set rule that shows in the
+		 * running config but installed nothing. The yang leaf is a bare
+		 * string, so this is the only real validation gate for non-CLI
+		 * northbound writers -- and the CLI grammar has holes glibc
+		 * inet_pton() rejects (e.g. "1.2.3.00"). */
+		struct ipaddr umh;
+		uint8_t umh_type, preference;
+
+		if (!bgp_route_set_umh_parse(
+			    yang_dnode_get_string(args->dnode, NULL), &umh,
+			    &umh_type, &preference, args->errmsg,
+			    args->errmsg_len))
+			return NB_ERR_VALIDATION;
+		break;
+	}
 	case NB_EV_PREPARE:
 	case NB_EV_ABORT:
 		break;

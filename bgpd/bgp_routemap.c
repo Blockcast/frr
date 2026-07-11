@@ -3034,7 +3034,7 @@ route_set_lcommunity(void *rule, const struct prefix *prefix, void *object)
 	if (old && old->refcnt == 0)
 		lcommunity_free(&old);
 
-	/* will be intern()'d or attr_flush()'d by bgp_update_main() */
+	/* will be intern()'d or attr_flush()'d by bgp_update() */
 	bgp_attr_set_lcommunity(attr, new);
 
 	return RMAP_OKAY;
@@ -3381,7 +3381,7 @@ route_set_ecommunity(void *rule, const struct prefix *prefix, void *object)
 	} else
 		new_ecom = ecommunity_dup(rcs->ecom);
 
-	/* will be intern()'d or attr_flush()'d by bgp_update_main() */
+	/* will be intern()'d or attr_flush()'d by bgp_update() */
 	bgp_attr_set_ecommunity(path->attr, new_ecom);
 
 	return RMAP_OKAY;
@@ -3499,7 +3499,7 @@ static const struct route_map_rule_cmd route_set_ecommunity_vri_cmd = {
 	route_set_ecommunity_free,
 };
 
-/* `set extcommunity umh <A.B.C.D|X:X::X> <pim|amt-relay> [preference (0-15)]'
+/* `set extcommunity umh <A.B.C.D|X:X::X:X> <pim|amt-relay> [preference (0-15)]'
  * -- DIMT Upstream Multicast Hop (draft-zzhang-mboned-dynamic-internet-mcast-
  * tunnel). Attached to the unicast route toward a multicast source so a
  * receiver can steer its (S,G) RPF onto the PIM Light tunnel facing the UMH.
@@ -3541,7 +3541,7 @@ route_set_ecommunity_umh(void *rule, const struct prefix *prefix, void *object)
 	} else
 		new_ecom = ecommunity_dup(rcs->ecom);
 
-	/* interned or attr_flush()'d by bgp_update_main(). */
+	/* interned or attr_flush()'d by bgp_update(). */
 	if (is_v6)
 		bgp_attr_set_ipv6_ecommunity(attr, new_ecom);
 	else
@@ -3550,39 +3550,105 @@ route_set_ecommunity_umh(void *rule, const struct prefix *prefix, void *object)
 	return RMAP_OKAY;
 }
 
+/* Parse a "set extcommunity umh" argument string:
+ *   <A.B.C.D|X:X::X:X> <pim|amt-relay> [preference (0-15)]
+ * Shared by the route-map compile below and the northbound VALIDATE stage
+ * (bgp_routemap_nb_config.c): a compile failure surfacing only at NB APPLY
+ * cannot reject the transaction anymore, so it would leave a set rule that
+ * shows in the running config but installed nothing -- multicast silently
+ * never starts. Validating up front turns that into a loud config error.
+ * Stricter than the old sscanf: a bare/incomplete "preference" tail or
+ * trailing junk is an error rather than a silent preference of 0. */
+bool bgp_route_set_umh_parse(const char *arg, struct ipaddr *umh,
+			     uint8_t *umh_type, uint8_t *preference,
+			     char *errmsg, size_t errmsg_len)
+{
+	char buf[128];
+	char *tok[4] = {};
+	char *t, *saveptr = NULL, *end = NULL;
+	unsigned long pref;
+	int ntok = 0;
+
+	if (strlcpy(buf, arg, sizeof(buf)) >= sizeof(buf)) {
+		snprintf(errmsg, errmsg_len, "%% UMH argument too long");
+		return false;
+	}
+
+	for (t = strtok_r(buf, " \t", &saveptr); t;
+	     t = strtok_r(NULL, " \t", &saveptr)) {
+		if (ntok == 4) {
+			snprintf(errmsg, errmsg_len,
+				 "%% Trailing junk after UMH preference");
+			return false;
+		}
+		tok[ntok++] = t;
+	}
+
+	if (ntok != 2 && ntok != 4) {
+		snprintf(errmsg, errmsg_len,
+			 "%% Expected: <A.B.C.D|X:X::X:X> <pim|amt-relay> [preference (0-15)]");
+		return false;
+	}
+
+	memset(umh, 0, sizeof(*umh));
+	if (inet_pton(AF_INET, tok[0], &umh->ipaddr_v4) == 1)
+		SET_IPADDR_V4(umh);
+	else if (inet_pton(AF_INET6, tok[0], &umh->ipaddr_v6) == 1)
+		SET_IPADDR_V6(umh);
+	else {
+		snprintf(errmsg, errmsg_len, "%% Invalid UMH address '%s'",
+			 tok[0]);
+		return false;
+	}
+
+	if (strmatch(tok[1], "pim"))
+		*umh_type = ZAPI_UMH_TYPE_PIM;
+	else if (strmatch(tok[1], "amt-relay"))
+		*umh_type = ZAPI_UMH_TYPE_AMT_RELAY;
+	else {
+		snprintf(errmsg, errmsg_len,
+			 "%% Invalid UMH type '%s' (must be pim or amt-relay)",
+			 tok[1]);
+		return false;
+	}
+
+	*preference = 0;
+	if (ntok == 4) {
+		if (!strmatch(tok[2], "preference")) {
+			snprintf(errmsg, errmsg_len,
+				 "%% Unexpected token '%s' (expected 'preference')",
+				 tok[2]);
+			return false;
+		}
+		pref = strtoul(tok[3], &end, 10);
+		if (tok[3][0] == '\0' || *end != '\0' ||
+		    pref > ZAPI_UMH_PREF_MAX) {
+			snprintf(errmsg, errmsg_len,
+				 "%% UMH preference must be 0-%d",
+				 ZAPI_UMH_PREF_MAX);
+			return false;
+		}
+		*preference = pref;
+	}
+
+	return true;
+}
+
 static void *route_set_ecommunity_umh_compile(const char *arg)
 {
 	struct rmap_ecom_set *rcs;
 	struct ecommunity *ecom;
-	struct in_addr umh4;
-	struct in6_addr umh6;
-	char addr[INET6_ADDRSTRLEN] = "";
-	char kind[16] = "";
-	unsigned int pref = 0;
-	uint8_t umh_type;
-	bool is_v6;
-	int n;
+	struct ipaddr umh = {};
+	uint8_t umh_type = 0;
+	uint8_t pref = 0;
+	char errmsg[128];
 
-	n = sscanf(arg, "%45s %15s preference %u", addr, kind, &pref);
-	if (n < 2)
-		return NULL;
-	if (inet_pton(AF_INET, addr, &umh4) == 1)
-		is_v6 = false;
-	else if (inet_pton(AF_INET6, addr, &umh6) == 1)
-		is_v6 = true;
-	else
-		return NULL;
-	if (strmatch(kind, "pim"))
-		umh_type = ZAPI_UMH_TYPE_PIM;
-	else if (strmatch(kind, "amt-relay"))
-		umh_type = ZAPI_UMH_TYPE_AMT_RELAY;
-	else
-		return NULL;
-	if (pref > 15)
+	if (!bgp_route_set_umh_parse(arg, &umh, &umh_type, &pref, errmsg,
+				     sizeof(errmsg)))
 		return NULL;
 
 	ecom = ecommunity_new();
-	if (is_v6) {
+	if (IS_IPADDR_V6(&umh)) {
 		struct ecommunity_val_ipv6 eval = {};
 
 		/* IPv6-address-specific: type octet 0x00 (== ENCODE_AS),
@@ -3590,7 +3656,7 @@ static void *route_set_ecommunity_umh_compile(const char *arg)
 		 * val[19]; the 20-byte unit is what marks it IPv6. */
 		eval.val[0] = ECOMMUNITY_ENCODE_AS;
 		eval.val[1] = ECOMMUNITY_UMH;
-		memcpy(&eval.val[2], &umh6, sizeof(umh6));
+		memcpy(&eval.val[2], &umh.ipaddr_v6, sizeof(umh.ipaddr_v6));
 		eval.val[18] = 0;
 		eval.val[19] = ECOMMUNITY_UMH_LA(pref, umh_type);
 
@@ -3605,7 +3671,8 @@ static void *route_set_ecommunity_umh_compile(const char *arg)
 
 		eval.val[0] = ECOMMUNITY_ENCODE_IP;
 		eval.val[1] = ECOMMUNITY_UMH;
-		memcpy(&eval.val[2], &umh4.s_addr, sizeof(umh4.s_addr));
+		memcpy(&eval.val[2], &umh.ipaddr_v4.s_addr,
+		       sizeof(umh.ipaddr_v4.s_addr));
 		eval.val[6] = 0;
 		eval.val[7] = ECOMMUNITY_UMH_LA(pref, umh_type);
 		ecommunity_add_val(ecom, &eval, false, false);
