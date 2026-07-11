@@ -197,6 +197,60 @@ interface r2-eth1
     assert result is None, result
 
 
+def test_r1_not_self_pinned_and_forwarding():
+    """r1 (the UMH itself) must IGNORE its own echoed-back mapping: its
+    (S,G) IIF stays the source LAN, OIF the light interface, and traffic
+    natively forwards through both kernel MFCs."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _r1_mroute():
+        data = _json_cmd("r1", "show ip mroute json")
+        sgdata = data.get(GROUP, {}).get(SOURCE, {})
+        if not sgdata:
+            return "r1 has no (S,G) mroute yet: {}".format(data)
+        if sgdata.get("iif") != "r1-eth1":
+            return (
+                "r1 (S,G) IIF is not the source LAN (self-pin bug?): "
+                "{}".format(sgdata)
+            )
+        oil = sgdata.get("oil", {})
+        if "r1-eth0" not in oil:
+            return "r1 (S,G) OIL lacks the light interface: {}".format(sgdata)
+        return None
+
+    _, result = topotest.run_and_expect(_r1_mroute, None, count=60, wait=1)
+    assert result is None, result
+
+    mcast_tester = os.path.join(CWD, "../lib/mcast-tester.py")
+    sender = tgen.gears["h1"].popen(
+        [mcast_tester, GROUP, "h1-eth0", "--send", "0.7"]
+    )
+    logger.info("started sender on h1: %s -> %s", SOURCE, GROUP)
+    try:
+
+        def _counts(rname):
+            data = _json_cmd(rname, "show ip mroute count json")
+            sgdata = data.get(GROUP, {}).get(SOURCE, {})
+            pkts = sgdata.get("packets", 0)
+            if pkts <= 0:
+                return "{}: no packets counted for ({}, {}): {}".format(
+                    rname, SOURCE, GROUP, sgdata
+                )
+            return None
+
+        for rname in ("r1", "r2"):
+            test_func = functools.partial(_counts, rname)
+            _, result = topotest.run_and_expect(
+                test_func, None, count=60, wait=1
+            )
+            assert result is None, result
+    finally:
+        sender.terminate()
+
+
 def test_ec_removal_acts_as_del():
     """The same prefix re-announced WITHOUT the UMH EC must clear the
     mapping and unpin the upstream (attribute loss == DEL). The upstream
