@@ -280,6 +280,28 @@ keyword at the end.
 
    Disable sending and receiving PIM control packets on the interface.
 
+.. clicmd:: ipv6 pim light
+
+   Make this a PIM Light interface (RFC 9739): Join/Prune is exchanged
+   without a PIM hello adjacency.  No hellos are sent; a Join/Prune from an
+   unknown router is accepted (materializing a synthetic neighbor that is
+   refreshed by each Join/Prune and expires on holdtime), and the interface
+   is a valid RPF nexthop without a neighbor.  Intended for point-to-point
+   tunnel interfaces toward a remote multicast island
+   (draft-zzhang-mboned-dynamic-internet-mcast-tunnel); the RPF route toward
+   the source must point out this interface via the remote router's unicast
+   address.  Cannot be combined with ``ipv6 pim passive``.  Instead of a
+   static route, the RPF may be steered by a BGP-learned Upstream Multicast
+   Hop mapping (``set extcommunity umh`` in bgpd); see
+   :clicmd:`show ipv6 pim dimt umh [json]`.
+
+.. clicmd:: show ipv6 pim dimt umh [json]
+
+   Display the bgpd-learned DIMT Upstream Multicast Hop mappings: for each
+   IPv6 source prefix, the UMH address joins are sent toward, its type
+   (``pim`` or ``amt-relay``), its preference, and the PIM Light interface
+   the (S,G) RPF is pinned to.
+
 .. clicmd:: ipv6 pim bsm
 
    Tell pim that we would like to use this interface to process bootstrap

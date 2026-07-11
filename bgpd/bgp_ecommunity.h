@@ -69,9 +69,12 @@
  *   pref[7:4] | type[3:0] (1 = PIM tunnel endpoint, 2 = AMT relay); high byte
  *   (val[6]) reserved (0).
  *
- * Wire, IPv6-address-specific (type 0x00 == ECOMMUNITY_ENCODE_AS, 20-octet):
- *   the IPv6-address-specific type octet is numerically 0x00, disambiguated
- *   from a 2-octet-AS EC by the 20-byte unit size (exactly as FRR's rt6).
+ * Wire, IPv6-address-specific (type 0x00, 20-octet):
+ *   the transitive IPv6-address-specific type high octet is numerically
+ *   0x00 (RFC 5701), the same value as a 2-octet-AS EC -- the 20-byte unit
+ *   size (IPv6 Extended Communities attribute carriage) is what
+ *   disambiguates. (FRR's own rt6 deliberately differs: it encodes
+ *   0x80/TRANS_EXP on the wire and only displays through a masked 0x00.)
  *   Global Admin (val[2..17]) = 16-byte UMH address; Local Admin low byte
  *   (val[19]) = the same pref|type nibbles; val[18] reserved (0).
  *
@@ -196,7 +199,7 @@ struct ecommunity_val {
 	uint8_t val[ECOMMUNITY_SIZE];
 };
 
-/* IPv6 Extended community value is eight octet.  */
+/* IPv6 Extended community value is twenty octets.  */
 struct ecommunity_val_ipv6 {
 	uint8_t val[IPV6_ECOMMUNITY_SIZE];
 };
