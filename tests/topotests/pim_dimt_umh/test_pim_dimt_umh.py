@@ -861,7 +861,15 @@ def test_no_pim_light_unpins_safely():
     the link-delete crash: STATIC_IIF suppresses every rpf-update repair
     path, so the disable hook must unpin (and delete the synthetic light
     neighbors) or the join timer fires on a dangling pin.  Re-enabling
-    must re-pin with zero mapping churn."""
+    must re-pin with zero mapping churn.
+
+    Ordering matters: the synthetic-neighbor-deletion assert on r1 runs
+    FIRST, while r2-eth2 is still light and the s4 wire carries only
+    Join/Prune.  Once either end goes non-light it starts periodic
+    hellos, and the peer then holds a REAL hello-based neighbor
+    (holdTimeMax 105) that `no ip pim light` must NOT delete -- checking
+    the r1 side after the r2 side would observe exactly that neighbor
+    and fail on a correct implementation."""
     tgen = get_topogen()
 
     if tgen.routers_have_failure():
@@ -897,6 +905,61 @@ route-map UMH permit 10
     )
     assert result is None, result
 
+    # r1-side: `no ip pim light` must DELETE the synthetic (L) neighbor
+    # that r2's joins materialized on r1-eth2, not leave it to linger.
+    def _r1_has_synthetic_neighbor():
+        neigh = _json_cmd("r1", "show ip pim neighbor json")
+        if neigh is None:
+            return "r1: unparseable pim neighbor JSON (pimd dead?)"
+        nbr = neigh.get("r1-eth2", {}).get("10.0.1.2")
+        if not nbr:
+            return "r1 has no neighbor 10.0.1.2 on r1-eth2: {}".format(neigh)
+        if nbr.get("light") is not True:
+            return "r1 neighbor 10.0.1.2 is not synthetic/light: {}".format(
+                nbr
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _r1_has_synthetic_neighbor, None, count=90, wait=1
+    )
+    assert result is None, result
+
+    tgen.gears["r1"].vtysh_cmd(
+        """
+configure terminal
+interface r1-eth2
+ no ip pim light
+"""
+    )
+
+    def _r1_light_neighbor_deleted():
+        neigh = _json_cmd("r1", "show ip pim neighbor json")
+        if neigh is None:
+            # a dead pimd must NOT satisfy this absence-assertion
+            return "r1: unparseable pim neighbor JSON (pimd dead?)"
+        # r2 is still light (never hellos) and r2's J/P is now rejected
+        # on the non-light r1-eth2, so NOTHING may re-create 10.0.1.2
+        if "10.0.1.2" in neigh.get("r1-eth2", {}):
+            return "r1 synthetic neighbor survived light disable: {}".format(
+                neigh.get("r1-eth2")
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _r1_light_neighbor_deleted, None, count=10, wait=1
+    )
+    assert result is None, result
+
+    tgen.gears["r1"].vtysh_cmd(
+        """
+configure terminal
+interface r1-eth2
+ ip pim light
+"""
+    )
+
+    # r2-side: disable light under the pinned, Joined upstream
     tgen.gears["r2"].vtysh_cmd(
         """
 configure terminal
@@ -944,46 +1007,6 @@ interface r2-eth2
         assert False, "r2 pimd died after join-timer period: {}".format(
             out[:200]
         )
-
-    # r1-side: disabling light must DELETE the synthetic (L) neighbor
-    # that r2's joins materialized on r1-eth2, not leave it to linger.
-    neigh = _json_cmd("r1", "show ip pim neighbor json")
-    assert neigh is not None, "r1: unparseable pim neighbor JSON (pimd dead?)"
-    assert "10.0.1.2" in neigh.get("r1-eth2", {}), (
-        "test premise broken: r1 has no light neighbor on r1-eth2: "
-        "{}".format(neigh)
-    )
-    tgen.gears["r1"].vtysh_cmd(
-        """
-configure terminal
-interface r1-eth2
- no ip pim light
-"""
-    )
-
-    def _r1_light_neighbor_deleted():
-        neigh = _json_cmd("r1", "show ip pim neighbor json")
-        if neigh is None:
-            # a dead pimd must NOT satisfy this absence-assertion
-            return "r1: unparseable pim neighbor JSON (pimd dead?)"
-        if "10.0.1.2" in neigh.get("r1-eth2", {}):
-            return "r1 synthetic neighbor survived light disable: {}".format(
-                neigh.get("r1-eth2")
-            )
-        return None
-
-    _, result = topotest.run_and_expect(
-        _r1_light_neighbor_deleted, None, count=10, wait=1
-    )
-    assert result is None, result
-
-    tgen.gears["r1"].vtysh_cmd(
-        """
-configure terminal
-interface r1-eth2
- ip pim light
-"""
-    )
 
     # re-enable on r2: the pin must return with zero mapping churn
     tgen.gears["r2"].vtysh_cmd(
