@@ -20,8 +20,6 @@
 #include "pim_pim.h"
 #include "pim_zebra.h"
 #include "pim_dimt.h"
-
-static void pim_zebra_umh_subscribe(struct zclient *zclient);
 #include "pim_iface.h"
 #include "pim_str.h"
 #include "pim_oil.h"
@@ -37,6 +35,8 @@ static void pim_zebra_umh_subscribe(struct zclient *zclient);
 #include "pim_ssm.h"
 #include "pim_vxlan.h"
 #include "pim_mlag.h"
+
+static void pim_zebra_umh_subscribe(struct zclient *zclient);
 
 #undef PIM_DEBUG_IFADDR_DUMP
 #define PIM_DEBUG_IFADDR_DUMP
@@ -559,7 +559,8 @@ static int pim_zebra_umh(ZAPI_CALLBACK_ARGS)
 		return 0;
 
 	if (zapi_umh_decode(zclient->ibuf, &zumh) < 0) {
-		zlog_warn("%s: UMH decode failed", __func__);
+		zlog_warn("%s: UMH decode failed (client bgpd via zebra, vrf %u)",
+			  __func__, vrf_id);
 		return 0;
 	}
 
@@ -570,16 +571,24 @@ static int pim_zebra_umh(ZAPI_CALLBACK_ARGS)
 /* Subscribe to the UMH relay and ask bgpd for a re-dump. */
 static void pim_zebra_umh_subscribe(struct zclient *zclient)
 {
+	struct pim_instance *pim = pim_get_pim_instance(VRF_DEFAULT);
 	struct stream *s;
 
 	if (!zclient || zclient->sock < 0)
 		return;
 
+	/* The replay re-dump is authoritative: mappings from a previous
+	 * bgpd whose DELs were lost across a restart/session bounce must
+	 * not survive. */
+	if (pim)
+		pim_dimt_umh_flush(pim);
+
 	s = zclient->obuf;
 	stream_reset(s);
 	zclient_create_header(s, ZEBRA_UMH_REPLAY, VRF_DEFAULT);
 	stream_putw_at(s, 0, stream_get_endp(s));
-	zclient_send_message(zclient);
+	if (zclient_send_message(zclient) == ZCLIENT_SEND_FAILURE)
+		zlog_warn("DIMT: UMH replay subscription not sent; mappings will not arrive until the next zebra reconnect");
 }
 
 static zclient_handler *const pim_handlers[] = {
