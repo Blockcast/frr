@@ -62,9 +62,21 @@
 #define ECOMMUNITY_VRF_ROUTE_IMPORT         0x0b
 /* draft-zzhang-mboned-dynamic-internet-mcast-tunnel Upstream Multicast Hop.
  * No IANA assignment yet: squat on the experimental-use sub-type range so a
- * later assignment is a one-line change. Wire (IPv4-address-specific):
- * Global Admin = UMH address; Local Admin low byte = pref[7:4] | type[3:0]
- * (1 = PIM tunnel endpoint, 2 = AMT relay); high byte reserved (0). */
+ * later assignment is a one-line change.
+ *
+ * Wire, IPv4-address-specific (type 0x01 == ECOMMUNITY_ENCODE_IP, 8-octet):
+ *   Global Admin (val[2..5]) = UMH address; Local Admin low byte (val[7]) =
+ *   pref[7:4] | type[3:0] (1 = PIM tunnel endpoint, 2 = AMT relay); high byte
+ *   (val[6]) reserved (0).
+ *
+ * Wire, IPv6-address-specific (type 0x00 == ECOMMUNITY_ENCODE_AS, 20-octet):
+ *   the IPv6-address-specific type octet is numerically 0x00, disambiguated
+ *   from a 2-octet-AS EC by the 20-byte unit size (exactly as FRR's rt6).
+ *   Global Admin (val[2..17]) = 16-byte UMH address; Local Admin low byte
+ *   (val[19]) = the same pref|type nibbles; val[18] reserved (0).
+ *
+ * Both families share this sub-type and the ECOMMUNITY_UMH_LA* nibble packing
+ * below; only the address width and the Local-Admin offset differ. */
 #define ECOMMUNITY_UMH                      0x80
 /* UMH Local Admin low byte: preference in the high nibble, type in the low. */
 #define ECOMMUNITY_UMH_LA(pref, type) ((uint8_t)(((pref) << 4) | ((type) & 0x0f)))
