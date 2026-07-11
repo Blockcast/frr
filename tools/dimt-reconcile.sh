@@ -25,10 +25,16 @@
 # EPERM inside an unprivileged container -- pre-add it from the host, we
 # tolerate the port already existing) and the PoP (OpenWrt ash).
 #
+# Safety: a missing/unreadable peers file (with no --peers inline list)
+# refuses to reconcile, and an empty desired peer set skips stale-tunnel
+# GC unless --allow-empty is given -- either case would otherwise be
+# indistinguishable from "delete every dimt-* tunnel on the fleet".
+#
 # Usage:
 #   dimt-reconcile.sh --self 100.64.0.40 [--peers-file /etc/dimt/peers]
 #                     [--peers 100.64.0.47,...] [--mtu 1252] [--port 6636]
 #                     [--no-frr] [--dry-run] [--watch SECONDS]
+#                     [--allow-empty]
 
 set -u
 
@@ -41,6 +47,8 @@ PREFIX="dimt-"
 DO_FRR=1
 DRY=0
 WATCH=0
+ALLOW_EMPTY="${DIMT_ALLOW_EMPTY:-0}"
+VTYSH_WARNED=0
 
 log() { echo "dimt-reconcile: $*" >&2; }
 
@@ -52,8 +60,10 @@ run() {
 	fi
 }
 
+# Print the header comment block (line 2 up to the first non-comment
+# line), so the usage text tracks header edits without a fixed range.
 usage() {
-	sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+	awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 	exit 1
 }
 
@@ -66,7 +76,12 @@ while [ $# -gt 0 ]; do
 	--port) FOU_PORT="$2"; shift 2 ;;
 	--no-frr) DO_FRR=0; shift ;;
 	--dry-run) DRY=1; shift ;;
-	--watch) WATCH="$2"; shift 2 ;;
+	--allow-empty) ALLOW_EMPTY=1; shift ;;
+	--watch)
+		case "${2:-}" in
+		'' | *[!0-9]*) log "--watch requires a number of seconds"; exit 1 ;;
+		esac
+		WATCH="$2"; shift 2 ;;
 	*) usage ;;
 	esac
 done
@@ -88,7 +103,7 @@ dev_of() {
 peers() {
 	{
 		[ -n "$PEERS_INLINE" ] && echo "$PEERS_INLINE" | tr ',' '\n'
-		[ -f "$PEERS_FILE" ] && sed 's/#.*//' "$PEERS_FILE"
+		[ -r "$PEERS_FILE" ] && sed 's/#.*//' "$PEERS_FILE"
 	} | tr -d ' \t' | grep . | sort -u
 }
 
@@ -105,14 +120,37 @@ ensure_fou() {
 
 frr_iface() { # <dev> <add|del>
 	[ "$DO_FRR" = 1 ] || return 0
-	command -v vtysh >/dev/null 2>&1 || return 0
+	if ! command -v vtysh >/dev/null 2>&1; then
+		if [ "$VTYSH_WARNED" = 0 ]; then
+			log "vtysh not found; skipping FRR enrollment for all peers"
+			VTYSH_WARNED=1
+		fi
+		return 0
+	fi
 	if [ "$2" = add ]; then
-		run vtysh -c 'configure terminal' -c "interface $1" \
-			-c 'ip pim' -c 'ip pim light' >/dev/null
+		if [ "$DRY" = 1 ]; then
+			log "DRY: vtysh -c 'configure terminal' -c 'interface $1' -c 'ip pim' -c 'ip pim light'"
+			return 0
+		fi
+		# vtysh reports some errors on stdout with exit status 0,
+		# as lines prefixed '%' -- check both.
+		out=$(vtysh -c 'configure terminal' -c "interface $1" \
+			-c 'ip pim' -c 'ip pim light' 2>&1)
+		rc=$?
+		if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -q '^%'; then
+			log "vtysh failed for $1: $out"
+			return 1
+		fi
 	else
-		run vtysh -c 'configure terminal' -c "no interface $1" \
+		if [ "$DRY" = 1 ]; then
+			log "DRY: vtysh -c 'configure terminal' -c 'no interface $1'"
+			return 0
+		fi
+		# Best effort: the interface stanza may already be gone.
+		vtysh -c 'configure terminal' -c "no interface $1" \
 			>/dev/null 2>&1 || true
 	fi
+	return 0
 }
 
 ensure_peer() { # <peer-overlay>
@@ -141,11 +179,13 @@ ensure_peer() { # <peer-overlay>
 		log "created $dev ($SELF -> $peer)"
 	fi
 
-	run ip link set "$dev" mtu "$MTU" multicast on up
+	run ip link set "$dev" mtu "$MTU" multicast on up || return 1
 
+	# An already-correct address passes the grep and is left alone;
+	# only a real flush-then-add failure fails the peer.
 	if ! ip -4 addr show dev "$dev" 2>/dev/null | grep -q "inet $self_in peer $peer_in/32"; then
 		run ip addr flush dev "$dev" 2>/dev/null
-		run ip addr add "$self_in" peer "$peer_in/32" dev "$dev"
+		run ip addr add "$self_in" peer "$peer_in/32" dev "$dev" || return 1
 	fi
 
 	frr_iface "$dev" add
@@ -168,22 +208,64 @@ gc_stale() {
 
 reconcile() {
 	rc=0
+
+	# A vanished registry must never read as "no peers desired": that
+	# would GC every tunnel on the box.  Refuse instead (in --watch
+	# mode the caller keeps looping and retries next cycle).
+	if [ -z "$PEERS_INLINE" ] && [ -n "$PEERS_FILE" ] && [ ! -r "$PEERS_FILE" ]; then
+		log "ERROR: peers file $PEERS_FILE missing/unreadable;" \
+			"refusing to reconcile (would remove every tunnel)"
+		return 1
+	fi
+
 	ensure_fou || rc=1
+
 	want=""
+	seen=""
+	npeers=0
 	for peer in $(peers); do
 		[ "$peer" = "$SELF" ] && continue
-		if ensure_peer "$peer"; then
-			want="$want $(dev_of "$peer")"
-		else
+		if ! echo "$peer" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+			log "ignoring invalid peer entry '$peer'"
+			continue
+		fi
+		dev=$(dev_of "$peer")
+		# Two peers in different /16s can collide on dimt-<o3>-<o4>;
+		# without this check the pair fights over one netdev as an
+		# endpoints-drifted recreate flip-flop every cycle.
+		prev=""
+		for pair in $seen; do
+			case "$pair" in
+			"$dev="*) prev="${pair#*=}" ;;
+			esac
+		done
+		if [ -n "$prev" ]; then
+			log "ERROR: peers $prev and $peer both derive device $dev;" \
+				"skipping $peer (addressing contract needs one overlay /16)"
+			rc=1
+			continue
+		fi
+		seen="$seen $dev=$peer"
+		npeers=$((npeers + 1))
+		# Keep desired peers out of GC's reach even when ensure_peer
+		# fails, so a transient failure cannot delete the tunnel.
+		want="$want $dev"
+		if ! ensure_peer "$peer"; then
 			log "failed to ensure peer $peer"
 			rc=1
 		fi
 	done
-	gc_stale "$want"
+
+	if [ "$npeers" -eq 0 ] && [ "$ALLOW_EMPTY" != 1 ]; then
+		log "WARNING: desired peer set is empty; skipping stale-tunnel GC" \
+			"(pass --allow-empty to force removal of every ${PREFIX}* tunnel)"
+	else
+		gc_stale "$want"
+	fi
 	return $rc
 }
 
-if [ "$WATCH" -gt 0 ] 2>/dev/null; then
+if [ "$WATCH" -gt 0 ]; then
 	while :; do
 		reconcile
 		sleep "$WATCH"
