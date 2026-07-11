@@ -3621,8 +3621,8 @@ bool bgp_route_set_umh_parse(const char *arg, struct ipaddr *umh,
 			return false;
 		}
 		pref = strtoul(tok[3], &end, 10);
-		if (tok[3][0] == '\0' || *end != '\0' ||
-		    pref > ZAPI_UMH_PREF_MAX) {
+		if (!isdigit((unsigned char)tok[3][0]) || tok[3][0] == '\0' ||
+		    *end != '\0' || pref > ZAPI_UMH_PREF_MAX) {
 			snprintf(errmsg, errmsg_len,
 				 "%% UMH preference must be 0-%d",
 				 ZAPI_UMH_PREF_MAX);
