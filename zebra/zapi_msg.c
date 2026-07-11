@@ -4146,7 +4146,8 @@ static void zread_mvpn_sg(ZAPI_HANDLER_ARGS)
 	struct stream *s;
 
 	if (zapi_mvpn_sg_decode(msg, &sg) < 0) {
-		zlog_warn("MVPN_SG relay: decode failed");
+		zlog_warn("MVPN_SG relay: decode failed (client %s, hdr length %u)",
+			  zebra_route_string(client->proto), hdr->length);
 		return;
 	}
 
@@ -4154,8 +4155,12 @@ static void zread_mvpn_sg(ZAPI_HANDLER_ARGS)
 		return;
 
 	bgp_client = zserv_find_client(ZEBRA_ROUTE_BGP, 0);
-	if (!bgp_client)
+	if (!bgp_client) {
+		if (IS_ZEBRA_DEBUG_EVENT)
+			zlog_debug("MVPN_SG relay from %s dropped: bgpd not connected (will resync on bgpd's next replay)",
+				   zebra_route_string(client->proto));
 		return;
+	}
 
 	if (IS_ZEBRA_DEBUG_EVENT)
 		zlog_debug("MVPN_SG relay: forwarding cmd %u to bgpd",
@@ -4217,7 +4222,8 @@ static void zread_umh(ZAPI_HANDLER_ARGS)
 	struct stream *s;
 
 	if (zapi_umh_decode(msg, &umh) < 0) {
-		zlog_warn("UMH relay: decode failed");
+		zlog_warn("UMH relay: decode failed (client %s, hdr length %u)",
+			  zebra_route_string(client->proto), hdr->length);
 		return;
 	}
 
@@ -4250,8 +4256,12 @@ static void zread_umh_replay(ZAPI_HANDLER_ARGS)
 		zlog_debug("UMH replay: pimd subscribed; relaying replay to bgpd");
 
 	bgp_client = zserv_find_client(ZEBRA_ROUTE_BGP, 0);
-	if (!bgp_client)
+	if (!bgp_client) {
+		if (IS_ZEBRA_DEBUG_EVENT)
+			zlog_debug("UMH replay request from %s dropped: bgpd not connected (will resync on bgpd route updates)",
+				   zebra_route_string(client->proto));
 		return;
+	}
 
 	s = stream_new(ZEBRA_SMALL_PACKET_SIZE);
 	zclient_create_header(s, ZEBRA_UMH_REPLAY, zvrf_id(zvrf));

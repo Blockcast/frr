@@ -66,6 +66,10 @@
  * Global Admin = UMH address; Local Admin low byte = pref[7:4] | type[3:0]
  * (1 = PIM tunnel endpoint, 2 = AMT relay); high byte reserved (0). */
 #define ECOMMUNITY_UMH                      0x80
+/* UMH Local Admin low byte: preference in the high nibble, type in the low. */
+#define ECOMMUNITY_UMH_LA(pref, type) ((uint8_t)(((pref) << 4) | ((type) & 0x0f)))
+#define ECOMMUNITY_UMH_LA_PREF(b) ((uint8_t)(b) >> 4)
+#define ECOMMUNITY_UMH_LA_TYPE(b) ((b) & 0x0f)
 
 /* from IANA: bgp-extended-communities/bgp-extended-communities.xhtml
  * 0x0c Flow-spec Redirect to IPv4 - draft-ietf-idr-flowspec-redirect

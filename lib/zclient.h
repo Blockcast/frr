@@ -714,11 +714,14 @@ enum zapi_umh_type {
 	ZAPI_UMH_TYPE_AMT_RELAY = 2,
 };
 
+/* preference is carried in a 4-bit EC field. */
+#define ZAPI_UMH_PREF_MAX 15
+
 struct zapi_umh {
 	struct prefix prefix; /* the unicast source route carrying the EC */
 	struct ipaddr umh;    /* Global Admin field: the UMH address */
 	uint8_t umh_type;     /* enum zapi_umh_type */
-	uint8_t preference;   /* 0-15, higher preferred */
+	uint8_t preference;   /* 0..ZAPI_UMH_PREF_MAX, higher preferred */
 };
 
 struct zapi_pw {

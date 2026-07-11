@@ -33,6 +33,8 @@
 #include "bgpd/bgp_debug.h"
 #include "bgpd/bgp_dimt.h"
 
+DEFINE_MTYPE_STATIC(BGPD, BGP_DIMT_UMH, "BGP DIMT UMH shadow entry");
+
 /* Prefixes we have announced a UMH for (info = the sent zapi_umh). */
 static struct route_table *dimt_sent;
 
@@ -55,8 +57,8 @@ static bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi,
 
 	for (i = 0; i < ecom->size; i++) {
 		const uint8_t *pnt = ecom->val + (i * ECOMMUNITY_SIZE);
-		uint8_t la_type = pnt[7] & 0x0f;
-		uint8_t la_pref = pnt[7] >> 4;
+		uint8_t la_type = ECOMMUNITY_UMH_LA_TYPE(pnt[7]);
+		uint8_t la_pref = ECOMMUNITY_UMH_LA_PREF(pnt[7]);
 
 		if (pnt[0] != ECOMMUNITY_ENCODE_IP ||
 		    pnt[1] != ECOMMUNITY_UMH)
@@ -85,8 +87,15 @@ static void bgp_dimt_umh_send(const struct prefix *p, struct in_addr umh,
 {
 	struct zapi_umh zumh = {};
 
-	if (!bgp_zclient || bgp_zclient->sock < 0)
+	if (!bgp_zclient || bgp_zclient->sock < 0) {
+		/* The caller still updates the shadow table on this failure,
+		 * which is correct: replay serves from the shadow, so it stays
+		 * the authoritative "what pimd should hold" set and the next
+		 * pimd replay recovers exactly the mappings we dropped here. */
+		zlog_warn("DIMT: UMH %s for %pFX not sent: zebra session down; pimd will resync on its next replay",
+			  add ? "add" : "del", p);
 		return;
+	}
 
 	prefix_copy(&zumh.prefix, p);
 	SET_IPADDR_V4(&zumh.umh);
@@ -102,7 +111,9 @@ static void bgp_dimt_umh_send(const struct prefix *p, struct in_addr umh,
 	zapi_umh_encode(bgp_zclient->obuf,
 			add ? ZEBRA_UMH_ADD : ZEBRA_UMH_DEL, VRF_DEFAULT,
 			&zumh);
-	zclient_send_message(bgp_zclient);
+	if (zclient_send_message(bgp_zclient) == ZCLIENT_SEND_FAILURE)
+		zlog_warn("DIMT: UMH %s for %pFX not sent: zclient send failed; pimd will resync on its next replay",
+			  add ? "add" : "del", p);
 }
 
 static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
@@ -132,7 +143,7 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 		struct zapi_umh *st = rn->info;
 
 		if (!st) {
-			st = XCALLOC(MTYPE_TMP, sizeof(*st));
+			st = XCALLOC(MTYPE_BGP_DIMT_UMH, sizeof(*st));
 			rn->info = st; /* keep the get-ref as the tree ref */
 		} else
 			route_unlock_node(rn);
@@ -159,7 +170,7 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 
 			bgp_dimt_umh_send(p, st->umh.ipaddr_v4, st->umh_type,
 					  st->preference, false);
-			XFREE(MTYPE_TMP, st);
+			XFREE(MTYPE_BGP_DIMT_UMH, st);
 			rn->info = NULL;
 			route_unlock_node(rn); /* tree ref */
 		}
@@ -169,35 +180,56 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 	return 0;
 }
 
-/* pimd (re-)subscribed through zebra: re-dump every selected v4 unicast
- * path that carries a UMH EC. */
+/* pimd (re-)subscribed through zebra: re-dump the shadow table. The shadow
+ * is updated on every loc-RIB change regardless of send success, so it --
+ * not the RIB -- is the single source of truth for "what pimd should
+ * hold". */
 int bgp_dimt_umh_replay(ZAPI_CALLBACK_ARGS)
 {
-	struct bgp *bgp = bgp_get_default();
-	struct bgp_dest *dest;
-	struct bgp_path_info *pi;
+	struct route_node *rn;
 
-	if (!bgp)
+	if (!dimt_sent)
 		return 0;
 
 	if (BGP_DEBUG(zebra, ZEBRA))
 		zlog_debug("DIMT: pimd requested UMH replay");
 
-	for (dest = bgp_table_top(bgp->rib[AFI_IP][SAFI_UNICAST]); dest;
-	     dest = bgp_route_next(dest)) {
-		for (pi = bgp_dest_get_bgp_path_info(dest); pi;
-		     pi = pi->next) {
-			struct in_addr umh;
-			uint8_t umh_type, pref;
+	for (rn = route_top(dimt_sent); rn; rn = route_next(rn)) {
+		struct zapi_umh *st = rn->info;
 
-			if (!CHECK_FLAG(pi->flags, BGP_PATH_SELECTED))
-				continue;
-			if (bgp_dimt_umh_from_path(pi, &umh, &umh_type,
-						   &pref))
-				bgp_dimt_umh_send(bgp_dest_get_prefix(dest),
-						  umh, umh_type, pref, true);
-			break;
-		}
+		if (!st)
+			continue;
+
+		bgp_dimt_umh_send(&st->prefix, st->umh.ipaddr_v4,
+				  st->umh_type, st->preference, true);
+	}
+
+	return 0;
+}
+
+/* `no router bgp` tears the loc-RIB down via bgp_table_finish() without
+ * firing per-prefix bgp_route_update hooks, so without this pimd would keep
+ * every announced mapping forever. Send a DEL per shadow entry and flush the
+ * table's contents (the table itself stays allocated for a re-created
+ * instance). */
+static int bgp_dimt_instance_delete(struct bgp *bgp)
+{
+	struct route_node *rn;
+
+	if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT || !dimt_sent)
+		return 0;
+
+	for (rn = route_top(dimt_sent); rn; rn = route_next(rn)) {
+		struct zapi_umh *st = rn->info;
+
+		if (!st)
+			continue;
+
+		bgp_dimt_umh_send(&st->prefix, st->umh.ipaddr_v4,
+				  st->umh_type, st->preference, false);
+		XFREE(MTYPE_BGP_DIMT_UMH, rn->info);
+		rn->info = NULL;
+		route_unlock_node(rn); /* tree ref */
 	}
 
 	return 0;
@@ -207,11 +239,16 @@ void bgp_dimt_init(void)
 {
 	dimt_sent = route_table_init();
 	hook_register(bgp_route_update, bgp_dimt_route_update);
+	hook_register(bgp_inst_delete, bgp_dimt_instance_delete);
 }
 
 void bgp_dimt_terminate(void)
 {
 	struct route_node *rn;
+
+	/* Post-terminate hook fires must not deref the freed table. */
+	hook_unregister(bgp_route_update, bgp_dimt_route_update);
+	hook_unregister(bgp_inst_delete, bgp_dimt_instance_delete);
 
 	if (!dimt_sent)
 		return;
@@ -219,7 +256,7 @@ void bgp_dimt_terminate(void)
 	for (rn = route_top(dimt_sent); rn; rn = route_next(rn)) {
 		if (!rn->info)
 			continue;
-		XFREE(MTYPE_TMP, rn->info);
+		XFREE(MTYPE_BGP_DIMT_UMH, rn->info);
 		rn->info = NULL;
 		route_unlock_node(rn);
 	}

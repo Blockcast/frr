@@ -1222,6 +1222,29 @@ static char *_ecommunity_ecom2str(struct ecommunity *ecom, int format, int filte
 						(struct in_addr *)pnt;
 					snprintfrr(encbuf, sizeof(encbuf),
 						   "NH:%pI4:%d", ipv4, pnt[5]);
+				} else if (sub_type == ECOMMUNITY_UMH &&
+					   type == ECOMMUNITY_ENCODE_IP) {
+					/* DIMT Upstream Multicast Hop: Global
+					 * Admin = UMH address, Local Admin low
+					 * byte = pref[7:4] | type[3:0]. */
+					struct in_addr *ipv4 =
+						(struct in_addr *)pnt;
+					uint8_t la_type =
+						ECOMMUNITY_UMH_LA_TYPE(pnt[5]);
+					const char *kind;
+
+					if (la_type == ZAPI_UMH_TYPE_PIM)
+						kind = "pim";
+					else if (la_type ==
+						 ZAPI_UMH_TYPE_AMT_RELAY)
+						kind = "amt-relay";
+					else
+						kind = "unknown";
+
+					snprintfrr(encbuf, sizeof(encbuf),
+						   "UMH:%pI4:%s:%u", ipv4, kind,
+						   ECOMMUNITY_UMH_LA_PREF(
+							   pnt[5]));
 				} else if (sub_type ==
 					   ECOMMUNITY_LINK_BANDWIDTH &&
 					   type == ECOMMUNITY_ENCODE_AS) {
