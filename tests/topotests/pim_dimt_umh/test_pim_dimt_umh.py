@@ -1045,22 +1045,25 @@ route-map UMH permit 10
 def test_pimd_restart_replays_umh():
     """pimd restart with ZERO BGP churn: the whole
     subscribe -> zebra relay -> bgpd shadow-table replay axis must
-    repopulate the UMH table, and both membership flavors (config-file
-    static-group, saved igmp join) must re-pin.  Without
-    replay-from-shadow a restarted pimd runs with an empty table until
-    the next route flap."""
+    repopulate the UMH table and re-pin the config-file static-group.
+    Without replay-from-shadow a restarted pimd runs with an empty table
+    until the next route flap.
+
+    Only GROUP2 (the pimd.conf static-group) survives the restart:
+    kill_router_daemons' save_config runs `write memory` (integrated
+    config) but startDaemons re-execs pimd against its original
+    per-daemon config file, so the runtime igmp join for GROUP is lost
+    and re-applied afterwards -- which doubles as proof that memberships
+    arriving AFTER the replay pin against the replayed table."""
     tgen = get_topogen()
 
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
-    # save_config=True (the default) preserves runtime config -- the
-    # igmp join-group -- across the restart, matching production where
-    # configs are write-saved.
     kill_router_daemons(tgen, "r2", ["pimd"])
     start_router_daemons(tgen, "r2", ["pimd"])
 
-    def _replayed_and_repinned():
+    def _replayed_and_static_group_repinned():
         data = _json_cmd("r2", "show ip pim dimt umh json")
         if data is None:
             return "r2: unparseable dimt umh JSON (pimd dead?)"
@@ -1071,25 +1074,53 @@ def test_pimd_restart_replays_umh():
         ups = _json_cmd("r2", "show ip pim upstream json")
         if ups is None:
             return "r2: unparseable pim upstream JSON (pimd dead?)"
-        for grp in (GROUP, GROUP2):
-            updata = ups.get(grp, {}).get(SOURCE, {})
-            if updata.get("joinState") != "Joined":
-                return "r2 {} upstream not re-Joined after restart: {}".format(
-                    grp, updata
-                )
-            if updata.get("inboundInterface") != "r2-eth0":
-                return "r2 {} upstream not re-pinned after restart: {}".format(
-                    grp, updata
-                )
+        updata = ups.get(GROUP2, {}).get(SOURCE, {})
+        if updata.get("joinState") != "Joined":
+            return "r2 static-group upstream not re-Joined after restart: {}".format(
+                updata
+            )
+        if updata.get("inboundInterface") != "r2-eth0":
+            return "r2 static-group upstream not re-pinned after restart: {}".format(
+                updata
+            )
         rpf = _json_cmd("r2", "show ip pim rpf json")
         if rpf is None:
             return "r2: unparseable pim rpf JSON (pimd dead?)"
-        if rpf.get(GROUP, {}).get(SOURCE, {}).get("rpfAddress") != UMH:
+        if rpf.get(GROUP2, {}).get(SOURCE, {}).get("rpfAddress") != UMH:
             return "r2 rpf is not the UMH after restart: {}".format(rpf)
         return None
 
     _, result = topotest.run_and_expect(
-        _replayed_and_repinned, None, count=120, wait=1
+        _replayed_and_static_group_repinned, None, count=120, wait=1
+    )
+    assert result is None, result
+
+    # re-apply the runtime membership lost across the restart: a NEW
+    # join must pin against the REPLAYED table (and the tests that
+    # follow depend on GROUP being Joined again)
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ ip igmp join-group {} {}
+""".format(GROUP, SOURCE)
+    )
+
+    def _new_join_pins_from_replayed_table():
+        ups = _json_cmd("r2", "show ip pim upstream json")
+        if ups is None:
+            return "r2: unparseable pim upstream JSON (pimd dead?)"
+        updata = ups.get(GROUP, {}).get(SOURCE, {})
+        if updata.get("joinState") != "Joined":
+            return "r2 re-joined upstream not Joined: {}".format(updata)
+        if updata.get("inboundInterface") != "r2-eth0":
+            return "r2 re-joined upstream not pinned via the replayed mapping: {}".format(
+                updata
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _new_join_pins_from_replayed_table, None, count=60, wait=1
     )
     assert result is None, result
 
