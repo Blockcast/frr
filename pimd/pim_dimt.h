@@ -24,7 +24,8 @@ struct vty;
 struct pim_dimt_umh {
 	struct prefix prefix;
 	pim_addr umh;
-	uint8_t umh_type;   /* enum zapi_umh_type; AMT stored/displayed only */
+	uint8_t umh_type;   /* enum zapi_umh_type; only PIM mappings drive
+			     * pins, AMT stored/displayed only */
 	uint8_t preference; /* 0-15, higher preferred */
 };
 
@@ -34,6 +35,11 @@ void pim_dimt_terminate(struct pim_instance *pim);
 /* ZEBRA_UMH_ADD / ZEBRA_UMH_DEL from bgpd (via zebra). */
 void pim_dimt_umh_update(struct pim_instance *pim,
 			 const struct zapi_umh *zumh, bool add);
+
+/* Drop every mapping and unpin all DIMT-owned upstreams.  Used when
+ * re-subscribing to the relay: the replay that follows is authoritative,
+ * stale mappings from a previous bgpd must not survive. */
+void pim_dimt_umh_flush(struct pim_instance *pim);
 
 /* Steer a (possibly new) upstream's RPF onto the light interface facing its
  * source's UMH; no-op when no mapping covers the source. */

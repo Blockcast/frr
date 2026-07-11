@@ -2387,8 +2387,26 @@ int lib_interface_pim_address_family_pim_light_enable_modify(struct nb_cb_modify
 		ifp = nb_running_get_entry(args->dnode, NULL, true);
 		pim_ifp = ifp->info;
 		pim_ifp->pim_light_enable = yang_dnode_get_bool(args->dnode, NULL);
-		if (pim_ifp->pim_light_enable)
+		if (pim_ifp->pim_light_enable) {
 			pim_dimt_iface_up(pim_ifp->pim, ifp);
+		} else {
+			struct listnode *node, *nnode;
+			struct pim_neighbor *neigh;
+
+			/* Light neighbors are synthetic (materialized by
+			 * Join/Prune, never by hellos) -- drop them now. */
+			for (ALL_LIST_ELEMENTS(pim_ifp->pim_neighbor_list,
+					       node, nnode, neigh))
+				if (neigh->light)
+					pim_neighbor_delete(ifp, neigh,
+							    "pim light disabled");
+
+			/* STATIC_IIF suppresses all normal RPF repair;
+			 * unpin anything DIMT pinned here or the pins
+			 * would silently persist on a non-light
+			 * interface. */
+			pim_dimt_iface_down(pim_ifp->pim, ifp);
+		}
 		break;
 	}
 

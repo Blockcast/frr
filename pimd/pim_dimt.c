@@ -22,6 +22,7 @@
 #include "pimd.h"
 #include "pim_instance.h"
 #include "pim_iface.h"
+#include "pim_memory.h"
 #include "pim_rpf.h"
 #include "pim_upstream.h"
 #include "pim_oil.h"
@@ -29,9 +30,11 @@
 #include "pim_str.h"
 #include "pim_dimt.h"
 
+DEFINE_MTYPE_STATIC(PIMD, PIM_DIMT_UMH, "PIM DIMT UMH mapping");
+
 static void pim_dimt_umh_free(void *arg)
 {
-	XFREE(MTYPE_TMP, arg);
+	XFREE(MTYPE_PIM_DIMT_UMH, arg);
 }
 
 void pim_dimt_init(struct pim_instance *pim)
@@ -79,8 +82,10 @@ static struct pim_dimt_umh *pim_dimt_umh_lookup(struct pim_instance *pim,
 	return best;
 }
 
-/* The light interface facing a UMH: pim-light enabled and a connected
- * (or ptp peer) subnet containing the UMH address. */
+/* The light interface facing a UMH: pim and pim-light enabled and a
+ * connected (or ptp peer) subnet containing the UMH address.  Requiring
+ * pim_enable filters out interfaces that cannot send joins and interfaces
+ * mid-teardown by `no ip pim`. */
 static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
 					      pim_addr umh_addr)
 {
@@ -93,8 +98,8 @@ static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
 		struct pim_interface *pim_ifp = ifp->info;
 		struct connected *c;
 
-		if (!pim_ifp || !pim_ifp->pim_light_enable ||
-		    !if_is_operative(ifp))
+		if (!pim_ifp || !pim_ifp->pim_enable ||
+		    !pim_ifp->pim_light_enable || !if_is_operative(ifp))
 			continue;
 
 		frr_each (if_connected, ifp->connected, c) {
@@ -129,6 +134,7 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 		zlog_debug("DIMT: pinning %s RPF to %s via UMH %pPAs",
 			   up->sg_str, ifp->name, &umh->umh);
 
+	PIM_UPSTREAM_FLAG_SET_SRC_DIMT(up->flags);
 	PIM_UPSTREAM_FLAG_SET_STATIC_IIF(up->flags);
 	pim_upstream_fill_static_iif(up, ifp);
 	up->rpf.source_nexthop.mrib_nexthop_addr = umh->umh;
@@ -141,16 +147,18 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 }
 
 /* Undo a pin (mapping removed): return the upstream to normal RPF
- * resolution. */
+ * resolution.  Only touches upstreams DIMT itself pinned -- STATIC_IIF
+ * owned by another user (pim_vxlan) is left alone. */
 static void pim_dimt_upstream_unpin(struct pim_instance *pim,
 				    struct pim_upstream *up)
 {
-	if (!PIM_UPSTREAM_FLAG_TEST_STATIC_IIF(up->flags))
+	if (!PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags))
 		return;
 
 	if (PIM_DEBUG_PIM_TRACE)
 		zlog_debug("DIMT: unpinning %s RPF", up->sg_str);
 
+	PIM_UPSTREAM_FLAG_UNSET_SRC_DIMT(up->flags);
 	PIM_UPSTREAM_FLAG_UNSET_STATIC_IIF(up->flags);
 	up->rpf.rpf_addr = PIMADDR_ANY;
 
@@ -161,33 +169,45 @@ static void pim_dimt_upstream_unpin(struct pim_instance *pim,
 	pim_upstream_update_join_desired(pim, up);
 }
 
+/* Authoritative pin resolution for one upstream: pin it when a usable
+ * pim-type mapping covers the source, otherwise drop any pin DIMT owns. */
 void pim_dimt_upstream_apply(struct pim_instance *pim,
 			     struct pim_upstream *up)
 {
 	struct pim_dimt_umh *umh;
-	struct interface *ifp;
+	struct interface *ifp = NULL;
 
 	if (pim_addr_is_any(up->sg.src))
 		return;
-	/* vxlan and other explicit STATIC_IIF owners keep theirs; only
-	 * upstreams we pinned (rpf_addr set from a mapping) or unpinned
-	 * ones are eligible. */
-	if (PIM_UPSTREAM_FLAG_TEST_SRC_VXLAN(up->flags))
+	/* STATIC_IIF set by another owner (e.g. pim_vxlan): keep theirs.
+	 * Only upstreams DIMT pinned itself, or unpinned ones, are
+	 * eligible. */
+	if (PIM_UPSTREAM_FLAG_TEST_STATIC_IIF(up->flags) &&
+	    !PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags))
 		return;
 
 	umh = pim_dimt_umh_lookup(pim, up->sg.src);
-	if (!umh)
-		return;
 
-	/* We ARE the UMH (source-side PE: our own origination echoes back
-	 * through the loc-RIB hook) -- normal RPF toward the local source
-	 * applies, never a pin toward ourselves. */
-	if (if_lookup_address_local(&umh->umh, PIM_AF, pim->vrf->vrf_id))
-		return;
+	/* Only pim-type mappings drive joins (amt-relay is stored and
+	 * displayed only).  A local UMH means we ARE the UMH (source-side
+	 * PE: our own origination echoes back through the loc-RIB hook) --
+	 * normal RPF toward the local source applies, never a pin toward
+	 * ourselves. */
+	if (umh && umh->umh_type == ZAPI_UMH_TYPE_PIM &&
+	    !if_lookup_address_local(&umh->umh, PIM_AF, pim->vrf->vrf_id)) {
+		ifp = pim_dimt_light_iface(pim, umh->umh);
+		if (!ifp && PIM_DEBUG_PIM_TRACE)
+			zlog_debug("DIMT: UMH %pPAs covers %s but no light interface resolves; not pinning",
+				   &umh->umh, up->sg_str);
+	}
 
-	ifp = pim_dimt_light_iface(pim, umh->umh);
-	if (!ifp)
+	if (!ifp) {
+		/* The source is not (or no longer) pinnable: drop any
+		 * stale DIMT pin so the mapping table and the actual
+		 * pinned RPF agree. */
+		pim_dimt_upstream_unpin(pim, up);
 		return;
+	}
 
 	pim_dimt_upstream_pin(pim, up, umh, ifp);
 }
@@ -219,9 +239,7 @@ void pim_dimt_iface_down(struct pim_instance *pim, struct interface *ifp)
 	struct pim_upstream *up;
 
 	frr_each (rb_pim_upstream, &pim->upstream_head, up) {
-		if (!PIM_UPSTREAM_FLAG_TEST_STATIC_IIF(up->flags))
-			continue;
-		if (PIM_UPSTREAM_FLAG_TEST_SRC_VXLAN(up->flags))
+		if (!PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags))
 			continue;
 		if (up->rpf.source_nexthop.interface != ifp)
 			continue;
@@ -232,7 +250,8 @@ void pim_dimt_iface_down(struct pim_instance *pim, struct interface *ifp)
 }
 
 void pim_dimt_umh_update(struct pim_instance *pim,
-			 const struct zapi_umh *zumh, bool add){
+			 const struct zapi_umh *zumh, bool add)
+{
 	struct pim_dimt_umh *umh;
 	struct pim_upstream *up;
 
@@ -243,7 +262,7 @@ void pim_dimt_umh_update(struct pim_instance *pim,
 
 	if (add) {
 		if (!umh) {
-			umh = XCALLOC(MTYPE_TMP, sizeof(*umh));
+			umh = XCALLOC(MTYPE_PIM_DIMT_UMH, sizeof(*umh));
 			prefix_copy(&umh->prefix, &zumh->prefix);
 			listnode_add(pim->dimt_umh_list, umh);
 		}
@@ -259,9 +278,6 @@ void pim_dimt_umh_update(struct pim_instance *pim,
 			zlog_debug("DIMT: UMH add %pFX -> %pPAs (type %u pref %u)",
 				   &umh->prefix, &umh->umh, umh->umh_type,
 				   umh->preference);
-
-		frr_each (rb_pim_upstream, &pim->upstream_head, up)
-			pim_dimt_upstream_apply(pim, up);
 	} else {
 		if (!umh)
 			return;
@@ -270,22 +286,30 @@ void pim_dimt_umh_update(struct pim_instance *pim,
 			zlog_debug("DIMT: UMH del %pFX", &zumh->prefix);
 
 		listnode_delete(pim->dimt_umh_list, umh);
-
-		frr_each (rb_pim_upstream, &pim->upstream_head, up) {
-			struct prefix psrc;
-
-			if (pim_addr_is_any(up->sg.src))
-				continue;
-			pim_addr_to_prefix(&psrc, up->sg.src);
-			if (!prefix_match(&umh->prefix, &psrc))
-				continue;
-			pim_dimt_upstream_unpin(pim, up);
-			/* another, shorter mapping may still cover it */
-			pim_dimt_upstream_apply(pim, up);
-		}
-
 		pim_dimt_umh_free(umh);
 	}
+
+	/* apply() is authoritative: it pins newly covered upstreams and
+	 * unpins ones no longer covered. */
+	frr_each (rb_pim_upstream, &pim->upstream_head, up)
+		pim_dimt_upstream_apply(pim, up);
+}
+
+void pim_dimt_umh_flush(struct pim_instance *pim)
+{
+	struct pim_upstream *up;
+
+	if (!pim->dimt_umh_list)
+		return;
+
+	if (PIM_DEBUG_PIM_TRACE)
+		zlog_debug("DIMT: flushing %u UMH mappings",
+			   listcount(pim->dimt_umh_list));
+
+	list_delete_all_node(pim->dimt_umh_list);
+
+	frr_each (rb_pim_upstream, &pim->upstream_head, up)
+		pim_dimt_upstream_apply(pim, up);
 }
 
 void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json)

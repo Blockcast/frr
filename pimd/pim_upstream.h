@@ -94,6 +94,12 @@ struct prefix_list;
 
 #define PIM_UPSTREAM_DM_FLAG_MASK_PRUNE                (1 << 23)
 
+/* RPF pinned to a PIM Light interface by a DIMT UMH mapping (pim_dimt.c);
+ * shares the STATIC_IIF mechanism with pim_vxlan, this flag records that
+ * DIMT owns the pin.
+ */
+#define PIM_UPSTREAM_FLAG_MASK_SRC_DIMT                (1 << 24)
+
 
 #define PIM_UPSTREAM_FLAG_ALL 0xFFFFFFFF
 
@@ -123,6 +129,7 @@ struct prefix_list;
 #define PIM_UPSTREAM_FLAG_TEST_USE_RPT(flags) ((flags) & PIM_UPSTREAM_FLAG_MASK_USE_RPT)
 #define PIM_UPSTREAM_FLAG_TEST_CAN_BE_LHR(flags) ((flags) & (PIM_UPSTREAM_FLAG_MASK_SRC_IGMP | PIM_UPSTREAM_FLAG_MASK_SRC_VXLAN_TERM))
 #define PIM_UPSTREAM_FLAG_TEST_MLAG_INTERFACE(flags) ((flags)&PIM_UPSTREAM_FLAG_MASK_MLAG_INTERFACE)
+#define PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(flags) ((flags) & PIM_UPSTREAM_FLAG_MASK_SRC_DIMT)
 
 #define PIM_UPSTREAM_DM_SET_PRUNE(flags) ((flags) |= PIM_UPSTREAM_DM_FLAG_MASK_PRUNE)
 #define PIM_UPSTREAM_DM_SET_INTERFACE(flags) ((flags) |= PIM_UPSTREAM_DM_FLAG_MASK_INTERFACE)
@@ -147,6 +154,7 @@ struct prefix_list;
 #define PIM_UPSTREAM_FLAG_SET_MLAG_PEER(flags) ((flags) |= PIM_UPSTREAM_FLAG_MASK_MLAG_PEER)
 #define PIM_UPSTREAM_FLAG_SET_USE_RPT(flags) ((flags) |= PIM_UPSTREAM_FLAG_MASK_USE_RPT)
 #define PIM_UPSTREAM_FLAG_SET_MLAG_INTERFACE(flags) ((flags) |= PIM_UPSTREAM_FLAG_MASK_MLAG_INTERFACE)
+#define PIM_UPSTREAM_FLAG_SET_SRC_DIMT(flags) ((flags) |= PIM_UPSTREAM_FLAG_MASK_SRC_DIMT)
 
 #define PIM_UPSTREAM_DM_UNSET_PRUNE(flags) ((flags) &= ~PIM_UPSTREAM_DM_FLAG_MASK_PRUNE)
 #define PIM_UPSTREAM_DM_UNSET_INTERFACE(flags) ((flags) &= ~PIM_UPSTREAM_DM_FLAG_MASK_INTERFACE)
@@ -173,6 +181,7 @@ struct prefix_list;
 #define PIM_UPSTREAM_FLAG_UNSET_SRC_NOCACHE(flags) ((flags) &= ~PIM_UPSTREAM_FLAG_MASK_SRC_NOCACHE)
 #define PIM_UPSTREAM_FLAG_UNSET_USE_RPT(flags) ((flags) &= ~PIM_UPSTREAM_FLAG_MASK_USE_RPT)
 #define PIM_UPSTREAM_FLAG_UNSET_MLAG_INTERFACE(flags) ((flags) &= ~PIM_UPSTREAM_FLAG_MASK_MLAG_INTERFACE)
+#define PIM_UPSTREAM_FLAG_UNSET_SRC_DIMT(flags) ((flags) &= ~PIM_UPSTREAM_FLAG_MASK_SRC_DIMT)
 
 /* The RPF cost is incremented by 10 if the RPF interface is the peerlink-rif.
  * This is used to force the MLAG switch with the lowest cost to the RPF

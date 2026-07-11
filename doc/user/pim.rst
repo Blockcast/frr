@@ -559,7 +559,8 @@ keyword at the end.
    Display the bgpd-learned DIMT Upstream Multicast Hop mappings: for each
    source prefix, the UMH address joins are sent toward, its type
    (``pim`` / ``amt-relay``), preference, and the resolved PIM Light
-   interface.
+   interface.  Only ``pim``-type mappings steer RPF; ``amt-relay`` mappings
+   are recorded and displayed but not acted on.
 
 .. clicmd:: ip igmp
 

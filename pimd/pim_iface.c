@@ -1458,14 +1458,22 @@ static void static_group_join(struct interface *ifp,
 
 	assert(pim_ifp);
 
-	if (pim_ifp->mroute_vif_index < 0)
-		return;
-
 	memset(&sg, 0, sizeof(sg));
 	sg.src = stgrp->source_addr;
 	sg.grp = stgrp->group_addr;
 
-	tib_sg_gm_join(pim_ifp->pim, sg, ifp, &(stgrp->oilp));
+	if (pim_ifp->mroute_vif_index < 0) {
+		if (PIM_DEBUG_GM_EVENTS)
+			zlog_debug("static group (%pPAs,%pPAs) deferred on %s: VIF not ready",
+				   &sg.src, &sg.grp, ifp->name);
+		return;
+	}
+
+	if (!tib_sg_gm_join(pim_ifp->pim, sg, ifp, &(stgrp->oilp))) {
+		if (PIM_DEBUG_GM_EVENTS)
+			zlog_debug("static group (%pPAs,%pPAs) join refused on %s (not DR or OIL setup failed); will retry on replay",
+				   &sg.src, &sg.grp, ifp->name);
+	}
 }
 
 static bool static_group_is_joined(struct interface *ifp,
@@ -2267,6 +2275,11 @@ void pim_pim_interface_delete(struct interface *ifp)
 		return;
 
 	pim_ifp->pim_enable = false;
+
+	/* The `no ip pim` config path reaches pim_if_delete() without the
+	 * if-down/if-unreal hooks firing; unpin DIMT-owned upstreams now or
+	 * their join timers would fire on a freed pim_interface. */
+	pim_dimt_iface_down(pim_ifp->pim, ifp);
 
 #if PIM_IPV == 4
 	pim_autorp_rm_ifp(ifp);
