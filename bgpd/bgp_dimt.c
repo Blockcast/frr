@@ -42,8 +42,10 @@ DEFINE_MTYPE_STATIC(BGPD, BGP_DIMT_UMH, "BGP DIMT UMH shadow entry");
 
 /* Prefixes we have announced a UMH for (info = the sent zapi_umh), one table
  * per AFI. A single FRR route_table's radix descent is family-blind and would
- * collide a v4 X/32 with a v6 whose leading bits equal X, so v4 and v6 shadows
- * must live in separate tables. Only [AFI_IP] and [AFI_IP6] are ever used. */
+ * return the same node for a v4 X/32 and a v6 /32 whose leading 32 bits equal
+ * X (longer v6 prefixes instead corrupt the tree through cross-family glue
+ * nodes), so v4 and v6 shadows must live in separate tables. Only [AFI_IP]
+ * and [AFI_IP6] are ever used. */
 static struct route_table *dimt_sent[AFI_MAX];
 
 /* Pull the best UMH EC (highest preference wins) out of a path's extended
@@ -105,8 +107,9 @@ static bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
 	return found;
 }
 
-static void bgp_dimt_umh_send(const struct prefix *p, struct ipaddr umh,
-			      uint8_t umh_type, uint8_t preference, bool add)
+static void bgp_dimt_umh_send(const struct prefix *p,
+			      const struct ipaddr *umh, uint8_t umh_type,
+			      uint8_t preference, bool add)
 {
 	struct zapi_umh zumh = {};
 
@@ -121,13 +124,13 @@ static void bgp_dimt_umh_send(const struct prefix *p, struct ipaddr umh,
 	}
 
 	prefix_copy(&zumh.prefix, p);
-	zumh.umh = umh; /* already family-tagged by bgp_dimt_umh_from_path() */
+	zumh.umh = *umh; /* already family-tagged by bgp_dimt_umh_from_path() */
 	zumh.umh_type = umh_type;
 	zumh.preference = preference;
 
 	if (BGP_DEBUG(zebra, ZEBRA))
 		zlog_debug("DIMT: %s UMH %pIA (type %u pref %u) for %pFX",
-			   add ? "add" : "del", &umh, umh_type, preference,
+			   add ? "add" : "del", umh, umh_type, preference,
 			   p);
 
 	zapi_umh_encode(bgp_zclient->obuf,
@@ -149,9 +152,10 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 	uint8_t new_pref = 0;
 	bool new_has;
 
-	/* IPv4/IPv6 unicast in the default instance only. The UMH EC's address
-	 * family matches the source route's family (v4 EC on v4 routes, v6 EC
-	 * on v6 routes). */
+	/* IPv4/IPv6 unicast in the default instance only. Extraction is
+	 * same-family by choice: a v4 UMH EC is read from v4 routes and a v6
+	 * UMH EC from v6 routes; a cross-family UMH EC is deliberately ignored
+	 * (BGP itself does not forbid one -- see the warn below). */
 	if ((afi != AFI_IP && afi != AFI_IP6) || safi != SAFI_UNICAST ||
 	    bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT)
 		return 0;
@@ -179,18 +183,32 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 		/* ADD is an upsert on the pimd side; resending an unchanged
 		 * mapping is harmless (the hook can fire with
 		 * old_select == new_select). */
-		bgp_dimt_umh_send(p, new_umh, new_type, new_pref, true);
+		bgp_dimt_umh_send(p, &new_umh, new_type, new_pref, true);
 	} else {
+		struct route_node *rn;
+		struct ipaddr xf_umh = {};
+		uint8_t xf_type = 0;
+		uint8_t xf_pref = 0;
+
+		/* A wrong-family UMH EC still attaches and displays in
+		 * `show bgp`, so without a hint the operator sees a
+		 * "configured" UMH that never maps and multicast that never
+		 * starts. Say why nothing happened. */
+		if (bgp_dimt_umh_from_path(new_route,
+					   afi == AFI_IP ? AFI_IP6 : AFI_IP,
+					   &xf_umh, &xf_type, &xf_pref))
+			zlog_warn("DIMT: %pFX carries a UMH extended community of the wrong address family; ignored (the UMH family must match the route family)",
+				  p);
+
 		/* Route withdrawn, or re-announced without the EC: DEL iff
 		 * we ever announced it. */
-		struct route_node *rn = route_node_lookup(dimt_sent[afi], p);
-
+		rn = route_node_lookup(dimt_sent[afi], p);
 		if (!rn)
 			return 0;
 		if (rn->info) {
 			struct zapi_umh *st = rn->info;
 
-			bgp_dimt_umh_send(p, st->umh, st->umh_type,
+			bgp_dimt_umh_send(p, &st->umh, st->umh_type,
 					  st->preference, false);
 			XFREE(MTYPE_BGP_DIMT_UMH, st);
 			rn->info = NULL;
@@ -228,7 +246,7 @@ int bgp_dimt_umh_replay(ZAPI_CALLBACK_ARGS)
 			if (!st)
 				continue;
 
-			bgp_dimt_umh_send(&st->prefix, st->umh, st->umh_type,
+			bgp_dimt_umh_send(&st->prefix, &st->umh, st->umh_type,
 					  st->preference, true);
 		}
 	}
@@ -260,7 +278,7 @@ static int bgp_dimt_instance_delete(struct bgp *bgp)
 			if (!st)
 				continue;
 
-			bgp_dimt_umh_send(&st->prefix, st->umh, st->umh_type,
+			bgp_dimt_umh_send(&st->prefix, &st->umh, st->umh_type,
 					  st->preference, false);
 			XFREE(MTYPE_BGP_DIMT_UMH, rn->info);
 			rn->info = NULL;

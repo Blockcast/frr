@@ -2944,6 +2944,12 @@ extern void bgp_route_map_terminate(void);
 
 extern bool bgp_route_map_has_extcommunity_rt(const struct route_map *map);
 
+/* Parse a "set extcommunity umh" argument; shared by the route-map compile
+ * and the northbound VALIDATE stage (see bgp_routemap.c). */
+extern bool bgp_route_set_umh_parse(const char *arg, struct ipaddr *umh,
+				    uint8_t *umh_type, uint8_t *preference,
+				    char *errmsg, size_t errmsg_len);
+
 extern int peer_cmp(struct peer *p1, struct peer *p2);
 
 extern int bgp_map_afi_safi_iana2int(iana_afi_t pkt_afi, iana_safi_t pkt_safi,

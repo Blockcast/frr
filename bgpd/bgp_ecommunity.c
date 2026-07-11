@@ -1223,7 +1223,9 @@ static char *_ecommunity_ecom2str(struct ecommunity *ecom, int format, int filte
 					snprintfrr(encbuf, sizeof(encbuf),
 						   "NH:%pI4:%d", ipv4, pnt[5]);
 				} else if (sub_type == ECOMMUNITY_UMH &&
-					   type == ECOMMUNITY_ENCODE_IP) {
+					   type == ECOMMUNITY_ENCODE_IP &&
+					   ecom->unit_size ==
+						   ECOMMUNITY_SIZE) {
 					/* DIMT Upstream Multicast Hop: Global
 					 * Admin = UMH address, Local Admin low
 					 * byte = pref[7:4] | type[3:0]. */
