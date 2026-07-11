@@ -101,11 +101,14 @@ def teardown_module(mod):
 
 
 def _json_cmd(rname, cmd):
+    """vtysh JSON helper: returns None (NOT {}) on unparseable output, so
+    a crashed/unresponsive daemon can never satisfy an absence-assertion
+    vacuously -- every predicate must treat None as failure."""
     out = get_topogen().gears[rname].vtysh_cmd(cmd)
     try:
         return json.loads(out)
     except ValueError:
-        return {}
+        return None
 
 
 def test_light_flag_and_no_adjacency():
@@ -118,6 +121,10 @@ def test_light_flag_and_no_adjacency():
 
     def _light_shown(rname, ifname):
         data = _json_cmd(rname, "show ip pim interface {} json".format(ifname))
+        if data is None:
+            return "{}: unparseable pim interface JSON (pimd dead?)".format(
+                rname
+            )
         ifdata = data.get(ifname, {})
         if ifdata.get("light") is not True:
             return "{}: light flag not shown on {}: {}".format(
@@ -136,12 +143,18 @@ def test_light_flag_and_no_adjacency():
     topotest.sleep(5, "letting any (wrong) hellos fire")
     for rname, ifname in (("r1", "r1-eth0"), ("r2", "r2-eth0")):
         neigh = _json_cmd(rname, "show ip pim neighbor json")
+        assert neigh is not None, (
+            "{}: unparseable pim neighbor JSON (pimd dead?)".format(rname)
+        )
         assert not neigh.get(ifname), (
             "{}: unexpected PIM neighbor on light interface {}: {}".format(
                 rname, ifname, neigh.get(ifname)
             )
         )
         traffic = _json_cmd(rname, "show ip pim interface traffic json")
+        assert traffic is not None, (
+            "{}: unparseable pim traffic JSON (pimd dead?)".format(rname)
+        )
         hello_tx = traffic.get(ifname, {}).get("helloTx", 0)
         assert hello_tx == 0, "{}: {} sent {} hellos on a light interface".format(
             rname, ifname, hello_tx
@@ -167,6 +180,8 @@ interface r2-eth1
 
     def _upstream_joined():
         data = _json_cmd("r2", "show ip pim upstream json")
+        if data is None:
+            return "r2: unparseable pim upstream JSON (pimd dead?)"
         updata = data.get(GROUP, {}).get(SOURCE, {})
         if updata.get("joinState") != "Joined":
             return "r2 upstream not Joined: {}".format(updata)
@@ -181,6 +196,8 @@ interface r2-eth1
 
     def _synthetic_neighbor():
         neigh = _json_cmd("r1", "show ip pim neighbor json")
+        if neigh is None:
+            return "r1: unparseable pim neighbor JSON (pimd dead?)"
         if "10.0.0.2" not in neigh.get("r1-eth0", {}):
             return "r1 has no light neighbor 10.0.0.2 on r1-eth0: {}".format(
                 neigh
@@ -191,6 +208,21 @@ interface r2-eth1
     assert result is None, (
         "the neighborless Join did not materialize a synthetic light neighbor: %s"
         % result
+    )
+
+    # DR must remain r1 itself: synthetic light neighbors carry no hello
+    # state and never participate in DR election.  If that exclusion
+    # regressed, the light neighbor 10.0.0.2 > 10.0.0.1 would win DR by
+    # address the instant it materialized.
+    ifdata = _json_cmd("r1", "show ip pim interface r1-eth0 json")
+    assert ifdata is not None, (
+        "r1: unparseable pim interface JSON (pimd dead?)"
+    )
+    dr_addr = ifdata.get("r1-eth0", {}).get("drAddress")
+    assert dr_addr == "10.0.0.1", (
+        "r1-eth0 DR stolen by the synthetic light neighbor: {}".format(
+            dr_addr
+        )
     )
 
 
@@ -204,6 +236,8 @@ def test_r1_oif_programmed():
 
     def _mroute_oif():
         data = _json_cmd("r1", "show ip mroute json")
+        if data is None:
+            return "r1: unparseable mroute JSON (pimd dead?)"
         sgdata = data.get(GROUP, {}).get(SOURCE, {})
         if not sgdata:
             return "r1 has no (S,G) mroute yet: {}".format(data)
@@ -236,6 +270,10 @@ def test_native_forwarding_end_to_end():
 
     def _counts(rname, iif, oif):
         data = _json_cmd(rname, "show ip mroute count json")
+        if data is None:
+            return "{}: unparseable mroute count JSON (pimd dead?)".format(
+                rname
+            )
         # shape: {"group": {"source": {..., "packets": N, ...}}} across
         # implementations the (S,G) row carries a packet counter; navigate
         # defensively.
@@ -274,6 +312,9 @@ interface r2-eth1
 
     def _oif_gone():
         data = _json_cmd("r1", "show ip mroute json")
+        if data is None:
+            # a dead pimd must NOT satisfy this absence-assertion
+            return "r1: unparseable mroute JSON (pimd dead?)"
         sgdata = data.get(GROUP, {}).get(SOURCE, {})
         oil = sgdata.get("oil", {})
         if "r1-eth0" in oil:
@@ -284,6 +325,23 @@ interface r2-eth1
 
     _, result = topotest.run_and_expect(_oif_gone, None, count=90, wait=1)
     assert result is None, result
+
+    # a full join/prune lifecycle later, the light interfaces must STILL
+    # have sent zero hellos -- this catches a periodic hello-timer leak
+    # that the 5s post-startup window in test_light_flag_and_no_adjacency
+    # is too short to see.
+    for rname, ifname in (("r1", "r1-eth0"), ("r2", "r2-eth0")):
+        traffic = _json_cmd(rname, "show ip pim interface traffic json")
+        assert traffic is not None, (
+            "{}: unparseable pim traffic JSON (pimd dead?)".format(rname)
+        )
+        hello_tx = traffic.get(ifname, {}).get("helloTx", 0)
+        assert hello_tx == 0, (
+            "{}: {} sent {} hellos on a light interface over the test's "
+            "lifetime (periodic hello-timer leak)".format(
+                rname, ifname, hello_tx
+            )
+        )
 
 
 if __name__ == "__main__":
