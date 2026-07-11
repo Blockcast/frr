@@ -1546,6 +1546,139 @@ route-map UMH6 permit 10
     assert result is None, result
 
 
+def test_v6_join_group_pim_toggle_leaves_cleanly():
+    """The v6 sibling of test_static_group_survives_pim_toggle, plus the
+    leave-side regression it exposed: saved configs write the mld +
+    join-group lines BEFORE `ipv6 pim`, so on (re)apply the sg's TIB join
+    is refused while pim is disabled ("PIM is not configured on this
+    interface").  pim_if_membership_refresh() used to feed such
+    not-yet-joined sgs straight into pim_ifchannel_local_membership_add()
+    when `ipv6 pim` came back -- bypassing tib_sg_gm_join(), so
+    sg->tib_joined stayed false, every later gm_sg_update() join retry
+    failed on the duplicate-oif check, and removing the join-group
+    skipped the prune: the INCLUDE membership (and with it the oif and
+    the upstream) was stranded until pim6d restarted, immune even to
+    join-group add/remove cycles."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ no ipv6 pim
+"""
+    )
+
+    def _v6_membership_torn_down():
+        data = _json_cmd("r2", "show ipv6 pim upstream json")
+        if data is None:
+            # a dead pim6d must NOT satisfy this absence-assertion
+            return "r2: unparseable v6 pim upstream JSON (pim6d dead?)"
+        if data.get(GROUP6, {}).get(SOURCE6, {}).get("joinState") == "Joined":
+            return "r2 v6 upstream survived pim disable: {}".format(data)
+        return None
+
+    _, result = topotest.run_and_expect(
+        _v6_membership_torn_down, None, count=30, wait=1
+    )
+    assert result is None, result
+
+    # re-enable in saved-config order: the mld + join-group lines are
+    # already present, `ipv6 pim` comes last, so membership_refresh runs
+    # against a live-but-unjoined sg.  The clear nudges the querier so
+    # the kernel's join-group socket re-reports promptly instead of
+    # waiting out a general query interval.
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ ipv6 pim
+"""
+    )
+    tgen.gears["r2"].vtysh_cmd("clear ipv6 mld interfaces")
+
+    def _v6_membership_reformed():
+        data = _json_cmd("r2", "show ipv6 pim local-membership json")
+        if data is None:
+            return "r2: unparseable v6 local-membership JSON (pim6d dead?)"
+        row = data.get("r2-eth1", {}).get(GROUP6, {})
+        if row.get("localMembership") != "INCLUDE":
+            return "r2 v6 local membership not re-formed: {}".format(data)
+        ups = _json_cmd("r2", "show ipv6 pim upstream json")
+        if ups is None:
+            return "r2: unparseable v6 pim upstream JSON (pim6d dead?)"
+        if ups.get(GROUP6, {}).get(SOURCE6, {}).get("joinState") != "Joined":
+            return "r2 v6 upstream not re-Joined after pim toggle: {}".format(
+                ups
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _v6_membership_reformed, None, count=90, wait=1
+    )
+    assert result is None, result
+
+    # THE regression: removing the join-group must tear everything down.
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ no ipv6 mld join-group {} {}
+""".format(GROUP6, SOURCE6)
+    )
+
+    def _v6_leave_cleans_up():
+        data = _json_cmd("r2", "show ipv6 pim local-membership json")
+        if data is None:
+            return "r2: unparseable v6 local-membership JSON (pim6d dead?)"
+        row = data.get("r2-eth1", {}).get(GROUP6, {})
+        if row.get("localMembership") == "INCLUDE":
+            return "r2 v6 local membership stranded after leave: {}".format(
+                data
+            )
+        ups = _json_cmd("r2", "show ipv6 pim upstream json")
+        if ups is None:
+            return "r2: unparseable v6 pim upstream JSON (pim6d dead?)"
+        if ups.get(GROUP6, {}).get(SOURCE6, {}).get("joinState") == "Joined":
+            return "r2 v6 upstream stranded after leave: {}".format(ups)
+        return None
+
+    _, result = topotest.run_and_expect(_v6_leave_cleans_up, None, count=90, wait=1)
+    assert result is None, result
+
+    # re-add: a leaked oif would make this join unclaimable ("OIF twice"),
+    # so a working re-join doubles as proof nothing was left behind.  It
+    # also restores the module's steady state.
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ ipv6 mld join-group {} {}
+""".format(GROUP6, SOURCE6)
+    )
+
+    def _v6_rejoin_works():
+        ups = _json_cmd("r2", "show ipv6 pim upstream json")
+        if ups is None:
+            return "r2: unparseable v6 pim upstream JSON (pim6d dead?)"
+        updata = ups.get(GROUP6, {}).get(SOURCE6, {})
+        if updata.get("joinState") != "Joined":
+            return "r2 v6 upstream did not re-Join after re-add: {}".format(
+                ups
+            )
+        if updata.get("staticIncomingInterface") is not True:
+            return "r2 v6 upstream not UMH-pinned after re-add: {}".format(
+                updata
+            )
+        return None
+
+    _, result = topotest.run_and_expect(_v6_rejoin_works, None, count=90, wait=1)
+    assert result is None, result
+
+
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
     sys.exit(pytest.main(args))
