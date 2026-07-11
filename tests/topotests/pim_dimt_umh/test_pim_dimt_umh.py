@@ -443,6 +443,86 @@ route-map UMH permit 10
     assert result is None, result
 
 
+def test_light_iface_flap_repins():
+    """A light interface disappearing and coming back (the reconciler's
+    recreate lifecycle) must re-pin existing upstreams: iface down ->
+    unpin; iface up -> the mapping resolves again and the pin re-forms
+    without any mapping or config churn."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    # move the UMH to r1's s4 address so the pin rides r2-eth2 while
+    # BGP (and the mapping) stay on r2-eth0.
+    tgen.gears["r1"].vtysh_cmd(
+        """
+configure terminal
+route-map UMH permit 10
+ set extcommunity umh 10.0.1.1 pim preference 5
+"""
+    )
+
+    def _pinned_to(iface):
+        def check():
+            data = _json_cmd("r2", "show ip pim upstream json")
+            updata = data.get(GROUP, {}).get(SOURCE, {})
+            if updata.get("staticIncomingInterface") is not True:
+                return "r2 upstream not pinned: {}".format(updata)
+            if updata.get("inboundInterface") != iface:
+                return "r2 upstream not pinned to {}: {}".format(
+                    iface, updata
+                )
+            return None
+
+        return check
+
+    _, result = topotest.run_and_expect(
+        _pinned_to("r2-eth2"), None, count=90, wait=1
+    )
+    assert result is None, result
+
+    tgen.gears["r2"].run("ip link set r2-eth2 down")
+
+    def _unpinned_from_eth2():
+        data = _json_cmd("r2", "show ip pim upstream json")
+        updata = data.get(GROUP, {}).get(SOURCE, {})
+        if (
+            updata.get("staticIncomingInterface") is True
+            and updata.get("inboundInterface") == "r2-eth2"
+        ):
+            return "r2 upstream still pinned to downed iface: {}".format(
+                updata
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _unpinned_from_eth2, None, count=30, wait=1
+    )
+    assert result is None, result
+
+    tgen.gears["r2"].run("ip link set r2-eth2 up")
+
+    _, result = topotest.run_and_expect(
+        _pinned_to("r2-eth2"), None, count=60, wait=1
+    )
+    assert result is None, result
+
+    # restore the UMH to the s1 address for the tests that follow
+    tgen.gears["r1"].vtysh_cmd(
+        """
+configure terminal
+route-map UMH permit 10
+ set extcommunity umh {} pim preference 5
+""".format(UMH)
+    )
+
+    _, result = topotest.run_and_expect(
+        _pinned_to("r2-eth0"), None, count=60, wait=1
+    )
+    assert result is None, result
+
+
 def test_withdraw_drops_upstream():
     """A full route withdraw clears the mapping AND the upstream's RPF
     (nothing left to resolve against)."""

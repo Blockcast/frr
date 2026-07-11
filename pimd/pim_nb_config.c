@@ -21,6 +21,7 @@
 #include "pim_static.h"
 #include "pim_ssm.h"
 #include "pim_dm.h"
+#include "pim_dimt.h"
 #include "pim_ssmpingd.h"
 #include "pim_vxlan.h"
 #include "pim_util.h"
@@ -2386,6 +2387,8 @@ int lib_interface_pim_address_family_pim_light_enable_modify(struct nb_cb_modify
 		ifp = nb_running_get_entry(args->dnode, NULL, true);
 		pim_ifp = ifp->info;
 		pim_ifp->pim_light_enable = yang_dnode_get_bool(args->dnode, NULL);
+		if (pim_ifp->pim_light_enable)
+			pim_dimt_iface_up(pim_ifp->pim, ifp);
 		break;
 	}
 

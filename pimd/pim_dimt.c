@@ -192,6 +192,23 @@ void pim_dimt_upstream_apply(struct pim_instance *pim,
 	pim_dimt_upstream_pin(pim, up, umh, ifp);
 }
 
+/* A light interface became usable (up / addressed / light-enabled):
+ * mappings that could not resolve an interface before can pin now --
+ * the reconciler recreating a tunnel netdev is exactly this. */
+void pim_dimt_iface_up(struct pim_instance *pim, struct interface *ifp)
+{
+	struct pim_interface *pim_ifp = ifp->info;
+	struct pim_upstream *up;
+
+	if (!pim_ifp || !pim_ifp->pim_light_enable)
+		return;
+	if (!pim->dimt_umh_list || !listcount(pim->dimt_umh_list))
+		return;
+
+	frr_each (rb_pim_upstream, &pim->upstream_head, up)
+		pim_dimt_upstream_apply(pim, up);
+}
+
 /* The pinned light interface went down or away.  STATIC_IIF exists to make
  * pim_rpf_update() a no-op, so none of the normal ifdown paths clear the
  * upstream's interface pointer -- the join timer would fire into a freed

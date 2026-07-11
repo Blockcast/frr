@@ -736,6 +736,7 @@ void pim_if_addr_add(struct connected *ifc)
 	gm_ifp_update(ifp);
 	pim_ifchannel_scan_forward_start(ifp);
 	pim_if_static_group_replay(ifp);
+	pim_dimt_iface_up(pim_ifp->pim, ifp);
 }
 
 static void pim_if_addr_del_igmp(struct connected *ifc)
@@ -899,6 +900,7 @@ void pim_if_addr_add_all(struct interface *ifp)
 	gm_ifp_update(ifp);
 	pim_ifchannel_scan_forward_start(ifp);
 	pim_if_static_group_replay(ifp);
+	pim_dimt_iface_up(pim_ifp->pim, ifp);
 
 	pim_rp_setup(pim_ifp->pim);
 	pim_rp_check_on_if_add(pim_ifp);
