@@ -5,10 +5,15 @@
  * A multicast source's unicast route may carry an Upstream Multicast Hop
  * extended community (ECOMMUNITY_UMH): "to reach this source's multicast,
  * send your PIM (Light) join toward <UMH address>". bgpd's role is pure
- * extraction: on every loc-RIB update in the IPv4 unicast table, mirror the
- * best path's UMH EC to pimd through zebra's stateless UMH relay
- * (ZEBRA_UMH_ADD/DEL). pimd owns the resulting table and steers (S,G) RPF
- * onto the PIM Light tunnel facing the UMH.
+ * extraction: on every loc-RIB update in the IPv4 or IPv6 unicast table,
+ * mirror the best path's UMH EC to pimd through zebra's stateless UMH relay
+ * (ZEBRA_UMH_ADD/DEL). pimd/pim6d own the resulting table and steer (S,G)
+ * RPF onto the PIM Light tunnel facing the UMH.
+ *
+ * The IPv4 UMH is an 8-byte IPv4-address-specific EC on attr->ecommunity; the
+ * IPv6 UMH is a 20-byte IPv6-address-specific EC on attr->ipv6_ecommunity. The
+ * zapi relay carries a family-tagged struct ipaddr, so only the per-family EC
+ * extraction below differs.
  *
  * Withdraw semantics matter: a prefix re-announced WITHOUT the EC must act
  * as a DEL (attribute loss, not route loss, is the classic hook bug). The
@@ -35,37 +40,47 @@
 
 DEFINE_MTYPE_STATIC(BGPD, BGP_DIMT_UMH, "BGP DIMT UMH shadow entry");
 
-/* Prefixes we have announced a UMH for (info = the sent zapi_umh). */
-static struct route_table *dimt_sent;
+/* Prefixes we have announced a UMH for (info = the sent zapi_umh), one table
+ * per AFI. A single FRR route_table's radix descent is family-blind and would
+ * collide a v4 X/32 with a v6 whose leading bits equal X, so v4 and v6 shadows
+ * must live in separate tables. Only [AFI_IP] and [AFI_IP6] are ever used. */
+static struct route_table *dimt_sent[AFI_MAX];
 
 /* Pull the best UMH EC (highest preference wins) out of a path's extended
- * communities. Returns true and fills umh/umh_type/preference on match. */
-static bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi,
-				   struct in_addr *umh, uint8_t *umh_type,
+ * communities. The IPv4 UMH rides the 8-byte ecommunity list (type 0x01,
+ * Local Admin at byte 7); the IPv6 UMH rides the 20-byte ipv6_ecommunity list
+ * (type 0x00, Local Admin at byte 19). Returns true and fills a family-tagged
+ * umh/umh_type/preference on match. */
+static bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
+				   struct ipaddr *umh, uint8_t *umh_type,
 				   uint8_t *preference)
 {
 	const struct ecommunity *ecom;
+	bool is_v6 = (afi == AFI_IP6);
+	uint8_t want_type = is_v6 ? ECOMMUNITY_ENCODE_AS : ECOMMUNITY_ENCODE_IP;
+	uint8_t unit = is_v6 ? IPV6_ECOMMUNITY_SIZE : ECOMMUNITY_SIZE;
+	uint8_t la_off = is_v6 ? 19 : 7;
 	uint32_t i;
 	bool found = false;
 
 	if (!pi || !pi->attr)
 		return false;
 
-	ecom = bgp_attr_get_ecommunity(pi->attr);
-	if (!ecom || !ecom->val || ecom->unit_size != ECOMMUNITY_SIZE)
+	ecom = is_v6 ? bgp_attr_get_ipv6_ecommunity(pi->attr)
+		     : bgp_attr_get_ecommunity(pi->attr);
+	if (!ecom || !ecom->val || ecom->unit_size != unit)
 		return false;
 
 	for (i = 0; i < ecom->size; i++) {
-		const uint8_t *pnt = ecom->val + (i * ECOMMUNITY_SIZE);
-		uint8_t la_type = ECOMMUNITY_UMH_LA_TYPE(pnt[7]);
-		uint8_t la_pref = ECOMMUNITY_UMH_LA_PREF(pnt[7]);
+		const uint8_t *pnt = ecom->val + (i * unit);
+		uint8_t la_type = ECOMMUNITY_UMH_LA_TYPE(pnt[la_off]);
+		uint8_t la_pref = ECOMMUNITY_UMH_LA_PREF(pnt[la_off]);
 
-		if (pnt[0] != ECOMMUNITY_ENCODE_IP ||
-		    pnt[1] != ECOMMUNITY_UMH)
+		if (pnt[0] != want_type || pnt[1] != ECOMMUNITY_UMH)
 			continue;
 
-		/* Unknown UMH types are ignored, reserved bits (pnt[6])
-		 * are not checked -- forward compatibility. */
+		/* Unknown UMH types are ignored, reserved bits are not
+		 * checked -- forward compatibility. */
 		if (la_type != ZAPI_UMH_TYPE_PIM &&
 		    la_type != ZAPI_UMH_TYPE_AMT_RELAY)
 			continue;
@@ -73,7 +88,15 @@ static bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi,
 		if (found && la_pref <= *preference)
 			continue;
 
-		memcpy(&umh->s_addr, pnt + 2, sizeof(umh->s_addr));
+		if (is_v6) {
+			SET_IPADDR_V6(umh);
+			memcpy(&umh->ipaddr_v6, pnt + 2,
+			       sizeof(umh->ipaddr_v6));
+		} else {
+			SET_IPADDR_V4(umh);
+			memcpy(&umh->ipaddr_v4, pnt + 2,
+			       sizeof(umh->ipaddr_v4));
+		}
 		*umh_type = la_type;
 		*preference = la_pref;
 		found = true;
@@ -82,7 +105,7 @@ static bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi,
 	return found;
 }
 
-static void bgp_dimt_umh_send(const struct prefix *p, struct in_addr umh,
+static void bgp_dimt_umh_send(const struct prefix *p, struct ipaddr umh,
 			      uint8_t umh_type, uint8_t preference, bool add)
 {
 	struct zapi_umh zumh = {};
@@ -98,13 +121,12 @@ static void bgp_dimt_umh_send(const struct prefix *p, struct in_addr umh,
 	}
 
 	prefix_copy(&zumh.prefix, p);
-	SET_IPADDR_V4(&zumh.umh);
-	zumh.umh.ipaddr_v4 = umh;
+	zumh.umh = umh; /* already family-tagged by bgp_dimt_umh_from_path() */
 	zumh.umh_type = umh_type;
 	zumh.preference = preference;
 
 	if (BGP_DEBUG(zebra, ZEBRA))
-		zlog_debug("DIMT: %s UMH %pI4 (type %u pref %u) for %pFX",
+		zlog_debug("DIMT: %s UMH %pIA (type %u pref %u) for %pFX",
 			   add ? "add" : "del", &umh, umh_type, preference,
 			   p);
 
@@ -122,24 +144,25 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 				 struct bgp_path_info *new_route)
 {
 	const struct prefix *p;
-	struct in_addr new_umh;
+	struct ipaddr new_umh = {};
 	uint8_t new_type = 0;
 	uint8_t new_pref = 0;
 	bool new_has;
 
-	/* v4 unicast in the default instance only; v6 is out of scope for
-	 * now (the UMH EC carries a v4 address either way). */
-	if (afi != AFI_IP || safi != SAFI_UNICAST ||
+	/* IPv4/IPv6 unicast in the default instance only. The UMH EC's address
+	 * family matches the source route's family (v4 EC on v4 routes, v6 EC
+	 * on v6 routes). */
+	if ((afi != AFI_IP && afi != AFI_IP6) || safi != SAFI_UNICAST ||
 	    bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT)
 		return 0;
 
 	p = bgp_dest_get_prefix(dest);
 
-	new_has = bgp_dimt_umh_from_path(new_route, &new_umh, &new_type,
+	new_has = bgp_dimt_umh_from_path(new_route, afi, &new_umh, &new_type,
 					 &new_pref);
 
 	if (new_has) {
-		struct route_node *rn = route_node_get(dimt_sent, p);
+		struct route_node *rn = route_node_get(dimt_sent[afi], p);
 		struct zapi_umh *st = rn->info;
 
 		if (!st) {
@@ -149,8 +172,7 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 			route_unlock_node(rn);
 
 		prefix_copy(&st->prefix, p);
-		SET_IPADDR_V4(&st->umh);
-		st->umh.ipaddr_v4 = new_umh;
+		st->umh = new_umh; /* family already tagged by from_path() */
 		st->umh_type = new_type;
 		st->preference = new_pref;
 
@@ -161,14 +183,14 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 	} else {
 		/* Route withdrawn, or re-announced without the EC: DEL iff
 		 * we ever announced it. */
-		struct route_node *rn = route_node_lookup(dimt_sent, p);
+		struct route_node *rn = route_node_lookup(dimt_sent[afi], p);
 
 		if (!rn)
 			return 0;
 		if (rn->info) {
 			struct zapi_umh *st = rn->info;
 
-			bgp_dimt_umh_send(p, st->umh.ipaddr_v4, st->umh_type,
+			bgp_dimt_umh_send(p, st->umh, st->umh_type,
 					  st->preference, false);
 			XFREE(MTYPE_BGP_DIMT_UMH, st);
 			rn->info = NULL;
@@ -186,22 +208,29 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
  * hold". */
 int bgp_dimt_umh_replay(ZAPI_CALLBACK_ARGS)
 {
-	struct route_node *rn;
+	afi_t afi;
 
-	if (!dimt_sent)
+	if (!dimt_sent[AFI_IP] && !dimt_sent[AFI_IP6])
 		return 0;
 
 	if (BGP_DEBUG(zebra, ZEBRA))
 		zlog_debug("DIMT: pimd requested UMH replay");
 
-	for (rn = route_top(dimt_sent); rn; rn = route_next(rn)) {
-		struct zapi_umh *st = rn->info;
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++) {
+		struct route_node *rn;
 
-		if (!st)
+		if (!dimt_sent[afi])
 			continue;
 
-		bgp_dimt_umh_send(&st->prefix, st->umh.ipaddr_v4,
-				  st->umh_type, st->preference, true);
+		for (rn = route_top(dimt_sent[afi]); rn; rn = route_next(rn)) {
+			struct zapi_umh *st = rn->info;
+
+			if (!st)
+				continue;
+
+			bgp_dimt_umh_send(&st->prefix, st->umh, st->umh_type,
+					  st->preference, true);
+		}
 	}
 
 	return 0;
@@ -214,22 +243,29 @@ int bgp_dimt_umh_replay(ZAPI_CALLBACK_ARGS)
  * instance). */
 static int bgp_dimt_instance_delete(struct bgp *bgp)
 {
-	struct route_node *rn;
+	afi_t afi;
 
-	if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT || !dimt_sent)
+	if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT)
 		return 0;
 
-	for (rn = route_top(dimt_sent); rn; rn = route_next(rn)) {
-		struct zapi_umh *st = rn->info;
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++) {
+		struct route_node *rn;
 
-		if (!st)
+		if (!dimt_sent[afi])
 			continue;
 
-		bgp_dimt_umh_send(&st->prefix, st->umh.ipaddr_v4,
-				  st->umh_type, st->preference, false);
-		XFREE(MTYPE_BGP_DIMT_UMH, rn->info);
-		rn->info = NULL;
-		route_unlock_node(rn); /* tree ref */
+		for (rn = route_top(dimt_sent[afi]); rn; rn = route_next(rn)) {
+			struct zapi_umh *st = rn->info;
+
+			if (!st)
+				continue;
+
+			bgp_dimt_umh_send(&st->prefix, st->umh, st->umh_type,
+					  st->preference, false);
+			XFREE(MTYPE_BGP_DIMT_UMH, rn->info);
+			rn->info = NULL;
+			route_unlock_node(rn); /* tree ref */
+		}
 	}
 
 	return 0;
@@ -237,29 +273,34 @@ static int bgp_dimt_instance_delete(struct bgp *bgp)
 
 void bgp_dimt_init(void)
 {
-	dimt_sent = route_table_init();
+	dimt_sent[AFI_IP] = route_table_init();
+	dimt_sent[AFI_IP6] = route_table_init();
 	hook_register(bgp_route_update, bgp_dimt_route_update);
 	hook_register(bgp_inst_delete, bgp_dimt_instance_delete);
 }
 
 void bgp_dimt_terminate(void)
 {
-	struct route_node *rn;
+	afi_t afi;
 
 	/* Post-terminate hook fires must not deref the freed table. */
 	hook_unregister(bgp_route_update, bgp_dimt_route_update);
 	hook_unregister(bgp_inst_delete, bgp_dimt_instance_delete);
 
-	if (!dimt_sent)
-		return;
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++) {
+		struct route_node *rn;
 
-	for (rn = route_top(dimt_sent); rn; rn = route_next(rn)) {
-		if (!rn->info)
+		if (!dimt_sent[afi])
 			continue;
-		XFREE(MTYPE_BGP_DIMT_UMH, rn->info);
-		rn->info = NULL;
-		route_unlock_node(rn);
+
+		for (rn = route_top(dimt_sent[afi]); rn; rn = route_next(rn)) {
+			if (!rn->info)
+				continue;
+			XFREE(MTYPE_BGP_DIMT_UMH, rn->info);
+			rn->info = NULL;
+			route_unlock_node(rn);
+		}
+		route_table_finish(dimt_sent[afi]);
+		dimt_sent[afi] = NULL;
 	}
-	route_table_finish(dimt_sent);
-	dimt_sent = NULL;
 }

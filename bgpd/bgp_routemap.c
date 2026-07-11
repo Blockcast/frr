@@ -3499,27 +3499,78 @@ static const struct route_map_rule_cmd route_set_ecommunity_vri_cmd = {
 	route_set_ecommunity_free,
 };
 
-/* `set extcommunity umh A.B.C.D <pim|amt-relay> [preference (0-15)]' --
- * DIMT Upstream Multicast Hop (draft-zzhang-mboned-dynamic-internet-mcast-
+/* `set extcommunity umh <A.B.C.D|X:X::X> <pim|amt-relay> [preference (0-15)]'
+ * -- DIMT Upstream Multicast Hop (draft-zzhang-mboned-dynamic-internet-mcast-
  * tunnel). Attached to the unicast route toward a multicast source so a
- * receiver can steer its (S,G) RPF onto the PIM Light tunnel facing the
- * UMH. */
+ * receiver can steer its (S,G) RPF onto the PIM Light tunnel facing the UMH.
+ *
+ * The IPv4 UMH is an 8-byte IPv4-address-specific EC riding attr->ecommunity
+ * (BGP_ATTR_EXT_COMMUNITIES); the IPv6 UMH is a 20-byte IPv6-address-specific
+ * EC riding attr->ipv6_ecommunity (BGP_ATTR_IPV6_EXT_COMMUNITIES). The compiled
+ * ecommunity's unit_size records which, and the apply fans it to the matching
+ * attribute list. */
+static enum route_map_cmd_result_t
+route_set_ecommunity_umh(void *rule, const struct prefix *prefix, void *object)
+{
+	struct rmap_ecom_set *rcs = rule;
+	struct bgp_path_info *path = object;
+	struct attr *attr = path->attr;
+	struct ecommunity *old_ecom, *new_ecom;
+	bool is_v6;
+
+	if (!rcs->ecom)
+		return RMAP_OKAY;
+
+	/* unit_size == 20 => IPv6-address-specific EC (attr 25); else the
+	 * 8-byte IPv4-address-specific EC (attr 16). */
+	is_v6 = (rcs->ecom->unit_size == IPV6_ECOMMUNITY_SIZE);
+
+	/* Additive, mirroring route_set_ecommunity(); merge/dup stride by
+	 * unit_size so the 20-byte v6 list is handled identically. */
+	old_ecom = is_v6 ? bgp_attr_get_ipv6_ecommunity(attr)
+			 : bgp_attr_get_ecommunity(attr);
+
+	if (old_ecom) {
+		new_ecom = ecommunity_merge(ecommunity_dup(old_ecom), rcs->ecom);
+
+		/* old_ecom->refcnt == 1 => owned elsewhere (e.g.
+		 * bgp_update_receive()); == 0 => set by a previous route-map
+		 * statement. */
+		if (!old_ecom->refcnt)
+			ecommunity_free(&old_ecom);
+	} else
+		new_ecom = ecommunity_dup(rcs->ecom);
+
+	/* interned or attr_flush()'d by bgp_update_main(). */
+	if (is_v6)
+		bgp_attr_set_ipv6_ecommunity(attr, new_ecom);
+	else
+		bgp_attr_set_ecommunity(attr, new_ecom);
+
+	return RMAP_OKAY;
+}
+
 static void *route_set_ecommunity_umh_compile(const char *arg)
 {
 	struct rmap_ecom_set *rcs;
 	struct ecommunity *ecom;
-	struct ecommunity_val eval = {};
-	struct in_addr umh;
-	char addr[INET_ADDRSTRLEN] = "";
+	struct in_addr umh4;
+	struct in6_addr umh6;
+	char addr[INET6_ADDRSTRLEN] = "";
 	char kind[16] = "";
 	unsigned int pref = 0;
 	uint8_t umh_type;
+	bool is_v6;
 	int n;
 
-	n = sscanf(arg, "%15s %15s preference %u", addr, kind, &pref);
+	n = sscanf(arg, "%45s %15s preference %u", addr, kind, &pref);
 	if (n < 2)
 		return NULL;
-	if (inet_pton(AF_INET, addr, &umh) != 1)
+	if (inet_pton(AF_INET, addr, &umh4) == 1)
+		is_v6 = false;
+	else if (inet_pton(AF_INET6, addr, &umh6) == 1)
+		is_v6 = true;
+	else
 		return NULL;
 	if (strmatch(kind, "pim"))
 		umh_type = ZAPI_UMH_TYPE_PIM;
@@ -3530,14 +3581,35 @@ static void *route_set_ecommunity_umh_compile(const char *arg)
 	if (pref > 15)
 		return NULL;
 
-	eval.val[0] = ECOMMUNITY_ENCODE_IP;
-	eval.val[1] = ECOMMUNITY_UMH;
-	memcpy(&eval.val[2], &umh.s_addr, sizeof(umh.s_addr));
-	eval.val[6] = 0;
-	eval.val[7] = ECOMMUNITY_UMH_LA(pref, umh_type);
-
 	ecom = ecommunity_new();
-	ecommunity_add_val(ecom, &eval, false, false);
+	if (is_v6) {
+		struct ecommunity_val_ipv6 eval = {};
+
+		/* IPv6-address-specific: type octet 0x00 (== ENCODE_AS),
+		 * 16-byte Global Admin at val[2..17], Local Admin low byte at
+		 * val[19]; the 20-byte unit is what marks it IPv6. */
+		eval.val[0] = ECOMMUNITY_ENCODE_AS;
+		eval.val[1] = ECOMMUNITY_UMH;
+		memcpy(&eval.val[2], &umh6, sizeof(umh6));
+		eval.val[18] = 0;
+		eval.val[19] = ECOMMUNITY_UMH_LA(pref, umh_type);
+
+		/* ecommunity_add_val_internal() does not update ecom->unit_size
+		 * (it only uses the passed size for striding), so set it here
+		 * before the add -- otherwise the 20-byte payload would carry a
+		 * stale unit_size of 8 and corrupt every downstream stride. */
+		ecom->unit_size = IPV6_ECOMMUNITY_SIZE;
+		ecommunity_add_val_ipv6(ecom, &eval, false, false);
+	} else {
+		struct ecommunity_val eval = {};
+
+		eval.val[0] = ECOMMUNITY_ENCODE_IP;
+		eval.val[1] = ECOMMUNITY_UMH;
+		memcpy(&eval.val[2], &umh4.s_addr, sizeof(umh4.s_addr));
+		eval.val[6] = 0;
+		eval.val[7] = ECOMMUNITY_UMH_LA(pref, umh_type);
+		ecommunity_add_val(ecom, &eval, false, false);
+	}
 
 	rcs = XCALLOC(MTYPE_ROUTE_MAP_COMPILED, sizeof(struct rmap_ecom_set));
 	rcs->ecom = ecommunity_intern(ecom);
@@ -3548,7 +3620,7 @@ static void *route_set_ecommunity_umh_compile(const char *arg)
 
 static const struct route_map_rule_cmd route_set_ecommunity_umh_cmd = {
 	"extcommunity umh",
-	route_set_ecommunity,
+	route_set_ecommunity_umh,
 	route_set_ecommunity_umh_compile,
 	route_set_ecommunity_free,
 };
@@ -7556,17 +7628,18 @@ ALIAS_YANG (no_set_ecommunity_vri,
 
 DEFPY_YANG (set_ecommunity_umh,
 	    set_ecommunity_umh_cmd,
-	    "set extcommunity umh A.B.C.D$umh <pim|amt-relay>$kind [preference (0-15)$pref]",
+	    "set extcommunity umh <A.B.C.D|X:X::X:X>$umh <pim|amt-relay>$kind [preference (0-15)$pref]",
 	    SET_STR
 	    "BGP extended community attribute\n"
 	    "DIMT Upstream Multicast Hop extended community\n"
-	    "UMH address\n"
+	    "UMH IPv4 address\n"
+	    "UMH IPv6 address\n"
 	    "UMH is a PIM (Light) tunnel endpoint\n"
 	    "UMH is an AMT relay\n"
 	    "UMH preference\n"
 	    "Preference value (higher preferred)\n")
 {
-	char value[64];
+	char value[96];
 	int ret;
 	const char *xpath =
 		"./set-action[action='frr-bgp-route-map:set-extcommunity-umh']";
@@ -7589,12 +7662,13 @@ DEFPY_YANG (set_ecommunity_umh,
 
 DEFPY_YANG (no_set_ecommunity_umh,
 	    no_set_ecommunity_umh_cmd,
-	    "no set extcommunity umh [A.B.C.D <pim|amt-relay> [preference (0-15)]]",
+	    "no set extcommunity umh [<A.B.C.D|X:X::X:X> <pim|amt-relay> [preference (0-15)]]",
 	    NO_STR
 	    SET_STR
 	    "BGP extended community attribute\n"
 	    "DIMT Upstream Multicast Hop extended community\n"
-	    "UMH address\n"
+	    "UMH IPv4 address\n"
+	    "UMH IPv6 address\n"
 	    "UMH is a PIM (Light) tunnel endpoint\n"
 	    "UMH is an AMT relay\n"
 	    "UMH preference\n"

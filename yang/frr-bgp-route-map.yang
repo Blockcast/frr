@@ -1089,7 +1089,7 @@ identity set-extcommunity-color {
         type string;
         description
           "Set the DIMT Upstream Multicast Hop ext-community:
-           'A.B.C.D <pim|amt-relay> [preference (0-15)]'";
+           '<A.B.C.D|X:X::X:X> <pim|amt-relay> [preference (0-15)]'";
       }
     }
 

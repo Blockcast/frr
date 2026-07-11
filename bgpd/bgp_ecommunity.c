@@ -1245,6 +1245,35 @@ static char *_ecommunity_ecom2str(struct ecommunity *ecom, int format, int filte
 						   "UMH:%pI4:%s:%u", ipv4, kind,
 						   ECOMMUNITY_UMH_LA_PREF(
 							   pnt[5]));
+				} else if (sub_type == ECOMMUNITY_UMH &&
+					   type == ECOMMUNITY_ENCODE_AS &&
+					   ecom->unit_size ==
+						   IPV6_ECOMMUNITY_SIZE) {
+					/* DIMT UMH, IPv6-address-specific: the
+					 * type octet is 0x00 (==ENCODE_AS) so
+					 * the 20-byte unit size is what marks it
+					 * IPv6. Global Admin = 16-byte UMH
+					 * address (pnt[0..15]); Local Admin low
+					 * byte (pnt[17] == val[19]) = pref[7:4] |
+					 * type[3:0]. */
+					struct in6_addr *ipv6 =
+						(struct in6_addr *)pnt;
+					uint8_t la_type =
+						ECOMMUNITY_UMH_LA_TYPE(pnt[17]);
+					const char *kind;
+
+					if (la_type == ZAPI_UMH_TYPE_PIM)
+						kind = "pim";
+					else if (la_type ==
+						 ZAPI_UMH_TYPE_AMT_RELAY)
+						kind = "amt-relay";
+					else
+						kind = "unknown";
+
+					snprintfrr(encbuf, sizeof(encbuf),
+						   "UMH:%pI6:%s:%u", ipv6, kind,
+						   ECOMMUNITY_UMH_LA_PREF(
+							   pnt[17]));
 				} else if (sub_type ==
 					   ECOMMUNITY_LINK_BANDWIDTH &&
 					   type == ECOMMUNITY_ENCODE_AS) {
