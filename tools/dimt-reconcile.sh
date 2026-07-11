@@ -108,6 +108,14 @@ peers() {
 }
 
 ensure_fou() {
+	# fou/ipip may not be loaded at boot (nothing else pulls them in;
+	# the legacy decap script used to).  Best-effort: inside an
+	# unprivileged container this fails and the pre-added host state
+	# carries us, same as the EPERM path below.
+	if command -v modprobe >/dev/null 2>&1; then
+		modprobe fou 2>/dev/null || true
+		modprobe ipip 2>/dev/null || true
+	fi
 	if ip fou show 2>/dev/null | grep -q "port $FOU_PORT "; then
 		return 0
 	fi
