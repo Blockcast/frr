@@ -876,6 +876,17 @@ DEFPY (interface_ipv6_pim_passive,
 	return pim_process_ip_pim_passive_cmd(vty, !no);
 }
 
+DEFPY (interface_ipv6_pim_light,
+	interface_ipv6_pim_light_cmd,
+	"[no] ipv6 pim light$light",
+	NO_STR
+	IPV6_STR
+	PIM_STR
+	"PIM Light interface (RFC 9739): Join/Prune without hello adjacency\n")
+{
+	return pim_process_ip_pim_light_cmd(vty, !no);
+}
+
 DEFPY (interface_ipv6_pim,
        interface_ipv6_pim_cmd,
        "[no] ipv6 pim [sm|ssm$ssm|dm$dm|sm-dm$smdm]",
@@ -3183,6 +3194,7 @@ void pim_cmd_init(void)
 
 	install_element(INTERFACE_NODE, &interface_ipv6_pim_cmd);
 	install_element(INTERFACE_NODE, &interface_ipv6_pim_passive_cmd);
+	install_element(INTERFACE_NODE, &interface_ipv6_pim_light_cmd);
 	install_element(INTERFACE_NODE, &interface_ipv6_pim_drprio_cmd);
 	install_element(INTERFACE_NODE, &interface_no_ipv6_pim_drprio_cmd);
 	install_element(INTERFACE_NODE, &interface_ipv6_pim_hello_cmd);
