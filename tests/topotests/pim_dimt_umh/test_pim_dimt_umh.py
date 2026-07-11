@@ -70,6 +70,14 @@ def build_topo(tgen):
     switch = tgen.add_switch("s3")
     switch.add_link(tgen.gears["r2"])
 
+    # s4: a second light segment (r1-eth2 <-> r2-eth2).  The BGP session
+    # stays on s1, so a UMH pointing at the s4 address exercises pins
+    # whose interface can die while the mapping survives -- the live
+    # deployment shape (BGP over the overlay, pin on the tunnel).
+    switch = tgen.add_switch("s4")
+    switch.add_link(tgen.gears["r1"])
+    switch.add_link(tgen.gears["r2"])
+
 
 def setup_module(mod):
     tgen = Topogen(build_topo, mod.__name__)
@@ -466,6 +474,101 @@ router bgp 65001
         _mapping_and_rpf_gone, None, count=90, wait=1
     )
     assert result is None, result
+
+
+def test_light_iface_delete_unpins_safely():
+    """Deleting the light interface out from under a pinned, Joined
+    upstream -- while the UMH mapping SURVIVES (BGP rides another
+    interface, as live) -- must unpin it.  STATIC_IIF suppresses every
+    rpf-update repair path, so without the ifdown hook the join timer
+    fires on a freed interface and pimd segfaults (seen live)."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    # restore the announcement withdrawn by the previous test, but with
+    # the UMH moved to r1's s4 address: the pin lands on r2-eth2 while
+    # BGP (and the mapping) stay alive on r2-eth0.
+    tgen.gears["r1"].vtysh_cmd(
+        """
+configure terminal
+route-map UMH permit 10
+ set extcommunity umh 10.0.1.1 pim preference 5
+exit
+router bgp 65001
+ address-family ipv4 unicast
+  redistribute connected route-map UMH
+"""
+    )
+
+    def _pinned_on_s4():
+        data = _json_cmd("r2", "show ip pim dimt umh json")
+        entry = data.get(SRC_PREFIX, {})
+        if entry.get("interface") != "r2-eth2":
+            return "r2 UMH not resolved on the s4 light iface: {}".format(
+                data
+            )
+        data = _json_cmd("r2", "show ip pim upstream json")
+        updata = data.get(GROUP, {}).get(SOURCE, {})
+        if updata.get("joinState") != "Joined":
+            return "r2 upstream not re-Joined: {}".format(updata)
+        if updata.get("staticIncomingInterface") is not True:
+            return "r2 upstream not pinned: {}".format(updata)
+        if updata.get("inboundInterface") != "r2-eth2":
+            return "r2 upstream not pinned to r2-eth2: {}".format(updata)
+        return None
+
+    _, result = topotest.run_and_expect(_pinned_on_s4, None, count=90, wait=1)
+    assert result is None, result
+
+    tgen.gears["r2"].run("ip link del r2-eth2")
+    logger.info("deleted r2-eth2 under a pinned Joined upstream")
+
+    def _unpinned_and_alive():
+        out = tgen.gears["r2"].vtysh_cmd("show ip pim upstream json")
+        try:
+            data = json.loads(out)
+        except ValueError:
+            return "r2 pimd unresponsive (crashed?): {}".format(out[:200])
+        updata = data.get(GROUP, {}).get(SOURCE, {})
+        if (
+            updata.get("staticIncomingInterface") is True
+            and updata.get("inboundInterface") == "r2-eth2"
+        ):
+            return "r2 upstream still pinned to deleted iface: {}".format(
+                updata
+            )
+        # the mapping survives (BGP is on r2-eth0): verify it did
+        mapping = _json_cmd("r2", "show ip pim dimt umh json")
+        if SRC_PREFIX not in mapping:
+            return "UMH mapping unexpectedly gone (test premise broken): {}".format(
+                mapping
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _unpinned_and_alive, None, count=30, wait=1
+    )
+    assert result is None, result
+
+    # the join timer period is 60s: outlast it to prove nothing fires on
+    # a stale interface pointer.
+    import time
+
+    time.sleep(65)
+    out = tgen.gears["r2"].vtysh_cmd("show ip pim upstream json")
+    try:
+        json.loads(out)
+    except ValueError:
+        assert False, "r2 pimd died after join-timer period: {}".format(
+            out[:200]
+        )
+
+    if tgen.routers_have_failure():
+        assert False, "router failure after light-iface delete: {}".format(
+            tgen.errors
+        )
 
 
 if __name__ == "__main__":

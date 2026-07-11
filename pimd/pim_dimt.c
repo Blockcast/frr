@@ -192,9 +192,30 @@ void pim_dimt_upstream_apply(struct pim_instance *pim,
 	pim_dimt_upstream_pin(pim, up, umh, ifp);
 }
 
-void pim_dimt_umh_update(struct pim_instance *pim,
-			 const struct zapi_umh *zumh, bool add)
+/* The pinned light interface went down or away.  STATIC_IIF exists to make
+ * pim_rpf_update() a no-op, so none of the normal ifdown paths clear the
+ * upstream's interface pointer -- the join timer would fire into a freed
+ * pim_interface.  Unpin everything pinned here and re-resolve (another
+ * light interface may cover the same UMH). */
+void pim_dimt_iface_down(struct pim_instance *pim, struct interface *ifp)
 {
+	struct pim_upstream *up;
+
+	frr_each (rb_pim_upstream, &pim->upstream_head, up) {
+		if (!PIM_UPSTREAM_FLAG_TEST_STATIC_IIF(up->flags))
+			continue;
+		if (PIM_UPSTREAM_FLAG_TEST_SRC_VXLAN(up->flags))
+			continue;
+		if (up->rpf.source_nexthop.interface != ifp)
+			continue;
+
+		pim_dimt_upstream_unpin(pim, up);
+		pim_dimt_upstream_apply(pim, up);
+	}
+}
+
+void pim_dimt_umh_update(struct pim_instance *pim,
+			 const struct zapi_umh *zumh, bool add){
 	struct pim_dimt_umh *umh;
 	struct pim_upstream *up;
 

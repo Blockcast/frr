@@ -137,7 +137,7 @@ ensure_peer() { # <peer-overlay>
 
 	if ! ip link show "$dev" >/dev/null 2>&1; then
 		run ip link add "$dev" type ipip local "$SELF" remote "$peer" \
-			encap fou encap-sport auto encap-dport "$FOU_PORT" || return 1
+			ttl 64 encap fou encap-sport auto encap-dport "$FOU_PORT" || return 1
 		log "created $dev ($SELF -> $peer)"
 	fi
 

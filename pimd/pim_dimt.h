@@ -40,6 +40,10 @@ void pim_dimt_umh_update(struct pim_instance *pim,
 void pim_dimt_upstream_apply(struct pim_instance *pim,
 			     struct pim_upstream *up);
 
+/* Unpin every upstream pinned to a light interface that went down/away
+ * (STATIC_IIF suppresses the normal rpf-update repair paths). */
+void pim_dimt_iface_down(struct pim_instance *pim, struct interface *ifp);
+
 void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json);
 
 #endif /* PIM_DIMT_H */

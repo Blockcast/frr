@@ -40,6 +40,7 @@
 #include "pim_vxlan.h"
 #include "pim_static.h"
 #include "pim_tib.h"
+#include "pim_dimt.h"
 #include "pim_util.h"
 #include "pim_routemap.h"
 
@@ -2148,11 +2149,18 @@ static int pim_ifp_down(struct interface *ifp)
 			ifp->mtu, if_is_operative(ifp));
 	}
 
+	pim = ifp->vrf->info;
+
+	/* DIMT-pinned upstreams bypass every rpf-update repair path
+	 * (STATIC_IIF); unpin them before this interface is torn down or
+	 * their join timer fires on a stale interface pointer. */
+	if (pim)
+		pim_dimt_iface_down(pim, ifp);
+
 	/* Avoid disabling the same interface twice */
 	if (pim_ifp && pim_ifp->mroute_vif_index == -1)
 		return 0;
 
-	pim = ifp->vrf->info;
 	if (!if_is_operative(ifp) || (pim && pim->shutdown)) {
 		pim_ifchannel_delete_all(ifp);
 		gm_group_delete(ifp);
@@ -2188,6 +2196,8 @@ static int pim_ifp_down(struct interface *ifp)
 
 static int pim_ifp_destroy(struct interface *ifp)
 {
+	struct pim_instance *pim = ifp->vrf->info;
+
 	if (PIM_DEBUG_ZEBRA) {
 		zlog_debug(
 			"%s: %s index %d vrf %s(%u) flags %ld metric %d mtu %d operative %d",
@@ -2196,13 +2206,13 @@ static int pim_ifp_destroy(struct interface *ifp)
 			ifp->mtu, if_is_operative(ifp));
 	}
 
+	if (pim)
+		pim_dimt_iface_down(pim, ifp);
+
 	if (!if_is_operative(ifp))
 		pim_if_addr_del_all(ifp);
 
 #if PIM_IPV == 4
-	struct pim_instance *pim;
-
-	pim = ifp->vrf->info;
 	if (pim && pim->vxlan.term_if == ifp)
 		pim_vxlan_del_term_dev(pim);
 #endif
