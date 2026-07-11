@@ -4222,6 +4222,49 @@ stream_failure:
 	return -1;
 }
 
+int zapi_umh_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
+		    const struct zapi_umh *umh)
+{
+	stream_reset(s);
+
+	zclient_create_header(s, cmd, vrf_id);
+	stream_putc(s, umh->prefix.family);
+	stream_putc(s, umh->prefix.prefixlen);
+	stream_put(s, &umh->prefix.u.prefix, prefix_blen(&umh->prefix));
+	stream_put_ipaddr(s, &umh->umh);
+	stream_putc(s, umh->umh_type);
+	stream_putc(s, umh->preference);
+
+	/* Put length at the first point of the stream. */
+	stream_putw_at(s, 0, stream_get_endp(s));
+
+	return 0;
+}
+
+int zapi_umh_decode(struct stream *s, struct zapi_umh *umh)
+{
+	uint8_t family;
+
+	memset(umh, 0, sizeof(*umh));
+
+	STREAM_GETC(s, family);
+	if (family != AF_INET && family != AF_INET6)
+		return -1;
+	umh->prefix.family = family;
+	STREAM_GETC(s, umh->prefix.prefixlen);
+	if (umh->prefix.prefixlen > prefix_blen(&umh->prefix) * 8)
+		return -1;
+	STREAM_GET(&umh->prefix.u.prefix, s, prefix_blen(&umh->prefix));
+	STREAM_GET_IPADDR(s, &umh->umh);
+	STREAM_GETC(s, umh->umh_type);
+	STREAM_GETC(s, umh->preference);
+
+	return 0;
+
+stream_failure:
+	return -1;
+}
+
 enum zclient_send_status zebra_send_mpls_labels(struct zclient *zclient,
 						int cmd, struct zapi_labels *zl)
 {

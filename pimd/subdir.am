@@ -17,6 +17,7 @@ pim_common = \
 	pimd/pim_assert.c \
 	pimd/pim_bfd.c \
 	pimd/pim_bsm.c \
+	pimd/pim_dimt.c \
 	pimd/pim_bsr_rpdb.c \
 	pimd/pim_cmd_common.c \
 	pimd/pim_errors.c \
@@ -106,6 +107,7 @@ noinst_HEADERS += \
 	pimd/pim_autorp.h \
 	pimd/pim_bfd.h \
 	pimd/pim_bsm.h \
+	pimd/pim_dimt.h \
 	pimd/pim_cmd.h \
 	pimd/pim_cmd_common.h \
 	pimd/pim_errors.h \

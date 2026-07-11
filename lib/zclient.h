@@ -197,6 +197,9 @@ typedef enum {
 	ZEBRA_MVPN_SG_ADD,
 	ZEBRA_MVPN_SG_DEL,
 	ZEBRA_MVPN_SG_REPLAY,
+	ZEBRA_UMH_ADD,
+	ZEBRA_UMH_DEL,
+	ZEBRA_UMH_REPLAY,
 	ZEBRA_MLAG_PROCESS_UP,
 	ZEBRA_MLAG_PROCESS_DOWN,
 	ZEBRA_MLAG_CLIENT_REGISTER,
@@ -700,6 +703,24 @@ struct zapi_mvpn_sg {
 	uint8_t role; /* enum zapi_mvpn_sg_role */
 };
 
+/*
+ * DIMT (draft-zzhang-mboned-dynamic-internet-mcast-tunnel) UMH glue:
+ * bgpd extracts the Upstream Multicast Hop extended community from unicast
+ * source routes, zebra relays it to pimd, pimd steers the (S,G) RPF onto
+ * the PIM Light tunnel interface facing the UMH.
+ */
+enum zapi_umh_type {
+	ZAPI_UMH_TYPE_PIM = 1,
+	ZAPI_UMH_TYPE_AMT_RELAY = 2,
+};
+
+struct zapi_umh {
+	struct prefix prefix; /* the unicast source route carrying the EC */
+	struct ipaddr umh;    /* Global Admin field: the UMH address */
+	uint8_t umh_type;     /* enum zapi_umh_type */
+	uint8_t preference;   /* 0-15, higher preferred */
+};
+
 struct zapi_pw {
 	char ifname[IFNAMSIZ];
 	ifindex_t ifindex;
@@ -1174,6 +1195,11 @@ extern int zapi_sr_policy_notify_status_decode(struct stream *s,
 extern int zapi_mvpn_sg_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
 			       const struct zapi_mvpn_sg *sg);
 extern int zapi_mvpn_sg_decode(struct stream *s, struct zapi_mvpn_sg *sg);
+
+/* DIMT bgpd<->pimd UMH glue (see struct zapi_umh). */
+extern int zapi_umh_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
+			   const struct zapi_umh *umh);
+extern int zapi_umh_decode(struct stream *s, struct zapi_umh *umh);
 
 extern enum zclient_send_status zebra_send_mpls_labels(struct zclient *zclient,
 						       int cmd,

@@ -4201,6 +4201,83 @@ int zapi_mvpn_sg_client_close_cleanup(struct zserv *client)
 	return 0;
 }
 
+/*
+ * DIMT (draft-zzhang-mboned-dynamic-internet-mcast-tunnel) UMH glue relay.
+ *
+ * Mirror image of the MVPN SG relay: bgpd is the producer (UMH extended
+ * community on unicast source routes), pimd the consumer. zebra keeps NO
+ * UMH state. On an ADD/DEL from bgpd, forward it verbatim to every PIM
+ * client iff one has subscribed (ZEBRA_PIM_WANTS_UMH). On a REPLAY from
+ * pimd, set the subscribe flag and ask bgpd to re-dump.
+ */
+static void zread_umh(ZAPI_HANDLER_ARGS)
+{
+	struct zapi_umh umh;
+	struct zserv *pim_client;
+	struct stream *s;
+
+	if (zapi_umh_decode(msg, &umh) < 0) {
+		zlog_warn("UMH relay: decode failed");
+		return;
+	}
+
+	if (!CHECK_FLAG(zvrf->flags, ZEBRA_PIM_WANTS_UMH))
+		return;
+
+	/* pimd and pim6d both register as ZEBRA_ROUTE_PIM; the prefix family
+	 * selects the interested one, but relaying to both is harmless. */
+	frr_each (zserv_client_list, &zrouter.client_list, pim_client) {
+		if (pim_client->proto != ZEBRA_ROUTE_PIM)
+			continue;
+
+		if (IS_ZEBRA_DEBUG_EVENT)
+			zlog_debug("UMH relay: forwarding cmd %u to pimd",
+				   hdr->command);
+
+		s = stream_new(ZEBRA_SMALL_PACKET_SIZE);
+		zapi_umh_encode(s, hdr->command, zvrf_id(zvrf), &umh);
+		zserv_send_message(pim_client, s);
+	}
+}
+
+static void zread_umh_replay(ZAPI_HANDLER_ARGS)
+{
+	struct zserv *bgp_client;
+	struct stream *s;
+
+	SET_FLAG(zvrf->flags, ZEBRA_PIM_WANTS_UMH);
+	if (IS_ZEBRA_DEBUG_EVENT)
+		zlog_debug("UMH replay: pimd subscribed; relaying replay to bgpd");
+
+	bgp_client = zserv_find_client(ZEBRA_ROUTE_BGP, 0);
+	if (!bgp_client)
+		return;
+
+	s = stream_new(ZEBRA_SMALL_PACKET_SIZE);
+	zclient_create_header(s, ZEBRA_UMH_REPLAY, zvrf_id(zvrf));
+	stream_putw_at(s, 0, stream_get_endp(s));
+	zserv_send_message(bgp_client, s);
+}
+
+/* Drop the UMH subscription when the last PIM client goes away; a
+ * restarted pimd re-subscribes via ZEBRA_UMH_REPLAY. */
+int zapi_umh_client_close_cleanup(struct zserv *client)
+{
+	struct zebra_vrf *zvrf = zebra_vrf_lookup_by_id(VRF_DEFAULT);
+	struct zserv *other;
+
+	if (client->proto != ZEBRA_ROUTE_PIM || !zvrf)
+		return 0;
+
+	frr_each (zserv_client_list, &zrouter.client_list, other) {
+		if (other != client && other->proto == ZEBRA_ROUTE_PIM)
+			return 0;
+	}
+
+	UNSET_FLAG(zvrf->flags, ZEBRA_PIM_WANTS_UMH);
+	return 0;
+}
+
 void (*const zserv_handlers[])(ZAPI_HANDLER_ARGS) = {
 	[ZEBRA_ROUTER_ID_ADD] = zread_router_id_add,
 	[ZEBRA_ROUTER_ID_DELETE] = zread_router_id_delete,
@@ -4272,6 +4349,9 @@ void (*const zserv_handlers[])(ZAPI_HANDLER_ARGS) = {
 	[ZEBRA_MVPN_SG_ADD] = zread_mvpn_sg,
 	[ZEBRA_MVPN_SG_DEL] = zread_mvpn_sg,
 	[ZEBRA_MVPN_SG_REPLAY] = zread_mvpn_sg_replay,
+	[ZEBRA_UMH_ADD] = zread_umh,
+	[ZEBRA_UMH_DEL] = zread_umh,
+	[ZEBRA_UMH_REPLAY] = zread_umh_replay,
 	[ZEBRA_MLAG_CLIENT_REGISTER] = zebra_mlag_client_register,
 	[ZEBRA_MLAG_CLIENT_UNREGISTER] = zebra_mlag_client_unregister,
 	[ZEBRA_MLAG_FORWARD_MSG] = zebra_mlag_forward_client_msg,

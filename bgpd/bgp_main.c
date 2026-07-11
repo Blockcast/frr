@@ -38,6 +38,7 @@
 #include "bgpd/bgp_nexthop.h"
 #include "bgpd/bgp_regex.h"
 #include "bgpd/bgp_clist.h"
+#include "bgpd/bgp_dimt.h"
 #include "bgpd/bgp_debug.h"
 #include "bgpd/bgp_errors.h"
 #include "bgpd/bgp_filter.h"
@@ -253,6 +254,7 @@ static FRR_NORETURN void bgp_exit(int status)
 	prefix_list_reset();
 
 	/* reverse community_list_init */
+	bgp_dimt_terminate();
 	community_list_terminate(bgp_clist);
 
 	bgp_vrf_terminate();

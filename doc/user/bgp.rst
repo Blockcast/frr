@@ -4525,6 +4525,19 @@ driven by these routes is not yet implemented.
    extended community (:rfc:`6514` Section 4.3) on the unicast route toward
    the source, falling back to the local AS.
 
+.. clicmd:: set extcommunity umh A.B.C.D <pim|amt-relay> [preference (0-15)]
+
+   Route-map set action attaching a DIMT Upstream Multicast Hop extended
+   community (draft-zzhang-mboned-dynamic-internet-mcast-tunnel;
+   IPv4-address-specific, experimental sub-type 0x80 pending IANA
+   assignment) to a route. Applied to the unicast route toward a multicast
+   source, it tells receivers where to send their (S,G) joins: ``pim``
+   names a PIM (Light) tunnel endpoint, ``amt-relay`` an AMT relay.
+   A receiving pimd (see :clicmd:`ip pim light`) pins the (S,G) RPF onto
+   the PIM Light interface facing the UMH -- no per-source static route is
+   needed. Among multiple UMH communities on one route the highest
+   preference wins.
+
 .. clicmd:: show bgp <ipv4|ipv6> mvpn [json]
 
    Display the MCAST-VPN table of the default BGP instance for the IPv4 or

@@ -59,6 +59,7 @@
 #endif
 #include "bgpd/bgp_evpn.h"
 #include "bgpd/bgp_mvpn.h"
+#include "bgpd/bgp_dimt.h"
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_vty.h"
@@ -9767,6 +9768,9 @@ void bgp_init(unsigned short instance)
 
 	/* Init zebra. */
 	bgp_zebra_init(bm->master, instance);
+
+	/* DIMT UMH extraction (loc-RIB hook). */
+	bgp_dimt_init();
 
 #ifdef ENABLE_BGP_VNC
 	vnc_zebra_init(bm->master);
