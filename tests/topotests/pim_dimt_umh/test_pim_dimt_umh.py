@@ -43,6 +43,10 @@ pytestmark = [pytest.mark.bgpd, pytest.mark.pimd]
 
 SOURCE = "10.10.10.10"
 GROUP = "232.1.1.10"
+# GROUP2 is joined via `ip igmp static-group` in r2's startup config: the
+# membership is processed at config-load time, BEFORE zebra has delivered
+# interface state and BEFORE BGP has delivered the UMH mapping.
+GROUP2 = "232.1.1.20"
 SRC_PREFIX = "10.10.10.0/24"
 UMH = "10.0.0.1"
 
@@ -141,6 +145,44 @@ def test_umh_mapping_relayed():
         return None
 
     _, result = topotest.run_and_expect(_mapping_present, None, count=60, wait=1)
+    assert result is None, result
+
+
+def test_static_group_at_boot_pins_rpf_via_umh():
+    """A static-group present in the STARTUP config (processed before zebra
+    interface state and before the BGP UMH mapping exist) must still end up
+    Joined and pinned once that state arrives -- no config kick allowed."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _boot_static_group_pinned():
+        data = _json_cmd("r2", "show ip pim upstream json")
+        updata = data.get(GROUP2, {}).get(SOURCE, {})
+        if not updata:
+            return "r2 has no upstream for boot-time static-group: {}".format(
+                data
+            )
+        if updata.get("joinState") != "Joined":
+            return "r2 boot static-group upstream not Joined: {}".format(
+                updata
+            )
+        if updata.get("inboundInterface") != "r2-eth0":
+            return "r2 boot static-group RPF not on light iface: {}".format(
+                updata
+            )
+        mroute = _json_cmd("r2", "show ip mroute json")
+        sgdata = mroute.get(GROUP2, {}).get(SOURCE, {})
+        if "r2-eth1" not in sgdata.get("oil", {}):
+            return "r2 boot static-group mroute lacks LAN OIF: {}".format(
+                sgdata
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _boot_static_group_pinned, None, count=60, wait=1
+    )
     assert result is None, result
 
 
