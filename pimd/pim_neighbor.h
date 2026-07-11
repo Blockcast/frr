@@ -63,7 +63,7 @@ pim_neighbor_add(struct interface *ifp, pim_addr source_addr,
 		 pim_hello_options hello_options, uint16_t holdtime,
 		 uint16_t propagation_delay, uint16_t override_interval,
 		 uint32_t dr_priority, uint32_t generation_id,
-		 struct list *addr_list, int send_hello_now);
+		 struct list *addr_list, int send_hello_now, bool light);
 void pim_neighbor_delete(struct interface *ifp, struct pim_neighbor *neigh,
 			 const char *delete_message);
 void pim_neighbor_delete_all(struct interface *ifp, const char *delete_message);

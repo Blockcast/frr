@@ -1104,6 +1104,23 @@ static bool pim_bsm_frag_send(uint8_t *buf, uint32_t len, struct interface *ifp,
 	return true;
 }
 
+/* RFC 9739 (PIM Light): a light adjacency is Join/Prune only, so
+ * synthetic light neighbors do not make an interface eligible for
+ * Bootstrap message forwarding.
+ */
+static bool pim_bsm_has_fwd_neighbor(struct pim_interface *pim_ifp)
+{
+	struct listnode *node;
+	struct pim_neighbor *neigh;
+
+	for (ALL_LIST_ELEMENTS_RO(pim_ifp->pim_neighbor_list, node, neigh)) {
+		if (!neigh->light)
+			return true;
+	}
+
+	return false;
+}
+
 static void pim_bsm_fwd_whole_sz(struct pim_instance *pim, uint8_t *buf,
 				 uint32_t len, int sz)
 {
@@ -1128,9 +1145,10 @@ static void pim_bsm_fwd_whole_sz(struct pim_instance *pim, uint8_t *buf,
 		 * When a Bootstrap message is forwarded, it is forwarded out
 		 * of every multicast-capable interface that has PIM neighbors.
 		 *
-		 * So skipping pim interfaces with no neighbors.
+		 * So skipping pim interfaces with no neighbors (light
+		 * neighbors do not count; see pim_bsm_has_fwd_neighbor).
 		 */
-		if (listcount(pim_ifp->pim_neighbor_list) == 0)
+		if (!pim_bsm_has_fwd_neighbor(pim_ifp))
 			continue;
 
 		pim_hello_require(ifp);
