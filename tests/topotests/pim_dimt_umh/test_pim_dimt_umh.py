@@ -1049,18 +1049,24 @@ def test_pimd_restart_replays_umh():
     Without replay-from-shadow a restarted pimd runs with an empty table
     until the next route flap.
 
-    Only GROUP2 (the pimd.conf static-group) survives the restart:
-    kill_router_daemons' save_config runs `write memory` (integrated
-    config) but startDaemons re-execs pimd against its original
-    per-daemon config file, so the runtime igmp join for GROUP is lost
-    and re-applied afterwards -- which doubles as proof that memberships
-    arriving AFTER the replay pin against the replayed table."""
+    Only GROUP2 (the pimd.conf static-group) survives the restart: the
+    restart deliberately uses save_config=False so pimd boots from the
+    pristine pimd.conf.  (save_config's `write memory` would bake the
+    runtime `ip igmp join-group` into the loaded config, and a
+    boot-time join-group fails its kernel socket join before the
+    interface is usable and never retries -- an upstream-inherited
+    boot-order gap in the join-group path, distinct from the
+    static-group replay this branch fixed; re-applying the identical
+    config line afterwards is then a northbound no-op.)  The runtime
+    join for GROUP is re-added fresh afterwards -- which doubles as
+    proof that memberships arriving AFTER the replay pin against the
+    replayed table."""
     tgen = get_topogen()
 
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
-    kill_router_daemons(tgen, "r2", ["pimd"])
+    kill_router_daemons(tgen, "r2", ["pimd"], save_config=False)
     start_router_daemons(tgen, "r2", ["pimd"])
 
     def _replayed_and_static_group_repinned():
