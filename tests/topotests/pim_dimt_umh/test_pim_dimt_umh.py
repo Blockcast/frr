@@ -186,6 +186,67 @@ def test_static_group_at_boot_pins_rpf_via_umh():
     assert result is None, result
 
 
+def test_static_group_survives_pim_toggle():
+    """Saved configs write the igmp/static-group lines BEFORE `ip pim`, so
+    on (re)apply the static-group membership is refused while pim is
+    disabled and the interface's first DR election has not run yet.  It
+    must re-form as soon as this router becomes DR -- no config kick."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ no ip pim
+"""
+    )
+
+    def _membership_torn_down():
+        data = _json_cmd("r2", "show ip pim upstream json")
+        if data.get(GROUP2, {}).get(SOURCE, {}).get("joinState") == "Joined":
+            return "r2 GROUP2 upstream survived pim disable: {}".format(data)
+        return None
+
+    _, result = topotest.run_and_expect(_membership_torn_down, None, count=30, wait=1)
+    assert result is None, result
+
+    # re-enable in saved-config order: the igmp + static-group lines are
+    # already present, `ip pim` comes last.
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ ip pim
+ ip pim passive
+"""
+    )
+
+    def _membership_reformed():
+        data = _json_cmd("r2", "show ip pim upstream json")
+        updata = data.get(GROUP2, {}).get(SOURCE, {})
+        if updata.get("joinState") != "Joined":
+            return "r2 GROUP2 upstream not re-Joined after pim toggle: {}".format(
+                data
+            )
+        if updata.get("inboundInterface") != "r2-eth0":
+            return "r2 GROUP2 RPF not back on the light iface: {}".format(
+                updata
+            )
+        mroute = _json_cmd("r2", "show ip mroute json")
+        sgdata = mroute.get(GROUP2, {}).get(SOURCE, {})
+        if "r2-eth1" not in sgdata.get("oil", {}):
+            return "r2 GROUP2 mroute lacks LAN OIF after toggle: {}".format(
+                sgdata
+            )
+        return None
+
+    _, result = topotest.run_and_expect(_membership_reformed, None, count=60, wait=1)
+    assert result is None, result
+
+
 def test_igmp_join_pins_rpf_via_umh():
     """An IGMPv3 (S,G) join drives the upstream to JOINED with a
     STATIC_IIF pin: RPF interface = the light interface facing the UMH,

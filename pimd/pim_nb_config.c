@@ -146,6 +146,8 @@ static void pim_if_membership_refresh(struct interface *ifp)
 	 */
 
 	pim_ifchannel_delete_on_noinfo(ifp);
+
+	pim_if_static_group_replay(ifp);
 }
 
 static int pim_cmd_interface_add(struct interface *ifp)
