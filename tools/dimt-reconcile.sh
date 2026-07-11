@@ -145,6 +145,17 @@ frr_iface() { # <dev> <add|del>
 		out=$(vtysh -c 'configure terminal' -c "interface $1" \
 			-c 'ip pim' -c 'ip pim light' 2>&1)
 		rc=$?
+		# FRR not (yet) running is NOT a peer failure: at boot the
+		# reconciler (S81) runs before frr (S95), and the interface
+		# stanza is write-saved so the daemon picks it up on start.
+		if [ "$rc" -ne 0 ] &&
+			printf '%s\n' "$out" | grep -q "failed to connect"; then
+			if [ "$VTYSH_WARNED" = 0 ]; then
+				log "FRR not running; skipping enrollment (write-saved config covers existing peers)"
+				VTYSH_WARNED=1
+			fi
+			return 0
+		fi
 		# vtysh reports errors on stdout with exit 0; match real
 		# error shapes only -- mgmtd's benign "% Configuration
 		# applied with notes: No changes found to be committed!"
