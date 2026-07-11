@@ -29,6 +29,18 @@ BGP / route-map / interface state that the next stage builds on (and
 restores what it changed for the stages after it).  In particular,
 test_light_iface_delete_unpins_safely permanently deletes r2-eth2, so
 every test that needs the s4 light segment must run before it.
+
+The suite is dual-stack: the test_v6_* stages at the END of the module
+exercise the IPv6 sibling of the pipeline -- a 20-byte
+IPv6-address-specific UMH EC on the IPv6 Extended Communities attribute,
+relayed bgpd -> zebra -> pim6d (pimd and pim6d each drop the other
+family's mappings; that isolation is asserted explicitly).  The v6 leg
+rides its own eBGP session over the s1 global addresses (2001:db8:1::/64)
+with the v4 AF deactivated on it, so the v4 stages' single-session,
+single-path state is untouched.  Because the v6 stages run after
+test_light_iface_delete_unpins_safely they must not depend on the s4
+segment (r2-eth2 is gone by then) and they inherit that stage's v4
+mapping leftovers -- see V4_LEFTOVER_UMH.
 """
 
 import functools
@@ -47,7 +59,7 @@ from lib.common_config import kill_router_daemons, start_router_daemons
 from lib.topogen import Topogen, TopoRouter, get_topogen
 from lib.topolog import logger
 
-pytestmark = [pytest.mark.bgpd, pytest.mark.pimd]
+pytestmark = [pytest.mark.bgpd, pytest.mark.pimd, pytest.mark.pim6d]
 
 SOURCE = "10.10.10.10"
 GROUP = "232.1.1.10"
@@ -64,6 +76,22 @@ SRC_PREFIX = "10.10.10.0/24"
 # a broader covering prefix used by the LPM test
 SRC_PREFIX16 = "10.10.0.0/16"
 UMH = "10.0.0.1"
+
+# ---- the IPv6 leg (the test_v6_* stages at the end of the module) ----
+# v6 mirrors of the v4 subnets: s1 = 2001:db8:1::/64, s2 (source LAN) =
+# 2001:db8:10::/64, s3 (receiver stub) = 2001:db8:20::/64, s4 =
+# 2001:db8:2::/64.  All addresses below are written in the canonical
+# lowercase-compressed form the JSON keys use.
+SOURCE6 = "2001:db8:10::10"
+GROUP6 = "ff3e::10"
+SRC_PREFIX6 = "2001:db8:10::/64"
+UMH6 = "2001:db8:1::1"
+# What the LAST v4 stage (test_light_iface_delete_unpins_safely) leaves in
+# pimd's mapping table for the v6 stages to assert family isolation
+# against: it restored `redistribute connected route-map UMH` with the
+# UMH moved to r1's s4 address and then deleted r2-eth2, so pimd still
+# holds SRC_PREFIX -> 10.0.1.1 (interface unresolved: r2-eth2 is gone).
+V4_LEFTOVER_UMH = "10.0.1.1"
 
 
 def build_topo(tgen):
@@ -104,6 +132,9 @@ def setup_module(mod):
         )
         router.load_config(
             TopoRouter.RD_PIM, os.path.join(CWD, "{}/pimd.conf".format(rname))
+        )
+        router.load_config(
+            TopoRouter.RD_PIM6, os.path.join(CWD, "{}/pim6d.conf".format(rname))
         )
         router.load_config(
             TopoRouter.RD_BGP, os.path.join(CWD, "{}/bgpd.conf".format(rname))
@@ -1266,6 +1297,253 @@ router bgp 65001
         assert False, "router failure after light-iface delete: {}".format(
             tgen.errors
         )
+
+
+def test_v6_umh_mapping_relayed():
+    """The v6 sibling of test_umh_mapping_relayed: a v6 unicast route
+    announced with `set extcommunity umh <v6-addr> pim preference 5` (a
+    20-byte IPv6-address-specific EC on the IPv6 Extended Communities
+    attribute) must land in pim6d's mapping table with the light interface
+    resolved -- and in pim6d's table ONLY (pimd drops non-v4 mappings).
+    The EC itself must render on r2's received path as
+    "UMH:<v6>:pim:5" under extendedIpv6Community.
+
+    Runs at the END of the module: r2-eth2 is already gone, so the whole
+    v6 leg lives on the s1 segment."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _v6_route_learned():
+        data = _json_cmd("r2", "show ipv6 route {} json".format(SRC_PREFIX6))
+        if data is None:
+            return "r2: unparseable v6 route JSON (zebra dead?)"
+        routes = data.get(SRC_PREFIX6, [])
+        for rt in routes:
+            if rt.get("protocol") == "bgp" and rt.get("selected"):
+                return None
+        return "r2 has no selected BGP route for {}: {}".format(
+            SRC_PREFIX6, data
+        )
+
+    _, result = topotest.run_and_expect(_v6_route_learned, None, count=60, wait=1)
+    assert result is None, result
+
+    def _v6_mapping_present():
+        data = _json_cmd("r2", "show ipv6 pim dimt umh json")
+        if data is None:
+            return "r2: unparseable v6 dimt umh JSON (pim6d dead?)"
+        entry = data.get(SRC_PREFIX6, {})
+        if entry.get("umh") != UMH6:
+            return "r2 v6 UMH mapping missing/wrong: {}".format(data)
+        if entry.get("type") != "pim":
+            return "r2 v6 UMH type wrong: {}".format(entry)
+        if entry.get("preference") != 5:
+            return "r2 v6 UMH preference wrong: {}".format(entry)
+        if entry.get("interface") != "r2-eth0":
+            return "r2 v6 UMH light interface not resolved: {}".format(entry)
+        # family isolation, leak direction: pim6d holds the v6 mapping,
+        # pimd must NOT (both daemons subscribe as ZEBRA_ROUTE_PIM and
+        # each drops the other family's relays).
+        v4data = _json_cmd("r2", "show ip pim dimt umh json")
+        if v4data is None:
+            return "r2: unparseable v4 dimt umh JSON (pimd dead?)"
+        if SRC_PREFIX6 in v4data:
+            return "v6 mapping leaked into pimd's v4 table: {}".format(
+                v4data
+            )
+        return None
+
+    _, result = topotest.run_and_expect(_v6_mapping_present, None, count=60, wait=1)
+    assert result is None, result
+
+    def _v6_ec_rendered():
+        data = _json_cmd(
+            "r2", "show bgp ipv6 unicast {} json".format(SRC_PREFIX6)
+        )
+        if data is None:
+            return "r2: unparseable bgp ipv6 unicast JSON (bgpd dead?)"
+        paths = data.get("paths", [])
+        if not paths:
+            return "r2 has no BGP paths for {}: {}".format(SRC_PREFIX6, data)
+        want = "UMH:{}:pim:5".format(UMH6)
+        for path in paths:
+            ecstr = path.get("extendedIpv6Community", {}).get("string", "")
+            if want in ecstr:
+                return None
+        return "no r2 path for {} carries '{}': {}".format(
+            SRC_PREFIX6, want, paths
+        )
+
+    _, result = topotest.run_and_expect(_v6_ec_rendered, None, count=60, wait=1)
+    assert result is None, result
+
+
+def test_v6_mld_join_pins_rpf():
+    """The v6 sibling of test_igmp_join_pins_rpf_via_umh: a real MLDv2
+    (S,G) join on r2's LAN drives the v6 upstream to JOINED with a
+    STATIC_IIF pin -- RPF interface = the light interface facing the v6
+    UMH, rpf address = the UMH -- with NO static route and NO v6 PIM
+    adjacency anywhere.  The neighborless Join must materialize a
+    synthetic light neighbor on r1; PIMv6 J/P is sourced from r2-eth0's
+    link-local (not predictable from config), so the r1 assertion scans
+    r1-eth0's neighbors for the light flag instead of a literal address."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ ipv6 mld join-group {} {}
+""".format(GROUP6, SOURCE6)
+    )
+
+    def _v6_upstream_pinned():
+        data = _json_cmd("r2", "show ipv6 pim upstream json")
+        if data is None:
+            return "r2: unparseable v6 pim upstream JSON (pim6d dead?)"
+        updata = data.get(GROUP6, {}).get(SOURCE6, {})
+        if updata.get("joinState") != "Joined":
+            return "r2 v6 upstream not Joined: {}".format(updata)
+        if updata.get("inboundInterface") != "r2-eth0":
+            return "r2 v6 upstream RPF not on the light interface: {}".format(
+                updata
+            )
+        if updata.get("staticIncomingInterface") is not True:
+            return "r2 v6 upstream not STATIC_IIF-pinned: {}".format(updata)
+        rpf = _json_cmd("r2", "show ipv6 pim rpf json")
+        if rpf is None:
+            return "r2: unparseable v6 pim rpf JSON (pim6d dead?)"
+        rpfdata = rpf.get(GROUP6, {}).get(SOURCE6, {})
+        if rpfdata.get("rpfAddress") != UMH6:
+            return "r2 v6 rpf address is not the UMH: {}".format(rpfdata)
+        return None
+
+    # MLD/PIMv6 convergence can lag IGMP: give it the longer leash
+    _, result = topotest.run_and_expect(_v6_upstream_pinned, None, count=90, wait=1)
+    assert result is None, result
+
+    def _v6_synthetic_neighbor():
+        neigh = _json_cmd("r1", "show ipv6 pim neighbor json")
+        if neigh is None:
+            return "r1: unparseable v6 pim neighbor JSON (pim6d dead?)"
+        for nbr in neigh.get("r1-eth0", {}).values():
+            if nbr.get("light") is True:
+                return None
+        return "r1 has no synthetic light neighbor on r1-eth0: {}".format(
+            neigh
+        )
+
+    _, result = topotest.run_and_expect(
+        _v6_synthetic_neighbor, None, count=90, wait=1
+    )
+    assert result is None, result
+
+
+def test_v6_ec_removal_acts_as_del():
+    """The v6 sibling of test_ec_removal_acts_as_del, doubling as the
+    family-isolation proof: the v6 prefix re-announced WITHOUT the UMH EC
+    (route survives) must clear the v6 mapping and unpin the v6 upstream
+    while pimd's v4 mapping -- whatever the v4 stages left behind -- stays
+    untouched.  Restoring the set must bring the v6 mapping back and
+    re-pin the still-Joined upstream.
+
+    The v4 leftover asserted against is documented at V4_LEFTOVER_UMH:
+    SRC_PREFIX -> 10.0.1.1, alive in pimd's table since
+    test_light_iface_delete_unpins_safely."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r1"].vtysh_cmd(
+        """
+configure terminal
+route-map UMH6 permit 10
+ no set extcommunity umh
+"""
+    )
+
+    def _v6_mapping_gone_v4_untouched():
+        data = _json_cmd("r2", "show ipv6 pim dimt umh json")
+        if data is None:
+            # a dead pim6d must NOT satisfy this absence-assertion
+            return "r2: unparseable v6 dimt umh JSON (pim6d dead?)"
+        if SRC_PREFIX6 in data:
+            return "r2 v6 UMH mapping survived EC removal: {}".format(data)
+        # family isolation, delete direction: the v6 DEL must not have
+        # touched pimd's v4 table.
+        v4data = _json_cmd("r2", "show ip pim dimt umh json")
+        if v4data is None:
+            return "r2: unparseable v4 dimt umh JSON (pimd dead?)"
+        if v4data.get(SRC_PREFIX, {}).get("umh") != V4_LEFTOVER_UMH:
+            return "v4 mapping disturbed by the v6 DEL: {}".format(v4data)
+        # the v6 upstream must have unpinned (attribute loss == DEL) but
+        # survive on its MLD membership.
+        ups = _json_cmd("r2", "show ipv6 pim upstream json")
+        if ups is None:
+            return "r2: unparseable v6 pim upstream JSON (pim6d dead?)"
+        updata = ups.get(GROUP6, {}).get(SOURCE6, {})
+        if updata.get("staticIncomingInterface") is not False:
+            return "r2 v6 upstream still STATIC_IIF-pinned: {}".format(
+                updata
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _v6_mapping_gone_v4_untouched, None, count=90, wait=1
+    )
+    assert result is None, result
+
+    # restore the set: the v6 mapping must return and re-pin
+    tgen.gears["r1"].vtysh_cmd(
+        """
+configure terminal
+route-map UMH6 permit 10
+ set extcommunity umh {} pim preference 5
+""".format(UMH6)
+    )
+
+    def _v6_mapping_back_and_repinned():
+        data = _json_cmd("r2", "show ipv6 pim dimt umh json")
+        if data is None:
+            return "r2: unparseable v6 dimt umh JSON (pim6d dead?)"
+        entry = data.get(SRC_PREFIX6, {})
+        if entry.get("umh") != UMH6:
+            return "r2 v6 UMH mapping did not return: {}".format(data)
+        if entry.get("type") != "pim" or entry.get("preference") != 5:
+            return "r2 v6 UMH mapping returned wrong: {}".format(entry)
+        if entry.get("interface") != "r2-eth0":
+            return "r2 v6 UMH light interface not resolved: {}".format(entry)
+        ups = _json_cmd("r2", "show ipv6 pim upstream json")
+        if ups is None:
+            return "r2: unparseable v6 pim upstream JSON (pim6d dead?)"
+        updata = ups.get(GROUP6, {}).get(SOURCE6, {})
+        if updata.get("staticIncomingInterface") is not True:
+            return "r2 v6 upstream not re-pinned: {}".format(updata)
+        rpf = _json_cmd("r2", "show ipv6 pim rpf json")
+        if rpf is None:
+            return "r2: unparseable v6 pim rpf JSON (pim6d dead?)"
+        if rpf.get(GROUP6, {}).get(SOURCE6, {}).get("rpfAddress") != UMH6:
+            return "r2 v6 rpf address is not the UMH: {}".format(rpf)
+        # and the v4 leftover is STILL intact after the v6 re-add
+        v4data = _json_cmd("r2", "show ip pim dimt umh json")
+        if v4data is None:
+            return "r2: unparseable v4 dimt umh JSON (pimd dead?)"
+        if v4data.get(SRC_PREFIX, {}).get("umh") != V4_LEFTOVER_UMH:
+            return "v4 mapping disturbed by the v6 re-add: {}".format(
+                v4data
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _v6_mapping_back_and_repinned, None, count=90, wait=1
+    )
+    assert result is None, result
 
 
 if __name__ == "__main__":
