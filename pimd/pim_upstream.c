@@ -40,6 +40,7 @@
 #include "pim_nht.h"
 #include "pim_ssm.h"
 #include "pim_vxlan.h"
+#include "pim_dimt.h"
 #include "pim_mlag.h"
 #include "pim_state_refresh.h"
 #include "pim_dm.h"
@@ -1313,6 +1314,10 @@ static struct pim_upstream *pim_upstream_new(struct pim_instance *pim,
 	if (pim_up_mlag_is_local(up)
 	    || PIM_UPSTREAM_FLAG_TEST_MLAG_INTERFACE(up->flags))
 		pim_mlag_up_local_add(pim, up);
+
+	/* DIMT: a bgpd-learned UMH mapping overrides the RPF just
+	 * computed (or repairs a failed one). */
+	pim_dimt_upstream_apply(pim, up);
 
 	if (PIM_DEBUG_PIM_TRACE) {
 		zlog_debug(

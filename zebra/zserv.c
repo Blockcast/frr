@@ -1715,4 +1715,5 @@ void zserv_init(void)
 
 	hook_register(zserv_client_close, zserv_client_close_cb);
 	hook_register(zserv_client_close, zapi_mvpn_sg_client_close_cleanup);
+	hook_register(zserv_client_close, zapi_umh_client_close_cleanup);
 }

@@ -171,6 +171,9 @@ struct pim_instance {
 	struct pim_autorp *autorp;
 
 	struct list *ssmpingd_list;
+
+	/* DIMT: bgpd-learned UMH mappings (struct pim_dimt_umh) */
+	struct list *dimt_umh_list;
 	pim_addr ssmpingd_group_addr;
 
 	unsigned int gm_socket_if_count;

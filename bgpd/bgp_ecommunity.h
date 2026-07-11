@@ -60,6 +60,12 @@
  * (GTM: global-table) unicast source route to identify the upstream PE; a
  * C-multicast (Type-6/7) join echoes its Global Administrator as a Route Target. */
 #define ECOMMUNITY_VRF_ROUTE_IMPORT         0x0b
+/* draft-zzhang-mboned-dynamic-internet-mcast-tunnel Upstream Multicast Hop.
+ * No IANA assignment yet: squat on the experimental-use sub-type range so a
+ * later assignment is a one-line change. Wire (IPv4-address-specific):
+ * Global Admin = UMH address; Local Admin low byte = pref[7:4] | type[3:0]
+ * (1 = PIM tunnel endpoint, 2 = AMT relay); high byte reserved (0). */
+#define ECOMMUNITY_UMH                      0x80
 
 /* from IANA: bgp-extended-communities/bgp-extended-communities.xhtml
  * 0x0c Flow-spec Redirect to IPv4 - draft-ietf-idr-flowspec-redirect

@@ -3499,6 +3499,60 @@ static const struct route_map_rule_cmd route_set_ecommunity_vri_cmd = {
 	route_set_ecommunity_free,
 };
 
+/* `set extcommunity umh A.B.C.D <pim|amt-relay> [preference (0-15)]' --
+ * DIMT Upstream Multicast Hop (draft-zzhang-mboned-dynamic-internet-mcast-
+ * tunnel). Attached to the unicast route toward a multicast source so a
+ * receiver can steer its (S,G) RPF onto the PIM Light tunnel facing the
+ * UMH. */
+static void *route_set_ecommunity_umh_compile(const char *arg)
+{
+	struct rmap_ecom_set *rcs;
+	struct ecommunity *ecom;
+	struct ecommunity_val eval = {};
+	struct in_addr umh;
+	char addr[INET_ADDRSTRLEN] = "";
+	char kind[16] = "";
+	unsigned int pref = 0;
+	uint8_t umh_type;
+	int n;
+
+	n = sscanf(arg, "%15s %15s preference %u", addr, kind, &pref);
+	if (n < 2)
+		return NULL;
+	if (inet_pton(AF_INET, addr, &umh) != 1)
+		return NULL;
+	if (strmatch(kind, "pim"))
+		umh_type = 1;
+	else if (strmatch(kind, "amt-relay"))
+		umh_type = 2;
+	else
+		return NULL;
+	if (pref > 15)
+		return NULL;
+
+	eval.val[0] = ECOMMUNITY_ENCODE_IP;
+	eval.val[1] = ECOMMUNITY_UMH;
+	memcpy(&eval.val[2], &umh.s_addr, sizeof(umh.s_addr));
+	eval.val[6] = 0;
+	eval.val[7] = (uint8_t)((pref << 4) | umh_type);
+
+	ecom = ecommunity_new();
+	ecommunity_add_val(ecom, &eval, false, false);
+
+	rcs = XCALLOC(MTYPE_ROUTE_MAP_COMPILED, sizeof(struct rmap_ecom_set));
+	rcs->ecom = ecommunity_intern(ecom);
+	rcs->none = false;
+
+	return rcs;
+}
+
+static const struct route_map_rule_cmd route_set_ecommunity_umh_cmd = {
+	"extcommunity umh",
+	route_set_ecommunity,
+	route_set_ecommunity_umh_compile,
+	route_set_ecommunity_free,
+};
+
 static void *route_set_ecommunity_nt_compile(const char *arg)
 {
 	struct rmap_ecom_set *rcs;
@@ -7500,6 +7554,58 @@ ALIAS_YANG (no_set_ecommunity_vri,
             "BGP extended community attribute\n"
             "VRF Route Import extended community (RFC 6514)\n")
 
+DEFPY_YANG (set_ecommunity_umh,
+	    set_ecommunity_umh_cmd,
+	    "set extcommunity umh A.B.C.D$umh <pim|amt-relay>$kind [preference (0-15)$pref]",
+	    SET_STR
+	    "BGP extended community attribute\n"
+	    "DIMT Upstream Multicast Hop extended community\n"
+	    "UMH address\n"
+	    "UMH is a PIM (Light) tunnel endpoint\n"
+	    "UMH is an AMT relay\n"
+	    "UMH preference\n"
+	    "Preference value (higher preferred)\n")
+{
+	char value[64];
+	int ret;
+	const char *xpath =
+		"./set-action[action='frr-bgp-route-map:set-extcommunity-umh']";
+	char xpath_value[XPATH_MAXLEN];
+
+	nb_cli_enqueue_change(vty, xpath, NB_OP_CREATE, NULL);
+
+	snprintf(xpath_value, sizeof(xpath_value),
+		 "%s/rmap-set-action/frr-bgp-route-map:extcommunity-umh",
+		 xpath);
+	if (pref_str)
+		snprintf(value, sizeof(value), "%s %s preference %ld",
+			 umh_str, kind, pref);
+	else
+		snprintf(value, sizeof(value), "%s %s", umh_str, kind);
+	nb_cli_enqueue_change(vty, xpath_value, NB_OP_MODIFY, value);
+	ret = nb_cli_apply_changes(vty, NULL);
+	return ret;
+}
+
+DEFPY_YANG (no_set_ecommunity_umh,
+	    no_set_ecommunity_umh_cmd,
+	    "no set extcommunity umh [A.B.C.D <pim|amt-relay> [preference (0-15)]]",
+	    NO_STR
+	    SET_STR
+	    "BGP extended community attribute\n"
+	    "DIMT Upstream Multicast Hop extended community\n"
+	    "UMH address\n"
+	    "UMH is a PIM (Light) tunnel endpoint\n"
+	    "UMH is an AMT relay\n"
+	    "UMH preference\n"
+	    "Preference value (higher preferred)\n")
+{
+	const char *xpath =
+		"./set-action[action='frr-bgp-route-map:set-extcommunity-umh']";
+	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
+	return nb_cli_apply_changes(vty, NULL);
+}
+
 DEFUN_YANG(set_ecommunity_none, set_ecommunity_none_cmd,
 	   "set extcommunity none",
 	   SET_STR
@@ -8516,6 +8622,7 @@ void bgp_route_map_init(void)
 	route_map_install_set(&route_set_ecommunity_nt_cmd);
 	route_map_install_set(&route_set_ecommunity_soo_cmd);
 	route_map_install_set(&route_set_ecommunity_vri_cmd);
+	route_map_install_set(&route_set_ecommunity_umh_cmd);
 	route_map_install_set(&route_set_ecommunity_lb_cmd);
 	route_map_install_set(&route_set_ecommunity_color_cmd);
 	route_map_install_set(&route_set_ecommunity_none_cmd);
@@ -8627,6 +8734,8 @@ void bgp_route_map_init(void)
 	install_element(RMAP_NODE, &no_set_ecommunity_soo_short_cmd);
 	install_element(RMAP_NODE, &set_ecommunity_vri_cmd);
 	install_element(RMAP_NODE, &no_set_ecommunity_vri_cmd);
+	install_element(RMAP_NODE, &set_ecommunity_umh_cmd);
+	install_element(RMAP_NODE, &no_set_ecommunity_umh_cmd);
 	install_element(RMAP_NODE, &no_set_ecommunity_vri_short_cmd);
 	install_element(RMAP_NODE, &set_ecommunity_lb_cmd);
 	install_element(RMAP_NODE, &no_set_ecommunity_lb_cmd);

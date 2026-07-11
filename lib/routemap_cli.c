@@ -1418,6 +1418,11 @@ void route_map_action_show(struct vty *vty, const struct lyd_node *dnode,
 			yang_dnode_get_string(
 				dnode,
 				"./rmap-set-action/frr-bgp-route-map:extcommunity-vrf-route-import"));
+	} else if (IS_SET_EXTCOMMUNITY_UMH(action)) {
+		vty_out(vty, " set extcommunity umh %s\n",
+			yang_dnode_get_string(
+				dnode,
+				"./rmap-set-action/frr-bgp-route-map:extcommunity-umh"));
 	} else if (IS_SET_EXTCOMMUNITY_LB(action)) {
 		enum ecommunity_lb_type lb_type;
 		char str[VTY_BUFSIZ];

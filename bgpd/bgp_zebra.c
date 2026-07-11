@@ -59,6 +59,7 @@
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_ted.h"
 #include "bgpd/bgp_mvpn.h"
+#include "bgpd/bgp_dimt.h"
 
 /* All information about zebra. */
 struct zclient *bgp_zclient = NULL;
@@ -4567,6 +4568,7 @@ static zclient_handler *const bgp_handlers[] = {
 	[ZEBRA_LOCAL_ES_DEL] = bgp_zebra_process_local_es_del,
 	[ZEBRA_MVPN_SG_ADD] = bgp_zebra_process_mvpn_sg,
 	[ZEBRA_MVPN_SG_DEL] = bgp_zebra_process_mvpn_sg,
+	[ZEBRA_UMH_REPLAY] = bgp_dimt_umh_replay,
 	[ZEBRA_VNI_ADD] = bgp_zebra_process_local_vni,
 	[ZEBRA_LOCAL_ES_EVI_ADD] = bgp_zebra_process_local_es_evi,
 	[ZEBRA_LOCAL_ES_EVI_DEL] = bgp_zebra_process_local_es_evi,

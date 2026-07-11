@@ -19,6 +19,9 @@
 #include "pimd.h"
 #include "pim_pim.h"
 #include "pim_zebra.h"
+#include "pim_dimt.h"
+
+static void pim_zebra_umh_subscribe(struct zclient *zclient);
 #include "pim_iface.h"
 #include "pim_str.h"
 #include "pim_oil.h"
@@ -421,6 +424,9 @@ static void pim_zebra_connected(struct zclient *zclient)
 
 	zclient_send_reg_requests(zclient, router->vrf_id);
 
+	/* (re-)subscribe to bgpd's DIMT UMH mappings */
+	pim_zebra_umh_subscribe(zclient);
+
 #if PIM_IPV == 4
 	/* request for VxLAN BUM group addresses */
 	pim_zebra_vxlan_replay();
@@ -543,6 +549,39 @@ static int pim_zebra_mvpn_sg_replay(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* DIMT UMH mapping from bgpd (via zebra's stateless relay). */
+static int pim_zebra_umh(ZAPI_CALLBACK_ARGS)
+{
+	struct pim_instance *pim = pim_get_pim_instance(vrf_id);
+	struct zapi_umh zumh;
+
+	if (!pim)
+		return 0;
+
+	if (zapi_umh_decode(zclient->ibuf, &zumh) < 0) {
+		zlog_warn("%s: UMH decode failed", __func__);
+		return 0;
+	}
+
+	pim_dimt_umh_update(pim, &zumh, cmd == ZEBRA_UMH_ADD);
+	return 0;
+}
+
+/* Subscribe to the UMH relay and ask bgpd for a re-dump. */
+static void pim_zebra_umh_subscribe(struct zclient *zclient)
+{
+	struct stream *s;
+
+	if (!zclient || zclient->sock < 0)
+		return;
+
+	s = zclient->obuf;
+	stream_reset(s);
+	zclient_create_header(s, ZEBRA_UMH_REPLAY, VRF_DEFAULT);
+	stream_putw_at(s, 0, stream_get_endp(s));
+	zclient_send_message(zclient);
+}
+
 static zclient_handler *const pim_handlers[] = {
 	[ZEBRA_INTERFACE_ADDRESS_ADD] = pim_zebra_if_address_add,
 	[ZEBRA_INTERFACE_ADDRESS_DELETE] = pim_zebra_if_address_del,
@@ -552,6 +591,10 @@ static zclient_handler *const pim_handlers[] = {
 	/* AF-agnostic: each of pimd/pim6d re-dumps its own announced GTM SG
 	 * set (v4 resp. v6) when bgpd re-subscribes. */
 	[ZEBRA_MVPN_SG_REPLAY] = pim_zebra_mvpn_sg_replay,
+
+	/* DIMT: bgpd-learned UMH mappings (AF filter inside). */
+	[ZEBRA_UMH_ADD] = pim_zebra_umh,
+	[ZEBRA_UMH_DEL] = pim_zebra_umh,
 
 #if PIM_IPV == 4
 	[ZEBRA_VXLAN_SG_ADD] = pim_zebra_vxlan_sg_proc,

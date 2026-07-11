@@ -549,7 +549,17 @@ keyword at the end.
    tunnel interfaces toward a remote multicast island
    (draft-zzhang-mboned-dynamic-internet-mcast-tunnel); the RPF route toward
    the source must point out this interface via the remote router's unicast
-   address.  Cannot be combined with ``ip pim passive``.
+   address.  Cannot be combined with ``ip pim passive``.  Instead of a
+   static route, the RPF may be steered by a BGP-learned Upstream Multicast
+   Hop mapping (``set extcommunity umh`` in bgpd); see
+   :clicmd:`show ip pim dimt umh [json]`.
+
+.. clicmd:: show ip pim dimt umh [json]
+
+   Display the bgpd-learned DIMT Upstream Multicast Hop mappings: for each
+   source prefix, the UMH address joins are sent toward, its type
+   (``pim`` / ``amt-relay``), preference, and the resolved PIM Light
+   interface.
 
 .. clicmd:: ip igmp
 

@@ -40,6 +40,7 @@
 #include "pim_macro.h"
 #include "pim_ssmpingd.h"
 #include "pim_zebra.h"
+#include "pim_dimt.h"
 #include "pim_static.h"
 #include "pim_rp.h"
 #include "pim_zlookup.h"
@@ -2656,6 +2657,28 @@ DEFPY (show_ip_pim_upstream_vrf_all,
        JSON_STR)
 {
 	return pim_show_upstream_vrf_all_helper(vty, !!json);
+}
+
+DEFPY (show_ip_pim_dimt_umh,
+       show_ip_pim_dimt_umh_cmd,
+       "show ip pim [vrf NAME] dimt umh [json$json]",
+       SHOW_STR
+       IP_STR
+       PIM_STR
+       VRF_CMD_HELP_STR
+       "DIMT dynamic multicast tunneling\n"
+       "bgpd-learned Upstream Multicast Hop mappings\n"
+       JSON_STR)
+{
+	struct vrf *v;
+
+	v = vrf_lookup_by_name(vrf ? vrf : VRF_DEFAULT_NAME);
+	if (!v || !v->info)
+		return CMD_WARNING;
+
+	pim_dimt_show_umh(v->info, vty, !!json);
+
+	return CMD_SUCCESS;
 }
 
 DEFPY (show_ip_pim_channel,
@@ -9547,6 +9570,7 @@ void pim_cmd_init(void)
 	install_element(VIEW_NODE, &show_ip_pim_upstream_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_vrf_all_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_channel_cmd);
+	install_element(VIEW_NODE, &show_ip_pim_dimt_umh_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_join_desired_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_rpf_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_rp_cmd);
