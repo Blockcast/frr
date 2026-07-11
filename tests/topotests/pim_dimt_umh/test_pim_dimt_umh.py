@@ -1586,9 +1586,58 @@ interface r2-eth1
     )
     assert result is None, result
 
+    # Cycle the join-group INSIDE the pim-off window: the removal tears
+    # down the old sg (which still owned TIB state from the pim-on era),
+    # and the re-add creates a FRESH sg whose very first TIB join is
+    # refused ("PIM is not configured on this interface") -- the exact
+    # vulnerable state pim_if_membership_refresh() used to mishandle.
+    # Merely toggling pim around an already-joined sg never enters it.
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ no ipv6 mld join-group {0} {1}
+""".format(GROUP6, SOURCE6)
+    )
+
+    # The old sg (which still owns TIB state from the pim-on era) must be
+    # FULLY gone before the re-add, or the fresh join just refreshes it
+    # and the vulnerable state never forms.  sg death needs the
+    # last-member query cycle to run out.
+    def _v6_sg_gone():
+        data = _json_cmd("r2", "show ipv6 mld joins json")
+        if data is None:
+            return "r2: unparseable v6 mld joins JSON (pim6d dead?)"
+        if GROUP6 in json.dumps(data):
+            return "r2 old MLD sg still alive: {}".format(data)
+        return None
+
+    _, result = topotest.run_and_expect(_v6_sg_gone, None, count=60, wait=1)
+    assert result is None, result
+
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ ipv6 mld join-group {0} {1}
+""".format(GROUP6, SOURCE6)
+    )
+
+    def _v6_fresh_sg_formed():
+        data = _json_cmd("r2", "show ipv6 mld joins json")
+        if data is None:
+            return "r2: unparseable v6 mld joins JSON (pim6d dead?)"
+        blob = json.dumps(data)
+        if GROUP6 not in blob:
+            return "r2 fresh MLD sg not formed under pim-off: {}".format(data)
+        return None
+
+    _, result = topotest.run_and_expect(_v6_fresh_sg_formed, None, count=30, wait=1)
+    assert result is None, result
+
     # re-enable in saved-config order: the mld + join-group lines are
     # already present, `ipv6 pim` comes last, so membership_refresh runs
-    # against a live-but-unjoined sg.  The clear nudges the querier so
+    # against a live-but-never-joined sg.  The clear nudges the querier so
     # the kernel's join-group socket re-reports promptly instead of
     # waiting out a general query interval.
     tgen.gears["r2"].vtysh_cmd(
