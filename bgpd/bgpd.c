@@ -3054,6 +3054,10 @@ int peer_deactivate(struct peer *peer, afi_t afi, safi_t safi)
 		bgp_recalculate_afi_safi_bestpaths(bgp, afi, safi_check);
 	}
 
+	if ((afi == AFI_IP || afi == AFI_IP6) && safi == SAFI_MCAST_VPN &&
+	    !bgp_afi_safi_peer_exists(bgp, afi, safi))
+		bgp_mvpn_withdraw_type1(bgp, afi);
+
 	/*
 	 * Unregister from zebra link-state database when the last peer is
 	 * deactivated for BGP-LS. This stops receiving IGP topology updates
@@ -4600,6 +4604,11 @@ int bgp_delete(struct bgp *bgp)
 	uint32_t a_ann_cnt = 0, a_l2_cnt = 0;
 
 	assert(bgp);
+
+	/* Withdraw locally-originated MVPN discovery before peers and RIB state
+	 * are discarded. The helper is safe when either route is already absent. */
+	bgp_mvpn_withdraw_type1(bgp, AFI_IP);
+	bgp_mvpn_withdraw_type1(bgp, AFI_IP6);
 
 	/*
 	 * Iterate the pending dest list and remove all the dest pertaining to
