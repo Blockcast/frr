@@ -908,7 +908,7 @@ void bgp_mvpn_withdraw_type1(struct bgp *bgp, afi_t afi)
 	struct prefix_mvpn p;
 	struct ipaddr orig;
 
-	if (bgp->router_id.s_addr == INADDR_ANY)
+	if (!bgp->peer_self || bgp->router_id.s_addr == INADDR_ANY)
 		return;
 
 	orig = mvpn_ipaddr_v4(bgp->router_id);
