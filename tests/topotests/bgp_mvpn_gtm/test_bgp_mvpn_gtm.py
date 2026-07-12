@@ -924,6 +924,51 @@ router bgp 65001
     r1.vtysh_cmd(
         """
 configure terminal
+router bgp 65001
+ no neighbor 10.0.0.2
+"""
+    )
+
+    def _type1_absent_after_neighbor_delete(v6, endpoints):
+        local = _local_type1_endpoints(v6)
+        remaining = {
+            route.get("pmsiTunnel", {}).get("endpoint")
+            for route in _mvpn_routes("r2", v6=v6)
+            if route.get("routeType") == 1
+        }
+        if not endpoints.intersection(local) and not endpoints.intersection(remaining):
+            return None
+        return "deleted neighbor's Type-1 remains: local={} remote={}".format(
+            local, remaining
+        )
+
+    for v6, endpoints in ((False, initial_v4), (True, initial_v6)):
+        test_func = functools.partial(
+            _type1_absent_after_neighbor_delete, v6, endpoints
+        )
+        _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+        assert result is None, result
+
+    r1.vtysh_cmd(
+        """
+configure terminal
+router bgp 65001
+ neighbor 10.0.0.2 remote-as 65001
+ address-family ipv4 unicast
+  neighbor 10.0.0.2 activate
+ address-family ipv4 mvpn
+  neighbor 10.0.0.2 activate
+ address-family ipv6 mvpn
+  neighbor 10.0.0.2 activate
+"""
+    )
+
+    _, result = topotest.run_and_expect(_both_restored, None, count=60, wait=1)
+    assert result is None, result
+
+    r1.vtysh_cmd(
+        """
+configure terminal
 no router bgp 65001
 """
     )

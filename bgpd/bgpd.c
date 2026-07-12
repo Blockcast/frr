@@ -3258,6 +3258,11 @@ int peer_delete(struct peer *peer)
 		peer_unlock(peer); /* bgp peer list reference */
 	}
 
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++)
+		if (peer->afc[afi][SAFI_MCAST_VPN] &&
+		    !bgp_afi_safi_peer_exists(bgp, afi, SAFI_MCAST_VPN))
+			bgp_mvpn_withdraw_type1(bgp, afi);
+
 	/* Local and remote addresses. */
 	if (peer->connection->su_local) {
 		sockunion_free(peer->connection->su_local);
