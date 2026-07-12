@@ -40,6 +40,7 @@
 #include "pim_macro.h"
 #include "pim_ssmpingd.h"
 #include "pim_zebra.h"
+#include "pim_dimt.h"
 #include "pim_static.h"
 #include "pim_rp.h"
 #include "pim_zlookup.h"
@@ -2658,6 +2659,28 @@ DEFPY (show_ip_pim_upstream_vrf_all,
 	return pim_show_upstream_vrf_all_helper(vty, !!json);
 }
 
+DEFPY (show_ip_pim_dimt_umh,
+       show_ip_pim_dimt_umh_cmd,
+       "show ip pim [vrf NAME] dimt umh [json$json]",
+       SHOW_STR
+       IP_STR
+       PIM_STR
+       VRF_CMD_HELP_STR
+       "DIMT dynamic multicast tunneling\n"
+       "bgpd-learned Upstream Multicast Hop mappings\n"
+       JSON_STR)
+{
+	struct vrf *v;
+
+	v = vrf_lookup_by_name(vrf ? vrf : VRF_DEFAULT_NAME);
+	if (!v || !v->info)
+		return CMD_WARNING;
+
+	pim_dimt_show_umh(v->info, vty, !!json);
+
+	return CMD_SUCCESS;
+}
+
 DEFPY (show_ip_pim_channel,
        show_ip_pim_channel_cmd,
        "show ip pim [vrf NAME] channel [json$json]",
@@ -5153,6 +5176,15 @@ DEFPY_YANG (no_pim_ecmp,
 
 	return nb_cli_apply_changes(vty, NULL);
 }
+
+DEFPY_YANG (pim_mvpn_gtm,
+       pim_mvpn_gtm_cmd,
+       "[no] mvpn-gtm",
+       NO_STR
+       "Global-Table Multicast (RFC 7716): originate BGP MCAST-VPN Type-7/Type-5 from local SSM join/source\n")
+{
+	return pim_process_mvpn_gtm_cmd(vty, !no);
+}
 DEFPY_ATTR(no_ip_pim_ecmp,
 			  no_ip_pim_ecmp_cmd,
 			  "no ip pim ecmp",
@@ -5863,6 +5895,17 @@ DEFPY (interface_ip_pim_passive,
 	"Disable exchange of protocol packets\n")
 {
 	return pim_process_ip_pim_passive_cmd(vty, !no);
+}
+
+DEFPY (interface_ip_pim_light,
+	interface_ip_pim_light_cmd,
+	"[no] ip pim light$light",
+	NO_STR
+	IP_STR
+	PIM_STR
+	"PIM Light interface (RFC 9739): Join/Prune without hello adjacency\n")
+{
+	return pim_process_ip_pim_light_cmd(vty, !no);
 }
 
 
@@ -9375,6 +9418,7 @@ void pim_cmd_init(void)
 	install_element(PIM_NODE, &no_pim_v6_secondary_cmd);
 	install_element(PIM_NODE, &pim_ecmp_cmd);
 	install_element(PIM_NODE, &no_pim_ecmp_cmd);
+	install_element(PIM_NODE, &pim_mvpn_gtm_cmd);
 	install_element(PIM_NODE, &pim_ecmp_rebalance_cmd);
 	install_element(PIM_NODE, &no_pim_ecmp_rebalance_cmd);
 	install_element(PIM_NODE, &pim_mlag_cmd);
@@ -9449,6 +9493,7 @@ void pim_cmd_init(void)
 	install_element(INTERFACE_NODE, &interface_ip_pim_allowrp_cmd);
 	install_element(INTERFACE_NODE, &interface_ip_pim_activeactive_cmd);
 	install_element(INTERFACE_NODE, &interface_ip_pim_passive_cmd);
+	install_element(INTERFACE_NODE, &interface_ip_pim_light_cmd);
 	install_element(INTERFACE_NODE, &interface_ip_pim_cmd);
 	install_element(INTERFACE_NODE, &interface_ip_pim_drprio_cmd);
 	install_element(INTERFACE_NODE, &interface_no_ip_pim_drprio_cmd);
@@ -9525,6 +9570,7 @@ void pim_cmd_init(void)
 	install_element(VIEW_NODE, &show_ip_pim_upstream_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_vrf_all_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_channel_cmd);
+	install_element(VIEW_NODE, &show_ip_pim_dimt_umh_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_join_desired_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_rpf_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_rp_cmd);

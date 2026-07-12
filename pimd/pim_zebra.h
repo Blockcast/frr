@@ -30,4 +30,11 @@ void pim_zebra_upstream_rpf_changed(struct pim_instance *pim,
 
 void pim_zebra_interface_set_master(struct interface *vrf,
 				    struct interface *ifp);
+
+/* Global-Table Multicast pimd->bgpd glue: idempotent reconcile of the BGP
+ * MVPN route announced for a local SSM (S,G). Call on any upstream lifecycle
+ * change that can alter join_state / FHR / source-stream, and with
+ * deleting=true just before the upstream is torn down. */
+void pim_gtm_upstream_update(struct pim_instance *pim, struct pim_upstream *up,
+			     bool deleting);
 #endif /* PIM_ZEBRA_H */

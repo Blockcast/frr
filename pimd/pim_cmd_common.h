@@ -23,6 +23,7 @@ int pim_process_pim_packet_cmd(struct vty *vty, const char *packet);
 int pim_process_no_pim_packet_cmd(struct vty *vty);
 int pim_process_keepalivetimer_cmd(struct vty *vty, const char *kat);
 int pim_process_no_keepalivetimer_cmd(struct vty *vty);
+int pim_process_mvpn_gtm_cmd(struct vty *vty, bool enable);
 int pim_process_rp_kat_cmd(struct vty *vty, const char *rpkat);
 int pim_process_no_rp_kat_cmd(struct vty *vty);
 int pim_process_register_suppress_cmd(struct vty *vty, const char *rst);
@@ -47,6 +48,7 @@ int pim_process_autorp_send_rp_discovery_scope_int_cmd(struct vty *vty, bool no,
 						       const char *interval, const char *holdtime);
 int pim_process_no_ip_pim_cmd(struct vty *vty);
 int pim_process_ip_pim_passive_cmd(struct vty *vty, bool enable);
+int pim_process_ip_pim_light_cmd(struct vty *vty, bool enable);
 int pim_process_ip_pim_mode_cmd(struct vty *vty, bool dm, bool smdm, bool ssm);
 int pim_process_ip_pim_drprio_cmd(struct vty *vty, const char *drpriority_str);
 int pim_process_no_ip_pim_drprio_cmd(struct vty *vty);

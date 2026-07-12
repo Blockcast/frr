@@ -396,6 +396,10 @@ DECLARE_QOBJ_TYPE(route_map);
 	(strmatch(A, "frr-bgp-route-map:set-extcommunity-nt"))
 #define IS_SET_EXTCOMMUNITY_SOO(A)                                             \
 	(strmatch(A, "frr-bgp-route-map:set-extcommunity-soo"))
+#define IS_SET_EXTCOMMUNITY_VRF_ROUTE_IMPORT(A)                                \
+	(strmatch(A, "frr-bgp-route-map:set-extcommunity-vrf-route-import"))
+#define IS_SET_EXTCOMMUNITY_UMH(A)                                             \
+	(strmatch(A, "frr-bgp-route-map:set-extcommunity-umh"))
 #define IS_SET_EXTCOMMUNITY_LB(A)                                              \
 	(strmatch(A, "frr-bgp-route-map:set-extcommunity-lb"))
 #define IS_SET_EXTCOMMUNITY_COLOR(A)                                           \

@@ -171,6 +171,9 @@ struct pim_instance {
 	struct pim_autorp *autorp;
 
 	struct list *ssmpingd_list;
+
+	/* DIMT: bgpd-learned UMH mappings (struct pim_dimt_umh) */
+	struct list *dimt_umh_list;
 	pim_addr ssmpingd_group_addr;
 
 	unsigned int gm_socket_if_count;
@@ -188,6 +191,10 @@ struct pim_instance {
 
 	bool ecmp_enable;
 	bool ecmp_rebalance_enable;
+	/* Global-Table Multicast (RFC 7716) pimd->bgpd glue: when set, a local
+	 * SSM (S,G) receiver join originates a BGP Type-7 and a local source a
+	 * Type-5, instead of / alongside native PIM signalling. */
+	bool gtm_enable;
 	/* No. of Dual active I/fs in pim_instance */
 	uint32_t inst_mlag_intf_cnt;
 

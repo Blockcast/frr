@@ -120,6 +120,14 @@ afi_t family2afi(int family)
 		return AFI_IP6;
 	else if (family == AF_ETHERNET || family == AF_EVPN)
 		return AFI_L2VPN;
+	else if (family == AF_MVPN)
+		/*
+		 * AF_MVPN spans both v4 and v6; the true AFI comes from the
+		 * inner (S,G) family, which this family-only helper cannot
+		 * see. MVPN code derives it there and never calls this; the
+		 * arm only keeps a generic caller off the AFI_UNSPEC=0 index.
+		 */
+		return AFI_IP;
 	return 0;
 }
 
@@ -184,6 +192,8 @@ const char *safi2str(safi_t safi)
 		return "bgp-ls";
 	case SAFI_UNREACH:
 		return "unreachability";
+	case SAFI_MCAST_VPN:
+		return "mvpn";
 	case SAFI_UNSPEC:
 	case SAFI_MAX:
 		return "unknown";
@@ -341,6 +351,8 @@ void prefix_copy(union prefixptr udest, union prefixconstptr usrc)
 	} else if (src->family == AF_EVPN) {
 		memcpy(&dest->u.prefix_evpn, &src->u.prefix_evpn,
 		       sizeof(struct evpn_addr));
+	} else if (src->family == AF_MVPN) {
+		memcpy(&dest->u.prefix_mvpn, &src->u.prefix_mvpn, sizeof(struct mvpn_addr));
 	} else if (src->family == AF_UNSPEC) {
 		dest->u.lp.id = src->u.lp.id;
 		dest->u.lp.adv_router = src->u.lp.adv_router;
@@ -434,6 +446,10 @@ int prefix_same(union prefixconstptr up1, union prefixconstptr up2)
 				return 1;
 		if (p1->family == AF_EVPN)
 			if (evpn_addr_same(&p1->u.prefix_evpn, &p2->u.prefix_evpn))
+				return 1;
+		if (p1->family == AF_MVPN)
+			if (!memcmp(&p1->u.prefix_mvpn, &p2->u.prefix_mvpn,
+				    sizeof(struct mvpn_addr)))
 				return 1;
 		if (p1->family == AF_FLOWSPEC) {
 			if (p1->u.prefix_flowspec.family !=
@@ -547,6 +563,10 @@ int prefix_common_bits(union prefixconstptr ua, union prefixconstptr ub)
 		length = ETH_ALEN;
 	if (p1->family == AF_EVPN)
 		length = 8 * sizeof(struct evpn_addr);
+	/*
+	 * AF_MVPN intentionally omitted: GTM host routes (route-type/src/grp)
+	 * are not aggregated, so length stays 0 and this returns -1 below.
+	 */
 
 	if (p1->family != p2->family || !length)
 		return -1;
@@ -578,6 +598,8 @@ const char *prefix_family_str(union prefixconstptr pu)
 		return "ether";
 	if (p->family == AF_EVPN)
 		return "evpn";
+	if (p->family == AF_MVPN)
+		return "mvpn";
 	return "unspec";
 }
 
@@ -1182,6 +1204,21 @@ const char *prefix2str(union prefixconstptr pu, char *str, int size)
 	case AF_EVPN:
 		prefixevpn2str((const struct prefix_evpn *)p, str, size);
 		break;
+
+	case AF_MVPN: {
+		const struct mvpn_addr *m = &p->u.prefix_mvpn;
+
+		/* Type-7 (Source Tree Join) also renders the Source AS so two
+		 * routes differing only in Source AS get distinct strings.
+		 */
+		if (m->route_type == 7)
+			snprintfrr(str, size, "[7]:[%u]:[%pIA]:[%pIA]", m->source_as, &m->src,
+				   &m->grp);
+		else
+			snprintfrr(str, size, "[%u]:[%pIA]:[%pIA]", m->route_type, &m->src,
+				   &m->grp);
+		break;
+	}
 
 	case AF_FLOWSPEC:
 		strlcpy(str, "FS prefix", size);

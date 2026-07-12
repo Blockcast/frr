@@ -252,6 +252,15 @@ module frr-pim {
         "Enable PIM ECMP Rebalance.";
     }
 
+    leaf mvpn-gtm {
+      type boolean;
+      default "false";
+      description
+        "Enable Global-Table Multicast (RFC 7716): originate BGP
+         MCAST-VPN Type-7/Type-5 routes from local SSM join/source
+         state.";
+    }
+
     leaf keep-alive-timer {
       type uint16 {
         range "1..max";
@@ -544,6 +553,13 @@ module frr-pim {
       default "false";
       description
         "Disable exchange of protocol packets.";
+    }
+    leaf pim-light-enable {
+      type boolean;
+      default "false";
+      description
+        "PIM Light interface (RFC 9739): accept and send Join/Prune
+         without a PIM hello adjacency.";
     }
     leaf pim-mode {
       type enumeration {

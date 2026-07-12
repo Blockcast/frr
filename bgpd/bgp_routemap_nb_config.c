@@ -1984,6 +1984,130 @@ lib_route_map_entry_set_action_rmap_set_action_extcommunity_soo_destroy(
 
 /*
  * XPath:
+ * /frr-route-map:lib/route-map/entry/set-action/rmap-set-action/frr-bgp-route-map:extcommunity-vrf-route-import
+ */
+int
+lib_route_map_entry_set_action_rmap_set_action_extcommunity_vrf_route_import_modify(
+	struct nb_cb_modify_args *args)
+{
+	struct routemap_hook_context *rhc;
+	const char *type;
+	int rv;
+
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		/* Add configuration. */
+		rhc = nb_running_get_entry(args->dnode, NULL, true);
+		type = yang_dnode_get_string(args->dnode, NULL);
+
+		/* Set destroy information. */
+		rhc->rhc_shook = generic_set_delete;
+		rhc->rhc_rule = "extcommunity vrf-route-import";
+		rhc->rhc_event = RMAP_EVENT_SET_DELETED;
+
+		rv = generic_set_add(rhc->rhc_rmi,
+				     "extcommunity vrf-route-import", type,
+				     args->errmsg, args->errmsg_len);
+		if (rv != CMD_SUCCESS) {
+			rhc->rhc_shook = NULL;
+			return NB_ERR_INCONSISTENCY;
+		}
+	}
+
+	return NB_OK;
+}
+
+int
+lib_route_map_entry_set_action_rmap_set_action_extcommunity_vrf_route_import_destroy(
+	struct nb_cb_destroy_args *args)
+{
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		return lib_route_map_entry_set_destroy(args);
+	}
+
+	return NB_OK;
+}
+
+/*
+ * XPath:
+ * /frr-route-map:lib/route-map/entry/set-action/rmap-set-action/frr-bgp-route-map:extcommunity-umh
+ */
+int lib_route_map_entry_set_action_rmap_set_action_extcommunity_umh_modify(
+	struct nb_cb_modify_args *args)
+{
+	struct routemap_hook_context *rhc;
+	const char *type;
+	int rv;
+
+	switch (args->event) {
+	case NB_EV_VALIDATE: {
+		/* Parse here, not at APPLY: an apply-stage compile failure
+		 * cannot reject the transaction anymore (nb_transaction_process
+		 * swallows it), which would leave a set rule that shows in the
+		 * running config but installed nothing. The yang leaf is a bare
+		 * string, so this is the only real validation gate for non-CLI
+		 * northbound writers -- and the CLI grammar has holes glibc
+		 * inet_pton() rejects (e.g. "1.2.3.00"). */
+		struct ipaddr umh;
+		uint8_t umh_type, preference;
+
+		if (!bgp_route_set_umh_parse(
+			    yang_dnode_get_string(args->dnode, NULL), &umh,
+			    &umh_type, &preference, args->errmsg,
+			    args->errmsg_len))
+			return NB_ERR_VALIDATION;
+		break;
+	}
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		/* Add configuration. */
+		rhc = nb_running_get_entry(args->dnode, NULL, true);
+		type = yang_dnode_get_string(args->dnode, NULL);
+
+		/* Set destroy information. */
+		rhc->rhc_shook = generic_set_delete;
+		rhc->rhc_rule = "extcommunity umh";
+		rhc->rhc_event = RMAP_EVENT_SET_DELETED;
+
+		rv = generic_set_add(rhc->rhc_rmi, "extcommunity umh", type,
+				     args->errmsg, args->errmsg_len);
+		if (rv != CMD_SUCCESS) {
+			rhc->rhc_shook = NULL;
+			return NB_ERR_INCONSISTENCY;
+		}
+	}
+
+	return NB_OK;
+}
+
+int lib_route_map_entry_set_action_rmap_set_action_extcommunity_umh_destroy(
+	struct nb_cb_destroy_args *args)
+{
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		return lib_route_map_entry_set_destroy(args);
+	}
+
+	return NB_OK;
+}
+
+/*
+ * XPath:
  * /frr-route-map:lib/route-map/entry/set-action/rmap-set-action/frr-bgp-route-map:ipv4-address
  */
 int lib_route_map_entry_set_action_rmap_set_action_ipv4_address_modify(

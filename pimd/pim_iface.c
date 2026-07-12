@@ -40,6 +40,7 @@
 #include "pim_vxlan.h"
 #include "pim_static.h"
 #include "pim_tib.h"
+#include "pim_dimt.h"
 #include "pim_util.h"
 #include "pim_routemap.h"
 
@@ -734,6 +735,8 @@ void pim_if_addr_add(struct connected *ifc)
 	}
 	gm_ifp_update(ifp);
 	pim_ifchannel_scan_forward_start(ifp);
+	pim_if_static_group_replay(ifp);
+	pim_dimt_iface_up(pim_ifp->pim, ifp);
 }
 
 static void pim_if_addr_del_igmp(struct connected *ifc)
@@ -896,6 +899,8 @@ void pim_if_addr_add_all(struct interface *ifp)
 	}
 	gm_ifp_update(ifp);
 	pim_ifchannel_scan_forward_start(ifp);
+	pim_if_static_group_replay(ifp);
+	pim_dimt_iface_up(pim_ifp->pim, ifp);
 
 	pim_rp_setup(pim_ifp->pim);
 	pim_rp_check_on_if_add(pim_ifp);
@@ -1441,13 +1446,79 @@ static struct gm_join *gm_join_new(struct interface *ifp, pim_addr group_addr,
 	return ij;
 }
 
+/* The local membership only forms when the interface is usable as an OIF:
+ * config-load runs before zebra has delivered ifindex/addresses, so the
+ * VIF does not exist yet (and pim_channel_add_oif() asserts on it).
+ * Deferred entries are picked up by pim_if_static_group_replay(). */
+static void static_group_join(struct interface *ifp,
+			      struct static_group *stgrp)
+{
+	struct pim_interface *pim_ifp = ifp->info;
+	pim_sgaddr sg;
+
+	assert(pim_ifp);
+
+	memset(&sg, 0, sizeof(sg));
+	sg.src = stgrp->source_addr;
+	sg.grp = stgrp->group_addr;
+
+	if (pim_ifp->mroute_vif_index < 0) {
+		if (PIM_DEBUG_GM_EVENTS)
+			zlog_debug("static group (%pPAs,%pPAs) deferred on %s: VIF not ready",
+				   &sg.src, &sg.grp, ifp->name);
+		return;
+	}
+
+	if (!tib_sg_gm_join(pim_ifp->pim, sg, ifp, &(stgrp->oilp))) {
+		if (PIM_DEBUG_GM_EVENTS)
+			zlog_debug("static group (%pPAs,%pPAs) join refused on %s (not DR or OIL setup failed); will retry on replay",
+				   &sg.src, &sg.grp, ifp->name);
+	}
+}
+
+static bool static_group_is_joined(struct interface *ifp,
+				   struct static_group *stgrp)
+{
+	struct pim_ifchannel *ch, *chrpt;
+	pim_sgaddr sg;
+
+	memset(&sg, 0, sizeof(sg));
+	sg.src = stgrp->source_addr;
+	sg.grp = stgrp->group_addr;
+
+	pim_ifchannel_find(ifp, &sg, &ch, &chrpt);
+
+	return ch && ch->local_ifmembership == PIM_IFMEMBERSHIP_INCLUDE;
+}
+
+void pim_if_static_group_replay(struct interface *ifp)
+{
+	struct pim_interface *pim_ifp = ifp->info;
+	struct listnode *node;
+	struct static_group *stgrp;
+
+	if (!pim_ifp || !pim_ifp->static_group_list)
+		return;
+
+	for (ALL_LIST_ELEMENTS_RO(pim_ifp->static_group_list, node, stgrp)) {
+		if (static_group_is_joined(ifp, stgrp))
+			continue;
+
+		if (PIM_DEBUG_GM_EVENTS)
+			zlog_debug("%s: replaying static group (S,G)=(%pPA,%pPA) on interface %s",
+				   __func__, &stgrp->source_addr,
+				   &stgrp->group_addr, ifp->name);
+
+		static_group_join(ifp, stgrp);
+	}
+}
+
 static struct static_group *static_group_new(struct interface *ifp,
 					     pim_addr group_addr,
 					     pim_addr source_addr)
 {
 	struct pim_interface *pim_ifp;
 	struct static_group *stgrp;
-	pim_sgaddr sg;
 
 	pim_ifp = ifp->info;
 	assert(pim_ifp);
@@ -1458,11 +1529,7 @@ static struct static_group *static_group_new(struct interface *ifp,
 	stgrp->source_addr = source_addr;
 	stgrp->oilp = NULL;
 
-	memset(&sg, 0, sizeof(sg));
-	sg.src = source_addr;
-	sg.grp = group_addr;
-
-	tib_sg_gm_join(pim_ifp->pim, sg, ifp, &(stgrp->oilp));
+	static_group_join(ifp, stgrp);
 
 	listnode_add(pim_ifp->static_group_list, stgrp);
 
@@ -2092,11 +2159,18 @@ static int pim_ifp_down(struct interface *ifp)
 			ifp->mtu, if_is_operative(ifp));
 	}
 
+	pim = ifp->vrf->info;
+
+	/* DIMT-pinned upstreams bypass every rpf-update repair path
+	 * (STATIC_IIF); unpin them before this interface is torn down or
+	 * their join timer fires on a stale interface pointer. */
+	if (pim)
+		pim_dimt_iface_down(pim, ifp);
+
 	/* Avoid disabling the same interface twice */
 	if (pim_ifp && pim_ifp->mroute_vif_index == -1)
 		return 0;
 
-	pim = ifp->vrf->info;
 	if (!if_is_operative(ifp) || (pim && pim->shutdown)) {
 		pim_ifchannel_delete_all(ifp);
 		gm_group_delete(ifp);
@@ -2132,6 +2206,8 @@ static int pim_ifp_down(struct interface *ifp)
 
 static int pim_ifp_destroy(struct interface *ifp)
 {
+	struct pim_instance *pim = ifp->vrf->info;
+
 	if (PIM_DEBUG_ZEBRA) {
 		zlog_debug(
 			"%s: %s index %d vrf %s(%u) flags %ld metric %d mtu %d operative %d",
@@ -2140,13 +2216,13 @@ static int pim_ifp_destroy(struct interface *ifp)
 			ifp->mtu, if_is_operative(ifp));
 	}
 
+	if (pim)
+		pim_dimt_iface_down(pim, ifp);
+
 	if (!if_is_operative(ifp))
 		pim_if_addr_del_all(ifp);
 
 #if PIM_IPV == 4
-	struct pim_instance *pim;
-
-	pim = ifp->vrf->info;
 	if (pim && pim->vxlan.term_if == ifp)
 		pim_vxlan_del_term_dev(pim);
 #endif
@@ -2199,6 +2275,11 @@ void pim_pim_interface_delete(struct interface *ifp)
 		return;
 
 	pim_ifp->pim_enable = false;
+
+	/* The `no ip pim` config path reaches pim_if_delete() without the
+	 * if-down/if-unreal hooks firing; unpin DIMT-owned upstreams now or
+	 * their join timers would fire on a freed pim_interface. */
+	pim_dimt_iface_down(pim_ifp->pim, ifp);
 
 #if PIM_IPV == 4
 	pim_autorp_rm_ifp(ifp);

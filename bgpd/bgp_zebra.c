@@ -58,6 +58,8 @@
 #include "bgpd/bgp_srv6.h"
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_ted.h"
+#include "bgpd/bgp_mvpn.h"
+#include "bgpd/bgp_dimt.h"
 
 /* All information about zebra. */
 struct zclient *bgp_zclient = NULL;
@@ -3336,6 +3338,34 @@ static void bgp_zebra_connected(struct zclient *zclient)
 	 * kick-start them?
 	 */
 	BGP_GR_ROUTER_DETECT_AND_SEND_CAPABILITY_TO_ZEBRA(bgp, bgp->peer);
+
+	/* Global-Table Multicast pimd->bgpd glue: if the GTM MVPN AF is active,
+	 * (re-)subscribe to zebra's SG relay so a local receiver join / source
+	 * detect from pimd (re-)originates the matching Type-7 / Type-5. */
+	if (bgp_mvpn_gtm_active(bgp))
+		bgp_zebra_mvpn_sg_subscribe();
+}
+
+/* Subscribe to zebra's pimd MVPN SG relay and request a replay of pimd's
+ * announced set.  Idempotent; called at zebra connect (zebra restart) and
+ * whenever the GTM MVPN AF state is (re-)activated -- at daemon startup the
+ * zebra session connects before "router bgp" exists, so the connect-time
+ * hook alone never fires on a normal boot. */
+void bgp_zebra_mvpn_sg_subscribe(void)
+{
+	struct stream *s;
+
+	if (!bgp_zclient || bgp_zclient->sock < 0)
+		return;
+
+	if (BGP_DEBUG(zebra, ZEBRA))
+		zlog_debug("MVPN_SG: subscribing to zebra SG relay (GTM active)");
+
+	s = bgp_zclient->obuf;
+	stream_reset(s);
+	zclient_create_header(s, ZEBRA_MVPN_SG_REPLAY, VRF_DEFAULT);
+	stream_putw_at(s, 0, stream_get_endp(s));
+	zclient_send_message(bgp_zclient);
 }
 
 void bgp_zebra_process_remote_routes_for_l2vni(struct event *e)
@@ -3417,6 +3447,44 @@ static int bgp_zebra_process_local_es_del(ZAPI_CALLBACK_ARGS)
 	frrtrace(1, frr_bgp, evpn_mh_local_es_del_zrecv, &esi);
 
 	bgp_evpn_local_es_del(bgp, &esi);
+
+	return 0;
+}
+
+/*
+ * Global-Table Multicast pimd->bgpd glue (relayed by zebra). pimd emitted a
+ * local SSM (S,G) role change: JOIN = a receiver wants the source, SOURCE = a
+ * local first-hop source is active. Map it to (re-)origination / withdraw of
+ * the matching MCAST-VPN route. cmd distinguishes ADD (negate=false) from DEL.
+ */
+static int bgp_zebra_process_mvpn_sg(ZAPI_CALLBACK_ARGS)
+{
+	struct bgp *bgp;
+	struct zapi_mvpn_sg sg;
+	bool negate = (cmd == ZEBRA_MVPN_SG_DEL);
+
+	if (BGP_DEBUG(zebra, ZEBRA))
+		zlog_debug("rx MVPN_SG %s from zebra",
+			   cmd == ZEBRA_MVPN_SG_DEL ? "DEL" : "ADD");
+
+	bgp = bgp_lookup_by_vrf_id(vrf_id);
+	if (!bgp)
+		return 0;
+
+	if (zapi_mvpn_sg_decode(zclient->ibuf, &sg) < 0)
+		return 0;
+
+	switch (sg.role) {
+	case ZAPI_MVPN_SG_JOIN:
+		bgp_mvpn_source_tree_join_set(bgp, &sg.src, &sg.grp, negate);
+		break;
+	case ZAPI_MVPN_SG_SOURCE:
+		bgp_mvpn_source_active_set(bgp, &sg.src, &sg.grp, negate);
+		break;
+	default:
+		zlog_warn("%s: unknown MVPN SG role %u", __func__, sg.role);
+		break;
+	}
 
 	return 0;
 }
@@ -4498,6 +4566,9 @@ static zclient_handler *const bgp_handlers[] = {
 	[ZEBRA_FEC_UPDATE] = bgp_read_fec_update,
 	[ZEBRA_LOCAL_ES_ADD] = bgp_zebra_process_local_es_add,
 	[ZEBRA_LOCAL_ES_DEL] = bgp_zebra_process_local_es_del,
+	[ZEBRA_MVPN_SG_ADD] = bgp_zebra_process_mvpn_sg,
+	[ZEBRA_MVPN_SG_DEL] = bgp_zebra_process_mvpn_sg,
+	[ZEBRA_UMH_REPLAY] = bgp_dimt_umh_replay,
 	[ZEBRA_VNI_ADD] = bgp_zebra_process_local_vni,
 	[ZEBRA_LOCAL_ES_EVI_ADD] = bgp_zebra_process_local_es_evi,
 	[ZEBRA_LOCAL_ES_EVI_DEL] = bgp_zebra_process_local_es_evi,

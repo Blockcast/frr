@@ -26,6 +26,11 @@ struct pim_neighbor {
 	uint16_t override_interval_msec;
 	uint32_t dr_priority;
 	uint32_t generation_id;
+	/* RFC 9739 (PIM Light): synthetic neighbor materialized from a
+	 * neighborless Join/Prune on a light interface; no hello state,
+	 * excluded from DR election.
+	 */
+	bool light;
 	struct list *prefix_list; /* list of struct prefix */
 	struct event *t_expire_timer;
 	struct interface *interface;
@@ -58,7 +63,7 @@ pim_neighbor_add(struct interface *ifp, pim_addr source_addr,
 		 pim_hello_options hello_options, uint16_t holdtime,
 		 uint16_t propagation_delay, uint16_t override_interval,
 		 uint32_t dr_priority, uint32_t generation_id,
-		 struct list *addr_list, int send_hello_now);
+		 struct list *addr_list, int send_hello_now, bool light);
 void pim_neighbor_delete(struct interface *ifp, struct pim_neighbor *neigh,
 			 const char *delete_message);
 void pim_neighbor_delete_all(struct interface *ifp, const char *delete_message);

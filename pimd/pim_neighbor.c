@@ -48,6 +48,11 @@ static void dr_election_by_addr(struct interface *ifp)
 	}
 
 	for (ALL_LIST_ELEMENTS_RO(pim_ifp->pim_neighbor_list, node, neigh)) {
+		/* RFC 9739 (PIM Light): synthetic light neighbors carry no
+		 * hello state and never participate in DR election.
+		 */
+		if (neigh->light)
+			continue;
 		if (pim_addr_cmp(neigh->source_addr, pim_ifp->pim_dr_addr) > 0)
 			pim_ifp->pim_dr_addr = neigh->source_addr;
 	}
@@ -77,6 +82,11 @@ static void dr_election_by_pri(struct interface *ifp)
 				  __func__, neigh->dr_priority,
 				  &neigh->source_addr, &pim_ifp->pim_dr_addr);
 		}
+		/* RFC 9739 (PIM Light): synthetic light neighbors carry no
+		 * hello state and never participate in DR election.
+		 */
+		if (neigh->light)
+			continue;
 		if ((neigh->dr_priority > dr_pri) ||
 		    ((neigh->dr_priority == dr_pri) &&
 		     (pim_addr_cmp(neigh->source_addr, pim_ifp->pim_dr_addr) >
@@ -128,6 +138,10 @@ int pim_if_dr_election(struct interface *ifp)
 		if (PIM_I_am_DR(pim_ifp)) {
 			pim_ifp->am_i_dr = true;
 			pim_clear_nocache_state(pim_ifp);
+			/* memberships tib_sg_gm_join() refused while we were
+			 * not DR (e.g. static-groups applied before the first
+			 * election ran) can form now */
+			pim_if_static_group_replay(ifp);
 		} else {
 			if (pim_ifp->am_i_dr == true) {
 				pim_reg_del_on_couldreg_fail(ifp);
@@ -272,7 +286,7 @@ pim_neighbor_new(struct interface *ifp, pim_addr source_addr,
 		 pim_hello_options hello_options, uint16_t holdtime,
 		 uint16_t propagation_delay, uint16_t override_interval,
 		 uint32_t dr_priority, uint32_t generation_id,
-		 struct list *addr_list)
+		 struct list *addr_list, bool light)
 {
 	struct pim_interface *pim_ifp;
 	struct pim_neighbor *neigh;
@@ -293,6 +307,7 @@ pim_neighbor_new(struct interface *ifp, pim_addr source_addr,
 	neigh->generation_id = generation_id;
 	neigh->prefix_list = addr_list;
 	neigh->interface = ifp;
+	neigh->light = light;
 
 	neigh->upstream_jp_agg = list_new();
 	neigh->upstream_jp_agg->cmp = pim_jp_agg_group_list_cmp;
@@ -317,31 +332,41 @@ pim_neighbor_new(struct interface *ifp, pim_addr source_addr,
 	zlog_notice("PIM NEIGHBOR UP: neighbor %pPA on interface %s",
 		    &source_addr, ifp->name);
 
-	if (neigh->propagation_delay_msec
-	    > pim_ifp->pim_neighbors_highest_propagation_delay_msec) {
-		pim_ifp->pim_neighbors_highest_propagation_delay_msec =
-			neigh->propagation_delay_msec;
-	}
-	if (neigh->override_interval_msec
-	    > pim_ifp->pim_neighbors_highest_override_interval_msec) {
-		pim_ifp->pim_neighbors_highest_override_interval_msec =
-			neigh->override_interval_msec;
-	}
+	/* light neighbors carry no hello options; keep them out of
+	 * hello-derived state
+	 */
+	if (!neigh->light) {
+		if (neigh->propagation_delay_msec
+		    > pim_ifp->pim_neighbors_highest_propagation_delay_msec) {
+			pim_ifp->pim_neighbors_highest_propagation_delay_msec =
+				neigh->propagation_delay_msec;
+		}
+		if (neigh->override_interval_msec
+		    > pim_ifp->pim_neighbors_highest_override_interval_msec) {
+			pim_ifp->pim_neighbors_highest_override_interval_msec =
+				neigh->override_interval_msec;
+		}
 
-	if (!PIM_OPTION_IS_SET(neigh->hello_options,
-			       PIM_OPTION_MASK_LAN_PRUNE_DELAY)) {
-		/* update num. of neighbors without hello option lan_delay */
-		++pim_ifp->pim_number_of_nonlandelay_neighbors;
-	}
+		if (!PIM_OPTION_IS_SET(neigh->hello_options,
+				       PIM_OPTION_MASK_LAN_PRUNE_DELAY)) {
+			/* update num. of neighbors without hello option
+			 * lan_delay
+			 */
+			++pim_ifp->pim_number_of_nonlandelay_neighbors;
+		}
 
-	if (!PIM_OPTION_IS_SET(neigh->hello_options,
-			       PIM_OPTION_MASK_DR_PRIORITY)) {
-		/* update num. of neighbors without hello option dr_pri */
-		++pim_ifp->pim_dr_num_nondrpri_neighbors;
-	}
+		if (!PIM_OPTION_IS_SET(neigh->hello_options,
+				       PIM_OPTION_MASK_DR_PRIORITY)) {
+			/* update num. of neighbors without hello option dr_pri
+			 */
+			++pim_ifp->pim_dr_num_nondrpri_neighbors;
+		}
 
-	// Register PIM Neighbor with BFD
-	pim_bfd_info_nbr_create(pim_ifp, neigh);
+		/* Register PIM Neighbor with BFD; a light neighbor never
+		 * agreed to an adjacency, so no BFD session toward it
+		 */
+		pim_bfd_info_nbr_create(pim_ifp, neigh);
+	}
 
 	/* flood to the new neighbor if needed */
 	if (HAVE_DENSE_MODE(pim_ifp->pim_mode)) {
@@ -468,7 +493,7 @@ pim_neighbor_add(struct interface *ifp, pim_addr source_addr,
 		 pim_hello_options hello_options, uint16_t holdtime,
 		 uint16_t propagation_delay, uint16_t override_interval,
 		 uint32_t dr_priority, uint32_t generation_id,
-		 struct list *addr_list, int send_hello_now)
+		 struct list *addr_list, int send_hello_now, bool light)
 {
 	struct pim_interface *pim_ifp;
 	struct pim_neighbor *neigh;
@@ -488,7 +513,7 @@ pim_neighbor_add(struct interface *ifp, pim_addr source_addr,
 	}
 
 	neigh = pim_neighbor_new(ifp, source_addr, hello_options, holdtime, propagation_delay,
-				 override_interval, dr_priority, generation_id, addr_list);
+				 override_interval, dr_priority, generation_id, addr_list, light);
 	if (!neigh) {
 		return 0;
 	}
@@ -559,6 +584,11 @@ static uint16_t find_neighbors_next_highest_propagation_delay_msec(
 				  neigh)) {
 		if (neigh == highest_neigh)
 			continue;
+		/* light neighbors carry no hello options; keep them out of
+		 * hello-derived state
+		 */
+		if (neigh->light)
+			continue;
 		if (neigh->propagation_delay_msec > next_highest_delay_msec)
 			next_highest_delay_msec = neigh->propagation_delay_msec;
 	}
@@ -583,6 +613,11 @@ static uint16_t find_neighbors_next_highest_override_interval_msec(
 				  neigh)) {
 		if (neigh == highest_neigh)
 			continue;
+		/* light neighbors carry no hello options; keep them out of
+		 * hello-derived state
+		 */
+		if (neigh->light)
+			continue;
 		if (neigh->override_interval_msec > next_highest_interval_msec)
 			next_highest_interval_msec =
 				neigh->override_interval_msec;
@@ -606,43 +641,56 @@ void pim_neighbor_delete(struct interface *ifp, struct pim_neighbor *neigh,
 
 	pim_if_assert_on_neighbor_down(ifp, neigh->source_addr);
 
-	if (!PIM_OPTION_IS_SET(neigh->hello_options,
-			       PIM_OPTION_MASK_LAN_PRUNE_DELAY)) {
-		/* update num. of neighbors without hello option lan_delay */
+	/* light neighbors carry no hello options; keep them out of
+	 * hello-derived state (they never contributed on creation)
+	 */
+	if (!neigh->light) {
+		if (!PIM_OPTION_IS_SET(neigh->hello_options,
+				       PIM_OPTION_MASK_LAN_PRUNE_DELAY)) {
+			/* update num. of neighbors without hello option
+			 * lan_delay
+			 */
 
-		--pim_ifp->pim_number_of_nonlandelay_neighbors;
-	}
-
-	if (!PIM_OPTION_IS_SET(neigh->hello_options,
-			       PIM_OPTION_MASK_DR_PRIORITY)) {
-		/* update num. of neighbors without dr_pri */
-
-		--pim_ifp->pim_dr_num_nondrpri_neighbors;
-	}
-
-	assert(neigh->propagation_delay_msec
-	       <= pim_ifp->pim_neighbors_highest_propagation_delay_msec);
-	assert(neigh->override_interval_msec
-	       <= pim_ifp->pim_neighbors_highest_override_interval_msec);
-
-	if (pim_if_lan_delay_enabled(ifp)) {
-
-		/* will delete a neighbor with highest propagation delay? */
-		if (neigh->propagation_delay_msec
-		    == pim_ifp->pim_neighbors_highest_propagation_delay_msec) {
-			/* then find the next highest propagation delay */
-			pim_ifp->pim_neighbors_highest_propagation_delay_msec =
-				find_neighbors_next_highest_propagation_delay_msec(
-					ifp, neigh);
+			--pim_ifp->pim_number_of_nonlandelay_neighbors;
 		}
 
-		/* will delete a neighbor with highest override interval? */
-		if (neigh->override_interval_msec
-		    == pim_ifp->pim_neighbors_highest_override_interval_msec) {
-			/* then find the next highest propagation delay */
-			pim_ifp->pim_neighbors_highest_override_interval_msec =
-				find_neighbors_next_highest_override_interval_msec(
-					ifp, neigh);
+		if (!PIM_OPTION_IS_SET(neigh->hello_options,
+				       PIM_OPTION_MASK_DR_PRIORITY)) {
+			/* update num. of neighbors without dr_pri */
+
+			--pim_ifp->pim_dr_num_nondrpri_neighbors;
+		}
+
+		assert(neigh->propagation_delay_msec
+		       <= pim_ifp->pim_neighbors_highest_propagation_delay_msec);
+		assert(neigh->override_interval_msec
+		       <= pim_ifp->pim_neighbors_highest_override_interval_msec);
+
+		if (pim_if_lan_delay_enabled(ifp)) {
+
+			/* will delete a neighbor with highest propagation
+			 * delay?
+			 */
+			if (neigh->propagation_delay_msec
+			    == pim_ifp->pim_neighbors_highest_propagation_delay_msec) {
+				/* then find the next highest propagation delay
+				 */
+				pim_ifp->pim_neighbors_highest_propagation_delay_msec =
+					find_neighbors_next_highest_propagation_delay_msec(
+						ifp, neigh);
+			}
+
+			/* will delete a neighbor with highest override
+			 * interval?
+			 */
+			if (neigh->override_interval_msec
+			    == pim_ifp->pim_neighbors_highest_override_interval_msec) {
+				/* then find the next highest propagation delay
+				 */
+				pim_ifp->pim_neighbors_highest_override_interval_msec =
+					find_neighbors_next_highest_override_interval_msec(
+						ifp, neigh);
+			}
 		}
 	}
 

@@ -50,6 +50,7 @@
 #include "bgpd/bgp_trace.h"
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_unreach.h"
+#include "bgpd/bgp_mvpn.h"
 
 /* Attribute strings for logging. */
 static const struct message attr_str[] = {
@@ -1141,6 +1142,7 @@ bool attrhash_cmp(const void *p1, const void *p2)
 		    attr1->aggregator_addr.s_addr == attr2->aggregator_addr.s_addr &&
 		    attr1->weight == attr2->weight && attr1->tag == attr2->tag &&
 		    attr1->label_index == attr2->label_index &&
+		    attr1->label == attr2->label &&
 		    attr1->mp_nexthop_len == attr2->mp_nexthop_len &&
 		    bgp_attr_get_ecommunity(attr1) == bgp_attr_get_ecommunity(attr2) &&
 		    bgp_attr_get_ipv6_ecommunity(attr1) == bgp_attr_get_ipv6_ecommunity(attr2) &&
@@ -4965,6 +4967,11 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 		case SAFI_UNREACH:
 			stream_putc(s, 0); /* no nexthop for unreachability */
 			break;
+		case SAFI_MCAST_VPN:
+			/* GTM (RFC 7716): plain IPv4 next hop, no RD prefix. */
+			stream_putc(s, BGP_ATTR_NHLEN_IPV4);
+			stream_put_ipv4(s, attr->nexthop.s_addr);
+			break;
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			assert(!"SAFI's UNSPEC or MAX being specified are a DEV ESCAPE");
@@ -5027,6 +5034,11 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 			break;
 		case SAFI_UNREACH:
 			stream_putc(s, 0); /* no nexthop for unreachability */
+			break;
+		case SAFI_MCAST_VPN:
+			/* GTM (RFC 7716): plain IPv6 global next hop. */
+			stream_putc(s, IPV6_MAX_BYTELEN);
+			stream_put(s, &attr->mp_nexthop_global, IPV6_MAX_BYTELEN);
 			break;
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
@@ -5190,6 +5202,9 @@ void bgp_packet_mpattr_prefix(struct stream *s, afi_t afi, safi_t safi, const st
 	case SAFI_MAX:
 		assert(!"Dev escape usage of SAFI_UNSPEC or MAX");
 		break;
+	case SAFI_MCAST_VPN:
+		bgp_mvpn_encode_prefix(s, p, addpath_capable, addpath_tx_id);
+		break;
 	case SAFI_MPLS_VPN:
 		if (addpath_capable)
 			stream_putl(s, addpath_tx_id);
@@ -5314,6 +5329,14 @@ size_t bgp_packet_mpattr_prefix_size(afi_t afi, safi_t safi,
 	case SAFI_UNSPEC:
 	case SAFI_MAX:
 		assert(!"Attempting to figure size for a SAFI_UNSPEC/SAFI_MAX this is a DEV ESCAPE");
+		break;
+	case SAFI_MCAST_VPN:
+		/*
+		 * Largest NLRI bgp_mvpn_encode_prefix() can emit (RFC 6514:
+		 * RouteType(1) + Length(1) + Type-7 IPv6 body), mirroring
+		 * EVPN's conservative single maximum.
+		 */
+		size = BGP_MVPN_MAX_NLRI_LEN;
 		break;
 	case SAFI_UNICAST:
 	case SAFI_MULTICAST:

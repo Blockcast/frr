@@ -24,6 +24,7 @@
 #include "pim_ssmpingd.h"
 #include "pim_vty.h"
 #include "pim_bsm.h"
+#include "pim_dimt.h"
 #include "pim_mlag.h"
 #include "pim_sock.h"
 
@@ -32,6 +33,8 @@ static void pim_instance_terminate(struct pim_instance *pim)
 	pim->stopping = true;
 
 	pim_vxlan_exit(pim);
+
+	pim_dimt_terminate(pim);
 
 	if (pim->static_routes)
 		list_delete(&pim->static_routes);
@@ -108,6 +111,8 @@ static struct pim_instance *pim_instance_init(struct vrf *vrf)
 	pim_vxlan_init(pim);
 
 	pim_nht_init(pim);
+
+	pim_dimt_init(pim);
 
 	pim->static_routes = list_new();
 	pim->static_routes->del = (void (*)(void *))pim_static_route_free;

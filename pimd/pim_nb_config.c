@@ -21,6 +21,7 @@
 #include "pim_static.h"
 #include "pim_ssm.h"
 #include "pim_dm.h"
+#include "pim_dimt.h"
 #include "pim_ssmpingd.h"
 #include "pim_vxlan.h"
 #include "pim_util.h"
@@ -131,10 +132,23 @@ static void pim_if_membership_refresh(struct interface *ifp)
 		} /* scan group sources */
 	}	 /* scan igmp groups */
 #else
+	/*
+	 * Restore PIM (S,G) membership only for MLD entries that already
+	 * own TIB state -- the analog of the IGMP_SOURCE_TEST_FORWARDING
+	 * gate in the IPv4 branch above.  Feeding a not-yet-joined sg in
+	 * here bypasses tib_sg_gm_join(): the ifchannel INCLUDE and the
+	 * PROTO_GM oif get created behind the sg's back, every later
+	 * gm_sg_update() join retry then fails on the duplicate-oif check,
+	 * and when the sg expires or the host leaves, its prune is skipped
+	 * (tib_joined was never set) -- stranding membership, oif and
+	 * upstream until the daemon restarts.  Entries without TIB state
+	 * are picked up by gm_sg_update()'s own join-retry path, which
+	 * keeps the bookkeeping coherent.
+	 */
 	sg_start = gm_sgs_first(gm_ifp->sgs);
 
 	frr_each_from (gm_sgs, gm_ifp->sgs, sg, sg_start) {
-		if (!in6_multicast_nofwd(&sg->sgaddr.grp)) {
+		if (sg->tib_joined && !in6_multicast_nofwd(&sg->sgaddr.grp)) {
 			pim_ifchannel_local_membership_add(
 				ifp, &sg->sgaddr, false /*is_vxlan*/);
 		}
@@ -146,6 +160,8 @@ static void pim_if_membership_refresh(struct interface *ifp)
 	 */
 
 	pim_ifchannel_delete_on_noinfo(ifp);
+
+	pim_if_static_group_replay(ifp);
 }
 
 static int pim_cmd_interface_add(struct interface *ifp)
@@ -705,6 +721,29 @@ int routing_control_plane_protocols_control_plane_protocol_pim_address_family_ec
 		pim = vrf->info;
 		pim->ecmp_rebalance_enable =
 			yang_dnode_get_bool(args->dnode, NULL);
+	}
+
+	return NB_OK;
+}
+
+/*
+ * XPath: /frr-routing:routing/control-plane-protocols/control-plane-protocol/frr-pim:pim/address-family/mvpn-gtm
+ */
+int routing_control_plane_protocols_control_plane_protocol_pim_address_family_mvpn_gtm_modify(
+	struct nb_cb_modify_args *args)
+{
+	struct vrf *vrf;
+	struct pim_instance *pim;
+
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		vrf = nb_running_get_entry(args->dnode, NULL, true);
+		pim = vrf->info;
+		pim->gtm_enable = yang_dnode_get_bool(args->dnode, NULL);
 	}
 
 	return NB_OK;
@@ -2305,6 +2344,16 @@ int lib_interface_pim_address_family_pim_passive_enable_modify(struct nb_cb_modi
 
 	switch (args->event) {
 	case NB_EV_VALIDATE:
+		/* Reciprocal of the pim-light-enable check: light and passive
+		 * are contradictory in either configuration order.
+		 */
+		if (yang_dnode_get_bool(args->dnode, NULL) &&
+		    yang_dnode_get_bool(args->dnode, "../pim-light-enable")) {
+			snprintf(args->errmsg, args->errmsg_len,
+				 "pim passive cannot be combined with pim light");
+			return NB_ERR_VALIDATION;
+		}
+		break;
 	case NB_EV_ABORT:
 	case NB_EV_PREPARE:
 		break;
@@ -2316,6 +2365,61 @@ int lib_interface_pim_address_family_pim_passive_enable_modify(struct nb_cb_modi
 		/* Trigger election in case it was never run before */
 		if (pim_ifp->pim_passive_enable && pim_addr_is_any(pim_ifp->pim_dr_addr))
 			pim_if_dr_election(ifp);
+		break;
+	}
+
+	return NB_OK;
+}
+
+/*
+ * XPath:
+ * /frr-interface:lib/interface/frr-pim:pim/address-family/pim-light-enable
+ */
+int lib_interface_pim_address_family_pim_light_enable_modify(struct nb_cb_modify_args *args)
+{
+	struct interface *ifp;
+	struct pim_interface *pim_ifp;
+
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+		/* Light (no-hello J/P exchange) and passive (no protocol
+		 * packets at all) are contradictory: passive's RX gate drops
+		 * the very Join/Prune light exists to accept.
+		 */
+		if (yang_dnode_get_bool(args->dnode, NULL) &&
+		    yang_dnode_get_bool(args->dnode, "../pim-passive-enable")) {
+			snprintf(args->errmsg, args->errmsg_len,
+				 "pim light cannot be combined with pim passive");
+			return NB_ERR_VALIDATION;
+		}
+		break;
+	case NB_EV_ABORT:
+	case NB_EV_PREPARE:
+		break;
+	case NB_EV_APPLY:
+		ifp = nb_running_get_entry(args->dnode, NULL, true);
+		pim_ifp = ifp->info;
+		pim_ifp->pim_light_enable = yang_dnode_get_bool(args->dnode, NULL);
+		if (pim_ifp->pim_light_enable) {
+			pim_dimt_iface_up(pim_ifp->pim, ifp);
+		} else {
+			struct listnode *node, *nnode;
+			struct pim_neighbor *neigh;
+
+			/* Light neighbors are synthetic (materialized by
+			 * Join/Prune, never by hellos) -- drop them now. */
+			for (ALL_LIST_ELEMENTS(pim_ifp->pim_neighbor_list,
+					       node, nnode, neigh))
+				if (neigh->light)
+					pim_neighbor_delete(ifp, neigh,
+							    "pim light disabled");
+
+			/* STATIC_IIF suppresses all normal RPF repair;
+			 * unpin anything DIMT pinned here or the pins
+			 * would silently persist on a non-light
+			 * interface. */
+			pim_dimt_iface_down(pim_ifp->pim, ifp);
+		}
 		break;
 	}
 

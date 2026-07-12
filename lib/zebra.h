@@ -185,7 +185,8 @@ typedef enum {
 	SAFI_FLOWSPEC = 7,
 	SAFI_BGP_LS = 8, /* BGP-LS (RFC 9552) */
 	SAFI_UNREACH = 9,
-	SAFI_MAX = 10
+	SAFI_MCAST_VPN = 10, /* MCAST-VPN (RFC 6514) */
+	SAFI_MAX = 11
 } safi_t;
 
 #define FOREACH_AFI_SAFI(afi, safi)                                            \
@@ -196,7 +197,9 @@ typedef enum {
  * Iterate the SAFIs that participate in Non-Stop Forwarding (Graceful
  * Restart): UNICAST, MULTICAST, MPLS_VPN, ENCAP and EVPN (SAFI 1-5),
  * plus UNREACH. LABELED_UNICAST, FLOWSPEC and BGP_LS are skipped as
- * they have no GR semantics.
+ * they have no GR semantics. SAFI_MCAST_VPN (10) is intentionally
+ * EXCLUDED: it is a control-plane-only GTM SAFI with no NSF forwarding
+ * state to preserve.
  */
 #define FOREACH_AFI_SAFI_NSF(afi, safi)                                        \
 	for (afi = AFI_IP; afi < AFI_MAX; afi++)                               \

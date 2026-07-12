@@ -270,6 +270,10 @@ int pim_global_config_write_worker(struct pim_instance *pim, struct vty *vty)
 		vty_out(vty, " ecmp\n");
 		++writes;
 	}
+	if (pim->gtm_enable) {
+		vty_out(vty, " mvpn-gtm\n");
+		++writes;
+	}
 
 	if (pim->ssmpingd_list) {
 		struct listnode *node;
@@ -627,6 +631,11 @@ int pim_config_write(struct vty *vty, int writes, struct interface *ifp,
 
 	if (pim_ifp->pim_passive_enable) {
 		vty_out(vty, " " PIM_AF_NAME " pim passive\n");
+		++writes;
+	}
+
+	if (pim_ifp->pim_light_enable) {
+		vty_out(vty, " " PIM_AF_NAME " pim light\n");
 		++writes;
 	}
 

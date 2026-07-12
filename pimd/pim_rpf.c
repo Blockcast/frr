@@ -26,6 +26,7 @@
 #include "pim_nht.h"
 #include "pim_oil.h"
 #include "pim_mlag.h"
+#include "pim_ssm.h"
 
 static pim_addr pim_rpf_find_rpf_addr(struct pim_upstream *up);
 
@@ -106,6 +107,14 @@ enum pim_rpf_result pim_rpf_update(struct pim_instance *pim, struct pim_upstream
 
 	if ((pim_addr_is_any(up->sg.src) && I_am_RP(pim, up->sg.grp)) ||
 	    PIM_UPSTREAM_FLAG_TEST_FHR(up->flags))
+		neigh_needed = false;
+
+	/* Global-Table Multicast (RFC 7716): a GTM SSM (S,G) is pulled from
+	 * the upstream PE over the BGP MCAST-VPN control plane (Type-7), not by
+	 * a PIM Join, so the RPF interface toward the source carries no PIM
+	 * neighbor.  Do not require one -- otherwise the receiver upstream never
+	 * resolves RPF, never reaches JoinDesired, and no Type-7 is originated. */
+	if (pim->gtm_enable && pim_is_grp_ssm(pim, up->sg.grp))
 		neigh_needed = false;
 
 	pim_nht_find_or_track(pim, up->upstream_addr, up, NULL, NULL);
@@ -257,8 +266,23 @@ static pim_addr pim_rpf_find_rpf_addr(struct pim_upstream *up)
 				     up->rpf.source_nexthop.mrib_nexthop_addr);
 	if (neigh)
 		rpf_addr = neigh->source_addr;
-	else
-		rpf_addr = PIMADDR_ANY;
+	else {
+		struct pim_interface *pim_ifp =
+			up->rpf.source_nexthop.interface->info;
+
+		/* RFC 9739 (PIM Light): no hello adjacency on a light
+		 * interface, so there is no neighbor to name.  Address the
+		 * Join/Prune to the MRIB nexthop toward the source (the
+		 * upstream router / UMH) so its upstream-neighbor field
+		 * carries a unicast address of the upstream router.
+		 */
+		if (pim_ifp && pim_ifp->pim_light_enable &&
+		    !pim_addr_is_any(
+			    up->rpf.source_nexthop.mrib_nexthop_addr))
+			rpf_addr = up->rpf.source_nexthop.mrib_nexthop_addr;
+		else
+			rpf_addr = PIMADDR_ANY;
+	}
 
 	return rpf_addr;
 }

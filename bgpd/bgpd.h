@@ -109,6 +109,8 @@ enum bgp_af_index {
 	BGP_AF_BGP_LS,
 	BGP_AF_IPV4_UNREACH,
 	BGP_AF_IPV6_UNREACH,
+	BGP_AF_IPV4_MVPN,
+	BGP_AF_IPV6_MVPN,
 	BGP_AF_MAX
 };
 
@@ -963,6 +965,11 @@ struct bgp {
 	bool reject_as_sets;
 
 	struct bgp_evpn_info *evpn_info;
+
+	/* GTM MCAST-VPN: MPLS label advertised in the Intra-AS I-PMSI A-D
+	 * PMSI Tunnel attribute (0 = unlabeled tunnel, RFC 6514 Section 5).
+	 */
+	uint32_t mvpn_ipmsi_label;
 
 	/* EVPN - use RFC 8365 to auto-derive RT */
 	int advertise_autort_rfc8365;
@@ -2937,6 +2944,12 @@ extern void bgp_route_map_terminate(void);
 
 extern bool bgp_route_map_has_extcommunity_rt(const struct route_map *map);
 
+/* Parse a "set extcommunity umh" argument; shared by the route-map compile
+ * and the northbound VALIDATE stage (see bgp_routemap.c). */
+extern bool bgp_route_set_umh_parse(const char *arg, struct ipaddr *umh,
+				    uint8_t *umh_type, uint8_t *preference,
+				    char *errmsg, size_t errmsg_len);
+
 extern int peer_cmp(struct peer *p1, struct peer *p2);
 
 extern int bgp_map_afi_safi_iana2int(iana_afi_t pkt_afi, iana_safi_t pkt_safi,
@@ -3022,6 +3035,8 @@ static inline int afindex(afi_t afi, safi_t safi)
 			return BGP_AF_BGP_LS;
 		case SAFI_UNREACH:
 			return BGP_AF_IPV4_UNREACH;
+		case SAFI_MCAST_VPN:
+			return BGP_AF_IPV4_MVPN;
 		case SAFI_EVPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
@@ -3046,6 +3061,8 @@ static inline int afindex(afi_t afi, safi_t safi)
 			return BGP_AF_BGP_LS;
 		case SAFI_UNREACH:
 			return BGP_AF_IPV6_UNREACH;
+		case SAFI_MCAST_VPN:
+			return BGP_AF_IPV6_MVPN;
 		case SAFI_EVPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
@@ -3064,6 +3081,7 @@ static inline int afindex(afi_t afi, safi_t safi)
 		case SAFI_ENCAP:
 		case SAFI_FLOWSPEC:
 		case SAFI_UNREACH:
+		case SAFI_MCAST_VPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			return BGP_AF_MAX;
@@ -3081,6 +3099,7 @@ static inline int afindex(afi_t afi, safi_t safi)
 		case SAFI_EVPN:
 		case SAFI_FLOWSPEC:
 		case SAFI_UNREACH:
+		case SAFI_MCAST_VPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			return BGP_AF_MAX;

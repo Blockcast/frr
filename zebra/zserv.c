@@ -1714,4 +1714,6 @@ void zserv_init(void)
 	install_element(ENABLE_NODE, &show_zebra_client_summary_cmd);
 
 	hook_register(zserv_client_close, zserv_client_close_cb);
+	hook_register(zserv_client_close, zapi_mvpn_sg_client_close_cleanup);
+	hook_register(zserv_client_close, zapi_umh_client_close_cleanup);
 }

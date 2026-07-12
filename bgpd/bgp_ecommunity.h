@@ -47,8 +47,44 @@
 #define ECOMMUNITY_TRAFFIC_ACTION           0x07
 #define ECOMMUNITY_REDIRECT_VRF             0x08
 #define ECOMMUNITY_TRAFFIC_MARKING          0x09
+/* RFC 6514 Section 5: Source AS Extended Community (Four-Octet-AS-Specific,
+ * encode 0x02). GTM receiver reads it off the source unicast route to fill the
+ * Type-7 Source-AS NLRI field. */
+#define ECOMMUNITY_SOURCE_AS                0x09
 #define ECOMMUNITY_REDIRECT_IP_NH           0x00
 #define ECOMMUNITY_COLOR 0x0b /* RFC9012 - color */
+/* RFC 6514 - VRF Route Import. IP-address-specific only (high-order octet
+ * ECOMMUNITY_ENCODE_IP); shares the 0x0b sub-type value with COLOR, which lives
+ * in the OPAQUE space, so there is no collision (see the note above: the
+ * low-order octet is scoped by the high-order octet). Carried on a
+ * (GTM: global-table) unicast source route to identify the upstream PE; a
+ * C-multicast (Type-6/7) join echoes its Global Administrator as a Route Target. */
+#define ECOMMUNITY_VRF_ROUTE_IMPORT         0x0b
+/* draft-zzhang-mboned-dynamic-internet-mcast-tunnel Upstream Multicast Hop.
+ * No IANA assignment yet: squat on the experimental-use sub-type range so a
+ * later assignment is a one-line change.
+ *
+ * Wire, IPv4-address-specific (type 0x01 == ECOMMUNITY_ENCODE_IP, 8-octet):
+ *   Global Admin (val[2..5]) = UMH address; Local Admin low byte (val[7]) =
+ *   pref[7:4] | type[3:0] (1 = PIM tunnel endpoint, 2 = AMT relay); high byte
+ *   (val[6]) reserved (0).
+ *
+ * Wire, IPv6-address-specific (type 0x00, 20-octet):
+ *   the transitive IPv6-address-specific type high octet is numerically
+ *   0x00 (RFC 5701), the same value as a 2-octet-AS EC -- the 20-byte unit
+ *   size (IPv6 Extended Communities attribute carriage) is what
+ *   disambiguates. (FRR's own rt6 deliberately differs: it encodes
+ *   0x80/TRANS_EXP on the wire and only displays through a masked 0x00.)
+ *   Global Admin (val[2..17]) = 16-byte UMH address; Local Admin low byte
+ *   (val[19]) = the same pref|type nibbles; val[18] reserved (0).
+ *
+ * Both families share this sub-type and the ECOMMUNITY_UMH_LA* nibble packing
+ * below; only the address width and the Local-Admin offset differ. */
+#define ECOMMUNITY_UMH                      0x80
+/* UMH Local Admin low byte: preference in the high nibble, type in the low. */
+#define ECOMMUNITY_UMH_LA(pref, type) ((uint8_t)(((pref) << 4) | ((type) & 0x0f)))
+#define ECOMMUNITY_UMH_LA_PREF(b) ((uint8_t)(b) >> 4)
+#define ECOMMUNITY_UMH_LA_TYPE(b) ((b) & 0x0f)
 
 /* from IANA: bgp-extended-communities/bgp-extended-communities.xhtml
  * 0x0c Flow-spec Redirect to IPv4 - draft-ietf-idr-flowspec-redirect
@@ -163,7 +199,7 @@ struct ecommunity_val {
 	uint8_t val[ECOMMUNITY_SIZE];
 };
 
-/* IPv6 Extended community value is eight octet.  */
+/* IPv6 Extended community value is twenty octets.  */
 struct ecommunity_val_ipv6 {
 	uint8_t val[IPV6_ECOMMUNITY_SIZE];
 };

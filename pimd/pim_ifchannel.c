@@ -823,6 +823,15 @@ static int nonlocal_upstream(int is_join, struct interface *recv_ifp,
 
 	is_local = !pim_addr_cmp(upstream, recv_pim_ifp->primary_address);
 
+	if (!is_local && recv_pim_ifp->pim_light_enable) {
+		/* RFC 9739 (PIM Light): the Join/Prune's upstream-neighbor
+		 * field may carry any unicast address of this router, not
+		 * necessarily the receiving interface's primary address.
+		 */
+		is_local = if_lookup_address_local(&upstream, PIM_AF,
+						   recv_pim_ifp->pim->vrf->vrf_id) != NULL;
+	}
+
 	if (is_local)
 		return 0;
 

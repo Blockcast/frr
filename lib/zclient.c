@@ -4192,6 +4192,94 @@ stream_failure:
 	return -1;
 }
 
+int zapi_mvpn_sg_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
+			const struct zapi_mvpn_sg *sg)
+{
+	stream_reset(s);
+
+	zclient_create_header(s, cmd, vrf_id);
+	stream_put_ipaddr(s, &sg->src);
+	stream_put_ipaddr(s, &sg->grp);
+	stream_putc(s, sg->role);
+
+	/* Put length at the first point of the stream. */
+	stream_putw_at(s, 0, stream_get_endp(s));
+
+	return 0;
+}
+
+int zapi_mvpn_sg_decode(struct stream *s, struct zapi_mvpn_sg *sg)
+{
+	memset(sg, 0, sizeof(*sg));
+
+	STREAM_GET_IPADDR(s, &sg->src);
+	STREAM_GET_IPADDR(s, &sg->grp);
+	STREAM_GETC(s, sg->role);
+
+	return 0;
+
+stream_failure:
+	return -1;
+}
+
+int zapi_umh_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
+		    const struct zapi_umh *umh)
+{
+	stream_reset(s);
+
+	zclient_create_header(s, cmd, vrf_id);
+	stream_putc(s, umh->prefix.family);
+	stream_putc(s, umh->prefix.prefixlen);
+	stream_put(s, &umh->prefix.u.prefix, prefix_blen(&umh->prefix));
+	stream_put_ipaddr(s, &umh->umh);
+	stream_putc(s, umh->umh_type);
+	stream_putc(s, umh->preference);
+
+	/* Put length at the first point of the stream. */
+	stream_putw_at(s, 0, stream_get_endp(s));
+
+	return 0;
+}
+
+int zapi_umh_decode(struct stream *s, struct zapi_umh *umh)
+{
+	uint8_t family;
+
+	memset(umh, 0, sizeof(*umh));
+
+	STREAM_GETC(s, family);
+	if (family != AF_INET && family != AF_INET6)
+		return -1;
+	umh->prefix.family = family;
+	STREAM_GETC(s, umh->prefix.prefixlen);
+	if (umh->prefix.prefixlen > prefix_blen(&umh->prefix) * 8)
+		return -1;
+	STREAM_GET(&umh->prefix.u.prefix, s, prefix_blen(&umh->prefix));
+	STREAM_GET_IPADDR(s, &umh->umh);
+	STREAM_GETC(s, umh->umh_type);
+	STREAM_GETC(s, umh->preference);
+
+	/* Decode is the trust boundary: garbage accepted here would become a
+	 * silent 0.0.0.0 mapping in pimd. */
+	if (umh->umh_type != ZAPI_UMH_TYPE_PIM &&
+	    umh->umh_type != ZAPI_UMH_TYPE_AMT_RELAY)
+		return -1;
+	if (umh->preference > ZAPI_UMH_PREF_MAX)
+		return -1;
+	/* The UMH address family must be consistent with the prefix family.
+	 * This also catches stream_get_ipaddr()'s no-default-case hole where
+	 * a corrupt family word yields an all-zero ipaddr that otherwise
+	 * decodes "successfully". */
+	if ((umh->prefix.family == AF_INET && !IS_IPADDR_V4(&umh->umh)) ||
+	    (umh->prefix.family == AF_INET6 && !IS_IPADDR_V6(&umh->umh)))
+		return -1;
+
+	return 0;
+
+stream_failure:
+	return -1;
+}
+
 enum zclient_send_status zebra_send_mpls_labels(struct zclient *zclient,
 						int cmd, struct zapi_labels *zl)
 {

@@ -60,6 +60,7 @@
 #include "bgpd/bgp_bfd.h"
 #include "bgpd/bgp_io.h"
 #include "bgpd/bgp_evpn.h"
+#include "bgpd/bgp_mvpn.h"
 #include "bgpd/bgp_evpn_vty.h"
 #include "bgpd/bgp_evpn_mh.h"
 #include "bgpd/bgp_addpath.h"
@@ -186,6 +187,8 @@ static enum node_type bgp_node_type(afi_t afi, safi_t safi)
 			return BGP_FLOWSPECV4_NODE;
 		case SAFI_UNREACH:
 			return BGP_IPV4U_NODE;
+		case SAFI_MCAST_VPN:
+			return BGP_IPV4_MVPN_NODE;
 		case SAFI_BGP_LS:
 		case SAFI_UNSPEC:
 		case SAFI_ENCAP:
@@ -209,6 +212,8 @@ static enum node_type bgp_node_type(afi_t afi, safi_t safi)
 			return BGP_FLOWSPECV6_NODE;
 		case SAFI_UNREACH:
 			return BGP_IPV6U_NODE;
+		case SAFI_MCAST_VPN:
+			return BGP_IPV6_MVPN_NODE;
 		case SAFI_BGP_LS:
 		case SAFI_UNSPEC:
 		case SAFI_ENCAP:
@@ -249,6 +254,8 @@ static const char *get_afi_safi_vty_str(afi_t afi, safi_t safi)
 			return "IPv4 Flowspec";
 		if (safi == SAFI_UNREACH)
 			return "IPv4 Unreachability";
+		if (safi == SAFI_MCAST_VPN)
+			return "IPv4 MCAST-VPN";
 	} else if (afi == AFI_IP6) {
 		if (safi == SAFI_UNICAST)
 			return "IPv6 Unicast";
@@ -264,6 +271,8 @@ static const char *get_afi_safi_vty_str(afi_t afi, safi_t safi)
 			return "IPv6 Flowspec";
 		if (safi == SAFI_UNREACH)
 			return "IPv6 Unreachability";
+		if (safi == SAFI_MCAST_VPN)
+			return "IPv6 MCAST-VPN";
 	} else if (afi == AFI_L2VPN) {
 		if (safi == SAFI_EVPN)
 			return "L2VPN EVPN";
@@ -298,6 +307,8 @@ static const char *get_afi_safi_json_str(afi_t afi, safi_t safi)
 			return "ipv4Flowspec";
 		if (safi == SAFI_UNREACH)
 			return "ipv4Unreachability";
+		if (safi == SAFI_MCAST_VPN)
+			return "ipv4Mvpn";
 	} else if (afi == AFI_IP6) {
 		if (safi == SAFI_UNICAST)
 			return "ipv6Unicast";
@@ -313,6 +324,8 @@ static const char *get_afi_safi_json_str(afi_t afi, safi_t safi)
 			return "ipv6Flowspec";
 		if (safi == SAFI_UNREACH)
 			return "ipv6Unreachability";
+		if (safi == SAFI_MCAST_VPN)
+			return "ipv6Mvpn";
 	} else if (afi == AFI_L2VPN) {
 		if (safi == SAFI_EVPN)
 			return "l2VpnEvpn";
@@ -470,6 +483,7 @@ afi_t bgp_node_afi(struct vty *vty)
 	case BGP_VPNV6_NODE:
 	case BGP_FLOWSPECV6_NODE:
 	case BGP_IPV6U_NODE:
+	case BGP_IPV6_MVPN_NODE:
 		afi = AFI_IP6;
 		break;
 	case BGP_EVPN_NODE:
@@ -501,6 +515,10 @@ safi_t bgp_node_safi(struct vty *vty)
 		break;
 	case BGP_EVPN_NODE:
 		safi = SAFI_EVPN;
+		break;
+	case BGP_IPV4_MVPN_NODE:
+	case BGP_IPV6_MVPN_NODE:
+		safi = SAFI_MCAST_VPN;
 		break;
 	case BGP_IPV4L_NODE:
 	case BGP_IPV6L_NODE:
@@ -583,6 +601,8 @@ safi_t bgp_vty_safi_from_str(const char *safi_str)
 		safi = SAFI_FLOWSPEC;
 	else if (strmatch(safi_str, "unreachability"))
 		safi = SAFI_UNREACH;
+	else if (strmatch(safi_str, "mvpn"))
+		safi = SAFI_MCAST_VPN;
 	return safi;
 }
 
@@ -659,6 +679,7 @@ static const char *get_bgp_default_af_flag(afi_t afi, safi_t safi)
 			return "ipv4-unreachability";
 		case SAFI_UNSPEC:
 		case SAFI_EVPN:
+		case SAFI_MCAST_VPN:
 		case SAFI_MAX:
 			return "unknown-afi/safi";
 		}
@@ -683,6 +704,7 @@ static const char *get_bgp_default_af_flag(afi_t afi, safi_t safi)
 			return "ipv6-unreachability";
 		case SAFI_UNSPEC:
 		case SAFI_EVPN:
+		case SAFI_MCAST_VPN:
 		case SAFI_MAX:
 			return "unknown-afi/safi";
 		}
@@ -699,6 +721,7 @@ static const char *get_bgp_default_af_flag(afi_t afi, safi_t safi)
 		case SAFI_LABELED_UNICAST:
 		case SAFI_FLOWSPEC:
 		case SAFI_UNREACH:
+		case SAFI_MCAST_VPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			return "unknown-afi/safi";
@@ -716,6 +739,7 @@ static const char *get_bgp_default_af_flag(afi_t afi, safi_t safi)
 		case SAFI_FLOWSPEC:
 		case SAFI_EVPN:
 		case SAFI_UNREACH:
+		case SAFI_MCAST_VPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			return "unknown-afi/safi";
@@ -11745,8 +11769,9 @@ DEFPY (af_routetarget_import,
 }
 
 DEFUN_NOSH(address_family_ipv4_safi, address_family_ipv4_safi_cmd,
-	   "address-family ipv4 [<unicast|multicast|vpn|labeled-unicast|flowspec|unreachability>]",
-	   "Enter Address Family command mode\n" BGP_AF_STR BGP_SAFI_WITH_LABEL_HELP_STR)
+	   "address-family ipv4 [<unicast|multicast|vpn|labeled-unicast|flowspec|unreachability|mvpn>]",
+	   "Enter Address Family command mode\n" BGP_AF_STR BGP_SAFI_WITH_LABEL_HELP_STR
+		   "Address Family modifier\n")
 {
 
 	if (argc == 3) {
@@ -11767,8 +11792,9 @@ DEFUN_NOSH(address_family_ipv4_safi, address_family_ipv4_safi_cmd,
 }
 
 DEFUN_NOSH(address_family_ipv6_safi, address_family_ipv6_safi_cmd,
-	   "address-family ipv6 [<unicast|multicast|vpn|labeled-unicast|flowspec|unreachability>]",
-	   "Enter Address Family command mode\n" BGP_AF_STR BGP_SAFI_WITH_LABEL_HELP_STR)
+	   "address-family ipv6 [<unicast|multicast|vpn|labeled-unicast|flowspec|unreachability|mvpn>]",
+	   "Enter Address Family command mode\n" BGP_AF_STR BGP_SAFI_WITH_LABEL_HELP_STR
+		   "Address Family modifier\n")
 {
 	if (argc == 3) {
 		VTY_DECLVAR_CONTEXT(bgp, bgp);
@@ -22065,6 +22091,8 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 			vty_frame(vty, "ipv4 flowspec");
 		else if (safi == SAFI_UNREACH)
 			vty_frame(vty, "ipv4 unreachability");
+		else if (safi == SAFI_MCAST_VPN)
+			vty_frame(vty, "ipv4 mvpn");
 	} else if (afi == AFI_IP6) {
 		if (safi == SAFI_UNICAST)
 			vty_frame(vty, "ipv6 unicast");
@@ -22080,6 +22108,8 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 			vty_frame(vty, "ipv6 flowspec");
 		else if (safi == SAFI_UNREACH)
 			vty_frame(vty, "ipv6 unreachability");
+		else if (safi == SAFI_MCAST_VPN)
+			vty_frame(vty, "ipv6 mvpn");
 	} else if (afi == AFI_L2VPN) {
 		if (safi == SAFI_EVPN)
 			vty_frame(vty, "l2vpn evpn");
@@ -22137,6 +22167,9 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 
 	if (safi == SAFI_MPLS_VPN)
 		bgp_vpn_config_write(vty, bgp, afi, safi);
+
+	if (safi == SAFI_MCAST_VPN)
+		bgp_mvpn_config_write(vty, bgp, afi, safi);
 
 	if (safi == SAFI_UNICAST) {
 		bgp_vpn_policy_config_write_afi(vty, bgp, afi);
@@ -22760,6 +22793,9 @@ int bgp_config_write(struct vty *vty)
 		/* IPv4 Unreachability configuration.  */
 		bgp_config_write_family(vty, bgp, AFI_IP, SAFI_UNREACH);
 
+		/* IPv4 MCAST-VPN configuration.  */
+		bgp_config_write_family(vty, bgp, AFI_IP, SAFI_MCAST_VPN);
+
 		/* IPv6 unicast configuration.  */
 		bgp_config_write_family(vty, bgp, AFI_IP6, SAFI_UNICAST);
 
@@ -22781,6 +22817,9 @@ int bgp_config_write(struct vty *vty)
 
 		/* IPv6 Unreachability configuration.  */
 		bgp_config_write_family(vty, bgp, AFI_IP6, SAFI_UNREACH);
+
+		/* IPv6 MCAST-VPN configuration.  */
+		bgp_config_write_family(vty, bgp, AFI_IP6, SAFI_MCAST_VPN);
 
 		/* EVPN configuration.  */
 		bgp_config_write_family(vty, bgp, AFI_L2VPN, SAFI_EVPN);
@@ -22887,6 +22926,22 @@ static struct cmd_node bgp_evpn_vni_node = {
 	.node = BGP_EVPN_VNI_NODE,
 	.parent_node = BGP_EVPN_NODE,
 	.prompt = "%s(config-router-af-vni)# ",
+};
+
+static struct cmd_node bgp_ipv4_mvpn_node = {
+	.name = "bgp ipv4 mvpn",
+	.node = BGP_IPV4_MVPN_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
+
+static struct cmd_node bgp_ipv6_mvpn_node = {
+	.name = "bgp ipv6 mvpn",
+	.node = BGP_IPV6_MVPN_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
 };
 
 static struct cmd_node bgp_flowspecv4_node = {
@@ -23233,6 +23288,101 @@ static void bgp_vty_if_init(void)
 			&mpls_bgp_l3vpn_multi_domain_switching_cmd);
 }
 
+/* MCAST-VPN (RFC 6514) Global Table Multicast — Route Type 5 Source Active. */
+
+DEFPY (bgp_mvpn_source_active,
+       bgp_mvpn_source_active_cmd,
+       "[no] bgp mvpn source-active A.B.C.D$source group A.B.C.D$group",
+       NO_STR
+       BGP_STR
+       "Multicast VPN (MCAST-VPN) commands\n"
+       "Originate a Global Table Multicast Source Active (Type 5) route\n"
+       "Multicast source address (C-S)\n"
+       "Multicast group\n"
+       "Multicast group address (C-G), SSM range 232.0.0.0/8\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct ipaddr src = { .ipa_type = IPADDR_V4, .ip._v4_addr = source };
+	struct ipaddr grp = { .ipa_type = IPADDR_V4, .ip._v4_addr = group };
+
+	/* GTM is SSM-only: enforce group in 232.0.0.0/8. */
+	if (!ipv4_mcast_ssm(&group)) {
+		vty_out(vty, "%% MCAST-VPN group %pI4 is not in the SSM range 232.0.0.0/8\n",
+			&group);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	return bgp_mvpn_source_active_set(bgp, &src, &grp, !!no);
+}
+
+DEFPY (bgp_mvpn_ipmsi_label,
+       bgp_mvpn_ipmsi_label_cmd,
+       "[no] bgp mvpn ipmsi-label (16-1048575)$label",
+       NO_STR
+       BGP_STR
+       "Multicast VPN (MCAST-VPN) commands\n"
+       "MPLS label for the Intra-AS I-PMSI A-D PMSI Tunnel attribute (default 0: unlabeled)\n"
+       "Label value\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+
+	bgp->mvpn_ipmsi_label = no ? 0 : label;
+	/* Re-originate so the new label replaces the installed Type-1 attr. */
+	bgp_mvpn_originate_type1(bgp);
+
+	return CMD_SUCCESS;
+}
+
+DEFPY (bgp_mvpn_source_active6,
+       bgp_mvpn_source_active6_cmd,
+       "[no] bgp mvpn source-active X:X::X:X$source6 group X:X::X:X$group6",
+       NO_STR
+       BGP_STR
+       "Multicast VPN (MCAST-VPN) commands\n"
+       "Originate a Global Table Multicast Source Active (Type 5) route\n"
+       "Multicast source address (C-S)\n"
+       "Multicast group\n"
+       "Multicast group address (C-G), IPv6 SSM range ff3x::/32\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct ipaddr src = { .ipa_type = IPADDR_V6, .ip._v6_addr = source6 };
+	struct ipaddr grp = { .ipa_type = IPADDR_V6, .ip._v6_addr = group6 };
+
+	/* GTM is SSM-only: enforce the IPv6 SSM range ff3x::/32 (RFC 4607). */
+	if (!ipv6_mcast_ssm(&group6)) {
+		vty_out(vty, "%% MCAST-VPN group %pI6 is not in the IPv6 SSM range ff3x::/32\n",
+			&group6);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	return bgp_mvpn_source_active_set(bgp, &src, &grp, !!no);
+}
+
+DEFPY (show_bgp_mvpn,
+       show_bgp_mvpn_cmd,
+       "show bgp <ipv4|ipv6>$afi_str mvpn [json$uj]",
+       SHOW_STR
+       BGP_STR
+       "Address Family\n"
+       "Address Family\n"
+       "Display MCAST-VPN (Source Active) routes\n"
+       JSON_STR)
+{
+	struct bgp *bgp = bgp_get_default();
+	afi_t afi = strmatch(afi_str, "ipv6") ? AFI_IP6 : AFI_IP;
+
+	if (!bgp) {
+		if (uj)
+			vty_out(vty, "{}\n");
+		else
+			vty_out(vty, "%% No BGP process configured\n");
+		return CMD_SUCCESS;
+	}
+
+	bgp_mvpn_show_routes(vty, bgp, afi, !!uj);
+	return CMD_SUCCESS;
+}
+
 void bgp_vty_init(void)
 {
 	cmd_variable_handler_register(bgp_var_neighbor);
@@ -23252,6 +23402,11 @@ void bgp_vty_init(void)
 	install_node(&bgp_vpnv6_node);
 	install_node(&bgp_evpn_node);
 	install_node(&bgp_evpn_vni_node);
+	install_node(&bgp_ipv4_mvpn_node);
+	/* IPv6 MCAST-VPN AF (RFC 6515): the v6 NLRI codec and dual-stack GTM
+	 * origination have landed, so the node is installed and the v6
+	 * capability is negotiable. */
+	install_node(&bgp_ipv6_mvpn_node);
 	install_node(&bgp_flowspecv4_node);
 	install_node(&bgp_flowspecv6_node);
 	install_node(&bgp_ipv4_unreachability_node);
@@ -23275,6 +23430,8 @@ void bgp_vty_init(void)
 	install_default(BGP_IPV6U_NODE);
 	install_default(BGP_EVPN_NODE);
 	install_default(BGP_EVPN_VNI_NODE);
+	install_default(BGP_IPV4_MVPN_NODE);
+	install_default(BGP_IPV6_MVPN_NODE);
 	install_default(BGP_SRV6_NODE);
 	install_default(BGP_LS_NODE);
 
@@ -23683,7 +23840,15 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV4U_NODE, &neighbor_activate_cmd);
 	install_element(BGP_IPV6U_NODE, &neighbor_activate_cmd);
 	install_element(BGP_EVPN_NODE, &neighbor_activate_cmd);
+	install_element(BGP_IPV4_MVPN_NODE, &neighbor_activate_cmd);
+	install_element(BGP_IPV6_MVPN_NODE, &neighbor_activate_cmd);
 	install_element(BGP_LS_NODE, &neighbor_activate_cmd);
+
+	/* MCAST-VPN (RFC 6514 GTM) config + show commands. */
+	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_source_active_cmd);
+	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_ipmsi_label_cmd);
+	install_element(BGP_IPV6_MVPN_NODE, &bgp_mvpn_source_active6_cmd);
+	install_element(VIEW_NODE, &show_bgp_mvpn_cmd);
 
 	/* "no neighbor activate" commands. */
 	install_element(BGP_NODE, &no_neighbor_activate_hidden_cmd);
@@ -23700,6 +23865,8 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV4U_NODE, &no_neighbor_activate_cmd);
 	install_element(BGP_IPV6U_NODE, &no_neighbor_activate_cmd);
 	install_element(BGP_EVPN_NODE, &no_neighbor_activate_cmd);
+	install_element(BGP_IPV4_MVPN_NODE, &no_neighbor_activate_cmd);
+	install_element(BGP_IPV6_MVPN_NODE, &no_neighbor_activate_cmd);
 	install_element(BGP_LS_NODE, &no_neighbor_activate_cmd);
 
 	/* "neighbor peer-group" set commands. */
@@ -24793,6 +24960,8 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV4U_NODE, &exit_address_family_cmd);
 	install_element(BGP_IPV6U_NODE, &exit_address_family_cmd);
 	install_element(BGP_EVPN_NODE, &exit_address_family_cmd);
+	install_element(BGP_IPV4_MVPN_NODE, &exit_address_family_cmd);
+	install_element(BGP_IPV6_MVPN_NODE, &exit_address_family_cmd);
 	install_element(BGP_LS_NODE, &exit_address_family_cmd);
 
 	/* BGP retain all route-target */

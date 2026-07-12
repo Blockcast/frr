@@ -33,6 +33,7 @@
 #include "pim_util.h"
 #include "pim_zebra.h"
 #include "pim_instance.h"
+#include "pim_dimt.h"
 
 #include "pimd/pim6_cmd_clippy.c"
 
@@ -610,6 +611,15 @@ DEFPY_YANG (no_pim6_keep_alive,
 {
 	return pim_process_no_keepalivetimer_cmd(vty);
 }
+
+DEFPY_YANG (pim6_mvpn_gtm,
+	    pim6_mvpn_gtm_cmd,
+	    "[no] mvpn-gtm",
+	    NO_STR
+	    "Global-Table Multicast (RFC 7716): originate BGP MCAST-VPN Type-7/Type-5 from local SSM join/source\n")
+{
+	return pim_process_mvpn_gtm_cmd(vty, !no);
+}
 DEFPY_ATTR(no_ipv6_pim_keep_alive,
            no_ipv6_pim_keep_alive_cmd,
            "no ipv6 pim keep-alive-timer [(1-65535)]",
@@ -865,6 +875,17 @@ DEFPY (interface_ipv6_pim_passive,
 	"Disable exchange of protocol packets\n")
 {
 	return pim_process_ip_pim_passive_cmd(vty, !no);
+}
+
+DEFPY (interface_ipv6_pim_light,
+	interface_ipv6_pim_light_cmd,
+	"[no] ipv6 pim light$light",
+	NO_STR
+	IPV6_STR
+	PIM_STR
+	"PIM Light interface (RFC 9739): Join/Prune without hello adjacency\n")
+{
+	return pim_process_ip_pim_light_cmd(vty, !no);
 }
 
 DEFPY (interface_ipv6_pim,
@@ -2125,6 +2146,28 @@ DEFPY (show_ipv6_pim_statistics,
 	return pim_show_statistics_helper(vrf, vty, word, !!json);
 }
 
+DEFPY (show_ipv6_pim_dimt_umh,
+       show_ipv6_pim_dimt_umh_cmd,
+       "show ipv6 pim [vrf NAME] dimt umh [json$json]",
+       SHOW_STR
+       IPV6_STR
+       PIM_STR
+       VRF_CMD_HELP_STR
+       "DIMT dynamic multicast tunneling\n"
+       "bgpd-learned Upstream Multicast Hop mappings\n"
+       JSON_STR)
+{
+	struct vrf *v;
+
+	v = vrf_lookup_by_name(vrf ? vrf : VRF_DEFAULT_NAME);
+	if (!v || !v->info)
+		return CMD_WARNING;
+
+	pim_dimt_show_umh(v->info, vty, !!json);
+
+	return CMD_SUCCESS;
+}
+
 DEFPY (show_ipv6_pim_upstream,
        show_ipv6_pim_upstream_cmd,
        "show ipv6 pim [vrf NAME] upstream [X:X::X:X$s_or_g [X:X::X:X$g]] [json$json]",
@@ -3144,6 +3187,7 @@ void pim_cmd_init(void)
 	install_element(PIM6_NODE, &no_pim6_packets_cmd);
 	install_element(PIM6_NODE, &pim6_keep_alive_cmd);
 	install_element(PIM6_NODE, &no_pim6_keep_alive_cmd);
+	install_element(PIM6_NODE, &pim6_mvpn_gtm_cmd);
 	install_element(PIM6_NODE, &pim6_rp_keep_alive_cmd);
 	install_element(PIM6_NODE, &no_pim6_rp_keep_alive_cmd);
 	install_element(PIM6_NODE, &pim6_register_suppress_cmd);
@@ -3173,6 +3217,7 @@ void pim_cmd_init(void)
 
 	install_element(INTERFACE_NODE, &interface_ipv6_pim_cmd);
 	install_element(INTERFACE_NODE, &interface_ipv6_pim_passive_cmd);
+	install_element(INTERFACE_NODE, &interface_ipv6_pim_light_cmd);
 	install_element(INTERFACE_NODE, &interface_ipv6_pim_drprio_cmd);
 	install_element(INTERFACE_NODE, &interface_no_ipv6_pim_drprio_cmd);
 	install_element(INTERFACE_NODE, &interface_ipv6_pim_hello_cmd);
@@ -3239,6 +3284,7 @@ void pim_cmd_init(void)
 	install_element(VIEW_NODE, &show_ipv6_pim_bsr_rpdb_cmd);
 	install_element(VIEW_NODE, &show_ipv6_pim_bsr_groups_cmd);
 	install_element(VIEW_NODE, &show_ipv6_pim_statistics_cmd);
+	install_element(VIEW_NODE, &show_ipv6_pim_dimt_umh_cmd);
 	install_element(VIEW_NODE, &show_ipv6_pim_upstream_cmd);
 	install_element(VIEW_NODE, &show_ipv6_pim_upstream_vrf_all_cmd);
 	install_element(VIEW_NODE, &show_ipv6_pim_upstream_join_desired_cmd);

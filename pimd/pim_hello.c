@@ -304,7 +304,8 @@ int pim_hello_recv(struct interface *ifp, pim_addr src_addr, uint8_t *tlv_buf,
 			hello_option_propagation_delay,
 			hello_option_override_interval,
 			hello_option_dr_priority, hello_option_generation_id,
-			hello_option_addr_list, PIM_NEIGHBOR_SEND_DELAY);
+			hello_option_addr_list, PIM_NEIGHBOR_SEND_DELAY,
+			false /* light */);
 		if (!neigh) {
 			if (PIM_DEBUG_PIM_HELLO)
 				zlog_warn(
@@ -353,7 +354,8 @@ int pim_hello_recv(struct interface *ifp, pim_addr src_addr, uint8_t *tlv_buf,
 						 hello_option_dr_priority,
 						 hello_option_generation_id,
 						 hello_option_addr_list,
-						 PIM_NEIGHBOR_SEND_NOW);
+						 PIM_NEIGHBOR_SEND_NOW,
+						 false /* light */);
 			if (!neigh) {
 				if (PIM_DEBUG_PIM_HELLO)
 					zlog_debug(

@@ -3034,7 +3034,7 @@ route_set_lcommunity(void *rule, const struct prefix *prefix, void *object)
 	if (old && old->refcnt == 0)
 		lcommunity_free(&old);
 
-	/* will be intern()'d or attr_flush()'d by bgp_update_main() */
+	/* will be intern()'d or attr_flush()'d by bgp_update() */
 	bgp_attr_set_lcommunity(attr, new);
 
 	return RMAP_OKAY;
@@ -3381,7 +3381,7 @@ route_set_ecommunity(void *rule, const struct prefix *prefix, void *object)
 	} else
 		new_ecom = ecommunity_dup(rcs->ecom);
 
-	/* will be intern()'d or attr_flush()'d by bgp_update_main() */
+	/* will be intern()'d or attr_flush()'d by bgp_update() */
 	bgp_attr_set_ecommunity(path->attr, new_ecom);
 
 	return RMAP_OKAY;
@@ -3468,6 +3468,227 @@ static const struct route_map_rule_cmd route_set_ecommunity_soo_cmd = {
 	"extcommunity soo",
 	route_set_ecommunity,
 	route_set_ecommunity_soo_compile,
+	route_set_ecommunity_free,
+};
+
+/* `set extcommunity vrf-route-import COMMUNITY' -- RFC 6514 VRF Route Import
+ * (IP-address-specific, sub-type 0x0b). A (GTM: global-table) multicast source
+ * PE attaches this to the unicast route toward C-S so a receiver can key the
+ * C-multicast (Type-7) join's Route Target on this PE. */
+static void *route_set_ecommunity_vri_compile(const char *arg)
+{
+	struct rmap_ecom_set *rcs;
+	struct ecommunity *ecom;
+
+	ecom = ecommunity_str2com(arg, ECOMMUNITY_VRF_ROUTE_IMPORT, 0);
+	if (!ecom)
+		return NULL;
+
+	rcs = XCALLOC(MTYPE_ROUTE_MAP_COMPILED, sizeof(struct rmap_ecom_set));
+	rcs->ecom = ecommunity_intern(ecom);
+	rcs->none = false;
+
+	return rcs;
+}
+
+/* Set community rule structure. */
+static const struct route_map_rule_cmd route_set_ecommunity_vri_cmd = {
+	"extcommunity vrf-route-import",
+	route_set_ecommunity,
+	route_set_ecommunity_vri_compile,
+	route_set_ecommunity_free,
+};
+
+/* `set extcommunity umh <A.B.C.D|X:X::X:X> <pim|amt-relay> [preference (0-15)]'
+ * -- DIMT Upstream Multicast Hop (draft-zzhang-mboned-dynamic-internet-mcast-
+ * tunnel). Attached to the unicast route toward a multicast source so a
+ * receiver can steer its (S,G) RPF onto the PIM Light tunnel facing the UMH.
+ *
+ * The IPv4 UMH is an 8-byte IPv4-address-specific EC riding attr->ecommunity
+ * (BGP_ATTR_EXT_COMMUNITIES); the IPv6 UMH is a 20-byte IPv6-address-specific
+ * EC riding attr->ipv6_ecommunity (BGP_ATTR_IPV6_EXT_COMMUNITIES). The compiled
+ * ecommunity's unit_size records which, and the apply fans it to the matching
+ * attribute list. */
+static enum route_map_cmd_result_t
+route_set_ecommunity_umh(void *rule, const struct prefix *prefix, void *object)
+{
+	struct rmap_ecom_set *rcs = rule;
+	struct bgp_path_info *path = object;
+	struct attr *attr = path->attr;
+	struct ecommunity *old_ecom, *new_ecom;
+	bool is_v6;
+
+	if (!rcs->ecom)
+		return RMAP_OKAY;
+
+	/* unit_size == 20 => IPv6-address-specific EC (attr 25); else the
+	 * 8-byte IPv4-address-specific EC (attr 16). */
+	is_v6 = (rcs->ecom->unit_size == IPV6_ECOMMUNITY_SIZE);
+
+	/* Additive, mirroring route_set_ecommunity(); merge/dup stride by
+	 * unit_size so the 20-byte v6 list is handled identically. */
+	old_ecom = is_v6 ? bgp_attr_get_ipv6_ecommunity(attr)
+			 : bgp_attr_get_ecommunity(attr);
+
+	if (old_ecom) {
+		new_ecom = ecommunity_merge(ecommunity_dup(old_ecom), rcs->ecom);
+
+		/* old_ecom->refcnt == 1 => owned elsewhere (e.g.
+		 * bgp_update_receive()); == 0 => set by a previous route-map
+		 * statement. */
+		if (!old_ecom->refcnt)
+			ecommunity_free(&old_ecom);
+	} else
+		new_ecom = ecommunity_dup(rcs->ecom);
+
+	/* interned or attr_flush()'d by bgp_update(). */
+	if (is_v6)
+		bgp_attr_set_ipv6_ecommunity(attr, new_ecom);
+	else
+		bgp_attr_set_ecommunity(attr, new_ecom);
+
+	return RMAP_OKAY;
+}
+
+/* Parse a "set extcommunity umh" argument string:
+ *   <A.B.C.D|X:X::X:X> <pim|amt-relay> [preference (0-15)]
+ * Shared by the route-map compile below and the northbound VALIDATE stage
+ * (bgp_routemap_nb_config.c): a compile failure surfacing only at NB APPLY
+ * cannot reject the transaction anymore, so it would leave a set rule that
+ * shows in the running config but installed nothing -- multicast silently
+ * never starts. Validating up front turns that into a loud config error.
+ * Stricter than the old sscanf: a bare/incomplete "preference" tail or
+ * trailing junk is an error rather than a silent preference of 0. */
+bool bgp_route_set_umh_parse(const char *arg, struct ipaddr *umh,
+			     uint8_t *umh_type, uint8_t *preference,
+			     char *errmsg, size_t errmsg_len)
+{
+	char buf[128];
+	char *tok[4] = {};
+	char *t, *saveptr = NULL, *end = NULL;
+	unsigned long pref;
+	int ntok = 0;
+
+	if (strlcpy(buf, arg, sizeof(buf)) >= sizeof(buf)) {
+		snprintf(errmsg, errmsg_len, "%% UMH argument too long");
+		return false;
+	}
+
+	for (t = strtok_r(buf, " \t", &saveptr); t;
+	     t = strtok_r(NULL, " \t", &saveptr)) {
+		if (ntok == 4) {
+			snprintf(errmsg, errmsg_len,
+				 "%% Trailing junk after UMH preference");
+			return false;
+		}
+		tok[ntok++] = t;
+	}
+
+	if (ntok != 2 && ntok != 4) {
+		snprintf(errmsg, errmsg_len,
+			 "%% Expected: <A.B.C.D|X:X::X:X> <pim|amt-relay> [preference (0-15)]");
+		return false;
+	}
+
+	memset(umh, 0, sizeof(*umh));
+	if (inet_pton(AF_INET, tok[0], &umh->ipaddr_v4) == 1)
+		SET_IPADDR_V4(umh);
+	else if (inet_pton(AF_INET6, tok[0], &umh->ipaddr_v6) == 1)
+		SET_IPADDR_V6(umh);
+	else {
+		snprintf(errmsg, errmsg_len, "%% Invalid UMH address '%s'",
+			 tok[0]);
+		return false;
+	}
+
+	if (strmatch(tok[1], "pim"))
+		*umh_type = ZAPI_UMH_TYPE_PIM;
+	else if (strmatch(tok[1], "amt-relay"))
+		*umh_type = ZAPI_UMH_TYPE_AMT_RELAY;
+	else {
+		snprintf(errmsg, errmsg_len,
+			 "%% Invalid UMH type '%s' (must be pim or amt-relay)",
+			 tok[1]);
+		return false;
+	}
+
+	*preference = 0;
+	if (ntok == 4) {
+		if (!strmatch(tok[2], "preference")) {
+			snprintf(errmsg, errmsg_len,
+				 "%% Unexpected token '%s' (expected 'preference')",
+				 tok[2]);
+			return false;
+		}
+		pref = strtoul(tok[3], &end, 10);
+		if (!isdigit((unsigned char)tok[3][0]) || tok[3][0] == '\0' ||
+		    *end != '\0' || pref > ZAPI_UMH_PREF_MAX) {
+			snprintf(errmsg, errmsg_len,
+				 "%% UMH preference must be 0-%d",
+				 ZAPI_UMH_PREF_MAX);
+			return false;
+		}
+		*preference = pref;
+	}
+
+	return true;
+}
+
+static void *route_set_ecommunity_umh_compile(const char *arg)
+{
+	struct rmap_ecom_set *rcs;
+	struct ecommunity *ecom;
+	struct ipaddr umh = {};
+	uint8_t umh_type = 0;
+	uint8_t pref = 0;
+	char errmsg[128];
+
+	if (!bgp_route_set_umh_parse(arg, &umh, &umh_type, &pref, errmsg,
+				     sizeof(errmsg)))
+		return NULL;
+
+	ecom = ecommunity_new();
+	if (IS_IPADDR_V6(&umh)) {
+		struct ecommunity_val_ipv6 eval = {};
+
+		/* IPv6-address-specific: type octet 0x00 (== ENCODE_AS),
+		 * 16-byte Global Admin at val[2..17], Local Admin low byte at
+		 * val[19]; the 20-byte unit is what marks it IPv6. */
+		eval.val[0] = ECOMMUNITY_ENCODE_AS;
+		eval.val[1] = ECOMMUNITY_UMH;
+		memcpy(&eval.val[2], &umh.ipaddr_v6, sizeof(umh.ipaddr_v6));
+		eval.val[18] = 0;
+		eval.val[19] = ECOMMUNITY_UMH_LA(pref, umh_type);
+
+		/* ecommunity_add_val_internal() does not update ecom->unit_size
+		 * (it only uses the passed size for striding), so set it here
+		 * before the add -- otherwise the 20-byte payload would carry a
+		 * stale unit_size of 8 and corrupt every downstream stride. */
+		ecom->unit_size = IPV6_ECOMMUNITY_SIZE;
+		ecommunity_add_val_ipv6(ecom, &eval, false, false);
+	} else {
+		struct ecommunity_val eval = {};
+
+		eval.val[0] = ECOMMUNITY_ENCODE_IP;
+		eval.val[1] = ECOMMUNITY_UMH;
+		memcpy(&eval.val[2], &umh.ipaddr_v4.s_addr,
+		       sizeof(umh.ipaddr_v4.s_addr));
+		eval.val[6] = 0;
+		eval.val[7] = ECOMMUNITY_UMH_LA(pref, umh_type);
+		ecommunity_add_val(ecom, &eval, false, false);
+	}
+
+	rcs = XCALLOC(MTYPE_ROUTE_MAP_COMPILED, sizeof(struct rmap_ecom_set));
+	rcs->ecom = ecommunity_intern(ecom);
+	rcs->none = false;
+
+	return rcs;
+}
+
+static const struct route_map_rule_cmd route_set_ecommunity_umh_cmd = {
+	"extcommunity umh",
+	route_set_ecommunity_umh,
+	route_set_ecommunity_umh_compile,
 	route_set_ecommunity_free,
 };
 
@@ -7422,6 +7643,110 @@ ALIAS_YANG (no_set_ecommunity_soo,
             "GP extended community attribute\n"
             "Site-of-Origin extended community\n")
 
+DEFUN_YANG (set_ecommunity_vri,
+	    set_ecommunity_vri_cmd,
+	    "set extcommunity vrf-route-import ASN:NN_OR_IP-ADDRESS:NN...",
+	    SET_STR
+	   "BGP extended community attribute\n"
+	   "VRF Route Import extended community (RFC 6514)\n"
+	   "VPN extended community\n")
+{
+	int idx_asn_nn = 3;
+	char *str;
+	int ret;
+	const char *xpath =
+		"./set-action[action='frr-bgp-route-map:set-extcommunity-vrf-route-import']";
+	char xpath_value[XPATH_MAXLEN];
+
+	nb_cli_enqueue_change(vty, xpath, NB_OP_CREATE, NULL);
+
+	snprintf(xpath_value, sizeof(xpath_value),
+		 "%s/rmap-set-action/frr-bgp-route-map:extcommunity-vrf-route-import",
+		 xpath);
+	str = argv_concat(argv, argc, idx_asn_nn);
+	nb_cli_enqueue_change(vty, xpath_value, NB_OP_MODIFY, str);
+	ret = nb_cli_apply_changes(vty, NULL);
+	XFREE(MTYPE_TMP, str);
+	return ret;
+}
+
+DEFUN_YANG (no_set_ecommunity_vri,
+	    no_set_ecommunity_vri_cmd,
+	    "no set extcommunity vrf-route-import ASN:NN_OR_IP-ADDRESS:NN...",
+	    NO_STR
+	    SET_STR
+	    "BGP extended community attribute\n"
+	    "VRF Route Import extended community (RFC 6514)\n"
+	    "VPN extended community\n")
+{
+	const char *xpath =
+		"./set-action[action='frr-bgp-route-map:set-extcommunity-vrf-route-import']";
+	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
+	return nb_cli_apply_changes(vty, NULL);
+}
+
+ALIAS_YANG (no_set_ecommunity_vri,
+            no_set_ecommunity_vri_short_cmd,
+            "no set extcommunity vrf-route-import",
+            NO_STR
+            SET_STR
+            "BGP extended community attribute\n"
+            "VRF Route Import extended community (RFC 6514)\n")
+
+DEFPY_YANG (set_ecommunity_umh,
+	    set_ecommunity_umh_cmd,
+	    "set extcommunity umh <A.B.C.D|X:X::X:X>$umh <pim|amt-relay>$kind [preference (0-15)$pref]",
+	    SET_STR
+	    "BGP extended community attribute\n"
+	    "DIMT Upstream Multicast Hop extended community\n"
+	    "UMH IPv4 address\n"
+	    "UMH IPv6 address\n"
+	    "UMH is a PIM (Light) tunnel endpoint\n"
+	    "UMH is an AMT relay\n"
+	    "UMH preference\n"
+	    "Preference value (higher preferred)\n")
+{
+	char value[96];
+	int ret;
+	const char *xpath =
+		"./set-action[action='frr-bgp-route-map:set-extcommunity-umh']";
+	char xpath_value[XPATH_MAXLEN];
+
+	nb_cli_enqueue_change(vty, xpath, NB_OP_CREATE, NULL);
+
+	snprintf(xpath_value, sizeof(xpath_value),
+		 "%s/rmap-set-action/frr-bgp-route-map:extcommunity-umh",
+		 xpath);
+	if (pref_str)
+		snprintf(value, sizeof(value), "%s %s preference %ld",
+			 umh_str, kind, pref);
+	else
+		snprintf(value, sizeof(value), "%s %s", umh_str, kind);
+	nb_cli_enqueue_change(vty, xpath_value, NB_OP_MODIFY, value);
+	ret = nb_cli_apply_changes(vty, NULL);
+	return ret;
+}
+
+DEFPY_YANG (no_set_ecommunity_umh,
+	    no_set_ecommunity_umh_cmd,
+	    "no set extcommunity umh [<A.B.C.D|X:X::X:X> <pim|amt-relay> [preference (0-15)]]",
+	    NO_STR
+	    SET_STR
+	    "BGP extended community attribute\n"
+	    "DIMT Upstream Multicast Hop extended community\n"
+	    "UMH IPv4 address\n"
+	    "UMH IPv6 address\n"
+	    "UMH is a PIM (Light) tunnel endpoint\n"
+	    "UMH is an AMT relay\n"
+	    "UMH preference\n"
+	    "Preference value (higher preferred)\n")
+{
+	const char *xpath =
+		"./set-action[action='frr-bgp-route-map:set-extcommunity-umh']";
+	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
+	return nb_cli_apply_changes(vty, NULL);
+}
+
 DEFUN_YANG(set_ecommunity_none, set_ecommunity_none_cmd,
 	   "set extcommunity none",
 	   SET_STR
@@ -8437,6 +8762,8 @@ void bgp_route_map_init(void)
 	route_map_install_set(&route_set_ecommunity_rt_cmd);
 	route_map_install_set(&route_set_ecommunity_nt_cmd);
 	route_map_install_set(&route_set_ecommunity_soo_cmd);
+	route_map_install_set(&route_set_ecommunity_vri_cmd);
+	route_map_install_set(&route_set_ecommunity_umh_cmd);
 	route_map_install_set(&route_set_ecommunity_lb_cmd);
 	route_map_install_set(&route_set_ecommunity_color_cmd);
 	route_map_install_set(&route_set_ecommunity_none_cmd);
@@ -8546,6 +8873,11 @@ void bgp_route_map_init(void)
 	install_element(RMAP_NODE, &set_ecommunity_soo_cmd);
 	install_element(RMAP_NODE, &no_set_ecommunity_soo_cmd);
 	install_element(RMAP_NODE, &no_set_ecommunity_soo_short_cmd);
+	install_element(RMAP_NODE, &set_ecommunity_vri_cmd);
+	install_element(RMAP_NODE, &no_set_ecommunity_vri_cmd);
+	install_element(RMAP_NODE, &set_ecommunity_umh_cmd);
+	install_element(RMAP_NODE, &no_set_ecommunity_umh_cmd);
+	install_element(RMAP_NODE, &no_set_ecommunity_vri_short_cmd);
 	install_element(RMAP_NODE, &set_ecommunity_lb_cmd);
 	install_element(RMAP_NODE, &no_set_ecommunity_lb_cmd);
 	install_element(RMAP_NODE, &no_set_ecommunity_lb_short_cmd);

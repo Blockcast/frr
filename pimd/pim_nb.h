@@ -18,6 +18,8 @@ int routing_control_plane_protocols_control_plane_protocol_pim_address_family_ec
 	struct nb_cb_modify_args *args);
 int routing_control_plane_protocols_control_plane_protocol_pim_address_family_ecmp_rebalance_modify(
 	struct nb_cb_modify_args *args);
+int routing_control_plane_protocols_control_plane_protocol_pim_address_family_mvpn_gtm_modify(
+	struct nb_cb_modify_args *args);
 int pim_address_family_join_prune_interval_modify(struct nb_cb_modify_args *args);
 int routing_control_plane_protocols_control_plane_protocol_pim_address_family_keep_alive_timer_modify(
 	struct nb_cb_modify_args *args);
@@ -136,6 +138,8 @@ int lib_interface_pim_address_family_destroy(struct nb_cb_destroy_args *args);
 int lib_interface_pim_address_family_pim_enable_modify(
 	struct nb_cb_modify_args *args);
 int lib_interface_pim_address_family_pim_passive_enable_modify(
+	struct nb_cb_modify_args *args);
+int lib_interface_pim_address_family_pim_light_enable_modify(
 	struct nb_cb_modify_args *args);
 int lib_interface_pim_address_family_pim_mode_modify(struct nb_cb_modify_args *args);
 int lib_interface_pim_address_family_hello_interval_modify(

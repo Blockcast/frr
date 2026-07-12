@@ -239,6 +239,19 @@ module frr-bgp-route-map {
       "Set BGP extended community attribute";
   }
 
+  identity set-extcommunity-vrf-route-import {
+    base frr-route-map:rmap-set-type;
+    description
+      "Set BGP VRF Route Import extended community attribute (RFC 6514)";
+  }
+
+  identity set-extcommunity-umh {
+    base frr-route-map:rmap-set-type;
+    description
+      "Set the DIMT Upstream Multicast Hop extended community
+       (draft-zzhang-mboned-dynamic-internet-mcast-tunnel)";
+  }
+
   identity set-extcommunity-lb {
     base frr-route-map:rmap-set-type;
     description
@@ -1054,6 +1067,29 @@ identity set-extcommunity-color {
         type string;
         description
           "Set BGP ext-community site-of-origin attribute";
+      }
+    }
+
+    case extcommunity-vrf-route-import {
+      when "derived-from-or-self(../frr-route-map:action, 'frr-bgp-route-map:set-extcommunity-vrf-route-import')";
+      description
+        "Value of the ext-community";
+      leaf extcommunity-vrf-route-import {
+        type string;
+        description
+          "Set BGP VRF Route Import ext-community attribute (RFC 6514)";
+      }
+    }
+
+    case extcommunity-umh {
+      when "derived-from-or-self(../frr-route-map:action, 'frr-bgp-route-map:set-extcommunity-umh')";
+      description
+        "Value of the ext-community";
+      leaf extcommunity-umh {
+        type string;
+        description
+          "Set the DIMT Upstream Multicast Hop ext-community:
+           '<A.B.C.D|X:X::X:X> <pim|amt-relay> [preference (0-15)]'";
       }
     }
 
