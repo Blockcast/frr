@@ -340,6 +340,7 @@ static int bgp_router_id_set(struct bgp *bgp, const struct in_addr *id,
 	/* EVPN uses router id in RD, withdraw them */
 	if (is_evpn_enabled())
 		bgp_evpn_handle_router_id_update(bgp, true);
+	bgp_mvpn_handle_router_id_update(bgp, true);
 
 	vpn_handle_router_id_update(bgp, true, is_config);
 
@@ -365,11 +366,8 @@ static int bgp_router_id_set(struct bgp *bgp, const struct in_addr *id,
 
 	vpn_handle_router_id_update(bgp, false, is_config);
 
-	/* GTM MCAST-VPN: (re)originate this PE's Intra-AS I-PMSI (Type-1) route
-	 * now that the router-id (Originating Router's IP) is known/changed.
-	 * No-op unless the GTM MVPN AF is active (RFC 6514 Section 4.1).
-	 */
-	bgp_mvpn_originate_type1(bgp);
+	/* Re-originate the MVPN Type-1 under the new router-id. */
+	bgp_mvpn_handle_router_id_update(bgp, false);
 
 	if (bgp && bgp->ls_info && bgp->ls_info->enable_distribution)
 		bgp_ls_export_bgp_topology(bgp);

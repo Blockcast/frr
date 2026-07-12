@@ -119,6 +119,10 @@ extern void bgp_mvpn_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, s
  * either AFI. Gate for the pimd->bgpd SG replay subscription. */
 extern bool bgp_mvpn_gtm_active(struct bgp *bgp);
 
+/* Withdraw the old Type-1 before a router-id change, or originate the new
+ * Type-1 afterward. */
+extern void bgp_mvpn_handle_router_id_update(struct bgp *bgp, bool withdraw);
+
 /* `show bgp ipv4 mvpn [json]` printer. */
 extern void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_json);
 

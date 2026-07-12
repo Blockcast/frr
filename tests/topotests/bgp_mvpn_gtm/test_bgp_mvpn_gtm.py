@@ -46,6 +46,7 @@ sys.path.append(os.path.join(CWD, "../"))
 
 # pylint: disable=C0413
 from lib import topotest
+from lib.common_config import kill_router_daemons, start_router_daemons
 from lib.topogen import Topogen, TopoRouter, get_topogen
 from lib.topolog import logger
 
@@ -778,6 +779,75 @@ interface r2-eth1
     test_func = functools.partial(_type7_v6_absent, "r1")
     _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
     assert result is None, "r1 still holds the IPv6 Type-7 after the MLD leave"
+
+
+def test_type1_router_id_lifecycle():
+    """A router-id change withdraws the old Type-1 in both MVPN planes."""
+    tgen = get_topogen()
+    r1 = tgen.gears["r1"]
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r1.vtysh_cmd(
+        """
+configure terminal
+router bgp 65001
+ bgp router-id 10.0.0.3
+"""
+    )
+
+    def _type1_rekeyed(router, v6):
+        endpoints = {
+            route.get("pmsiTunnel", {}).get("endpoint")
+            for route in _mvpn_routes(router, v6=v6)
+            if route.get("routeType") == 1
+        }
+        if "10.0.0.3" in endpoints and "10.0.0.1" not in endpoints:
+            return None
+        return "Type-1 endpoints did not rekey from 10.0.0.1 to 10.0.0.3: {}".format(
+            endpoints
+        )
+
+    for router in ("r1", "r2"):
+        for v6 in (False, True):
+            test_func = functools.partial(_type1_rekeyed, router, v6)
+            _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+            assert result is None, "{} retained a stale {} Type-1 after router-id change".format(
+                router, "IPv6" if v6 else "IPv4"
+            )
+
+    r1.vtysh_cmd(
+        """
+configure terminal
+router bgp 65001
+ no bgp router-id
+"""
+    )
+
+    def _removed_id_absent(v6):
+        endpoints = {
+            route.get("pmsiTunnel", {}).get("endpoint")
+            for route in _mvpn_routes("r1", v6=v6)
+            if route.get("routeType") == 1
+        }
+        if "10.0.0.3" not in endpoints:
+            return None
+        return "removed router-id still has a Type-1 route: {}".format(endpoints)
+
+    for v6 in (False, True):
+        test_func = functools.partial(_removed_id_absent, v6)
+        _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+        assert result is None, "r1 retained the removed router-id's Type-1"
+
+    # Persist the removal, restart bgpd, and verify reconstruction does not
+    # resurrect the removed Type-1 key.
+    kill_router_daemons(tgen, "r1", ["bgpd"], save_config=True)
+    start_router_daemons(tgen, "r1", ["bgpd"])
+    for v6 in (False, True):
+        test_func = functools.partial(_removed_id_absent, v6)
+        _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+        assert result is None, "r1 resurrected a removed Type-1 after bgpd restart"
 
 
 if __name__ == "__main__":
