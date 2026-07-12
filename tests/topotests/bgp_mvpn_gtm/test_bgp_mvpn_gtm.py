@@ -928,18 +928,27 @@ no router bgp 65001
 """
     )
 
-    def _remote_type1_absent(v6, endpoints):
+    def _type1_absent_after_instance_delete(v6, endpoints):
+        local = {
+            route.get("pmsiTunnel", {}).get("endpoint")
+            for route in _mvpn_routes("r1", v6=v6)
+            if route.get("routeType") == 1
+        }
         remaining = {
             route.get("pmsiTunnel", {}).get("endpoint")
             for route in _mvpn_routes("r2", v6=v6)
             if route.get("routeType") == 1
         }
-        if not endpoints.intersection(remaining):
+        if not endpoints.intersection(local) and not endpoints.intersection(remaining):
             return None
-        return "deleted instance's Type-1 remains: {}".format(remaining)
+        return "deleted instance's Type-1 remains: local={} remote={}".format(
+            local, remaining
+        )
 
     for v6, endpoints in ((False, initial_v4), (True, initial_v6)):
-        test_func = functools.partial(_remote_type1_absent, v6, endpoints)
+        test_func = functools.partial(
+            _type1_absent_after_instance_delete, v6, endpoints
+        )
         _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
         assert result is None, result
 
