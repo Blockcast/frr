@@ -850,6 +850,100 @@ router bgp 65001
         assert result is None, "r1 resurrected a removed Type-1 after bgpd restart"
 
 
+def test_type1_address_family_and_instance_lifecycle():
+    """AF deactivation and instance deletion withdraw self-originated Type-1s."""
+    tgen = get_topogen()
+    r1 = tgen.gears["r1"]
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _local_type1_endpoints(v6):
+        return {
+            route.get("pmsiTunnel", {}).get("endpoint")
+            for route in _mvpn_routes("r1", v6=v6)
+            if route.get("routeType") == 1
+        }
+
+    initial_v4 = _local_type1_endpoints(False)
+    initial_v6 = _local_type1_endpoints(True)
+    assert initial_v4, "r1 had no IPv4 Type-1 before lifecycle test"
+    assert initial_v6, "r1 had no IPv6 Type-1 before lifecycle test"
+
+    r1.vtysh_cmd(
+        """
+configure terminal
+router bgp 65001
+ address-family ipv6 mvpn
+  no neighbor 10.0.0.2 activate
+"""
+    )
+
+    def _v6_withdrawn_v4_retained():
+        v4 = _local_type1_endpoints(False)
+        v6 = _local_type1_endpoints(True)
+        if initial_v4.issubset(v4) and not initial_v6.intersection(v6):
+            return None
+        return "AF deactivation left v4={} v6={}".format(v4, v6)
+
+    _, result = topotest.run_and_expect(
+        _v6_withdrawn_v4_retained, None, count=60, wait=1
+    )
+    assert result is None, result
+
+    # Repeating cleanup after the AF and route are already absent is a no-op.
+    r1.vtysh_cmd(
+        """
+configure terminal
+router bgp 65001
+ address-family ipv6 mvpn
+  no neighbor 10.0.0.2 activate
+"""
+    )
+    assert _v6_withdrawn_v4_retained() is None
+
+    r1.vtysh_cmd(
+        """
+configure terminal
+router bgp 65001
+ address-family ipv6 mvpn
+  neighbor 10.0.0.2 activate
+"""
+    )
+
+    def _both_restored():
+        if initial_v4.issubset(_local_type1_endpoints(False)) and initial_v6.issubset(
+            _local_type1_endpoints(True)
+        ):
+            return None
+        return "Type-1 routes were not restored after AF reactivation"
+
+    _, result = topotest.run_and_expect(_both_restored, None, count=60, wait=1)
+    assert result is None, result
+
+    r1.vtysh_cmd(
+        """
+configure terminal
+no router bgp 65001
+"""
+    )
+
+    def _remote_type1_absent(v6, endpoints):
+        remaining = {
+            route.get("pmsiTunnel", {}).get("endpoint")
+            for route in _mvpn_routes("r2", v6=v6)
+            if route.get("routeType") == 1
+        }
+        if not endpoints.intersection(remaining):
+            return None
+        return "deleted instance's Type-1 remains: {}".format(remaining)
+
+    for v6, endpoints in ((False, initial_v4), (True, initial_v6)):
+        test_func = functools.partial(_remote_type1_absent, v6, endpoints)
+        _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+        assert result is None, result
+
+
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
     sys.exit(pytest.main(args))

@@ -814,7 +814,7 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 	bool active[AFI_MAX] = {};
 	afi_t afi;
 
-	if (bgp->router_id.s_addr == INADDR_ANY)
+	if (bgp->router_id.s_addr == INADDR_ANY || !bgp->peer_self)
 		return;
 
 	active[AFI_IP] = bgp_afi_safi_peer_exists(bgp, AFI_IP, SAFI_MCAST_VPN);
@@ -903,16 +903,10 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 	aspath_unintern(&attr.aspath);
 }
 
-void bgp_mvpn_handle_router_id_update(struct bgp *bgp, bool withdraw)
+void bgp_mvpn_withdraw_type1(struct bgp *bgp, afi_t afi)
 {
 	struct prefix_mvpn p;
 	struct ipaddr orig;
-	afi_t afi;
-
-	if (!withdraw) {
-		bgp_mvpn_originate_type1(bgp);
-		return;
-	}
 
 	if (bgp->router_id.s_addr == INADDR_ANY)
 		return;
@@ -920,10 +914,22 @@ void bgp_mvpn_handle_router_id_update(struct bgp *bgp, bool withdraw)
 	orig = mvpn_ipaddr_v4(bgp->router_id);
 	bgp_mvpn_build_prefix_type1(&p, &orig);
 
+	bgp_mvpn_route_remove(bgp, bgp->peer_self, afi, &p, BGP_ROUTE_STATIC);
+}
+
+void bgp_mvpn_handle_router_id_update(struct bgp *bgp, bool withdraw)
+{
+	afi_t afi;
+
+	if (!withdraw) {
+		bgp_mvpn_originate_type1(bgp);
+		return;
+	}
+
 	/* The route may exist in either plane even if its last peer was just
 	 * deactivated, so look up and remove both copies unconditionally. */
 	for (afi = AFI_IP; afi <= AFI_IP6; afi++)
-		bgp_mvpn_route_remove(bgp, bgp->peer_self, afi, &p, BGP_ROUTE_STATIC);
+		bgp_mvpn_withdraw_type1(bgp, afi);
 }
 
 /*
