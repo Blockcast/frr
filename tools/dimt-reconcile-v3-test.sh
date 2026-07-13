@@ -120,6 +120,8 @@ $RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
 check "receiver: mroute withdrawn on leave (holddown 0)" \
 	grep -q "no ip mroute 69.25.95.102/32 10.99.0.47" "$TESTDIR/vty.log"
 check "receiver: state cleaned" sh -c "! test -f '$STATE/mroute-69.25.95.102'"
+check "receiver: last leave GCs via v2 --allow-empty (no leaked tunnel)" \
+	grep -q -- "--allow-empty" "$TESTDIR/v2.log"
 
 # --- source-pe mode ---------------------------------------------------
 

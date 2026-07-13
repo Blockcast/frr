@@ -258,8 +258,14 @@ sync_tunnels() {
 	mv "$overlay.tmp" "$overlay"
 	union=$( { sed 's/#.*//' /etc/dimt/peers 2>/dev/null; cat "$overlay"; } |
 		tr -d ' \t\r' | grep . | sort -u | tr '\n' ',' | sed 's/,$//')
-	[ -n "$union" ] || return 0
-	run "$V2" --self "$SELF" --peers "$union"
+	# An EMPTY union is passed explicitly (--allow-empty, registry file
+	# overridden) so the LAST leave GCs the last tunnel -- a fully-dynamic
+	# site (empty registry) would otherwise leak the final tunnel forever.
+	if [ -n "$union" ]; then
+		run "$V2" --self "$SELF" --peers "$union"
+	else
+		run "$V2" --self "$SELF" --peers-file /dev/null --allow-empty
+	fi
 }
 
 receiver_pass() {
