@@ -328,6 +328,22 @@ ensure_peer() { # <peer-overlay>
 
 	run ip link set "$dev" mtu "$MTU" multicast on up || return 1
 
+	# OpenWrt defaults rx-gro-list (fraglist GRO) ON for every netdev.
+	# It coalesces same-outer-tuple UDP and each stage on this path
+	# then eats the aggregate: on the underlay device the FOU/GRE
+	# decap processes only the head segment, and on the tunnel itself
+	# the inner aggregate is mangled in bridge/DSA TX segmentation.
+	# Measured 2/3 silent loss at 26-52 Mbps with every drop counter
+	# clean; 99.97% delivery with the flag off (2026-07-13).  Direct
+	# (not via run): best-effort on both real and DRY passes would
+	# pollute the DRY trace; ethtool may be absent and non-OpenWrt
+	# kernels default the flag off, so failures are ignored.
+	if [ "$DRY" != 1 ] && command -v ethtool >/dev/null 2>&1; then
+		ethtool -K "$dev" rx-gro-list off 2>/dev/null
+		[ -n "$out_dev" ] &&
+			ethtool -K "$out_dev" rx-gro-list off 2>/dev/null
+	fi
+
 	# An already-correct address passes the grep and is left alone;
 	# only a real flush-then-add failure fails the peer.  The flush is
 	# family-scoped: an unscoped flush would also remove the IPv6
