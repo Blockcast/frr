@@ -150,7 +150,7 @@ vty_conf() {
 	out=$(vtysh -c 'configure terminal' "$@" 2>&1)
 	rc=$?
 	if [ $rc -ne 0 ] || printf '%s\n' "$out" |
-		grep -v 'No changes found' | grep -q '^%'; then
+		 grep -vE 'No changes found|Configuration applied with notes' | grep -q '^%'; then
 		log "vtysh config failed: $out"
 		return 1
 	fi
