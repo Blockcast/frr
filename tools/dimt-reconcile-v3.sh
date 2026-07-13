@@ -617,7 +617,14 @@ if [ -n "$TRIGGER_IFACE" ] && [ "$ONCE" = 0 ]; then
 				sleep 2
 			  done >"$FIFO" ) &
 			TCPDUMP_LOOP=$!
-			trap 'pkill -P $TCPDUMP_LOOP 2>/dev/null; kill $TCPDUMP_LOOP 2>/dev/null; rm -f "$FIFO"' EXIT INT TERM
+			trap 'pkill -P $TCPDUMP_LOOP 2>/dev/null; kill $TCPDUMP_LOOP 2>/dev/null; rm -f "$FIFO"' EXIT
+			# A TERM/INT trap REPLACES default termination: without an
+			# explicit exit the shell resumes the main loop after the
+			# handler and the daemon becomes unkillable by SIGTERM
+			# (survives procd/systemd stop; observed 2026-07-13, only
+			# SIGKILL worked).  exit here fires the EXIT trap above.
+			trap 'exit 143' TERM
+			trap 'exit 130' INT
 			exec 3<>"$FIFO"   # <> so open never blocks and EOF never surfaces
 			# `read -t` probe: EOF on /dev/null exits 1 with the option
 			# accepted; an unsupported option (dash) exits 2.
