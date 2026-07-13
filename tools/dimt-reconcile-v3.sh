@@ -383,8 +383,10 @@ if [ -n "$TRIGGER_IFACE" ] && [ "$ONCE" = 0 ]; then
 			TCPDUMP_LOOP=$!
 			trap 'pkill -P $TCPDUMP_LOOP 2>/dev/null; kill $TCPDUMP_LOOP 2>/dev/null; rm -f "$FIFO"' EXIT INT TERM
 			exec 3<>"$FIFO"   # <> so open never blocks and EOF never surfaces
-			# `read -t` probe: busybox ash + bash have it; dash does not.
-			if (read -t 1 _ </dev/null) 2>/dev/null; then READ_T=1; else READ_T=0; fi
+			# `read -t` probe: EOF on /dev/null exits 1 with the option
+			# accepted; an unsupported option (dash) exits 2.
+			(read -r -t 0 _ </dev/null) 2>/dev/null
+			case $? in 0 | 1) READ_T=1 ;; *) READ_T=0 ;; esac
 			EVENTS=1
 			log "trigger armed on $TRIGGER_IFACE (filter: $TFILT; read -t: $READ_T)"
 		fi
