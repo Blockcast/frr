@@ -46,7 +46,7 @@ fi
 prev=""
 for a in "$@"; do
 	if [ "$prev" = "-c" ]; then
-		slug=$(echo "$a" | tr ' ' '-')
+		slug=$(echo "$a" | tr ' /' '--')
 		[ -f "$FAKEVTY_DIR/$slug" ] && cat "$FAKEVTY_DIR/$slug"
 	fi
 	prev="$a"
@@ -122,6 +122,67 @@ check "receiver: mroute withdrawn on leave (holddown 0)" \
 check "receiver: state cleaned" sh -c "! test -f '$STATE/mroute-69.25.95.102'"
 check "receiver: last leave GCs via v2 --allow-empty (no leaked tunnel)" \
 	grep -q -- "--allow-empty" "$TESTDIR/v2.log"
+
+# --- receiver mode: O2 BGP UMH discovery ------------------------------
+
+cat > "$TESTDIR/show-ip-igmp-sources" <<'EOF'
+Interface        Group           Source          Timer Fwd Uptime
+br-lan           232.0.0.1       69.25.95.102    04:10   Y 00:00:17
+EOF
+# two ECs on one line: preference 9 must beat preference 5; the amt
+# record must never match (pim tunnels only).
+cat > "$TESTDIR/show-bgp-ipv4-unicast-69.25.95.102-32" <<'EOF'
+BGP routing table entry for 69.25.95.102/32, version 2
+  65001
+    100.64.0.47 from 100.64.0.47 (100.64.0.47)
+      Origin IGP, metric 0, valid, external, best (First path received)
+      Extended Community: UMH:10.99.0.47:pim:5 UMH:10.99.0.99:pim:9 UMH:10.99.0.66:amt:15
+EOF
+: > "$TESTDIR/vty.log"; : > "$TESTDIR/v2.log"
+$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/no-such-map" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once >/dev/null 2>&1
+
+check "O2: peer discovered via BGP UMH (no map)" \
+	grep -q "ip mroute 69.25.95.102/32 10.99.0.99" "$TESTDIR/vty.log"
+check "O2: highest preference wins (9 over 5)" \
+	sh -c "! grep -q 'ip mroute 69.25.95.102/32 10.99.0.47' '$TESTDIR/vty.log'"
+check "O2: amt-type UMH never selected" \
+	sh -c "! grep -q '10.99.0.66' '$TESTDIR/vty.log'"
+check "O2: tunnel outer derived from UMH inner (v2 sees 100.64.0.99)" \
+	grep -q "100.64.0.99" "$TESTDIR/v2.log"
+
+# map entry overrides BGP discovery (local provisioning wins)
+cat > "$TESTDIR/show-ip-igmp-sources" <<'EOF'
+Interface        Group           Source          Timer Fwd Uptime
+br-lan           232.0.0.1       69.25.95.102    04:10   Y 00:00:17
+EOF
+echo "69.25.95.102 100.64.0.88" > "$TESTDIR/source-peers"
+rm -f "$STATE"/mroute-* "$STATE"/seen-*
+: > "$TESTDIR/vty.log"
+$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once >/dev/null 2>&1
+
+check "O2: static map overrides BGP UMH" \
+	grep -q "ip mroute 69.25.95.102/32 10.99.0.88" "$TESTDIR/vty.log"
+
+# neither map nor a pim-type UMH -> no state installed
+cat > "$TESTDIR/show-bgp-ipv4-unicast-69.25.95.102-32" <<'EOF'
+BGP routing table entry for 69.25.95.102/32, version 2
+      Extended Community: UMH:10.99.0.66:amt:15
+EOF
+rm -f "$STATE"/mroute-* "$STATE"/seen-*
+: > "$TESTDIR/vty.log"
+$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/no-such-map" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once >/dev/null 2>&1
+
+check "O2: amt-only UMH -> no peer, no mroute" \
+	sh -c "! grep -q 'ip mroute' '$TESTDIR/vty.log'"
+
+# cleanup for the source-pe block
+rm -f "$TESTDIR/show-bgp-ipv4-unicast-69.25.95.102-32" "$STATE"/mroute-* "$STATE"/seen-*
 
 # --- source-pe mode ---------------------------------------------------
 

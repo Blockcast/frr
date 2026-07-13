@@ -198,20 +198,59 @@ upstream_usable() { # <S> <G>
 }
 
 # Resolve the source-side DIMT peer for source S.
-# 1. static map (--source-map): "S peer" / "default peer" lines.
-# 2. TODO(O2): DNS -- reverse TYPE260 on S, select the non-geo
-#    DIMT-tier AMTRELAY record (NOT the geo-routed AMT relay FQDN --
-#    that would hand us our own site's relay).  Sketch:
-#      dig +short TYPE260 $(reverse_of $S).in-addr.arpa
-#    then map the DIMT-tier target to its overlay address.
+# 1. static map (--source-map): "S peer" / "default peer" lines.  Local
+#    provisioning is the draft's baseline mechanism and doubles as the
+#    operator override, so an entry here always wins.
+# 2. BGP UMH extended community (O2, the draft's endorsed discovery,
+#    draft-zzhang-mboned-dynamic-internet-mcast-tunnel section 3):
+#    the source-side PE originates S/32 with
+#      set extcommunity umh <inner-addr> pim preference <p>
+#    which FRR renders as "UMH:<addr>:pim:<pref>".  Only type "pim"
+#    records apply here (RFC 9739 PIM-Light tunnel); "amt" records are
+#    for AMT gateways.  Highest preference wins (draft section 3.2; the
+#    AS_PATH-length tiebreak is irrelevant on our single-path session).
+#    The UMH names the peer's INNER (data-plane) address; the tunnel
+#    outer endpoint is recovered via the inverse of inner_of().
+#    NOT DNS: TYPE260/DRIAD is host-oriented last-mile discovery and is
+#    explicitly not the draft's router-to-router mechanism.
+resolve_peer_bgp() { # <S> -> peer outer address
+	umh=$(vtysh -c "show bgp ipv4 unicast $1/32" 2>/dev/null | awk '
+		{
+			line = $0
+			# several ECs render space-separated on one line, and a
+			# multi-path route repeats the line -- scan every match.
+			while (match(line, /UMH:[0-9.]+:pim:[0-9]+/)) {
+				s = substr(line, RSTART + 4, RLENGTH - 4)
+				split(s, a, ":")
+				if (a[3] + 0 >= best) { best = a[3] + 0; addr = a[1] }
+				line = substr(line, RSTART + RLENGTH)
+			}
+		}
+		END { if (addr) print addr; else exit 1 }
+	') || return 1
+	outer_of "$umh"
+}
+
+# Inverse of inner_of: overlay-inner 10.99.X.Y -> outer 100.64.X.Y.
+# A UMH outside 10.99/16 is already an outer/routable endpoint (the
+# non-overlay deployment shape) and passes through unchanged.
+outer_of() { # <addr>
+	case "$1" in
+	10.99.*) echo "$1" | awk -F. '{ printf "100.64.%s.%s\n", $3, $4 }' ;;
+	*) echo "$1" ;;
+	esac
+}
+
 resolve_peer() { # <S>
-	[ -r "$SOURCE_MAP" ] || return 1
-	awk -v s="$1" '
-		/^[ \t]*#/ || NF < 2 { next }
-		$1 == s        { print $2; found = 1; exit }
-		$1 == "default" { dflt = $2 }
-		END { if (!found && dflt) print dflt; exit (found || dflt) ? 0 : 1 }
-	' "$SOURCE_MAP"
+	if [ -r "$SOURCE_MAP" ]; then
+		awk -v s="$1" '
+			/^[ \t]*#/ || NF < 2 { next }
+			$1 == s        { print $2; found = 1; exit }
+			$1 == "default" { dflt = $2 }
+			END { if (!found && dflt) print dflt; exit (found || dflt) ? 0 : 1 }
+		' "$SOURCE_MAP" && return 0
+	fi
+	resolve_peer_bgp "$1"
 }
 
 mroute_state() { echo "$STATE_DIR/mroute-$1"; }
@@ -279,7 +318,7 @@ receiver_pass() {
 		[ -f "$(mroute_state "$s")" ] && continue
 		upstream_usable "$s" "$g" && continue
 		peer=$(resolve_peer "$s") || {
-			log "no peer for source $s (no map entry; DNS discovery TODO O2)"
+			log "no peer for source $s (no map entry, no BGP UMH route)"
 			continue
 		}
 		install_mroute "$s" "$peer"
