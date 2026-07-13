@@ -12,13 +12,20 @@
 # receiver (or a remote join) exists, and is torn down afterwards:
 #
 #   --mode receiver   (PoP border, e.g. the nbg6817)
-#     Watches IGMPv3 (S,G) memberships on downstream interfaces.  For a
-#     source S with no usable PIM upstream: resolve the source-side peer
-#     (static map now; TYPE260 DIMT-tier DNS later, open item O2),
-#     ensure the tunnel (delegated to v2 via a dynamic peers overlay),
-#     and install the RPF override that lets pim-light send the join:
+#     Watches IGMPv3 AND MLDv2 (S,G) memberships on downstream
+#     interfaces.  For a source S with no usable PIM upstream: resolve
+#     the source-side peer (static map override, else the BGP UMH
+#     extended community, O2), ensure the tunnel (delegated to v2 via a
+#     dynamic peers overlay), and install the RPF override that lets
+#     pim-light send the join:
 #
-#         ip mroute <S>/32 <inner4(peer)>
+#         ip mroute <S>/32 <inner4(peer)>          (v4)
+#         ipv6 route <S>/128 <inner6(peer)>        (v6; FRR has no
+#             `ipv6 mroute` -- pim6d RPF-resolves via the unicast RIB,
+#             so a distance-1 static /128 via the tunnel inner IS the
+#             override.  It also steers v6 unicast for S through the
+#             tunnel while a receiver exists: harmless for ULA source
+#             labels, revisit if a source is ever a global address.)
 #
 #     NEXTHOP-form is load-bearing (O1 finding 1): the interface form
 #     resolves the RPF nexthop to the source itself, the Join goes out
@@ -36,7 +43,8 @@
 #     snooping fabrics (pve vmbr*, MX) actually deliver the stream
 #     (O1 finding 2 -- a PIM join alone pulls nothing):
 #
-#         interface <seg>; ip igmp join <G> <S>
+#         interface <seg>; ip igmp join <G> <S>       (v4)
+#         interface <seg>; ipv6 mld join <G6> <S6>    (v6)
 #
 #     Removes the join (after hold-down) when the mroute is gone, so
 #     no receivers => no standing segment pull.
@@ -50,6 +58,7 @@
 # Usage:
 #   dimt-reconcile-v3.sh --mode receiver --self <overlay-ipv4>
 #       [--source-map /etc/dimt/source-peers] [--ssm-prefix 232.]
+#       [--ssm6-prefix ff3]
 #       [--interval 5] [--holddown 300] [--state-dir /var/run/dimt-v3]
 #       [--v2 /usr/sbin/dimt-reconcile.sh] [--no-v2]
 #       [--trigger-iface <dev>] [--dry-run] [--once]
@@ -67,11 +76,11 @@
 #   polling without it. On shells whose `read` lacks -t (dash), event
 #   waits degrade to 1s sub-polls of the event pipe.
 #
-# --source-map lines: "<source-ip> <peer-overlay-ipv4>"  ('#' comments).
-#   A line "default <peer>" catches all unmatched SSM sources.
-#   TODO(O2): DNS discovery -- reverse TYPE260 on S selecting the
-#   non-geo DIMT-tier record -- replaces the map as the primary path;
-#   the map stays as an override.
+# --source-map lines: "<source-ip> <peer-overlay-ipv4>"  ('#' comments;
+#   the source may be v4 or v6, the peer is always the v4 overlay --
+#   tunnels are shared dual-stack inner).  "default <peer>" catches
+#   unmatched v4 SSM sources, "default6 <peer>" the v6 ones.  A map
+#   entry overrides BGP UMH discovery (O2).
 
 set -u
 
@@ -79,6 +88,7 @@ MODE=""
 SELF="${DIMT_SELF:-}"
 SOURCE_MAP="${DIMT_SOURCE_MAP:-/etc/dimt/source-peers}"
 SSM_PREFIX="${DIMT_SSM_PREFIX:-232.}"
+SSM6_PREFIX="${DIMT_SSM6_PREFIX:-ff3}"
 INTERVAL=5
 HOLDDOWN=""
 STATE_DIR="${DIMT_V3_STATE_DIR:-/var/run/dimt-v3}"
@@ -110,6 +120,7 @@ while [ $# -gt 0 ]; do
 	--self) SELF="$2"; shift 2 ;;
 	--source-map) SOURCE_MAP="$2"; shift 2 ;;
 	--ssm-prefix) SSM_PREFIX="$2"; shift 2 ;;
+	--ssm6-prefix) SSM6_PREFIX="$2"; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
 	--holddown) HOLDDOWN="$2"; shift 2 ;;
 	--state-dir) STATE_DIR="$2"; shift 2 ;;
@@ -142,6 +153,15 @@ command -v vtysh >/dev/null 2>&1 || { log "vtysh not found; nothing to reconcile
 # Must match dimt-reconcile.sh inner_of(): inner4(X) = 10.99.<o3>.<o4>.
 inner_of() {
 	echo "$1" | awk -F. '{ printf "10.99.%s.%s", $3, $4 }'
+}
+
+# Must match dimt-reconcile.sh inner6(): fd99::<o3>:<o4>, the decimal
+# octets written as literal groups, zero o3 collapsing (fd99::47).
+inner6_of() {
+	echo "$1" | awk -F. '{
+		if ($3 == 0) printf "fd99::%s", $4
+		else         printf "fd99::%s:%s", $3, $4
+	}'
 }
 
 now() { date +%s; }
@@ -213,30 +233,48 @@ upstream_usable() { # <S> <G>
 #    outer endpoint is recovered via the inverse of inner_of().
 #    NOT DNS: TYPE260/DRIAD is host-oriented last-mile discovery and is
 #    explicitly not the draft's router-to-router mechanism.
-resolve_peer_bgp() { # <S> -> peer outer address
-	umh=$(vtysh -c "show bgp ipv4 unicast $1/32" 2>/dev/null | awk '
+# stdin: `show bgp ...` output -> best pim-type UMH address on stdout.
+# ECs are whitespace-delimited tokens "UMH:<addr>:pim:<pref>" (v4 or v6
+# address; v6 contains colons, so anchor on the ":pim:<n>" tail rather
+# than splitting).  amt-type records never match (AMT-gateway tier).
+# Highest preference wins (draft section 3.2; the AS_PATH-length
+# tiebreak is irrelevant on our single-path session).
+umh_best() {
+	awk '
 		{
-			line = $0
-			# several ECs render space-separated on one line, and a
-			# multi-path route repeats the line -- scan every match.
-			while (match(line, /UMH:[0-9.]+:pim:[0-9]+/)) {
-				s = substr(line, RSTART + 4, RLENGTH - 4)
-				split(s, a, ":")
-				if (a[3] + 0 >= best) { best = a[3] + 0; addr = a[1] }
-				line = substr(line, RSTART + RLENGTH)
+			for (i = 1; i <= NF; i++) {
+				if ($i !~ /^UMH:/) continue
+				s = substr($i, 5)
+				if (s !~ /:pim:[0-9]+$/) continue
+				p = s; sub(/.*:pim:/, "", p)
+				a = s; sub(/:pim:[0-9]+$/, "", a)
+				if (p + 0 >= best) { best = p + 0; addr = a }
 			}
 		}
 		END { if (addr) print addr; else exit 1 }
-	') || return 1
+	'
+}
+
+resolve_peer_bgp() { # <S> -> peer outer address
+	umh=$(vtysh -c "show bgp ipv4 unicast $1/32" 2>/dev/null | umh_best) ||
+		return 1
 	outer_of "$umh"
 }
 
-# Inverse of inner_of: overlay-inner 10.99.X.Y -> outer 100.64.X.Y.
-# A UMH outside 10.99/16 is already an outer/routable endpoint (the
-# non-overlay deployment shape) and passes through unchanged.
+resolve_peer_bgp6() { # <S6> -> peer outer address
+	umh=$(vtysh -c "show bgp ipv6 unicast $1/128" 2>/dev/null | umh_best) ||
+		return 1
+	outer_of "$umh"
+}
+
+# Inverse of inner_of()/inner6_of(): overlay-inner -> outer 100.64.X.Y.
+# A UMH outside the inner ranges is already an outer/routable endpoint
+# (the non-overlay deployment shape) and passes through unchanged.
 outer_of() { # <addr>
 	case "$1" in
 	10.99.*) echo "$1" | awk -F. '{ printf "100.64.%s.%s\n", $3, $4 }' ;;
+	fd99::*:*) echo "${1#fd99::}" | awk -F: '{ printf "100.64.%s.%s\n", $1, $2 }' ;;
+	fd99::*) echo "100.64.0.${1#fd99::}" ;;
 	*) echo "$1" ;;
 	esac
 }
@@ -251,6 +289,45 @@ resolve_peer() { # <S>
 		' "$SOURCE_MAP" && return 0
 	fi
 	resolve_peer_bgp "$1"
+}
+
+# v6 twin ("default6 <peer>" catches unmatched v6 sources; a v6 source
+# row is just "<v6-source> <peer-overlay-v4>" -- the tunnel outer is
+# always the v4 overlay address, tunnels are shared dual-stack inner).
+resolve_peer6() { # <S6>
+	if [ -r "$SOURCE_MAP" ]; then
+		awk -v s="$1" '
+			/^[ \t]*#/ || NF < 2 { next }
+			$1 == s         { print $2; found = 1; exit }
+			$1 == "default6" { dflt = $2 }
+			END { if (!found && dflt) print dflt; exit (found || dflt) ? 0 : 1 }
+		' "$SOURCE_MAP" && return 0
+	fi
+	resolve_peer_bgp6 "$1"
+}
+
+# Emit "S G" per active downstream MLDv2 (S,G) membership.  pim6d
+# groups rows under "On interface <ifc>:" headers:
+#   vtysh$ show ipv6 mld joins
+#   Group      Source     State  LastSeen  NonTrkSeen  Created
+#   On interface br-lan:
+#   ff3e::1:1  fd69::193  JOIN   00:00:02  -           00:01:12
+receiver_wants6() {
+	vtysh -c 'show ipv6 mld joins' 2>/dev/null | awk -v ssm="$SSM6_PREFIX" '
+		/^On interface / { ifc = $3; sub(/:$/, "", ifc); next }
+		ifc ~ /^dimt-/ || ifc == "" { next }
+		NF < 3 || $1 == "Group"     { next }
+		$2 == "*"                   { next }
+		index($1, ssm) != 1         { next }
+		$3 == "JOIN" { print $2, $1 }
+	' | sort -u
+}
+
+upstream_usable6() { # <S6> <G6>
+	vtysh -c 'show ipv6 pim upstream' 2>/dev/null | awk -v s="$1" -v g="$2" '
+		$2 == s && $3 == g && $1 != "Unknown" { found = 1 }
+		END { exit found ? 0 : 1 }
+	'
 }
 
 mroute_state() { echo "$STATE_DIR/mroute-$1"; }
@@ -285,6 +362,40 @@ remove_mroute() { # <S>
 	log "withdrew RPF override $1/32 -> $nh"
 }
 
+# v6 RPF override.  FRR has no `ipv6 mroute`; pim6d RPF-resolves via
+# the unicast RIB, so a distance-1 static /128 via the peer's inner6
+# is the override -- it beats the BGP UMH route (distance 20, which
+# recurses to tailscale0, NOT the tunnel).  Caveat: unlike `ip mroute`
+# this also steers v6 UNICAST for S through the tunnel while a
+# receiver exists; harmless for ULA source labels (fd69::/16), worth
+# revisiting if a source is ever a global address something talks to.
+mroute6_state() { echo "$STATE_DIR/mroute6-$1"; }
+
+install_mroute6() { # <S6> <peer-overlay-v4>
+	nh=$(inner6_of "$2")
+	[ "$DRY" = 1 ] || {
+		echo "peer=$2"
+		echo "nexthop=$nh"
+		echo "since=$(now)"
+	} >"$(mroute6_state "$1")"
+	sync_tunnels
+	if ! vty_conf -c "ipv6 route $1/128 $nh"; then
+		run rm -f "$(mroute6_state "$1")"
+		sync_tunnels
+		return 1
+	fi
+	log "installed v6 RPF override $1/128 -> $nh (peer $2)"
+}
+
+remove_mroute6() { # <S6>
+	st=$(mroute6_state "$1")
+	[ -f "$st" ] || return 0
+	nh=$(sed -n 's/^nexthop=//p' "$st")
+	vty_conf -c "no ipv6 route $1/128 $nh" || return 1
+	run rm -f "$st"
+	log "withdrew v6 RPF override $1/128 -> $nh"
+}
+
 # Rebuild the dynamic peers overlay and hand the union (registry file
 # untouched, it stays v2's input) to v2 so tunnel ensure/GC has ONE
 # owner.  With --no-v2 (dogfood over a pre-existing static tunnel) this
@@ -293,7 +404,7 @@ sync_tunnels() {
 	[ "$DO_V2" = 1 ] || return 0
 	[ -x "$V2" ] || { log "v2 reconciler $V2 not executable; --no-v2 to silence"; return 0; }
 	overlay="$STATE_DIR/peers.dynamic"
-	sed -n 's/^peer=//p' "$STATE_DIR"/mroute-* 2>/dev/null | sort -u >"$overlay.tmp"
+	sed -n 's/^peer=//p' "$STATE_DIR"/mroute-* "$STATE_DIR"/mroute6-* 2>/dev/null | sort -u >"$overlay.tmp"
 	mv "$overlay.tmp" "$overlay"
 	union=$( { sed 's/#.*//' /etc/dimt/peers 2>/dev/null; cat "$overlay"; } |
 		tr -d ' \t\r' | grep . | sort -u | tr '\n' ',' | sed 's/,$//')
@@ -337,6 +448,33 @@ receiver_pass() {
 			remove_mroute "$s" && run rm -f "$STATE_DIR/seen-$s" && sync_tunnels
 		fi
 	done
+
+	# 3/4. the v6 family, same shape (MLDv2 wants; static-/128 override)
+	wants6=$(receiver_wants6)
+	echo "$wants6" | while read -r s g; do
+		[ -n "$s" ] || continue
+		mark_seen "$STATE_DIR/seen6-$s"
+		[ -f "$(mroute6_state "$s")" ] && continue
+		upstream_usable6 "$s" "$g" && continue
+		peer=$(resolve_peer6 "$s") || {
+			log "no peer for v6 source $s (no map entry, no BGP UMH6 route)"
+			continue
+		}
+		install_mroute6 "$s" "$peer"
+	done
+
+	for st in "$STATE_DIR"/mroute6-*; do
+		[ -f "$st" ] || continue
+		s=${st##*/mroute6-}
+		if echo "$wants6" | grep -q "^$s "; then
+			mark_seen "$STATE_DIR/seen6-$s"
+			continue
+		fi
+		last=$(seen_at "$STATE_DIR/seen6-$s")
+		if [ $((nowts - last)) -ge "$HOLDDOWN" ]; then
+			remove_mroute6 "$s" && run rm -f "$STATE_DIR/seen6-$s" && sync_tunnels
+		fi
+	done
 }
 
 # --- source-pe mode ---------------------------------------------------
@@ -367,6 +505,31 @@ remove_seg_join() { # <S> <G>
 	log "left ($1, $2) on $SEG_IFACE"
 }
 
+# v6 twins: (S,G) mroutes with the segment IIF answered by an MLDv2
+# membership on the segment (`ipv6 mld join`), so MLD-snooping fabrics
+# deliver the v6 stream -- O1 finding 2, same physics as IGMP.
+segment_pulls6() {
+	vtysh -c 'show ipv6 mroute' 2>/dev/null | awk -v seg="$SEG_IFACE" '
+		NF < 6 || $1 == "Source" { next }
+		$5 == seg && $4 == "PIM" { print $1, $2 }
+	' | sort -u
+}
+
+join6_state() { echo "$STATE_DIR/join6-$1-$2"; }
+
+ensure_seg_join6() { # <S6> <G6>
+	[ -f "$(join6_state "$1" "$2")" ] && return 0
+	vty_conf -c "interface $SEG_IFACE" -c "ipv6 mld join $2 $1" || return 1
+	[ "$DRY" = 1 ] || echo "since=$(now)" >"$(join6_state "$1" "$2")"
+	log "joined v6 ($1, $2) on $SEG_IFACE (segment pull)"
+}
+
+remove_seg_join6() { # <S6> <G6>
+	vty_conf -c "interface $SEG_IFACE" -c "no ipv6 mld join $2 $1" || return 1
+	run rm -f "$(join6_state "$1" "$2")"
+	log "left v6 ($1, $2) on $SEG_IFACE"
+}
+
 source_pe_pass() {
 	pulls=$(segment_pulls)
 	nowts=$(now)
@@ -387,6 +550,27 @@ source_pe_pass() {
 		last=$(seen_at "$STATE_DIR/pseen-$s-$g")
 		if [ $((nowts - last)) -ge "$HOLDDOWN" ]; then
 			remove_seg_join "$s" "$g" && run rm -f "$STATE_DIR/pseen-$s-$g"
+		fi
+	done
+
+	# v6 family, same shape
+	pulls6=$(segment_pulls6)
+	echo "$pulls6" | while read -r s g; do
+		[ -n "$s" ] || continue
+		mark_seen "$STATE_DIR/pseen6-$s-$g"
+		ensure_seg_join6 "$s" "$g"
+	done
+
+	for st in "$STATE_DIR"/join6-*; do
+		[ -f "$st" ] || continue
+		sg=${st##*/join6-}
+		s=${sg%-*}; g=${sg##*-}
+		if echo "$pulls6" | grep -q "^$s $g\$"; then
+			continue
+		fi
+		last=$(seen_at "$STATE_DIR/pseen6-$s-$g")
+		if [ $((nowts - last)) -ge "$HOLDDOWN" ]; then
+			remove_seg_join6 "$s" "$g" && run rm -f "$STATE_DIR/pseen6-$s-$g"
 		fi
 	done
 }
@@ -415,8 +599,15 @@ EVENTS=0
 if [ -n "$TRIGGER_IFACE" ] && [ "$ONCE" = 0 ]; then
 	if command -v tcpdump >/dev/null 2>&1; then
 		case "$MODE" in
-		receiver) TFILT="igmp[0] == 0x22 or igmp[0] == 0x16" ;; # v3 report / v2 report
-		source-pe) TFILT="pim and ip[9] == 103 and ip[20] & 0x0f == 3" ;; # PIM Join/Prune
+		# v4: IGMPv3/v2 membership reports.  v6: MLDv2 reports are
+		# ICMPv6 type 143 to ff02::16, normally behind a hop-by-hop
+		# options header (router alert), so match both the HBH-shifted
+		# (ip6 proto 0, ICMPv6 at offset 48) and direct (proto 58,
+		# offset 40) encodings -- ip6[] cannot skip extension headers.
+		receiver) TFILT="igmp[0] == 0x22 or igmp[0] == 0x16 or (ip6 proto 0 and ip6[48] == 143) or (ip6 proto 58 and ip6[40] == 143)" ;;
+		# PIM Join/Prune, both families (PIMv6 is proto 103 directly
+		# after the v6 header; type in the low nibble of the first byte).
+		source-pe) TFILT="(pim and ip[9] == 103 and ip[20] & 0x0f == 3) or (ip6 proto 103 and ip6[40] & 0x0f == 3)" ;;
 		esac
 		FIFO="$STATE_DIR/.events"
 		rm -f "$FIFO"; mkfifo "$FIFO" || { log "mkfifo failed; polling only"; FIFO=""; }

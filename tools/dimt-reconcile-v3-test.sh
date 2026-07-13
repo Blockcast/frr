@@ -184,6 +184,83 @@ check "O2: amt-only UMH -> no peer, no mroute" \
 # cleanup for the source-pe block
 rm -f "$TESTDIR/show-bgp-ipv4-unicast-69.25.95.102-32" "$STATE"/mroute-* "$STATE"/seen-*
 
+# --- receiver mode: v6 (MLDv2) -----------------------------------------
+
+cat > "$TESTDIR/show-ip-igmp-sources" <<'EOF'
+Interface        Group           Source          Timer Fwd Uptime
+br-lan           232.0.0.1       69.25.95.102    04:10   Y 00:00:17
+EOF
+cat > "$TESTDIR/show-ipv6-mld-joins" <<'EOF'
+Group                           Source                          State               LastSeen  NonTrkSeen     Created
+
+On interface br-lan:
+ff3e::1:1                       fd69::193                       JOIN                00:00:02           -    00:01:12
+ff02::16                        *                               JOIN                00:00:02           -    04:00:21
+On interface dimt-0-47:
+ff3e::9:9                       fd69::999                       JOIN                00:00:02           -    00:01:12
+EOF
+cat > "$TESTDIR/show-ipv6-pim-upstream" <<'EOF'
+ Iif      Source  Group    State  Uptime    JoinTimer  RSTimer   KATimer   RefCnt
+EOF
+# v6 UMH via BGP: pim pref 7 wins; amt never matches.  The dual-stack
+# pass must also keep resolving the v4 source (map row below).
+cat > "$TESTDIR/show-bgp-ipv6-unicast-fd69::193-128" <<'EOF'
+BGP routing table entry for fd69::193/128, version 3
+  65001
+    fd7a:115c:a1e0::2f from fd7a:115c:a1e0::2f (100.64.0.47)
+      Origin IGP, metric 0, valid, external, best (First path received)
+      Extended IPv6 Community: UMH:fd99::99:pim:7 UMH:fd99::66:amt:15
+EOF
+echo "69.25.95.102 100.64.0.47" > "$TESTDIR/source-peers"
+: > "$TESTDIR/vty.log"; : > "$TESTDIR/v2.log"
+$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once >/dev/null 2>&1
+
+check "v6: static /128 RPF override via BGP UMH6 (inner6 nexthop)" \
+	grep -q "ipv6 route fd69::193/128 fd99::99" "$TESTDIR/vty.log"
+check "v6: amt-type UMH6 never selected" \
+	sh -c "! grep -q 'fd99::66' '$TESTDIR/vty.log'"
+check "v6: ASM (*) membership ignored" \
+	sh -c "! grep -q 'ff02::16' '$TESTDIR/vty.log'"
+check "v6: membership on a dimt-* iface ignored" \
+	sh -c "! grep -q 'fd69::999' '$TESTDIR/vty.log'"
+check "v6: dual-stack pass still installs the v4 override" \
+	grep -q "ip mroute 69.25.95.102/32 10.99.0.47" "$TESTDIR/vty.log"
+check "v6: outer derived from UMH6 inner (v2 union has 100.64.0.99)" \
+	grep -q "100.64.0.99" "$TESTDIR/v2.log"
+check "v6: state recorded" test -f "$STATE/mroute6-fd69::193"
+
+# v6 map row overrides BGP
+cat > "$TESTDIR/source-peers" <<'EOF'
+69.25.95.102 100.64.0.47
+fd69::193 100.64.0.88
+EOF
+rm -f "$STATE"/mroute6-* "$STATE"/seen6-*
+: > "$TESTDIR/vty.log"
+$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once >/dev/null 2>&1
+
+check "v6: static map overrides BGP UMH6" \
+	grep -q "ipv6 route fd69::193/128 fd99::88" "$TESTDIR/vty.log"
+
+# v6 receiver leaves -> holddown 0 -> withdraw
+cat > "$TESTDIR/show-ipv6-mld-joins" <<'EOF'
+Group                           Source                          State               LastSeen  NonTrkSeen     Created
+EOF
+: > "$TESTDIR/vty.log"
+$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --holddown 0 --once >/dev/null 2>&1
+
+check "v6: /128 override withdrawn on leave (holddown 0)" \
+	grep -q "no ipv6 route fd69::193/128 fd99::88" "$TESTDIR/vty.log"
+check "v6: state cleaned" sh -c "! test -f '$STATE/mroute6-fd69::193'"
+
+rm -f "$TESTDIR/show-ipv6-mld-joins" "$TESTDIR/show-bgp-ipv6-unicast-fd69::193-128" \
+	"$STATE"/mroute-* "$STATE"/mroute6-* "$STATE"/seen-* "$STATE"/seen6-*
+
 # --- source-pe mode ---------------------------------------------------
 
 cat > "$TESTDIR/show-ip-mroute" <<'EOF'
@@ -199,6 +276,32 @@ check "source-pe: igmp join emitted for segment-IIF mroute (O1 finding 2)" \
 	grep -q "interface eth0 -c ip igmp join 232.0.0.1 69.25.95.102" "$TESTDIR/vty.log"
 check "source-pe: non-segment-IIF mroute (mcast0) ignored" \
 	sh -c "! grep -q '232.1.1.1' '$TESTDIR/vty.log'"
+
+# v6 segment pull
+cat > "$TESTDIR/show-ipv6-mroute" <<'EOF'
+ Source     Group      Flags  Proto  Input   Output     TTL  Uptime
+ fd69::193  ff3e::1:1  SFT    PIM    eth0    dimt-0-40  1    00:00:28
+ fd69::777  ff3e::7:7  ST     PIM    mcast0  dimt-0-40  1    05:46:18
+EOF
+: > "$TESTDIR/vty.log"
+$RUN_SH "$V3" --mode source-pe --segment-iface eth0 \
+	--state-dir "$STATE" --once >/dev/null 2>&1
+
+check "source-pe v6: mld join emitted for segment-IIF mroute" \
+	grep -q "interface eth0 -c ipv6 mld join ff3e::1:1 fd69::193" "$TESTDIR/vty.log"
+check "source-pe v6: non-segment-IIF v6 mroute ignored" \
+	sh -c "! grep -q 'fd69::777' '$TESTDIR/vty.log'"
+
+# v6 mroute gone -> holddown 0 -> mld leave
+cat > "$TESTDIR/show-ipv6-mroute" <<'EOF'
+ Source     Group      Flags  Proto  Input   Output     TTL  Uptime
+EOF
+: > "$TESTDIR/vty.log"
+$RUN_SH "$V3" --mode source-pe --segment-iface eth0 \
+	--state-dir "$STATE" --holddown 0 --once >/dev/null 2>&1
+
+check "source-pe v6: mld join removed when mroute gone" \
+	grep -q "no ipv6 mld join ff3e::1:1 fd69::193" "$TESTDIR/vty.log"
 
 # mroute gone -> holddown 0 -> leave
 cat > "$TESTDIR/show-ip-mroute" <<'EOF'
