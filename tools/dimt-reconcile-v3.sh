@@ -52,10 +52,20 @@
 #       [--source-map /etc/dimt/source-peers] [--ssm-prefix 232.]
 #       [--interval 5] [--holddown 300] [--state-dir /var/run/dimt-v3]
 #       [--v2 /usr/sbin/dimt-reconcile.sh] [--no-v2]
-#       [--dry-run] [--once]
+#       [--trigger-iface <dev>] [--dry-run] [--once]
 #   dimt-reconcile-v3.sh --mode source-pe --segment-iface <dev>
 #       [--interval 5] [--holddown 60] [--state-dir /var/run/dimt-v3]
-#       [--dry-run] [--once]
+#       [--trigger-iface <dev>] [--dry-run] [--once]
+#
+# --trigger-iface: event-assisted reconciliation for sub-second join
+#   latency. A respawning line-buffered tcpdump co-process watches the
+#   named interface for the mode's control packets (receiver: IGMP on
+#   the downstream iface; source-pe: PIM on the tunnel iface) and kicks
+#   an immediate pass, so cold-start latency is bounded by packet
+#   arrival + one pass instead of the poll interval. --interval remains
+#   the correctness/GC fallback. Needs tcpdump; degrades to pure
+#   polling without it. On shells whose `read` lacks -t (dash), event
+#   waits degrade to 1s sub-polls of the event pipe.
 #
 # --source-map lines: "<source-ip> <peer-overlay-ipv4>"  ('#' comments).
 #   A line "default <peer>" catches all unmatched SSM sources.
@@ -75,6 +85,7 @@ STATE_DIR="${DIMT_V3_STATE_DIR:-/var/run/dimt-v3}"
 V2="${DIMT_V2:-/usr/sbin/dimt-reconcile.sh}"
 DO_V2=1
 SEG_IFACE=""
+TRIGGER_IFACE=""
 DRY=0
 ONCE=0
 
@@ -105,6 +116,7 @@ while [ $# -gt 0 ]; do
 	--v2) V2="$2"; shift 2 ;;
 	--no-v2) DO_V2=0; shift ;;
 	--segment-iface) SEG_IFACE="$2"; shift 2 ;;
+	--trigger-iface) TRIGGER_IFACE="$2"; shift 2 ;;
 	--dry-run) DRY=1; shift ;;
 	--once) ONCE=1; shift ;;
 	*) usage ;;
@@ -206,13 +218,22 @@ mroute_state() { echo "$STATE_DIR/mroute-$1"; }
 
 install_mroute() { # <S> <peer-overlay>
 	nh=$(inner_of "$2")
-	# NEXTHOP-form, never the interface form (O1 finding 1).
-	vty_conf -c "ip mroute $1/32 $nh" || return 1
+	# State first, then tunnel, then mroute: for a NEW peer the tunnel
+	# netdev must exist before pimd can resolve the nexthop and emit the
+	# join, and sync_tunnels derives the dynamic peer set from the state
+	# files. On vtysh failure the state (and tunnel claim) is rolled back.
 	[ "$DRY" = 1 ] || {
 		echo "peer=$2"
 		echo "nexthop=$nh"
 		echo "since=$(now)"
 	} >"$(mroute_state "$1")"
+	sync_tunnels
+	# NEXTHOP-form, never the interface form (O1 finding 1).
+	if ! vty_conf -c "ip mroute $1/32 $nh"; then
+		run rm -f "$(mroute_state "$1")"
+		sync_tunnels
+		return 1
+	fi
 	log "installed RPF override $1/32 -> $nh (peer $2)"
 }
 
@@ -255,7 +276,7 @@ receiver_pass() {
 			log "no peer for source $s (no map entry; DNS discovery TODO O2)"
 			continue
 		}
-		install_mroute "$s" "$peer" && sync_tunnels
+		install_mroute "$s" "$peer"
 	done
 
 	# 2. receivers gone -> hold-down -> withdraw
@@ -329,11 +350,107 @@ source_pe_pass() {
 
 mkdir -p "$STATE_DIR" || { log "cannot create state dir $STATE_DIR"; exit 1; }
 
-while :; do
+# Event-assisted mode: a respawning tcpdump co-process writes one line
+# per matching control packet into a FIFO; the main loop waits on the
+# FIFO with the poll interval as timeout, so a cold join is handled at
+# packet-arrival time while GC/correctness still runs every INTERVAL.
+#
+# Safeguards (a broken or hostile client spamming reports must not spin
+# vtysh):
+#   - the BPF filter matches only the mode's join-carrying packets
+#     (IGMPv3/v2 membership reports; PIM Join/Prune) -- queries and
+#     hellos never wake us;
+#   - MIN-GAP: at most one *triggered* pass per second (events landing
+#     inside the gap are absorbed by that pass or the next tick);
+#   - BURST budget: >10 triggered passes in a 10s window disables the
+#     trigger until the window rolls (logged once per storm), leaving
+#     interval polling in charge. Worst case under storm == pre-trigger
+#     behavior.
+EVENTS=0
+if [ -n "$TRIGGER_IFACE" ] && [ "$ONCE" = 0 ]; then
+	if command -v tcpdump >/dev/null 2>&1; then
+		case "$MODE" in
+		receiver) TFILT="igmp[0] == 0x22 or igmp[0] == 0x16" ;; # v3 report / v2 report
+		source-pe) TFILT="pim and ip[9] == 103 and ip[20] & 0x0f == 3" ;; # PIM Join/Prune
+		esac
+		FIFO="$STATE_DIR/.events"
+		rm -f "$FIFO"; mkfifo "$FIFO" || { log "mkfifo failed; polling only"; FIFO=""; }
+		if [ -n "$FIFO" ]; then
+			( while :; do
+				tcpdump -l -n -p -i "$TRIGGER_IFACE" "$TFILT" 2>/dev/null
+				sleep 2
+			  done >"$FIFO" ) &
+			TCPDUMP_LOOP=$!
+			trap 'pkill -P $TCPDUMP_LOOP 2>/dev/null; kill $TCPDUMP_LOOP 2>/dev/null; rm -f "$FIFO"' EXIT INT TERM
+			exec 3<>"$FIFO"   # <> so open never blocks and EOF never surfaces
+			# `read -t` probe: busybox ash + bash have it; dash does not.
+			if (read -t 1 _ </dev/null) 2>/dev/null; then READ_T=1; else READ_T=0; fi
+			EVENTS=1
+			log "trigger armed on $TRIGGER_IFACE (filter: $TFILT; read -t: $READ_T)"
+		fi
+	else
+		log "tcpdump not found; --trigger-iface ignored (polling only)"
+	fi
+fi
+
+LAST_TRIG=0
+WIN_START=0
+WIN_COUNT=0
+STORM=0
+
+wait_next() {
+	if [ "$EVENTS" = 0 ]; then
+		sleep "$INTERVAL"
+		return 1  # timeout -> periodic pass
+	fi
+	if [ "$READ_T" = 1 ]; then
+		read -r -t "$INTERVAL" _ <&3 && return 0 || return 1
+	fi
+	# dash fallback: 1s sub-polls of the pipe via non-blocking dd
+	i=0
+	while [ "$i" -lt "$INTERVAL" ]; do
+		sleep 1
+		if dd bs=512 count=1 iflag=nonblock <&3 2>/dev/null | grep -q .; then
+			return 0
+		fi
+		i=$((i + 1))
+	done
+	return 1
+}
+
+do_pass() {
 	case "$MODE" in
 	receiver) receiver_pass ;;
 	source-pe) source_pe_pass ;;
 	esac
-	[ "$ONCE" = 1 ] && break
-	sleep "$INTERVAL"
+	LAST_PASS=$(now)
+}
+
+do_pass
+[ "$ONCE" = 1 ] && exit 0
+
+while :; do
+	if wait_next; then
+		nowts=$(now)
+		# GC starvation guard: a continuous event stream must not defer
+		# the periodic pass indefinitely.
+		if [ $((nowts - LAST_PASS)) -ge "$INTERVAL" ]; then
+			do_pass
+			continue
+		fi
+		# rolling 10s burst window
+		if [ $((nowts - WIN_START)) -ge 10 ]; then
+			WIN_START=$nowts; WIN_COUNT=0
+			[ "$STORM" = 1 ] && { STORM=0; log "trigger storm cleared"; }
+		fi
+		WIN_COUNT=$((WIN_COUNT + 1))
+		if [ "$STORM" = 1 ] || [ "$WIN_COUNT" -gt 10 ]; then
+			[ "$STORM" = 0 ] && log "trigger storm (>10 events/10s); rate-limiting to interval polling"
+			STORM=1
+			continue
+		fi
+		[ "$nowts" -le "$LAST_TRIG" ] && continue  # min-gap 1s
+		LAST_TRIG=$nowts
+	fi
+	do_pass
 done
