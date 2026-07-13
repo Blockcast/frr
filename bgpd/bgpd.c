@@ -340,6 +340,7 @@ static int bgp_router_id_set(struct bgp *bgp, const struct in_addr *id,
 	/* EVPN uses router id in RD, withdraw them */
 	if (is_evpn_enabled())
 		bgp_evpn_handle_router_id_update(bgp, true);
+	bgp_mvpn_handle_router_id_update(bgp, true);
 
 	vpn_handle_router_id_update(bgp, true, is_config);
 
@@ -365,11 +366,8 @@ static int bgp_router_id_set(struct bgp *bgp, const struct in_addr *id,
 
 	vpn_handle_router_id_update(bgp, false, is_config);
 
-	/* GTM MCAST-VPN: (re)originate this PE's Intra-AS I-PMSI (Type-1) route
-	 * now that the router-id (Originating Router's IP) is known/changed.
-	 * No-op unless the GTM MVPN AF is active (RFC 6514 Section 4.1).
-	 */
-	bgp_mvpn_originate_type1(bgp);
+	/* Re-originate the MVPN Type-1 under the new router-id. */
+	bgp_mvpn_handle_router_id_update(bgp, false);
 
 	if (bgp && bgp->ls_info && bgp->ls_info->enable_distribution)
 		bgp_ls_export_bgp_topology(bgp);
@@ -3056,6 +3054,10 @@ int peer_deactivate(struct peer *peer, afi_t afi, safi_t safi)
 		bgp_recalculate_afi_safi_bestpaths(bgp, afi, safi_check);
 	}
 
+	if ((afi == AFI_IP || afi == AFI_IP6) && safi == SAFI_MCAST_VPN &&
+	    !bgp_afi_safi_peer_exists(bgp, afi, safi))
+		bgp_mvpn_withdraw_type1(bgp, afi);
+
 	/*
 	 * Unregister from zebra link-state database when the last peer is
 	 * deactivated for BGP-LS. This stops receiving IGP topology updates
@@ -3255,6 +3257,11 @@ int peer_delete(struct peer *peer)
 		hash_release(bgp->connectionhash, peer->connection);
 		peer_unlock(peer); /* bgp peer list reference */
 	}
+
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++)
+		if (peer->afc[afi][SAFI_MCAST_VPN] &&
+		    !bgp_afi_safi_peer_exists(bgp, afi, SAFI_MCAST_VPN))
+			bgp_mvpn_withdraw_type1(bgp, afi);
 
 	/* Local and remote addresses. */
 	if (peer->connection->su_local) {
@@ -4602,6 +4609,11 @@ int bgp_delete(struct bgp *bgp)
 	uint32_t a_ann_cnt = 0, a_l2_cnt = 0;
 
 	assert(bgp);
+
+	/* Withdraw locally-originated MVPN discovery before peers and RIB state
+	 * are discarded. The helper is safe when either route is already absent. */
+	bgp_mvpn_withdraw_type1(bgp, AFI_IP);
+	bgp_mvpn_withdraw_type1(bgp, AFI_IP6);
 
 	/*
 	 * Iterate the pending dest list and remove all the dest pertaining to

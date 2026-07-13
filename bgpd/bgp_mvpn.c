@@ -805,15 +805,6 @@ bool bgp_mvpn_gtm_active(struct bgp *bgp)
  * two lifecycle hooks (peer AF activate / router-id set) satisfies both first
  * installs the route, and re-invocation deduplicates via attrhash_cmp.
  *
- * KNOWN LIMITATION (GTM MVP): on a router-id X->Y change this originates the new
- * Type-1 keyed by Y but does not withdraw the stale one keyed by X, so the PE
- * briefly advertises two I-PMSI A-D routes until the session/AF refreshes. The
- * startup 0.0.0.0->addr path is clean (no prior route). Likewise, deactivating
- * the GTM MVPN AF (or tearing down the bgp instance) does not withdraw this
- * self-originated Type-1, leaving a stale I-PMSI A-D marker until peers age it
- * out. Follow-up (both cases): a bgp_mvpn_withdraw_type1(bgp, old_id) hook
- * called before re-originating and on AF-deactivate/teardown, as
- * bgp_evpn_handle_router_id_update does.
  */
 void bgp_mvpn_originate_type1(struct bgp *bgp)
 {
@@ -823,7 +814,7 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 	bool active[AFI_MAX] = {};
 	afi_t afi;
 
-	if (bgp->router_id.s_addr == INADDR_ANY)
+	if (bgp->router_id.s_addr == INADDR_ANY || !bgp->peer_self)
 		return;
 
 	active[AFI_IP] = bgp_afi_safi_peer_exists(bgp, AFI_IP, SAFI_MCAST_VPN);
@@ -910,6 +901,35 @@ void bgp_mvpn_originate_type1(struct bgp *bgp)
 	 */
 	bgp_attr_flush(&attr);
 	aspath_unintern(&attr.aspath);
+}
+
+void bgp_mvpn_withdraw_type1(struct bgp *bgp, afi_t afi)
+{
+	struct prefix_mvpn p;
+	struct ipaddr orig;
+
+	if (!bgp->peer_self || bgp->router_id.s_addr == INADDR_ANY)
+		return;
+
+	orig = mvpn_ipaddr_v4(bgp->router_id);
+	bgp_mvpn_build_prefix_type1(&p, &orig);
+
+	bgp_mvpn_route_remove(bgp, bgp->peer_self, afi, &p, BGP_ROUTE_STATIC);
+}
+
+void bgp_mvpn_handle_router_id_update(struct bgp *bgp, bool withdraw)
+{
+	afi_t afi;
+
+	if (!withdraw) {
+		bgp_mvpn_originate_type1(bgp);
+		return;
+	}
+
+	/* The route may exist in either plane even if its last peer was just
+	 * deactivated, so look up and remove both copies unconditionally. */
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++)
+		bgp_mvpn_withdraw_type1(bgp, afi);
 }
 
 /*

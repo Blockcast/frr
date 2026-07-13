@@ -102,6 +102,9 @@ extern int bgp_mvpn_source_active_set(struct bgp *bgp, const struct ipaddr *src,
  */
 extern void bgp_mvpn_originate_type1(struct bgp *bgp);
 
+/* Withdraw this PE's Type-1 route from one MCAST-VPN address family. */
+extern void bgp_mvpn_withdraw_type1(struct bgp *bgp, afi_t afi);
+
 /*
  * Originate/withdraw a local Type-7 (C-multicast Source Tree Join) route for a
  * pimd-reported receiver join, relayed through zebra (bgp_zebra_process_mvpn_sg).
@@ -118,6 +121,10 @@ extern void bgp_mvpn_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, s
 /* True if the GTM MVPN AF (SAFI 5) is active on any peer of this instance, in
  * either AFI. Gate for the pimd->bgpd SG replay subscription. */
 extern bool bgp_mvpn_gtm_active(struct bgp *bgp);
+
+/* Withdraw the old Type-1 before a router-id change, or originate the new
+ * Type-1 afterward. */
+extern void bgp_mvpn_handle_router_id_update(struct bgp *bgp, bool withdraw);
 
 /* `show bgp ipv4 mvpn [json]` printer. */
 extern void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_json);
