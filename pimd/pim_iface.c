@@ -844,6 +844,20 @@ void pim_if_addr_del(struct connected *ifc, int force_prim_as_any)
 
 	pim_if_addr_del_igmp(ifc);
 	pim_if_addr_del_pim(ifc);
+
+	/* A connected subnet that resolved a DIMT light interface toward a UMH
+	 * may have just been removed.  A DIMT pin carries STATIC_IIF, which
+	 * makes pim_rpf_update() a no-op, so no normal repair path re-resolves
+	 * it; without a re-apply here a pin can strand on an interface that no
+	 * longer faces the UMH.  pim_dimt_iface_up() re-resolves every upstream
+	 * and unpins any whose light interface no longer covers its UMH -- the
+	 * delete-side counterpart of the same call in pim_if_addr_add(). */
+	{
+		struct pim_interface *pim_ifp = ifp->info;
+
+		if (pim_ifp)
+			pim_dimt_iface_up(pim_ifp->pim, ifp);
+	}
 }
 
 void pim_if_addr_add_all(struct interface *ifp)
