@@ -32,6 +32,7 @@ HOLD_TIME = 90
 
 AFI_IP = 1
 SAFI_UNICAST = 1
+SAFI_MCAST_VPN = 5
 ECOMMUNITY_ENCODE_AS4 = 0x02
 ECOMMUNITY_SOURCE_AS = 0x09
 
@@ -44,8 +45,12 @@ def build_open(local_as, router_id):
     """OPEN advertising the IPv4-unicast MP capability and 4-octet AS."""
     rid = socket.inet_aton(router_id)
     mp_cap = struct.pack("!BB", 1, 4) + struct.pack("!HBB", AFI_IP, 0, SAFI_UNICAST)
+    # Also negotiate MCAST-VPN so the PE's ipv4 mvpn AF has an established
+    # neighbor and will originate the local Type-7 (the PE advertises the
+    # Type-7 back to us; our recv loop just ignores it).
+    mp_cap_mvpn = struct.pack("!BB", 1, 4) + struct.pack("!HBB", AFI_IP, 0, SAFI_MCAST_VPN)
     as4_cap = struct.pack("!BB", 65, 4) + struct.pack("!I", local_as)
-    caps = mp_cap + as4_cap
+    caps = mp_cap + mp_cap_mvpn + as4_cap
     opt_params = struct.pack("!BB", 2, len(caps)) + caps
     as_field = local_as if local_as < 65536 else 23456  # AS_TRANS
     payload = (
