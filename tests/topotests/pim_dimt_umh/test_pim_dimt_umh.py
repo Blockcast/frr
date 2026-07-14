@@ -1728,6 +1728,281 @@ interface r2-eth1
     assert result is None, result
 
 
+# ---- v6 hardening stages (terminal): the remaining v4 siblings the v6
+# leg was missing -- amt-relay-no-pin, the data-plane (self-pin +
+# forwarding + MFC counts) assertion, pim6d restart-replay, and the full
+# withdraw.  They run last, after test_v6_join_group_pim_toggle_leaves_
+# cleanly has left GROUP6 Joined and UMH-pinned, and the final withdraw is
+# deliberately the module's terminal stage.  Two v6 cases are NOT covered
+# here by design: a covering-prefix LPM fallback (the v6 leg has only the
+# s1 light segment once r2-eth2 is deleted, so there is no second interface
+# to fall back onto), and a malformed-on-the-wire v6 UMH EC (that needs a
+# crafted BGP peer like bgp_mvpn_gtm_malformed/peer1/crafter.py, a separate
+# suite rather than a stage in this ordered module).
+
+
+def test_v6_amt_relay_mapping_does_not_pin():
+    """The v6 sibling of test_amt_relay_mapping_does_not_pin: an
+    amt-relay-type v6 UMH mapping is recorded and displayed but must NOT
+    steer pim6d RPF.  Switching the type in place exercises the v6 upsert
+    path -- pim -> amt-relay must UNPIN the v6 upstream, amt-relay -> pim
+    must re-pin it.  (GROUP6 is left Joined and pinned by the preceding
+    stage.)"""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r1"].vtysh_cmd(
+        """
+configure terminal
+route-map UMH6 permit 10
+ set extcommunity umh {} amt-relay preference 5
+""".format(UMH6)
+    )
+
+    def _v6_amt_mapping_no_pin():
+        data = _json_cmd("r2", "show ipv6 pim dimt umh json")
+        if data is None:
+            return "r2: unparseable v6 dimt umh JSON (pim6d dead?)"
+        entry = data.get(SRC_PREFIX6, {})
+        if entry.get("type") != "amt-relay":
+            return "r2 v6 mapping is not amt-relay yet: {}".format(data)
+        ups = _json_cmd("r2", "show ipv6 pim upstream json")
+        if ups is None:
+            return "r2: unparseable v6 pim upstream JSON (pim6d dead?)"
+        updata = ups.get(GROUP6, {}).get(SOURCE6, {})
+        if updata.get("staticIncomingInterface") is not False:
+            return "r2 v6 upstream pinned by an amt-relay mapping: {}".format(
+                updata
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _v6_amt_mapping_no_pin, None, count=90, wait=1
+    )
+    assert result is None, result
+
+    # back to pim type: the pin must return
+    tgen.gears["r1"].vtysh_cmd(
+        """
+configure terminal
+route-map UMH6 permit 10
+ set extcommunity umh {} pim preference 5
+""".format(UMH6)
+    )
+
+    def _v6_repinned_after_amt():
+        data = _json_cmd("r2", "show ipv6 pim upstream json")
+        if data is None:
+            return "r2: unparseable v6 pim upstream JSON (pim6d dead?)"
+        updata = data.get(GROUP6, {}).get(SOURCE6, {})
+        if updata.get("staticIncomingInterface") is not True:
+            return "r2 v6 upstream not re-pinned after amt->pim: {}".format(
+                updata
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _v6_repinned_after_amt, None, count=90, wait=1
+    )
+    assert result is None, result
+
+
+def test_v6_forwarding_and_no_self_pin():
+    """The v6 sibling of test_r1_not_self_pinned_and_forwarding, and the
+    v6 data-plane assertion the suite otherwise lacks entirely: r1 (the
+    UMH itself) must IGNORE its own echoed-back v6 mapping -- its (S,G)
+    IIF stays the source LAN (r1-eth1), OIF the light interface (r1-eth0)
+    -- and v6 traffic must forward natively through BOTH kernel MFCs.
+
+    h1 carries no v6 address in the base topology (it is the v4 sender),
+    so the v6 source address is added for the duration of this test and
+    removed afterwards."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    # r1 must not have self-pinned its own (S,G): the traffic ingress is
+    # the source LAN, and the light interface is only an OIF here.  (This
+    # is control-plane state from r2's join and holds before any traffic,
+    # exactly as the v4 sibling checks it.)
+    def _r1_v6_not_self_pinned():
+        data = _json_cmd("r1", "show ipv6 mroute json")
+        if data is None:
+            return "r1: unparseable v6 mroute JSON (pim6d dead?)"
+        sgdata = data.get(GROUP6, {}).get(SOURCE6, {})
+        if not sgdata:
+            return "r1 has no v6 (S,G) mroute yet: {}".format(data)
+        if sgdata.get("iif") != "r1-eth1":
+            return (
+                "r1 v6 (S,G) IIF is not the source LAN (self-pin bug?): "
+                "{}".format(sgdata)
+            )
+        if "r1-eth0" not in sgdata.get("oil", {}):
+            return "r1 v6 (S,G) OIL lacks the light interface: {}".format(
+                sgdata
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _r1_v6_not_self_pinned, None, count=90, wait=1
+    )
+    assert result is None, result
+
+    # give h1 the v6 source address and source the group (mcast-tester
+    # picks the family from the group address)
+    tgen.gears["h1"].run("ip -6 addr add {}/64 dev h1-eth0".format(SOURCE6))
+    mcast_tester = os.path.join(CWD, "../lib/mcast-tester.py")
+    sender = tgen.gears["h1"].popen(
+        [mcast_tester, GROUP6, "h1-eth0", "--send", "0.7"]
+    )
+    logger.info("started v6 sender on h1: %s -> %s", SOURCE6, GROUP6)
+    try:
+
+        def _counts(rname):
+            data = _json_cmd(rname, "show ipv6 mroute count json")
+            if data is None:
+                return (
+                    "{}: unparseable v6 mroute count JSON (pim6d dead?)".format(
+                        rname
+                    )
+                )
+            sgdata = data.get(GROUP6, {}).get(SOURCE6, {})
+            pkts = sgdata.get("packets", 0)
+            if pkts <= 0:
+                return "{}: no v6 packets counted for ({}, {}): {}".format(
+                    rname, SOURCE6, GROUP6, sgdata
+                )
+            return None
+
+        for rname in ("r1", "r2"):
+            test_func = functools.partial(_counts, rname)
+            _, result = topotest.run_and_expect(
+                test_func, None, count=60, wait=1
+            )
+            assert result is None, result
+    finally:
+        sender.terminate()
+        tgen.gears["h1"].run(
+            "ip -6 addr del {}/64 dev h1-eth0".format(SOURCE6)
+        )
+
+
+def test_v6_pim6d_restart_replays_umh():
+    """The v6 sibling of test_pimd_restart_replays_umh: pim6d restart with
+    ZERO BGP churn must replay the v6 UMH table from the bgpd shadow via
+    the subscribe -> zebra relay axis.  Unlike the v4 leg there is no
+    config-file static-group, so the proof is: the mapping re-appears (and
+    re-resolves its light interface) with no route flap, and a runtime MLD
+    join re-added after the restart pins against the REPLAYED table.  The
+    restart deliberately uses save_config=False so pim6d boots from the
+    pristine pim6d.conf and the runtime MLD join is dropped first."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    kill_router_daemons(tgen, "r2", ["pim6d"], save_config=False)
+    start_router_daemons(tgen, "r2", ["pim6d"])
+
+    def _v6_mapping_replayed():
+        data = _json_cmd("r2", "show ipv6 pim dimt umh json")
+        if data is None:
+            return "r2: unparseable v6 dimt umh JSON (pim6d dead?)"
+        entry = data.get(SRC_PREFIX6, {})
+        if entry.get("umh") != UMH6:
+            return "r2 v6 UMH mapping not replayed after restart: {}".format(
+                data
+            )
+        if entry.get("interface") != "r2-eth0":
+            return (
+                "r2 v6 UMH light iface not re-resolved after restart: "
+                "{}".format(entry)
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _v6_mapping_replayed, None, count=120, wait=1
+    )
+    assert result is None, result
+
+    # a fresh MLD join must pin against the replayed table
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ ipv6 mld join-group {} {}
+""".format(GROUP6, SOURCE6)
+    )
+
+    def _v6_new_join_pins_from_replayed_table():
+        ups = _json_cmd("r2", "show ipv6 pim upstream json")
+        if ups is None:
+            return "r2: unparseable v6 pim upstream JSON (pim6d dead?)"
+        updata = ups.get(GROUP6, {}).get(SOURCE6, {})
+        if updata.get("joinState") != "Joined":
+            return "r2 v6 re-joined upstream not Joined: {}".format(updata)
+        if updata.get("inboundInterface") != "r2-eth0":
+            return (
+                "r2 v6 re-joined upstream not pinned via the replayed "
+                "mapping: {}".format(updata)
+            )
+        if updata.get("staticIncomingInterface") is not True:
+            return "r2 v6 re-joined upstream not STATIC_IIF-pinned: {}".format(
+                updata
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _v6_new_join_pins_from_replayed_table, None, count=90, wait=1
+    )
+    assert result is None, result
+
+
+def test_v6_withdraw_drops_upstream():
+    """The v6 sibling of test_withdraw_drops_upstream, and the module's
+    terminal v6 stage: a full v6 route withdraw (remove the redistribute)
+    clears the v6 mapping AND the v6 upstream's RPF -- there is nothing
+    left to resolve against."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r1"].vtysh_cmd(
+        """
+configure terminal
+router bgp 65001
+ address-family ipv6 unicast
+  no redistribute connected route-map UMH6
+"""
+    )
+
+    def _v6_mapping_and_rpf_gone():
+        data = _json_cmd("r2", "show ipv6 pim dimt umh json")
+        if data is None:
+            # a dead pim6d must NOT satisfy this absence-assertion
+            return "r2: unparseable v6 dimt umh JSON (pim6d dead?)"
+        if SRC_PREFIX6 in data:
+            return "r2 v6 UMH mapping survived withdraw: {}".format(data)
+        ups = _json_cmd("r2", "show ipv6 pim upstream json")
+        if ups is None:
+            return "r2: unparseable v6 pim upstream JSON (pim6d dead?)"
+        updata = ups.get(GROUP6, {}).get(SOURCE6, {})
+        if updata and updata.get("joinState") == "Joined":
+            return "r2 v6 upstream still Joined after withdraw: {}".format(
+                updata
+            )
+        return None
+
+    _, result = topotest.run_and_expect(
+        _v6_mapping_and_rpf_gone, None, count=90, wait=1
+    )
+    assert result is None, result
+
+
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
     sys.exit(pytest.main(args))
