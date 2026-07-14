@@ -933,6 +933,51 @@ void bgp_mvpn_handle_router_id_update(struct bgp *bgp, bool withdraw)
 }
 
 /*
+ * Remove this PE's local Type-7 (C-multicast Source Tree Join) route for
+ * (C-S, C-G) regardless of its Source AS.  source_as is part of the Type-7
+ * NLRI key but is re-derived from the source route on withdraw, and that value
+ * can differ from origination time -- the Source-AS extended community may have
+ * changed, or the source route may be gone by the time the receiver leaves --
+ * so an exact-prefix remove would miss the originally originated route.  A PE
+ * holds at most one local join per (C-S, C-G), so a match on the C-S/C-G pair
+ * is unambiguous.
+ */
+static void bgp_mvpn_route_remove_type7_sg(struct bgp *bgp, struct peer *peer,
+					   const struct ipaddr *src,
+					   const struct ipaddr *grp)
+{
+	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
+	struct bgp_table *table = bgp->rib[afi][SAFI_MCAST_VPN];
+	struct bgp_dest *dest;
+
+	if (!table)
+		return;
+
+	for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
+		const struct prefix_mvpn *p =
+			(const struct prefix_mvpn *)bgp_dest_get_prefix(dest);
+		struct bgp_path_info *pi;
+
+		if (p->family != AF_MVPN ||
+		    p->prefix.route_type != BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN)
+			continue;
+		if (ipaddr_cmp(&p->prefix.src, src) != 0 ||
+		    ipaddr_cmp(&p->prefix.grp, grp) != 0)
+			continue;
+
+		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+			if (pi->peer != peer || pi->type != ZEBRA_ROUTE_BGP ||
+			    pi->sub_type != BGP_ROUTE_STATIC)
+				continue;
+			bgp_unlink_nexthop(pi);
+			bgp_path_info_mark_for_delete(dest, pi);
+			bgp_process(bgp, dest, pi, afi, SAFI_MCAST_VPN);
+			break;
+		}
+	}
+}
+
+/*
  * Originate or withdraw a local Type-7 (C-multicast Source Tree Join) route,
  * mirroring bgp_mvpn_source_active_set(). This is the pimd-driven join path:
  * pimd reports local receiver interest in (C-S, C-G) through the zebra SG
@@ -947,10 +992,20 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 	uint32_t source_as = 0;
 	struct in_addr umh = { .s_addr = INADDR_ANY };
 
+	if (negate) {
+		/* Withdraw removes by (C-S, C-G) ignoring the Source AS.  It is
+		 * part of the Type-7 NLRI key but is re-derived from the source
+		 * route, whose Source-AS extended community can change -- or the
+		 * source route can be gone -- while a receiver stays joined; an
+		 * exact-prefix remove keyed off the current value would miss the
+		 * originally originated join and strand it, advertised
+		 * indefinitely. */
+		bgp_mvpn_route_remove_type7_sg(bgp, bgp->peer_self, src, grp);
+		return CMD_SUCCESS;
+	}
+
 	/* RFC 6514 Section 5: the Source AS and the upstream PE both come off
-	 * the unicast route toward C-S (Junos "src-as" / "rt-import"). Resolved
-	 * before build_prefix so add and withdraw key the same NLRI (the source
-	 * route is present while a receiver is joined). */
+	 * the unicast route toward C-S (Junos "src-as" / "rt-import"). */
 	bgp_mvpn_resolve_from_source_route(bgp, src, &source_as, &umh);
 	/* RFC 6514 4.6: the Source AS is the AS of the PE the source attaches
 	 * to.  With no Source-AS extended community on the source route
@@ -959,12 +1014,6 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 		source_as = bgp->as;
 
 	bgp_mvpn_build_prefix_type7(&p, source_as, src, grp);
-
-	if (negate) {
-		bgp_mvpn_route_remove(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p), &p,
-				      BGP_ROUTE_STATIC);
-		return CMD_SUCCESS;
-	}
 
 	bgp_attr_default_set(&attr, bgp, BGP_ORIGIN_IGP);
 	bgp_attr_set(&attr, BGP_ATTR_NEXT_HOP);
