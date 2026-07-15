@@ -865,10 +865,25 @@ def test_type1_address_family_and_instance_lifecycle():
             if route.get("routeType") == 1
         }
 
+    def _own_type1_endpoints(v6):
+        return {
+            route.get("pmsiTunnel", {}).get("endpoint")
+            for route in _mvpn_routes("r1", v6=v6)
+            if route.get("routeType") == 1 and route.get("selfOriginated")
+        }
+
     initial_v4 = _local_type1_endpoints(False)
     initial_v6 = _local_type1_endpoints(True)
     assert initial_v4, "r1 had no IPv4 Type-1 before lifecycle test"
     assert initial_v6, "r1 had no IPv6 Type-1 before lifecycle test"
+    # A neighbor/instance teardown withdraws THIS router's own
+    # self-originated Type-1. A peer's self route legitimately remains
+    # while that peer is still configured on the far side, so the absence
+    # checks below key on r1's own endpoints, not the full initial set.
+    own_v4 = _own_type1_endpoints(False)
+    own_v6 = _own_type1_endpoints(True)
+    assert own_v4, "r1 self-originated no IPv4 Type-1 before lifecycle test"
+    assert own_v6, "r1 self-originated no IPv6 Type-1 before lifecycle test"
 
     r1.vtysh_cmd(
         """
@@ -942,7 +957,7 @@ router bgp 65001
             local, remaining
         )
 
-    for v6, endpoints in ((False, initial_v4), (True, initial_v6)):
+    for v6, endpoints in ((False, own_v4), (True, own_v6)):
         test_func = functools.partial(
             _type1_absent_after_neighbor_delete, v6, endpoints
         )
@@ -990,7 +1005,7 @@ no router bgp 65001
             local, remaining
         )
 
-    for v6, endpoints in ((False, initial_v4), (True, initial_v6)):
+    for v6, endpoints in ((False, own_v4), (True, own_v6)):
         test_func = functools.partial(
             _type1_absent_after_instance_delete, v6, endpoints
         )
