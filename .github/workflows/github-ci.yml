@@ -262,7 +262,7 @@ jobs:
           # Retry install as well; mirrors can fail between update and install.
           install_ok=0
           for i in $(seq 1 ${APT_RETRIES}); do
-            sudo apt-get install -y linux-modules-extra-azure linux-modules-${MODPKGVER} linux-modules-extra-${MODPKGVER} python3-xmltodict && install_ok=1 && break || sleep 10
+            sudo apt-get install -y kmod linux-modules-extra-azure linux-modules-${MODPKGVER} linux-modules-extra-${MODPKGVER} python3-xmltodict && install_ok=1 && break || sleep 10
           done
           [ "${install_ok}" -eq 1 ] || { echo "ERROR: apt-get install failed after ${APT_RETRIES} attempts" >&2; exit 1; }
           # Github is running old kernels but installing newer packages :(
