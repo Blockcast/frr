@@ -763,13 +763,25 @@ static int pim_msg_send_frame(pim_addr src, pim_addr dst, ifindex_t ifindex,
 	pktinfo->ipi6_addr = src;
 
 	retval = sendmsg(fd, &smsghdr, 0);
-	if (retval < 0)
+	if (retval < 0) {
 		flog_err(
 			EC_LIB_SOCKET,
 			"sendmsg failed: source: %pI6 Dest: %pI6 ifindex: %d: %s (%d)",
 			&src, &dst, ifindex, safe_strerror(errno), errno);
+		return -1;
+	}
 
-	return retval;
+	/*
+	 * Normalize to the 0-on-success / -1-on-error contract that every
+	 * pim_msg_send() caller expects (pim_jp_flush_packet, pim_hello_send,
+	 * pim_assert_send, ...). sendmsg() returns the byte count on success,
+	 * and the IPv4 pim_msg_send_frame() already collapses that to 0 — this
+	 * IPv6 variant was returning the raw count, so a *successful* Join/Prune
+	 * send tripped `if (pim_msg_send(...))` and logged a spurious
+	 * "could not send PIM message on interface <ifp>" every J/P cycle
+	 * (misdiagnosed as a link-local send failure on GRE/DIMT tunnels).
+	 */
+	return 0;
 }
 #endif
 
