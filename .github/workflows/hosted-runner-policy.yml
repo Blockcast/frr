@@ -1,0 +1,27 @@
+name: Hosted runner label policy
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/scripts/check-runner-labels.py'
+  push:
+    branches:
+      - master
+      - 'stable/**'
+      - 'rc/**'
+      - 'ci/**'
+    paths:
+      - '.github/workflows/**'
+      - '.github/scripts/check-runner-labels.py'
+
+permissions:
+  contents: read
+
+jobs:
+  enforce:
+    runs-on: default
+    steps:
+      - uses: actions/checkout@v5
+      - name: Reject GitHub-hosted runner labels
+        run: python3 .github/scripts/check-runner-labels.py

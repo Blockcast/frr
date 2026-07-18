@@ -7,13 +7,13 @@ on:
 jobs:
   behind:
     if: github.repository == 'frrouting/frr'
-    runs-on: ubuntu-latest
+    runs-on: default
     permissions:
       contents: read
       pull-requests: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0

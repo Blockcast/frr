@@ -8,7 +8,7 @@ jobs:
   freeze_warning:
     if: ${{ contains(github.event.*.labels.*.name, 'freeze') || contains(github.event.*.labels.*.name, 'do not merge') }}
     name: Warn before merging if a "freeze" or "do not merge" label exists
-    runs-on: ubuntu-latest
+    runs-on: default
     steps:
       - name: Check for "freeze" label
         run: |

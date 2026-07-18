@@ -26,7 +26,7 @@ jobs:
   # Classify changes: doc/ vs everything else (skip Docker build/tests when only doc/ changed).
   doc-path-filter:
     if: ${{ github.event_name != 'pull_request' || github.actor != 'mergify[bot]' }}
-    runs-on: ubuntu-latest
+    runs-on: default
     name: Documentation path filter
     permissions:
       contents: read
@@ -52,7 +52,7 @@ jobs:
   Prepare-MIB-Cache:
     needs: doc-path-filter
     if: ${{ needs.doc-path-filter.outputs.non_doc == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: default
     name: Prepare shared MIB cache
     timeout-minutes: 20
     steps:
@@ -105,7 +105,7 @@ jobs:
   Documentation-HTML:
     needs: doc-path-filter
     if: ${{ needs.doc-path-filter.outputs.doc == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: default
     name: HTML documentation (user + developer)
     timeout-minutes: 20
     steps:
@@ -140,7 +140,7 @@ jobs:
           if-no-files-found: error
 
   Build:
-    runs-on: ${{ matrix.cfg.os }}
+    runs-on: default
     needs: Prepare-MIB-Cache
     name: ${{ matrix.cfg.name }}
     # Guardrail in case a build leg hangs.
@@ -149,14 +149,12 @@ jobs:
       # Keep all matrix legs running so we get full failure signal.
       fail-fast: false
       matrix:
-        # cache_base controls Buildx cache sharing across related variants.
-        # Most legs use their own scope; LTTng reuses the amd64_u24 base scope.
+        # The distro under test lives in the image, independent of the ARC host OS.
+        # LTTng reuses the Ubuntu 24.04 cache because only its final build differs.
         cfg:
-        -  { os: 'ubuntu-latest',    rel: '22.04',  name: 'Ubuntu 22.04 amd64 Build',       platform: 'amd64_u22',       cache_base: 'amd64_u22' }
-        -  { os: 'ubuntu-latest',    rel: '24.04',  name: 'Ubuntu 24.04 amd64 Build',       platform: 'amd64_u24',       cache_base: 'amd64_u24' }
-        -  { os: 'ubuntu-22.04-arm', rel: '22.04',  name: 'Ubuntu 22.04 arm64 Build',       platform: 'arm64_u22',       cache_base: 'arm64_u22' }
-        -  { os: 'ubuntu-22.04-arm', rel: '24.04',  name: 'Ubuntu 24.04 arm64 Build',       platform: 'arm64_u24',       cache_base: 'arm64_u24' }
-        -  { os: 'ubuntu-latest',    rel: '24.04',  name: 'Ubuntu 24.04 amd64 LTTng Build', platform: 'amd64_u24_lttng', cache_base: 'amd64_u24', lttng: 'true' }
+        -  { rel: '22.04', name: 'Ubuntu 22.04 amd64 Build',       platform: 'amd64_u22',       cache_base: 'amd64_u22' }
+        -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 Build',       platform: 'amd64_u24',       cache_base: 'amd64_u24' }
+        -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 LTTng Build', platform: 'amd64_u24_lttng', cache_base: 'amd64_u24', lttng: 'true' }
 
     steps:
       - name: Checkout
@@ -173,6 +171,12 @@ jobs:
           key: mib-cache-v1-ubuntu24
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: registry.blockcast.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
       - name: Build docker image (cached)
         uses: docker/build-push-action@v6
         env:
@@ -188,9 +192,9 @@ jobs:
             FRR_SOURCE_REV=${{ github.sha }}
           # Keep existing test flow: export as docker image tar artifact.
           outputs: type=docker,dest=/tmp/frr-${{ matrix.cfg.platform }}.tar
-          # Reuse/persist BuildKit layers per CI platform variant.
-          cache-from: type=gha,scope=github-ci-${{ matrix.cfg.cache_base }}
-          cache-to: type=gha,mode=max,scope=github-ci-${{ matrix.cfg.cache_base }}
+          # Harbor connectivity is intentionally required for heavy image builds.
+          cache-from: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.cache_base }}-buildcache
+          cache-to: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.cache_base }}-buildcache,mode=max,image-manifest=true,oci-mediatypes=true
       - name: Upload docker image artifact
         uses: actions/upload-artifact@v7
         with:
@@ -218,7 +222,7 @@ jobs:
         run: rm -rf test-results-${{ matrix.cfg.platform }}* /tmp/frr-${{ matrix.cfg.platform }}.tar
 
   Test:
-    runs-on: ${{ matrix.cfg.os }}
+    runs-on: default
     needs: Build
     name: ${{ matrix.cfg.name }}
     # Topotest runs can be long; still cap runtime for stuck jobs.
@@ -228,10 +232,8 @@ jobs:
       fail-fast: false
       matrix:
         cfg:
-        -  { os: 'ubuntu-latest', rel: '22.04',  name: 'Ubuntu 22.04 amd64 Test',platform : 'amd64_u22' }
-        -  { os: 'ubuntu-latest' ,rel: '24.04',  name: 'Ubuntu 24.04 amd64 Test',platform : 'amd64_u24' }
-        -  { os: 'ubuntu-22.04-arm' ,rel: '22.04',  name: 'Ubuntu 22.04 arm64 Test',platform : 'arm64_u22' }
-        -  { os: 'ubuntu-22.04-arm' ,rel: '24.04',  name: 'Ubuntu 24.04 arm64 Test',platform : 'arm64_u24' }
+        -  { rel: '22.04', name: 'Ubuntu 22.04 amd64 Test', platform: 'amd64_u22' }
+        -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 Test', platform: 'amd64_u24' }
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -260,7 +262,7 @@ jobs:
           # Retry install as well; mirrors can fail between update and install.
           install_ok=0
           for i in $(seq 1 ${APT_RETRIES}); do
-            sudo apt-get install -y linux-modules-extra-azure linux-modules-${MODPKGVER} linux-modules-extra-${MODPKGVER} python3-xmltodict && install_ok=1 && break || sleep 10
+            sudo apt-get install -y kmod linux-modules-extra-azure linux-modules-${MODPKGVER} linux-modules-extra-${MODPKGVER} python3-xmltodict && install_ok=1 && break || sleep 10
           done
           [ "${install_ok}" -eq 1 ] || { echo "ERROR: apt-get install failed after ${APT_RETRIES} attempts" >&2; exit 1; }
           # Github is running old kernels but installing newer packages :(

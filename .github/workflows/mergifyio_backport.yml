@@ -5,9 +5,9 @@ on: [issue_comment]
 jobs:
   mergifyio_backport:
     if: github.repository == 'frrouting/frr'
-    runs-on: ubuntu-latest
+    runs-on: default
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v5
 
       - uses: actions-ecosystem/action-regex-match@v2
         id: regex-match
