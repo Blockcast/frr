@@ -4,8 +4,9 @@
  *
  * Copyright (C) 2026 Blockcast, Inc.
  *
- * Implements RFC 6514 MCAST-VPN Route Types 1 (Intra-AS I-PMSI A-D), 5
- * (Source Active A-D) and 7 (C-multicast Source Tree Join), constrained to
+ * Implements RFC 6514 MCAST-VPN Route Types 1 (Intra-AS I-PMSI A-D), 3
+ * (S-PMSI A-D), 4 (Leaf A-D), 5 (Source Active A-D) and 7 (C-multicast Source
+ * Tree Join), constrained to
  * Global Table Multicast (RFC 7716): the Route Distinguisher is always zero
  * (single global table) and only SSM groups are used (232.0.0.0/8 for IPv4,
  * ff3x::/32 for IPv6).
@@ -18,10 +19,11 @@
 
 #include "bgpd/bgpd.h"
 
-/* RFC 6514 MCAST-VPN route types. Types 1 (Intra-AS I-PMSI A-D), 5 (GTM SSM
- * Source Active) and 7 (C-multicast Source Tree Join) are implemented.
+/* RFC 6514 MCAST-VPN route types implemented by the GTM codec.
  */
 #define BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI   1
+#define BGP_MVPN_ROUTE_TYPE_S_PMSI_AD	     3
+#define BGP_MVPN_ROUTE_TYPE_LEAF_AD	     4
 #define BGP_MVPN_ROUTE_TYPE_SOURCE_ACTIVE    5
 #define BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN 7
 
@@ -33,6 +35,14 @@
 
 /* IPv6 (RFC 6515): RD(8) + OriginatingRouterIP(16) = 24 octets. */
 #define BGP_MVPN_TYPE1_V6_SPEC_LEN 24
+
+/* RFC 6514 Section 4.3: RD + C-S + C-G + originating-router address. */
+#define BGP_MVPN_TYPE3_V4_SPEC_LEN 22
+#define BGP_MVPN_TYPE3_V6_SPEC_LEN 58
+
+/* RFC 6514 Section 4.4: complete Type-3 NLRI route key + leaf originator. */
+#define BGP_MVPN_TYPE4_V4_SPEC_LEN 28
+#define BGP_MVPN_TYPE4_V6_SPEC_LEN 76
 
 /*
  * RFC 6514 Section 4.5 Source Active A-D route, route-type-specific portion
@@ -57,11 +67,11 @@
 #define BGP_MVPN_TYPE7_V6_SPEC_LEN 46
 
 /*
- * Largest on-wire NLRI this codec emits: Route Type(1) + Length(1) + Type-7
- * IPv6 body(46) = 48 octets. Used to reserve stream room ahead of
+ * Largest on-wire NLRI this codec emits: Route Type(1) + Length(1) + Type-4
+ * IPv6 body(76) = 78 octets. Used to reserve stream room ahead of
  * bgp_mvpn_encode_prefix(); must stay >= what any encoder arm writes.
  */
-#define BGP_MVPN_MAX_NLRI_LEN (2 + BGP_MVPN_TYPE7_V6_SPEC_LEN)
+#define BGP_MVPN_MAX_NLRI_LEN (2 + BGP_MVPN_TYPE4_V6_SPEC_LEN)
 
 /* Fill a prefix_mvpn for a Type-5 (Source Active) route. C-S/C-G may be v4 or
  * v6 but must share a family. */
@@ -74,6 +84,13 @@ extern void bgp_mvpn_build_prefix_type5(struct prefix_mvpn *p, const struct ipad
  * in the src slot (route_type keeps it distinct from Type-5/7).
  */
 extern void bgp_mvpn_build_prefix_type1(struct prefix_mvpn *p, const struct ipaddr *orig_ip);
+
+/* Fill S-PMSI A-D and Leaf A-D keys. Type-4 embeds the complete Type-3 key. */
+extern void bgp_mvpn_build_prefix_type3(struct prefix_mvpn *p, const struct ipaddr *src,
+					const struct ipaddr *grp, const struct ipaddr *originator);
+extern void bgp_mvpn_build_prefix_type4(struct prefix_mvpn *p, const struct ipaddr *src,
+					const struct ipaddr *grp, const struct ipaddr *originator,
+					const struct ipaddr *leaf_originator);
 
 /* Fill a prefix_mvpn for a Type-7 (C-multicast Source Tree Join) route. */
 extern void bgp_mvpn_build_prefix_type7(struct prefix_mvpn *p, uint32_t source_as,

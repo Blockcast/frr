@@ -3,9 +3,8 @@
 
 """
 crafter.py: minimal raw BGP speaker that negotiates the MCAST-VPN (AFI 1,
-SAFI 5) address family and sends deliberately crafted MVPN Route Type 5
-(Source Active) NLRIs to exercise the receive-path hardening in
-bgp_nlri_parse_mvpn().
+SAFI 5) address family and sends deliberately crafted MVPN Route Type 3, 4 and
+5 NLRIs to exercise the receive-path hardening in bgp_nlri_parse_mvpn().
 
 It sends, in order:
 
@@ -39,7 +38,11 @@ HOLD_TIME = 90
 
 AFI_IP = 1
 SAFI_MCAST_VPN = 5
+MVPN_TYPE3 = 3
+MVPN_TYPE4 = 4
 MVPN_TYPE5 = 5
+MVPN_TYPE3_SPEC_LEN = 22
+MVPN_TYPE4_SPEC_LEN = 28
 MVPN_TYPE5_SPEC_LEN = 18
 IPV4_BITLEN = 32
 
@@ -50,6 +53,12 @@ NONSSM_SRC = "10.20.20.1"
 NONSSM_GRP = "239.1.1.1"      # ASM range -> must be dropped
 NONRD_SRC = "10.20.20.2"
 NONRD_GRP = "232.2.2.2"       # valid SSM group, but RD != 0 -> must be dropped
+SELECTIVE_SRC = "10.30.30.1"
+SELECTIVE_GRP = "232.30.30.1"
+TYPE3_ORIGINATOR = "10.0.0.2"
+TYPE4_LEAF = "10.0.0.3"
+MALFORMED_SRC = "10.30.30.2"
+MALFORMED_GRP = "232.30.30.2"
 
 
 def build_open(local_as, router_id):
@@ -88,9 +97,29 @@ def _type5_nlri(rd, src, grp):
     )
 
 
-def build_mvpn_update(local_id, rd, src, grp):
-    """UPDATE with ORIGIN, empty AS_PATH (iBGP) and an MP_REACH Type-5 NLRI."""
-    nlri = _type5_nlri(rd, src, grp)
+def _type3_nlri(rd, src, grp, originator, length=MVPN_TYPE3_SPEC_LEN):
+    body = (
+        rd
+        + struct.pack("!B", IPV4_BITLEN)
+        + socket.inet_aton(src)
+        + struct.pack("!B", IPV4_BITLEN)
+        + socket.inet_aton(grp)
+        + socket.inet_aton(originator)
+    )
+    return struct.pack("!BB", MVPN_TYPE3, length) + body
+
+
+def _type4_nlri(rd, src, grp, originator, leaf, nested_length=MVPN_TYPE3_SPEC_LEN):
+    route_key = _type3_nlri(rd, src, grp, originator, nested_length)
+    return (
+        struct.pack("!BB", MVPN_TYPE4, MVPN_TYPE4_SPEC_LEN)
+        + route_key
+        + socket.inet_aton(leaf)
+    )
+
+
+def build_mvpn_update(local_id, nlri, include_pmsi=False):
+    """UPDATE with ORIGIN, empty AS_PATH (iBGP) and one MCAST-VPN NLRI."""
 
     # MP_REACH_NLRI value: AFI(2) SAFI(1) NHLen(1) NH(4) Reserved(1) NLRI
     mp_reach_val = (
@@ -108,6 +137,11 @@ def build_mvpn_update(local_id, rd, src, grp):
     attrs += struct.pack("!BBB", 0x40, 2, 0)
     # LOCAL_PREF: well-known transitive, type 5, len 4 (mandatory for iBGP)
     attrs += struct.pack("!BBB", 0x40, 5, 4) + struct.pack("!I", 100)
+    if include_pmsi:
+        # Optional-transitive PMSI Tunnel: flags=0, ingress replication,
+        # label=0, tunnel endpoint=local_id.
+        pmsi = struct.pack("!BB", 0, 6) + b"\x00" * 3 + socket.inet_aton(local_id)
+        attrs += struct.pack("!BBB", 0xC0, 22, len(pmsi)) + pmsi
     # MP_REACH_NLRI: optional (0x80), type 14
     attrs += struct.pack("!BBB", 0x80, 14, len(mp_reach_val)) + mp_reach_val
 
@@ -198,12 +232,46 @@ def main():
     nonzero_rd = struct.pack("!Q", 1)  # 8-octet RD, value 1 (non-zero)
 
     # A: positive control -- valid Type-5, must install.
-    sock.sendall(build_mvpn_update(local_id, zero_rd, VALID_SRC, VALID_GRP))
+    sock.sendall(build_mvpn_update(local_id, _type5_nlri(zero_rd, VALID_SRC, VALID_GRP)))
     # B: non-SSM group -- must be dropped.
-    sock.sendall(build_mvpn_update(local_id, zero_rd, NONSSM_SRC, NONSSM_GRP))
+    sock.sendall(build_mvpn_update(local_id, _type5_nlri(zero_rd, NONSSM_SRC, NONSSM_GRP)))
     # C: non-zero RD -- must be dropped.
-    sock.sendall(build_mvpn_update(local_id, nonzero_rd, NONRD_SRC, NONRD_GRP))
-    # D: empty MP_UNREACH -- must not crash the receiver.
+    sock.sendall(build_mvpn_update(local_id, _type5_nlri(nonzero_rd, NONRD_SRC, NONRD_GRP)))
+    # D: valid S-PMSI A-D and Leaf A-D positive controls.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type3_nlri(zero_rd, SELECTIVE_SRC, SELECTIVE_GRP, TYPE3_ORIGINATOR),
+            include_pmsi=True,
+        )
+    )
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type4_nlri(
+                zero_rd,
+                SELECTIVE_SRC,
+                SELECTIVE_GRP,
+                TYPE3_ORIGINATOR,
+                TYPE4_LEAF,
+            ),
+        )
+    )
+    # E: outer Type-4 length is valid but its embedded Type-3 length lies.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type4_nlri(
+                zero_rd,
+                MALFORMED_SRC,
+                MALFORMED_GRP,
+                TYPE3_ORIGINATOR,
+                TYPE4_LEAF,
+                nested_length=MVPN_TYPE3_SPEC_LEN - 1,
+            ),
+        )
+    )
+    # F: empty MP_UNREACH -- must not crash the receiver.
     sock.sendall(build_empty_mp_unreach())
     print("crafted UPDATEs sent", flush=True)
 
