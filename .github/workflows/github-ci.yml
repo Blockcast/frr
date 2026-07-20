@@ -195,7 +195,7 @@ jobs:
           outputs: type=docker,dest=/tmp/frr-${{ matrix.cfg.platform }}.tar
           # Harbor connectivity is intentionally required for heavy image builds.
           cache-from: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.cache_base }}-buildcache
-          cache-to: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.cache_base }}-buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+          cache-to: ${{ github.ref == 'refs/heads/master' && format('type=registry,ref=registry.blockcast.net/cache/frr-ci:{0}-buildcache,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=3', matrix.cfg.cache_base) || '' }}
       - name: Upload docker image artifact
         uses: actions/upload-artifact@v7
         with:
