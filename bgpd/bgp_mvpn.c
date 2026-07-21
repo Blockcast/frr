@@ -1282,6 +1282,10 @@ static void bgp_mvpn_leaf_from_type3_set(struct bgp *bgp,
 	struct ipaddr leaf_originator;
 	struct attr attr;
 
+	/* v6 selective (Type-4) leaf origination is deferred alongside Type-3 --
+	 * see the note in bgp_mvpn_selective_source_set(). The v6 Type-3/4
+	 * receive/parse/reconcile path is fully mirrored; only local origination
+	 * waits on an explicitly selected IPv6 PE address. */
 	if (IS_IPADDR_V6(&type3->prefix.src) ||
 	    bgp->router_id.s_addr == INADDR_ANY || !bgp->peer_self)
 		return;
@@ -1315,6 +1319,8 @@ static void bgp_mvpn_selective_join_set(struct bgp *bgp,
 	struct bgp_table *table = bgp->rib[afi][SAFI_MCAST_VPN];
 	struct bgp_dest *dest;
 
+	/* v6 selective origination is deferred -- see
+	 * bgp_mvpn_selective_source_set(). */
 	if (!table || IS_IPADDR_V6(src))
 		return;
 

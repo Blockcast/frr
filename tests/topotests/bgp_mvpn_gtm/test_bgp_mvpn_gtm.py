@@ -796,6 +796,108 @@ def test_full_mvpn_exchange():
     assert result is None, "full MVPN exchange incomplete: {}".format(result)
 
 
+def test_selective_reconcile_both_arrival_orders():
+    """Type-3 (S-PMSI) and the receiver join reconcile to a Type-4 in EITHER order.
+
+    test_selective_routes_replay_after_daemon_restarts proves convergence but the
+    arrival order a given run produces is nondeterministic (its own docstring says
+    so). This drives BOTH orderings explicitly, on fresh groups (same source h1,
+    distinct G) that do not touch the standing (SOURCE, GROUP) state:
+
+    - order A (join before Type-3): r2 IGMP-joins (SOURCE, GA) while no sender for
+      GA exists -> a Type-7 is originated but there is no remote Type-3, so no
+      Type-4. h1 then starts sending to GA -> r1 pimd originates the Type-3 ->
+      r2's local-join reconcile (bgp_mvpn_selective_join_set) installs the Type-4.
+    - order B (Type-3 before join): h1 sends to GB first -> r1's Type-3 exists (and
+      reaches r2) -> r2 then IGMP-joins (SOURCE, GB) -> r2's remote-Type-3
+      reconcile (route_install, has_local_join) installs the Type-4.
+
+    Both orderings must end with r1 holding the Type-4 (leafOriginator 10.0.0.2).
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    ga = "232.1.1.20"
+    gb = "232.1.1.21"
+    mcast_tester = os.path.join(CWD, "../lib/mcast-tester.py")
+    senders = []
+
+    def _type4_present(group):
+        route = _selective_route(_mvpn_routes("r1"), 4, SOURCE, group)
+        if (
+            route
+            and route.get("originator") == "10.0.0.1"
+            and route.get("leafOriginator") == "10.0.0.2"
+        ):
+            return None
+        return "Type-4 ({}, {}) not present on r1: {}".format(
+            SOURCE, group, _mvpn_routes("r1")
+        )
+
+    def _type4_absent(group):
+        if _selective_route(_mvpn_routes("r1"), 4, SOURCE, group) is None:
+            return None
+        return "Type-4 ({}, {}) present on r1 with no remote Type-3".format(
+            SOURCE, group
+        )
+
+    def _type3_present(router, group):
+        if _selective_route(_mvpn_routes(router), 3, SOURCE, group):
+            return None
+        return "Type-3 ({}, {}) not yet on {}".format(SOURCE, group, router)
+
+    def _join(group):
+        tgen.gears["r2"].vtysh_cmd(
+            "configure terminal\ninterface r2-eth1\n ip igmp join-group {} {}\n".format(
+                group, SOURCE
+            )
+        )
+
+    try:
+        # ---- order A: join first, source second ----
+        _join(ga)
+        # No sender for GA yet: local join without a remote Type-3 -> no Type-4.
+        _, result = topotest.run_and_expect(
+            functools.partial(_type4_absent, ga), None, count=10, wait=1
+        )
+        assert result is None, result
+        senders.append(
+            tgen.gears["h1"].popen([mcast_tester, ga, "h1-eth0", "--send", "0.7"])
+        )
+        _, result = topotest.run_and_expect(
+            functools.partial(_type4_present, ga), None, count=90, wait=1
+        )
+        assert result is None, "order A (join before Type-3) did not reconcile to Type-4"
+
+        # ---- order B: source first, join second ----
+        senders.append(
+            tgen.gears["h1"].popen([mcast_tester, gb, "h1-eth0", "--send", "0.7"])
+        )
+        _, result = topotest.run_and_expect(
+            functools.partial(_type3_present, "r2", gb), None, count=90, wait=1
+        )
+        assert result is None, "order B setup: r1 did not originate/propagate the Type-3 for GB"
+        _join(gb)
+        _, result = topotest.run_and_expect(
+            functools.partial(_type4_present, gb), None, count=90, wait=1
+        )
+        assert result is None, "order B (Type-3 before join) did not reconcile to Type-4"
+    finally:
+        # Restore the standing state: drop the extra joins, reap the extra
+        # senders. (Their FHR Type-3/5 age out on the PIM keep-alive; distinct
+        # groups, so they do not perturb the SOURCE/GROUP tests that follow.)
+        tgen.gears["r2"].vtysh_cmd(
+            "configure terminal\ninterface r2-eth1\n"
+            " no ip igmp join-group {} {}\n no ip igmp join-group {} {}\n".format(
+                ga, SOURCE, gb, SOURCE
+            )
+        )
+        for sender in senders:
+            sender.terminate()
+
+
 def test_type7_withdraw_on_igmp_leave():
     """Removing the IGMP join must withdraw the Type-7 from r1.
 
