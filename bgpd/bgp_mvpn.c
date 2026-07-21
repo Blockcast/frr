@@ -996,6 +996,47 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, const struct ipaddr *src, const 
 	return CMD_SUCCESS;
 }
 
+static void bgp_mvpn_remove_local_selective_routes(struct bgp *bgp,
+						   uint8_t route_type,
+						   const struct ipaddr *src,
+						   const struct ipaddr *grp,
+						   const struct ipaddr *originator)
+{
+	afi_t afi;
+
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++) {
+		struct bgp_table *table = bgp->rib[afi][SAFI_MCAST_VPN];
+		struct bgp_dest *dest;
+
+		if (!table)
+			continue;
+
+		for (dest = bgp_table_top(table); dest;
+		     dest = bgp_route_next(dest)) {
+			const struct prefix_mvpn *p =
+				(const struct prefix_mvpn *)bgp_dest_get_prefix(dest);
+			struct bgp_path_info *pi;
+
+			if (p->family != AF_MVPN || p->prefix.route_type != route_type ||
+			    (src && ipaddr_cmp(&p->prefix.src, src) != 0) ||
+			    (grp && ipaddr_cmp(&p->prefix.grp, grp) != 0) ||
+			    (originator &&
+			     ipaddr_cmp(&p->prefix.originator, originator) != 0))
+				continue;
+
+			for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+				if (pi->peer != bgp->peer_self ||
+				    pi->sub_type != BGP_ROUTE_STATIC ||
+				    CHECK_FLAG(pi->flags, BGP_PATH_REMOVED))
+					continue;
+				bgp_unlink_nexthop(pi);
+				bgp_path_info_mark_for_delete(dest, pi);
+				bgp_process(bgp, dest, pi, afi, SAFI_MCAST_VPN);
+			}
+		}
+	}
+}
+
 int bgp_mvpn_selective_source_set(struct bgp *bgp, const struct ipaddr *src,
 				  const struct ipaddr *grp, bool negate)
 {
@@ -1009,16 +1050,18 @@ int bgp_mvpn_selective_source_set(struct bgp *bgp, const struct ipaddr *src,
 	 * selective origination reuses it -- no separate IPv6 PE address is
 	 * needed. AFI is keyed off the source family via bgp_mvpn_prefix_afi(),
 	 * mirroring the non-selective Source-Active path above. */
-	if (bgp->router_id.s_addr == INADDR_ANY || !bgp->peer_self)
+	if (!bgp->peer_self)
+		return CMD_SUCCESS;
+	if (negate) {
+		bgp_mvpn_remove_local_selective_routes(
+			bgp, BGP_MVPN_ROUTE_TYPE_S_PMSI_AD, src, grp, NULL);
+		return CMD_SUCCESS;
+	}
+	if (bgp->router_id.s_addr == INADDR_ANY)
 		return CMD_SUCCESS;
 
 	originator = mvpn_ipaddr_v4(bgp->router_id);
 	bgp_mvpn_build_prefix_type3(&p, src, grp, &originator);
-	if (negate) {
-		bgp_mvpn_route_remove(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p),
-				      &p, BGP_ROUTE_STATIC);
-		return CMD_SUCCESS;
-	}
 
 	bgp_attr_default_set(&attr, bgp, BGP_ORIGIN_IGP);
 	bgp_attr_set(&attr, BGP_ATTR_NEXT_HOP);
@@ -1184,6 +1227,10 @@ void bgp_mvpn_handle_router_id_update(struct bgp *bgp, bool withdraw)
 	 * deactivated, so look up and remove both copies unconditionally. */
 	for (afi = AFI_IP; afi <= AFI_IP6; afi++)
 		bgp_mvpn_withdraw_type1(bgp, afi);
+	bgp_mvpn_remove_local_selective_routes(
+		bgp, BGP_MVPN_ROUTE_TYPE_S_PMSI_AD, NULL, NULL, NULL);
+	bgp_mvpn_remove_local_selective_routes(
+		bgp, BGP_MVPN_ROUTE_TYPE_LEAF_AD, NULL, NULL, NULL);
 }
 
 /*
@@ -1286,17 +1333,20 @@ static void bgp_mvpn_leaf_from_type3_set(struct bgp *bgp,
 	/* v6 leaf (Type-4) origination reuses the v4 router-id originator
 	 * (RFC 6515), same as bgp_mvpn_selective_source_set(); AFI keyed by the
 	 * source family. */
-	if (bgp->router_id.s_addr == INADDR_ANY || !bgp->peer_self)
+	if (!bgp->peer_self)
+		return;
+	if (negate) {
+		bgp_mvpn_remove_local_selective_routes(
+			bgp, BGP_MVPN_ROUTE_TYPE_LEAF_AD, &type3->prefix.src,
+			&type3->prefix.grp, &type3->prefix.originator);
+		return;
+	}
+	if (bgp->router_id.s_addr == INADDR_ANY)
 		return;
 
 	leaf_originator = mvpn_ipaddr_v4(bgp->router_id);
 	bgp_mvpn_build_prefix_type4(&leaf, &type3->prefix.src, &type3->prefix.grp,
 				    &type3->prefix.originator, &leaf_originator);
-	if (negate) {
-		bgp_mvpn_route_remove(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&leaf),
-				      &leaf, BGP_ROUTE_STATIC);
-		return;
-	}
 
 	bgp_attr_default_set(&attr, bgp, BGP_ORIGIN_IGP);
 	bgp_attr_set(&attr, BGP_ATTR_NEXT_HOP);

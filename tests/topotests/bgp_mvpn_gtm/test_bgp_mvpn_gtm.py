@@ -1053,6 +1053,66 @@ interface r2-eth1
     assert result is None, "r1 still holds the IPv6 Type-7 after the MLD leave"
 
 
+def test_selective_routes_router_id_lifecycle():
+    """A router-id change rekeys local Type-3/4 state after pimd replay."""
+    tgen = get_topogen()
+    r1 = tgen.gears["r1"]
+    r2 = tgen.gears["r2"]
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r2.vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ ip igmp join-group {} {}
+""".format(GROUP, SOURCE)
+    )
+
+    def _selective_rekeyed(expected, stale):
+        routes = _mvpn_routes("r1") + _mvpn_routes("r2")
+        type3 = _selective_route(routes, 3)
+        type4 = _selective_route(routes, 4)
+        if (
+            type3
+            and type3.get("originator") == expected
+            and type4
+            and type4.get("leafOriginator") == "10.0.0.2"
+            and type4.get("originator") == expected
+            and all(
+                route.get("originator") != stale
+                and route.get("leafOriginator") != stale
+                for route in routes
+                if route.get("routeType") in (3, 4)
+            )
+        ):
+            return None
+        return "selective routes did not rekey from {} to {}: {}".format(
+            stale, expected, routes
+        )
+
+    for expected, stale in (("10.0.0.3", "10.0.0.1"), ("10.0.0.1", "10.0.0.3")):
+        r1.vtysh_cmd(
+            """
+configure terminal
+router bgp 65001
+ bgp router-id {}
+""".format(expected)
+        )
+        test_func = functools.partial(_selective_rekeyed, expected, stale)
+        _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
+        assert result is None, result
+
+    r2.vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ no ip igmp join-group {} {}
+""".format(GROUP, SOURCE)
+    )
+
+
 def test_type1_router_id_lifecycle():
     """A router-id change withdraws the old Type-1 in both MVPN planes."""
     tgen = get_topogen()
