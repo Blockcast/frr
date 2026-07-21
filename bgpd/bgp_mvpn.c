@@ -717,6 +717,22 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			continue;
 		}
 
+		/*
+		 * Type-3 (S-PMSI A-D) intentionally has NO equivalent PMSI-Tunnel
+		 * gate here, unlike Type-1 above. Per RFC 6514 Section 5 an S-PMSI
+		 * A-D conveys its selective-tunnel binding via the PMSI Tunnel
+		 * attribute, so a receive-path tunnel-type check is defensible in
+		 * principle. This PR ships the codec + selective-forwarding RIB
+		 * install only; PIM-driven per-(S,G) Type-3/4 origination -- the
+		 * state that would actually consume the tunnel binding -- is the
+		 * next stage (see "Remaining Before Ready"). Gating Type-3 install
+		 * on a tunnel attribute before that origination path exists would
+		 * drop valid selective A-D routes with nothing yet to bind. Deferred
+		 * deliberately: the follow-on PIM-integration task MUST decide
+		 * whether the Type-3 receive path gains the same INGR_REPL gate.
+		 * Tracked: BLO-15578.
+		 */
+
 		/* Type-1's plane is the AF the NLRI arrived on (RFC 6515 permits a
 		 * v4 originator inside the IPv6 AF); Type-5/7 key off the C-S/C-G
 		 * family, which the length checks above already tied to the body.

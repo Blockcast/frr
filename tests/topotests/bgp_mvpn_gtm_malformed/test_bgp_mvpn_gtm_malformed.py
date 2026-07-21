@@ -57,6 +57,7 @@ NONSSM_SG = ("10.20.20.1", "239.1.1.1")
 NONRD_SG = ("10.20.20.2", "232.2.2.2")
 SELECTIVE_SG = ("10.30.30.1", "232.30.30.1")
 MALFORMED_SG = ("10.30.30.2", "232.30.30.2")
+RECOVER_SG = ("10.40.40.1", "232.40.40.1")
 TYPE3_ORIGINATOR = "10.0.0.2"
 TYPE4_LEAF = "10.0.0.3"
 
@@ -228,6 +229,32 @@ def test_malformed_nested_type3_rejected():
     """A Leaf A-D route with a lying embedded Type-3 length must not install."""
     routes = _mvpn_routes("r1")
     assert not _has_selective_route(routes, 4, MALFORMED_SG, TYPE4_LEAF), routes
+
+
+def test_intrapacket_framing_recovery():
+    """A valid Type-5 following a malformed NLRI in the SAME UPDATE must install.
+
+    test_malformed_nested_type3_rejected proves a lone malformed Leaf A-D is
+    dropped without resetting the session, but not that framing recovers *within*
+    the packet. Here (crafter case E2) a malformed Type-4 -- lying embedded Type-3
+    length -- is immediately followed by a well-formed Type-5 in one MP_REACH. The
+    receiver must skip the malformed NLRI by its outer length (the length-2 skip
+    arithmetic) and still parse+install the trailing Type-5. If the skip is off by
+    any amount, the trailing route never appears. (BLO-15578 review follow-up.)
+    """
+
+    def _present():
+        if not _has_type5(_mvpn_routes("r1"), RECOVER_SG):
+            return "trailing valid Type-5 {} after a malformed NLRI not installed".format(
+                RECOVER_SG
+            )
+        return None
+
+    _, result = topotest.run_and_expect(_present, None, count=60, wait=1)
+    assert result is None, (
+        "r1 did not install the Type-5 that followed a malformed NLRI in the same "
+        "UPDATE -- intra-packet framing recovery (the length-2 skip) is broken"
+    )
 
 
 def test_no_crash_after_empty_mp_unreach():

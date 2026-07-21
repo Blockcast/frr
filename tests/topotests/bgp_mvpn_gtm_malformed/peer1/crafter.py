@@ -59,6 +59,8 @@ TYPE3_ORIGINATOR = "10.0.0.2"
 TYPE4_LEAF = "10.0.0.3"
 MALFORMED_SRC = "10.30.30.2"
 MALFORMED_GRP = "232.30.30.2"
+RECOVER_SRC = "10.40.40.1"
+RECOVER_GRP = "232.40.40.1"   # valid SSM; trailing NLRI after a malformed one
 
 
 def build_open(local_as, router_id):
@@ -269,6 +271,25 @@ def main():
                 TYPE4_LEAF,
                 nested_length=MVPN_TYPE3_SPEC_LEN - 1,
             ),
+        )
+    )
+    # E2: intra-packet framing recovery -- a malformed Type-4 (lying embedded
+    # Type-3 length, as in E) immediately followed by a WELL-FORMED Type-5 in the
+    # SAME MP_REACH. Proves the receiver skips the malformed NLRI by its outer
+    # length (the length-2 skip arithmetic) and still parses the trailing valid
+    # NLRI, not merely that it survives a lone malformed NLRI. (BLO-15578.)
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type4_nlri(
+                zero_rd,
+                MALFORMED_SRC,
+                MALFORMED_GRP,
+                TYPE3_ORIGINATOR,
+                TYPE4_LEAF,
+                nested_length=MVPN_TYPE3_SPEC_LEN - 1,
+            )
+            + _type5_nlri(zero_rd, RECOVER_SRC, RECOVER_GRP),
         )
     )
     # F: empty MP_UNREACH -- must not crash the receiver.
