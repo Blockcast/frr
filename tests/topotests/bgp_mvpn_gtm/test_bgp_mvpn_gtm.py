@@ -450,6 +450,77 @@ interface r2-eth1
     assert result is None, "Type-7 upstream RT was not resolved from the VRF Route Import (0x0b) EC"
 
 
+def test_type7_reresolves_when_route_import_arrives_after_join():
+    """A local Type-7 must re-resolve its upstream RT when the unicast route
+    toward C-S changes *after* the join is already up (reactive re-resolution).
+
+    The RFC 6514 Section 5 upstream RT is read from the unicast route toward C-S
+    at origination. A receiver can join before that route carries its route-
+    import EC -- e.g. the source PE advertises the covering route, or adds the
+    EC, only later. Without reactive re-resolution the Type-7 keeps whatever it
+    resolved at origination (here the Source-Active next-hop fallback) and never
+    targets the real upstream PE, so the source PE never imports the join.
+
+    r1 advertises 10.99.99.3/32 with NO route-import and a static Source Active
+    for (10.99.99.3, 232.9.9.11). r2 IGMP-joins that (S,G): with no route-import
+    on the source route, the Type-7 falls back to the SA next hop RT:10.0.0.1:0.
+    Then r1 re-advertises 10.99.99.3/32 carrying vrf-route-import 10.255.0.4:0.
+    r2's Type-7 must switch to RT:10.255.0.4:0 WITHOUT the join being touched.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r2"].vtysh_cmd(
+        """
+configure terminal
+interface r2-eth1
+ ip igmp join-group 232.9.9.11 10.99.99.3
+"""
+    )
+
+    def _type7_rt(router, want):
+        routes = _mvpn_routes(router)
+        for r in routes:
+            if (
+                r.get("routeType") == 7
+                and r.get("source") == "10.99.99.3"
+                and r.get("group") == "232.9.9.11"
+            ):
+                rt = r.get("extendedCommunity", {}).get("string")
+                if rt == want:
+                    return None
+                return "Type-7 (10.99.99.3, 232.9.9.11) carries {} (want {})".format(
+                    rt, want
+                )
+        return "Type-7 (10.99.99.3, 232.9.9.11) not found in {}".format(routes)
+
+    # Precondition: no route-import on the source route -> SA next-hop fallback.
+    test_func = functools.partial(_type7_rt, "r2", "RT:10.0.0.1:0")
+    _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
+    assert result is None, "Type-7 did not originate with the SA next-hop fallback RT before route-import"
+
+    # The source PE now attaches a route-import EC to the C-S unicast route.
+    # The join is deliberately NOT touched -- only the unicast route changes.
+    tgen.gears["r1"].vtysh_cmd(
+        """
+configure terminal
+route-map addvri3 permit 10
+ set extcommunity vrf-route-import 10.255.0.4:0
+router bgp 65001
+ address-family ipv4 unicast
+  network 10.99.99.3/32 route-map addvri3
+"""
+    )
+
+    # The fix: r2's unicast best path for 10.99.99.3 changed, so the dependent
+    # Type-7 must re-resolve to the route-import RT with no join churn.
+    test_func = functools.partial(_type7_rt, "r2", "RT:10.255.0.4:0")
+    _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
+    assert result is None, "Type-7 did not re-resolve its upstream RT after route-import arrived post-join"
+
+
 def test_type5_v6_source_active_propagates():
     """A local IPv6 GTM Source Active (Type 5) route on r1 must reach r2 (RFC 6515).
 
