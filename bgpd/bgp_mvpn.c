@@ -1004,18 +1004,19 @@ int bgp_mvpn_selective_source_set(struct bgp *bgp, const struct ipaddr *src,
 	struct in6_addr tunn_id = {};
 	struct ipaddr originator;
 
-	/* The current GTM core identifies PEs by the IPv4 BGP router-id. IPv6
-	 * Type-3/4 wire support is independent, but local v6 origination needs an
-	 * explicitly selected IPv6 PE address before it can be enabled safely. */
-	if (IS_IPADDR_V6(src) || bgp->router_id.s_addr == INADDR_ANY ||
-	    !bgp->peer_self)
+	/* GTM identifies PEs by the IPv4 BGP router-id in both planes (RFC 6515:
+	 * a v4 Originating Router address inside the IPv6 MCAST-VPN AF), so v6
+	 * selective origination reuses it -- no separate IPv6 PE address is
+	 * needed. AFI is keyed off the source family via bgp_mvpn_prefix_afi(),
+	 * mirroring the non-selective Source-Active path above. */
+	if (bgp->router_id.s_addr == INADDR_ANY || !bgp->peer_self)
 		return CMD_SUCCESS;
 
 	originator = mvpn_ipaddr_v4(bgp->router_id);
 	bgp_mvpn_build_prefix_type3(&p, src, grp, &originator);
 	if (negate) {
-		bgp_mvpn_route_remove(bgp, bgp->peer_self, AFI_IP, &p,
-				      BGP_ROUTE_STATIC);
+		bgp_mvpn_route_remove(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p),
+				      &p, BGP_ROUTE_STATIC);
 		return CMD_SUCCESS;
 	}
 
@@ -1032,7 +1033,7 @@ int bgp_mvpn_selective_source_set(struct bgp *bgp, const struct ipaddr *src,
 	bgp_attr_set_tunn_id(&attr, &tunn_id);
 	attr.label = 0;
 	bgp_mvpn_attach_gtm_rt(&attr);
-	bgp_mvpn_route_install(bgp, bgp->peer_self, AFI_IP, &p, &attr,
+	bgp_mvpn_route_install(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p), &p, &attr,
 			       BGP_ROUTE_STATIC);
 	bgp_attr_flush(&attr);
 	aspath_unintern(&attr.aspath);
@@ -1282,20 +1283,18 @@ static void bgp_mvpn_leaf_from_type3_set(struct bgp *bgp,
 	struct ipaddr leaf_originator;
 	struct attr attr;
 
-	/* v6 selective (Type-4) leaf origination is deferred alongside Type-3 --
-	 * see the note in bgp_mvpn_selective_source_set(). The v6 Type-3/4
-	 * receive/parse/reconcile path is fully mirrored; only local origination
-	 * waits on an explicitly selected IPv6 PE address. */
-	if (IS_IPADDR_V6(&type3->prefix.src) ||
-	    bgp->router_id.s_addr == INADDR_ANY || !bgp->peer_self)
+	/* v6 leaf (Type-4) origination reuses the v4 router-id originator
+	 * (RFC 6515), same as bgp_mvpn_selective_source_set(); AFI keyed by the
+	 * source family. */
+	if (bgp->router_id.s_addr == INADDR_ANY || !bgp->peer_self)
 		return;
 
 	leaf_originator = mvpn_ipaddr_v4(bgp->router_id);
 	bgp_mvpn_build_prefix_type4(&leaf, &type3->prefix.src, &type3->prefix.grp,
 				    &type3->prefix.originator, &leaf_originator);
 	if (negate) {
-		bgp_mvpn_route_remove(bgp, bgp->peer_self, AFI_IP, &leaf,
-				      BGP_ROUTE_STATIC);
+		bgp_mvpn_route_remove(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&leaf),
+				      &leaf, BGP_ROUTE_STATIC);
 		return;
 	}
 
@@ -1305,7 +1304,7 @@ static void bgp_mvpn_leaf_from_type3_set(struct bgp *bgp,
 	attr.mp_nexthop_global_in = bgp->router_id;
 	attr.mp_nexthop_len = IPV4_MAX_BYTELEN;
 	bgp_mvpn_attach_ip_rt(&attr, type3->prefix.originator.ipaddr_v4);
-	bgp_mvpn_route_install(bgp, bgp->peer_self, AFI_IP, &leaf, &attr,
+	bgp_mvpn_route_install(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&leaf), &leaf, &attr,
 			       BGP_ROUTE_STATIC);
 	bgp_attr_flush(&attr);
 	aspath_unintern(&attr.aspath);
@@ -1319,9 +1318,7 @@ static void bgp_mvpn_selective_join_set(struct bgp *bgp,
 	struct bgp_table *table = bgp->rib[afi][SAFI_MCAST_VPN];
 	struct bgp_dest *dest;
 
-	/* v6 selective origination is deferred -- see
-	 * bgp_mvpn_selective_source_set(). */
-	if (!table || IS_IPADDR_V6(src))
+	if (!table)
 		return;
 
 	for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
