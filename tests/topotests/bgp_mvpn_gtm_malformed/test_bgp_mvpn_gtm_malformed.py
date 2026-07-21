@@ -14,12 +14,14 @@ test_bgp_mvpn_gtm_malformed.py:
 
 Adversarial receive-path tests for the BGP MCAST-VPN (AFI 1, SAFI 5, RFC 6514)
 Global Table Multicast decoder. A raw BGP speaker (peer1/crafter.py) negotiates
-the MCAST-VPN AF with an FRR router and sends deliberately crafted Route Type 5
-(Source Active) NLRIs plus an empty MP_UNREACH. The FRR side must:
+the MCAST-VPN AF with an FRR router and sends Type-3/4/5 NLRIs plus an empty
+MP_UNREACH. The FRR side must:
 
   * install a VALID Type-5 (positive control),
   * DROP a Type-5 whose group is outside the SSM range 232.0.0.0/8,
   * DROP a Type-5 carrying a non-zero Route Distinguisher (GTM requires RD 0),
+  * install valid S-PMSI A-D and Leaf A-D routes,
+  * DROP a Leaf A-D route with a malformed embedded S-PMSI route key,
   * NOT crash on an MP_UNREACH that carries only AFI+SAFI (empty NLRI) -- the
     stream_new(0) assertion-abort that the receive-path hardening fixes.
 
@@ -53,6 +55,11 @@ pytestmark = [pytest.mark.bgpd]
 VALID_SG = ("10.9.9.9", "232.9.9.9")
 NONSSM_SG = ("10.20.20.1", "239.1.1.1")
 NONRD_SG = ("10.20.20.2", "232.2.2.2")
+SELECTIVE_SG = ("10.30.30.1", "232.30.30.1")
+MALFORMED_SG = ("10.30.30.2", "232.30.30.2")
+RECOVER_SG = ("10.40.40.1", "232.40.40.1")
+TYPE3_ORIGINATOR = "10.0.0.2"
+TYPE4_LEAF = "10.0.0.3"
 
 
 def build_topo(tgen):
@@ -100,6 +107,20 @@ def _has_type5(routes, sg):
     src, grp = sg
     for r in routes:
         if r.get("routeType") == 5 and r.get("source") == src and r.get("group") == grp:
+            return True
+    return False
+
+
+def _has_selective_route(routes, route_type, sg, leaf=None):
+    src, grp = sg
+    for route in routes:
+        if (
+            route.get("routeType") == route_type
+            and route.get("source") == src
+            and route.get("group") == grp
+            and route.get("originator") == TYPE3_ORIGINATOR
+            and (leaf is None or route.get("leafOriginator") == leaf)
+        ):
             return True
     return False
 
@@ -183,6 +204,56 @@ def test_non_zero_rd_rejected():
     routes = _mvpn_routes("r1")
     assert not _has_type5(routes, NONRD_SG), (
         "r1 installed a non-zero-RD Type-5 {}; routes={}".format(NONRD_SG, routes)
+    )
+
+
+def test_valid_type3_and_type4_accepted():
+    """Valid S-PMSI and Leaf A-D routes must install with their exact keys."""
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _present():
+        routes = _mvpn_routes("r1")
+        if not _has_selective_route(routes, 3, SELECTIVE_SG):
+            return "valid Type-3 not installed: {}".format(routes)
+        if not _has_selective_route(routes, 4, SELECTIVE_SG, TYPE4_LEAF):
+            return "valid Type-4 not installed: {}".format(routes)
+        return None
+
+    _, result = topotest.run_and_expect(_present, None, count=60, wait=1)
+    assert result is None, result
+
+
+def test_malformed_nested_type3_rejected():
+    """A Leaf A-D route with a lying embedded Type-3 length must not install."""
+    routes = _mvpn_routes("r1")
+    assert not _has_selective_route(routes, 4, MALFORMED_SG, TYPE4_LEAF), routes
+
+
+def test_intrapacket_framing_recovery():
+    """A valid Type-5 following a malformed NLRI in the SAME UPDATE must install.
+
+    test_malformed_nested_type3_rejected proves a lone malformed Leaf A-D is
+    dropped without resetting the session, but not that framing recovers *within*
+    the packet. Here (crafter case E2) a malformed Type-4 -- lying embedded Type-3
+    length -- is immediately followed by a well-formed Type-5 in one MP_REACH. The
+    receiver must skip the malformed NLRI by its outer length (the length-2 skip
+    arithmetic) and still parse+install the trailing Type-5. If the skip is off by
+    any amount, the trailing route never appears. (BLO-15578 review follow-up.)
+    """
+
+    def _present():
+        if not _has_type5(_mvpn_routes("r1"), RECOVER_SG):
+            return "trailing valid Type-5 {} after a malformed NLRI not installed".format(
+                RECOVER_SG
+            )
+        return None
+
+    _, result = topotest.run_and_expect(_present, None, count=60, wait=1)
+    assert result is None, (
+        "r1 did not install the Type-5 that followed a malformed NLRI in the same "
+        "UPDATE -- intra-packet framing recovery (the length-2 skip) is broken"
     )
 
 

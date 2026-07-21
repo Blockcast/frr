@@ -126,16 +126,17 @@ struct evpn_addr {
 };
 
 /* MCAST-VPN address (RFC 6514), constrained to Global Table Multicast
- * (RFC 7716). Only the fields needed to key Route Type 5 (Source Active A-D)
- * and Route Type 7 (C-multicast Source Tree Join) routes are carried: the
- * Route Distinguisher is always zero under GTM (single global table), so it is
- * not stored here. source_as holds the Type-7 Source AS (0 for Type-5) so that
- * it is part of the RIB key and renderable from the prefix.
+ * (RFC 7716). The Route Distinguisher is always zero under GTM (single global
+ * table), so it is not stored here. originator identifies the S-PMSI source PE;
+ * leaf_originator identifies a Leaf A-D source PE. source_as is only used by
+ * Type-7. Unused fields stay zero so the whole structure is a stable RIB key.
  */
 struct mvpn_addr {
 	uint8_t route_type;
 	struct ipaddr src; /* C-S (multicast source) -- v4 or v6 */
 	struct ipaddr grp; /* C-G (multicast group)  -- v4 or v6 */
+	struct ipaddr originator; /* Type-3 route originator; embedded by Type-4 */
+	struct ipaddr leaf_originator; /* Type-4 leaf originator */
 	uint32_t source_as; /* Type-7 Source AS (host order); 0 for Type-5 */
 };
 

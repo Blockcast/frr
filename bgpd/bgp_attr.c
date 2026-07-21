@@ -5333,7 +5333,7 @@ size_t bgp_packet_mpattr_prefix_size(afi_t afi, safi_t safi,
 	case SAFI_MCAST_VPN:
 		/*
 		 * Largest NLRI bgp_mvpn_encode_prefix() can emit (RFC 6514:
-		 * RouteType(1) + Length(1) + Type-7 IPv6 body), mirroring
+		 * RouteType(1) + Length(1) + Type-4 IPv6 body), mirroring
 		 * EVPN's conservative single maximum.
 		 */
 		size = BGP_MVPN_MAX_NLRI_LEN;
