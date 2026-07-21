@@ -1409,6 +1409,73 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 	return CMD_SUCCESS;
 }
 
+/*
+ * Re-resolve locally-originated Type-7 joins after the unicast route toward a
+ * C-S changes.
+ *
+ * The RFC 6514 Section 5 communities on a pimd-driven Type-7 (the upstream-PE
+ * Route Target derived from the source route's VRF Route Import EC, and the
+ * Source AS) are read from the unicast route toward C-S at origination time in
+ * bgp_mvpn_source_tree_join_set(). A receiver can stay joined across changes to
+ * that unicast route -- most importantly, the route can arrive (or gain its
+ * rt-import EC) *after* the join, in which case the Type-7 was first originated
+ * RT-less and never targets the correct upstream PE. This reconcile is the
+ * missing reactive half: when a unicast best path changes, re-originate any
+ * local Type-7 whose C-S the changed prefix covers, so the RT/Source-AS track
+ * the source route. Re-origination is idempotent (bgp_mvpn_route_install dedups
+ * an unchanged attr via attrhash_cmp), so an unrelated change is a cheap no-op.
+ *
+ * Called from the unicast best-path path only when GTM is active, so a non-GTM
+ * instance pays nothing. The MCAST-VPN table walked here holds one entry per
+ * local join (small), and the C-S family fixes which AFI's table to scan.
+ */
+void bgp_mvpn_reresolve_joins_for_route(struct bgp *bgp, afi_t afi, const struct prefix *changed)
+{
+	struct bgp_table *table = bgp->rib[afi][SAFI_MCAST_VPN];
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi;
+
+	if (!table || !bgp->peer_self || !changed)
+		return;
+
+	for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
+		const struct prefix *pfx = bgp_dest_get_prefix(dest);
+		const struct mvpn_addr *m = &pfx->u.prefix_mvpn;
+		struct prefix csrc = {};
+
+		if (pfx->family != AF_MVPN ||
+		    m->route_type != BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN)
+			continue;
+
+		/* Only our own pimd-driven joins carry a resolvable upstream. */
+		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
+			if (pi->peer == bgp->peer_self &&
+			    pi->sub_type == BGP_ROUTE_STATIC)
+				break;
+		if (!pi)
+			continue;
+
+		/* Does the changed unicast prefix cover this join's C-S? The
+		 * Type-7's C-S family selects the table AFI, so it always matches
+		 * `afi` here; build the host prefix and test containment. */
+		if (IS_IPADDR_V6(&m->src)) {
+			csrc.family = AF_INET6;
+			csrc.prefixlen = IPV6_MAX_BITLEN;
+			csrc.u.prefix6 = m->src.ipaddr_v6;
+		} else {
+			csrc.family = AF_INET;
+			csrc.prefixlen = IPV4_MAX_BITLEN;
+			csrc.u.prefix4 = m->src.ipaddr_v4;
+		}
+		if (changed->family != csrc.family ||
+		    !prefix_match(changed, &csrc))
+			continue;
+
+		/* Re-derive RT + Source-AS from the (now changed) source route. */
+		bgp_mvpn_source_tree_join_set(bgp, &m->src, &m->grp, false);
+	}
+}
+
 void bgp_mvpn_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi)
 {
 	struct bgp_table *table = bgp->rib[afi][safi];

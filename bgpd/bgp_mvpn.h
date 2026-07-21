@@ -138,6 +138,15 @@ extern void bgp_mvpn_withdraw_type1(struct bgp *bgp, afi_t afi);
 extern int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 					 const struct ipaddr *grp, bool negate);
 
+/*
+ * Re-resolve locally-originated Type-7 joins whose C-S is covered by a changed
+ * unicast prefix, so the upstream-PE RT and Source AS (read from the unicast
+ * route toward C-S) track that route after the join is already up. Idempotent;
+ * call from the unicast best-path path, gated on bgp_mvpn_gtm_active().
+ */
+extern void bgp_mvpn_reresolve_joins_for_route(struct bgp *bgp, afi_t afi,
+					       const struct prefix *changed);
+
 /* running-config emission for `bgp mvpn source-active` under the AF node. */
 extern void bgp_mvpn_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi);
 
