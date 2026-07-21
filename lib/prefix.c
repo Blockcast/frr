@@ -1208,10 +1208,17 @@ const char *prefix2str(union prefixconstptr pu, char *str, int size)
 	case AF_MVPN: {
 		const struct mvpn_addr *m = &p->u.prefix_mvpn;
 
+		/* Type-1 (Intra-AS I-PMSI A-D) carries no C-S/C-G -- only the
+		 * Originating Router's IP, kept in the src slot; its grp is
+		 * always zero, so the generic form would print a meaningless
+		 * trailing [0.0.0.0]. Emit route-type + originator only.
+		 */
+		if (m->route_type == 1)
+			snprintfrr(str, size, "[1]:[%pIA]", &m->src);
 		/* Type-7 (Source Tree Join) also renders the Source AS so two
 		 * routes differing only in Source AS get distinct strings.
 		 */
-		if (m->route_type == 7)
+		else if (m->route_type == 7)
 			snprintfrr(str, size, "[7]:[%u]:[%pIA]:[%pIA]", m->source_as, &m->src,
 				   &m->grp);
 		else
