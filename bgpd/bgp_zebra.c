@@ -3480,6 +3480,7 @@ static int bgp_zebra_process_mvpn_sg(ZAPI_CALLBACK_ARGS)
 		break;
 	case ZAPI_MVPN_SG_SOURCE:
 		bgp_mvpn_source_active_set(bgp, &sg.src, &sg.grp, negate);
+		bgp_mvpn_selective_source_set(bgp, &sg.src, &sg.grp, negate);
 		break;
 	default:
 		zlog_warn("%s: unknown MVPN SG role %u", __func__, sg.role);

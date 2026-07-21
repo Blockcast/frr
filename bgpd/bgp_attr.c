@@ -1116,6 +1116,7 @@ unsigned int attrhash_key_make(const void *p)
 	MIX3(attr->mm_seqnum, attr->df_alg, attr->df_pref);
 	MIX(attr->encap_tunneltype);
 	MIX(bgp_attr_get_pmsi_tnl_type(attr));
+	MIX(bgp_attr_get_pmsi_tnl_flags(attr));
 	if (bgp_attr_get_pmsi_tnl_type(attr) == PMSI_TNLTYPE_INGR_REPL)
 		key = jhash(bgp_attr_get_tunn_id(attr)->s6_addr, IPV6_MAX_BYTELEN, key);
 	key = jhash(&attr->rmac, sizeof(attr->rmac), key);
@@ -1177,6 +1178,7 @@ bool attrhash_cmp(const void *p1, const void *p2)
 		    bgp_nhc_same(bgp_attr_get_nhc(attr1), bgp_attr_get_nhc(attr2)) &&
 		    bgp_ls_attr_same(bgp_attr_get_ls_attr(attr1), bgp_attr_get_ls_attr(attr2)) &&
 		    (bgp_attr_get_pmsi_tnl_type(attr1) == bgp_attr_get_pmsi_tnl_type(attr2)) &&
+		    (bgp_attr_get_pmsi_tnl_flags(attr1) == bgp_attr_get_pmsi_tnl_flags(attr2)) &&
 		    IPV6_ADDR_SAME(bgp_attr_get_tunn_id(attr1), bgp_attr_get_tunn_id(attr2)))
 			return true;
 	}
@@ -3904,6 +3906,7 @@ bgp_attr_pmsi_tunnel(struct bgp_attr_parser_args *args)
 	struct attr *const attr = args->attr;
 	const bgp_size_t length = args->length;
 	uint8_t tnl_type;
+	uint8_t tnl_flags;
 	int attr_parse_len = 2 + BGP_LABEL_BYTES;
 	struct in_addr tunn_id;
 
@@ -3919,7 +3922,7 @@ bgp_attr_pmsi_tunnel(struct bgp_attr_parser_args *args)
 		return bgp_attr_malformed(args, BGP_NOTIFY_UPDATE_ATTR_LENG_ERR,
 					  args->total);
 	}
-	stream_getc(connection->curr); /* Flags */
+	tnl_flags = stream_getc(connection->curr);
 	tnl_type = stream_getc(connection->curr);
 	if (tnl_type > PMSI_TNLTYPE_MAX) {
 		flog_err(EC_BGP_ATTR_PMSI_TYPE,
@@ -3945,6 +3948,7 @@ bgp_attr_pmsi_tunnel(struct bgp_attr_parser_args *args)
 
 	bgp_attr_set(attr, BGP_ATTR_PMSI_TUNNEL);
 	bgp_attr_set_pmsi_tnl_type(attr, tnl_type);
+	bgp_attr_set_pmsi_tnl_flags(attr, tnl_flags);
 	stream_get(&attr->label, connection->curr, BGP_LABEL_BYTES);
 
 	/* Decode ingress-replication tunnel id */
@@ -6076,7 +6080,7 @@ bgp_size_t bgp_packet_attribute(struct bgp *bgp, struct peer *peer, struct strea
 			stream_putc(s, BGP_ATTR_PMSI_TUNNEL_LBL_ONLY_LEN);
 		}
 
-		stream_putc(s, 0); /* Flags */
+		stream_putc(s, bgp_attr_get_pmsi_tnl_flags(attr));
 		stream_putc(s, bgp_attr_get_pmsi_tnl_type(attr));
 		stream_put(s, &(attr->label), BGP_LABEL_BYTES); /* MPLS Label/VXLAN VNI */
 

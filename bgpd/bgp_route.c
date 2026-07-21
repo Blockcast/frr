@@ -13690,6 +13690,12 @@ skip_nexthop:
 		if (json_paths) {
 			json_pmsi = json_object_new_object();
 			json_object_string_add(json_pmsi, "tunnelType", msgstr);
+			json_object_int_add(json_pmsi, "flags",
+					    bgp_attr_get_pmsi_tnl_flags(attr));
+			json_object_boolean_add(
+				json_pmsi, "leafInfoRequired",
+				CHECK_FLAG(bgp_attr_get_pmsi_tnl_flags(attr),
+					   PMSI_TNL_FLAG_LEAF_INFO_REQUIRED));
 			json_object_int_add(json_pmsi, "label",
 					    label2vni(&attr->label));
 

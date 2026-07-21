@@ -121,6 +121,17 @@ def _mvpn_routes(router, v6=False):
     return json.loads(tgen.gears[router].vtysh_cmd(cmd)).get("routes", [])
 
 
+def _selective_route(routes, route_type, source=SOURCE, group=GROUP):
+    for route in routes:
+        if (
+            route.get("routeType") == route_type
+            and route.get("source") == source
+            and route.get("group") == group
+        ):
+            return route
+    return None
+
+
 def test_bgp_mvpn_converge():
     """The iBGP session must reach Established before capabilities are stable."""
     tgen = get_topogen()
@@ -240,6 +251,7 @@ def test_type5_from_pimd_source_detect():
 
     def _type5_pimd(router):
         routes = _mvpn_routes(router)
+        saw_type5 = False
         for r in routes:
             if (
                 r.get("routeType") == 5
@@ -247,14 +259,27 @@ def test_type5_from_pimd_source_detect():
                 and r.get("group") == GROUP
                 and r.get("extendedCommunity", {}).get("string") == "RT:0.0.0.0:0"
             ):
+                saw_type5 = True
+                break
+        type3 = _selective_route(routes, 3)
+        if saw_type5 and type3:
+            pmsi = type3.get("pmsiTunnel", {})
+            if (
+                type3.get("originator") == "10.0.0.1"
+                and pmsi.get("type") == "ingressReplication"
+                and pmsi.get("endpoint") == "10.0.0.1"
+                and pmsi.get("leafInfoRequired") is True
+                and type3.get("extendedCommunity", {}).get("string")
+                == "RT:0.0.0.0:0"
+            ):
                 return None
-        return "pimd-driven Type-5 ({}, {}) not found in {}".format(
+        return "pimd-driven Type-5/Type-3 ({}, {}) not complete in {}".format(
             SOURCE, GROUP, routes
         )
 
     test_func = functools.partial(_type5_pimd, "r2")
     _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
-    assert result is None, "r2 did not learn the pimd-originated Type-5 for the live source"
+    assert result is None, "r2 did not learn the pimd-originated Type-5/Type-3 for the live source"
 
 
 def test_type7_from_igmp_join():
@@ -292,6 +317,7 @@ interface r2-eth1
 
     def _type7_present(router):
         routes = _mvpn_routes(router)
+        saw_type7 = False
         for r in routes:
             if (
                 r.get("routeType") == 7
@@ -300,14 +326,24 @@ interface r2-eth1
                 and r.get("sourceAs") == 65001
                 and r.get("extendedCommunity", {}).get("string") == "RT:10.0.0.1:0"
             ):
-                return None
-        return "Type-7 ({}, {}, AS 65001) with RT:10.0.0.1:0 not found in {}".format(
+                saw_type7 = True
+                break
+        type4 = _selective_route(routes, 4)
+        if (
+            saw_type7
+            and type4
+            and type4.get("originator") == "10.0.0.1"
+            and type4.get("leafOriginator") == "10.0.0.2"
+            and type4.get("extendedCommunity", {}).get("string") == "RT:10.0.0.1:0"
+        ):
+            return None
+        return "Type-7/Type-4 ({}, {}) not complete in {}".format(
             SOURCE, GROUP, routes
         )
 
     test_func = functools.partial(_type7_present, "r1")
     _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
-    assert result is None, "r1 did not learn the pimd-originated Type-7 for the IGMP join"
+    assert result is None, "r1 did not learn the pimd-originated Type-7/Type-4 for the IGMP join"
 
 
 def test_type7_umh_from_route_import():
@@ -591,6 +627,49 @@ def test_type1_ipmsi_with_ir_pmsi():
     assert result is None, "r2 did not learn r1's MVPN Type-1 Intra-AS I-PMSI route"
 
 
+def test_selective_routes_replay_after_daemon_restarts():
+    """pimd-owned (S,G) state reconstructs Type-3/4 after daemon restarts."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    kill_router_daemons(tgen, "r1", ["bgpd"])
+    start_router_daemons(tgen, "r1", ["bgpd"])
+
+    def _type3_replayed():
+        route = _selective_route(_mvpn_routes("r2"), 3)
+        if route and route.get("pmsiTunnel", {}).get("leafInfoRequired") is True:
+            return None
+        return "r1 bgpd restart did not replay pimd's Type-3: {}".format(
+            _mvpn_routes("r2")
+        )
+
+    _, result = topotest.run_and_expect(_type3_replayed, None, count=90, wait=1)
+    assert result is None, result
+
+    # Save the runtime IGMP join, then restart both consumers/producers. The
+    # order is deliberately not controlled: either the PIM replay or the remote
+    # Type-3 can arrive first, and the reconcile hooks must converge to Type-4.
+    kill_router_daemons(tgen, "r2", ["bgpd", "pimd"], save_config=True)
+    start_router_daemons(tgen, "r2", ["pimd", "bgpd"])
+
+    def _type4_replayed():
+        route = _selective_route(_mvpn_routes("r1"), 4)
+        if (
+            route
+            and route.get("originator") == "10.0.0.1"
+            and route.get("leafOriginator") == "10.0.0.2"
+        ):
+            return None
+        return "r2 bgpd/pimd restart did not replay Type-4: {}".format(
+            _mvpn_routes("r1")
+        )
+
+    _, result = topotest.run_and_expect(_type4_replayed, None, count=120, wait=1)
+    assert result is None, result
+
+
 def test_full_mvpn_exchange():
     """End-to-end: SAFI-5 session + Type-1/5/7 exchange in one scenario.
 
@@ -667,6 +746,22 @@ def test_full_mvpn_exchange():
                 return True
         return False
 
+    def _has_type3(routes, source, group):
+        route = _selective_route(routes, 3, source, group)
+        return bool(
+            route
+            and route.get("originator") == "10.0.0.1"
+            and route.get("pmsiTunnel", {}).get("leafInfoRequired") is True
+        )
+
+    def _has_type4(routes, source, group):
+        route = _selective_route(routes, 4, source, group)
+        return bool(
+            route
+            and route.get("originator") == "10.0.0.1"
+            and route.get("leafOriginator") == "10.0.0.2"
+        )
+
     def _full_exchange():
         r1_routes = _mvpn_routes("r1")
         r2_routes = _mvpn_routes("r2")
@@ -678,6 +773,8 @@ def test_full_mvpn_exchange():
             missing.append(
                 "r2 lacks r1's pimd Type-5 ({}, {})".format(SOURCE, GROUP)
             )
+        if not _has_type3(r2_routes, SOURCE, GROUP):
+            missing.append("r2 lacks r1's pimd Type-3 ({}, {})".format(SOURCE, GROUP))
         if not _has_type1(r1_routes, "10.0.0.2"):
             missing.append("r1 lacks r2's Type-1 (IR endpoint 10.0.0.2)")
         if not _has_type7(r1_routes, SOURCE, GROUP, 65001):
@@ -686,6 +783,8 @@ def test_full_mvpn_exchange():
                     SOURCE, GROUP
                 )
             )
+        if not _has_type4(r1_routes, SOURCE, GROUP):
+            missing.append("r1 lacks r2's pimd Type-4 ({}, {})".format(SOURCE, GROUP))
 
         if missing:
             return "{} [r1={} r2={}]".format(
@@ -725,18 +824,18 @@ interface r2-eth1
         routes = _mvpn_routes(router)
         for r in routes:
             if (
-                r.get("routeType") == 7
+                r.get("routeType") in (4, 7)
                 and r.get("source") == SOURCE
                 and r.get("group") == GROUP
             ):
-                return "Type-7 ({}, {}) still present after IGMP leave".format(
-                    SOURCE, GROUP
+                return "Type-{} ({}, {}) still present after IGMP leave".format(
+                    r.get("routeType"), SOURCE, GROUP
                 )
         return None
 
     test_func = functools.partial(_type7_absent, "r1")
     _, result = topotest.run_and_expect(test_func, None, count=90, wait=1)
-    assert result is None, "r1 still holds the Type-7 after the IGMP leave"
+    assert result is None, "r1 still holds the Type-7/Type-4 after the IGMP leave"
 
 
 def test_type7_v6_withdraw_on_mld_leave():

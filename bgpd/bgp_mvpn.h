@@ -110,6 +110,12 @@ extern int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_
 extern int bgp_mvpn_source_active_set(struct bgp *bgp, const struct ipaddr *src,
 				      const struct ipaddr *grp, bool negate);
 
+/* Originate/withdraw the selective S-PMSI A-D route paired with a local
+ * pimd-reported source. */
+extern int bgp_mvpn_selective_source_set(struct bgp *bgp,
+					 const struct ipaddr *src,
+					 const struct ipaddr *grp, bool negate);
+
 /*
  * Auto-originate this PE's Intra-AS I-PMSI A-D (Type-1) route with an
  * Ingress-Replication PMSI Tunnel attribute (RFC 6514 Section 4.1 + Section 5).

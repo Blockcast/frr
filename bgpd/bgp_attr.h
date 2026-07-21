@@ -109,6 +109,9 @@ enum pta_type {
 	PMSI_TNLTYPE_MAX = PMSI_TNLTYPE_MLDP_MP2MP
 };
 
+/* RFC 6514 Section 5 PMSI Tunnel attribute flags. */
+#define PMSI_TNL_FLAG_LEAF_INFO_REQUIRED 0x01
+
 /* Hard limit on sub-TLVs within a single Tunnel Encap attribute (RFC 9012).
  * Prevents a peer from driving unbounded XCALLOC churn with valid packets.
  * This is not defined in the RFC, but is a sanity check to prevent memory
@@ -157,6 +160,7 @@ struct attr_extra {
 
 	/* PMSI tunnel type (RFC 6514). */
 	enum pta_type pmsi_tnl_type;
+	uint8_t pmsi_tnl_flags;
 
 	/* PMSI Tunnel Id */
 	struct in6_addr tunn_id;
@@ -528,6 +532,27 @@ static inline uint32_t mac_mobility_seqnum(struct attr *attr)
 static inline enum pta_type bgp_attr_get_pmsi_tnl_type(const struct attr *attr)
 {
 	return attr->extra ? attr->extra->pmsi_tnl_type : PMSI_TNLTYPE_NO_INFO;
+}
+
+static inline uint8_t bgp_attr_get_pmsi_tnl_flags(const struct attr *attr)
+{
+	return attr->extra ? attr->extra->pmsi_tnl_flags : 0;
+}
+
+static inline void bgp_attr_set_pmsi_tnl_flags(struct attr *attr, uint8_t flags)
+{
+	uint8_t old = bgp_attr_get_pmsi_tnl_flags(attr);
+
+	if (old == flags)
+		return;
+	if (old == 0) {
+		bgp_attr_extra_get(attr)->pmsi_tnl_flags = flags;
+		return;
+	}
+
+	attr->extra->pmsi_tnl_flags = flags;
+	if (flags == 0)
+		bgp_attr_extra_put(attr);
 }
 
 static inline void bgp_attr_unset_tunn_id(struct attr *attr)

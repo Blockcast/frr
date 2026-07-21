@@ -60,6 +60,10 @@ MALFORMED_SG = ("10.30.30.2", "232.30.30.2")
 RECOVER_SG = ("10.40.40.1", "232.40.40.1")
 TYPE3_ORIGINATOR = "10.0.0.2"
 TYPE4_LEAF = "10.0.0.3"
+NO_PMSI_SG = ("10.30.30.9", "232.30.30.9")
+V6_SELECTIVE_SG = ("2001:db8:30::1", "ff3e::30")
+V6_TYPE3_ORIGINATOR = "2001:db8:ffff::2"
+V6_TYPE4_LEAF = "2001:db8:ffff::3"
 
 
 def build_topo(tgen):
@@ -98,8 +102,11 @@ def teardown_module(mod):
     tgen.stop_topology()
 
 
-def _mvpn_routes(router):
-    out = json.loads(get_topogen().gears[router].vtysh_cmd("show bgp ipv4 mvpn json"))
+def _mvpn_routes(router, v6=False):
+    afi = "ipv6" if v6 else "ipv4"
+    out = json.loads(
+        get_topogen().gears[router].vtysh_cmd("show bgp {} mvpn json".format(afi))
+    )
     return out.get("routes", [])
 
 
@@ -111,14 +118,16 @@ def _has_type5(routes, sg):
     return False
 
 
-def _has_selective_route(routes, route_type, sg, leaf=None):
+def _has_selective_route(
+    routes, route_type, sg, leaf=None, originator=TYPE3_ORIGINATOR
+):
     src, grp = sg
     for route in routes:
         if (
             route.get("routeType") == route_type
             and route.get("source") == src
             and route.get("group") == grp
-            and route.get("originator") == TYPE3_ORIGINATOR
+            and route.get("originator") == originator
             and (leaf is None or route.get("leafOriginator") == leaf)
         ):
             return True
@@ -217,12 +226,47 @@ def test_valid_type3_and_type4_accepted():
         routes = _mvpn_routes("r1")
         if not _has_selective_route(routes, 3, SELECTIVE_SG):
             return "valid Type-3 not installed: {}".format(routes)
+        type3 = next(route for route in routes if route.get("routeType") == 3)
+        if not type3.get("pmsiTunnel", {}).get("leafInfoRequired"):
+            return "Type-3 PMSI L-bit was not preserved: {}".format(type3)
         if not _has_selective_route(routes, 4, SELECTIVE_SG, TYPE4_LEAF):
             return "valid Type-4 not installed: {}".format(routes)
         return None
 
     _, result = topotest.run_and_expect(_present, None, count=60, wait=1)
     assert result is None, result
+
+
+def test_valid_ipv6_type3_and_type4_accepted():
+    """IPv6 Type-3/4 keys and the PMSI L-bit survive raw-peer exchange."""
+
+    def _present():
+        routes = _mvpn_routes("r1", v6=True)
+        if not _has_selective_route(
+            routes, 3, V6_SELECTIVE_SG, originator=V6_TYPE3_ORIGINATOR
+        ):
+            return "valid IPv6 Type-3 not installed: {}".format(routes)
+        if not _has_selective_route(
+            routes,
+            4,
+            V6_SELECTIVE_SG,
+            leaf=V6_TYPE4_LEAF,
+            originator=V6_TYPE3_ORIGINATOR,
+        ):
+            return "valid IPv6 Type-4 not installed: {}".format(routes)
+        type3 = next(route for route in routes if route.get("routeType") == 3)
+        if not type3.get("pmsiTunnel", {}).get("leafInfoRequired"):
+            return "IPv6 Type-3 PMSI L-bit was not preserved: {}".format(type3)
+        return None
+
+    _, result = topotest.run_and_expect(_present, None, count=60, wait=1)
+    assert result is None, result
+
+
+def test_type3_without_pmsi_rejected():
+    """A Type-3 without an ingress-replication PMSI binding is unusable."""
+    routes = _mvpn_routes("r1")
+    assert not _has_selective_route(routes, 3, NO_PMSI_SG), routes
 
 
 def test_malformed_nested_type3_rejected():
