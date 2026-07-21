@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: ISC
 
 """
-crafter.py: minimal raw BGP speaker that negotiates the MCAST-VPN (AFI 1,
-SAFI 5) address family and sends deliberately crafted MVPN Route Type 3, 4 and
-5 NLRIs to exercise the receive-path hardening in bgp_nlri_parse_mvpn().
+crafter.py: minimal raw BGP speaker that negotiates the IPv4 and IPv6
+MCAST-VPN address families and sends deliberately crafted MVPN Route Type 3,
+4 and 5 NLRIs to exercise the receive path in bgp_nlri_parse_mvpn().
 
 It sends, in order:
 
@@ -37,6 +37,7 @@ BGP_VERSION = 4
 HOLD_TIME = 90
 
 AFI_IP = 1
+AFI_IP6 = 2
 SAFI_MCAST_VPN = 5
 MVPN_TYPE3 = 3
 MVPN_TYPE4 = 4
@@ -44,7 +45,12 @@ MVPN_TYPE5 = 5
 MVPN_TYPE3_SPEC_LEN = 22
 MVPN_TYPE4_SPEC_LEN = 28
 MVPN_TYPE5_SPEC_LEN = 18
+MVPN_TYPE3_V6_SPEC_LEN = 58
+MVPN_TYPE4_V6_SPEC_LEN = 76
+MVPN_TYPE5_V6_SPEC_LEN = 42
 IPV4_BITLEN = 32
+IPV6_BITLEN = 128
+PMSI_FLAG_LEAF_INFO_REQUIRED = 1
 
 # Crafted (S,G)s. Distinct per case so the test can assert each independently.
 VALID_SRC = "10.9.9.9"
@@ -57,10 +63,16 @@ SELECTIVE_SRC = "10.30.30.1"
 SELECTIVE_GRP = "232.30.30.1"
 TYPE3_ORIGINATOR = "10.0.0.2"
 TYPE4_LEAF = "10.0.0.3"
+NO_PMSI_SRC = "10.30.30.9"
+NO_PMSI_GRP = "232.30.30.9"
 MALFORMED_SRC = "10.30.30.2"
 MALFORMED_GRP = "232.30.30.2"
 RECOVER_SRC = "10.40.40.1"
 RECOVER_GRP = "232.40.40.1"   # valid SSM; trailing NLRI after a malformed one
+V6_SELECTIVE_SRC = "2001:db8:30::1"
+V6_SELECTIVE_GRP = "ff3e::30"
+V6_TYPE3_ORIGINATOR = "2001:db8:ffff::2"
+V6_TYPE4_LEAF = "2001:db8:ffff::3"
 
 
 def build_open(local_as, router_id):
@@ -68,7 +80,10 @@ def build_open(local_as, router_id):
     rid = socket.inet_aton(router_id)
 
     # Multiprotocol Extensions capability (code 1): AFI(2) Reserved(1) SAFI(1)
-    mp_cap = struct.pack("!BB", 1, 4) + struct.pack("!HBB", AFI_IP, 0, SAFI_MCAST_VPN)
+    mp_cap = b"".join(
+        struct.pack("!BBHBB", 1, 4, afi, 0, SAFI_MCAST_VPN)
+        for afi in (AFI_IP, AFI_IP6)
+    )
     # 4-octet AS capability (code 65): AS(4)
     as4_cap = struct.pack("!BB", 65, 4) + struct.pack("!I", local_as)
     caps = mp_cap + as4_cap
@@ -99,35 +114,52 @@ def _type5_nlri(rd, src, grp):
     )
 
 
-def _type3_nlri(rd, src, grp, originator, length=MVPN_TYPE3_SPEC_LEN):
+def _packed_addr(address):
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    return socket.inet_pton(family, address)
+
+
+def _type3_nlri(rd, src, grp, originator, length=None):
+    v6 = ":" in src
+    if length is None:
+        length = MVPN_TYPE3_V6_SPEC_LEN if v6 else MVPN_TYPE3_SPEC_LEN
+    bitlen = IPV6_BITLEN if v6 else IPV4_BITLEN
     body = (
         rd
-        + struct.pack("!B", IPV4_BITLEN)
-        + socket.inet_aton(src)
-        + struct.pack("!B", IPV4_BITLEN)
-        + socket.inet_aton(grp)
-        + socket.inet_aton(originator)
+        + struct.pack("!B", bitlen)
+        + _packed_addr(src)
+        + struct.pack("!B", bitlen)
+        + _packed_addr(grp)
+        + _packed_addr(originator)
     )
     return struct.pack("!BB", MVPN_TYPE3, length) + body
 
 
-def _type4_nlri(rd, src, grp, originator, leaf, nested_length=MVPN_TYPE3_SPEC_LEN):
+def _type4_nlri(rd, src, grp, originator, leaf, nested_length=None):
+    v6 = ":" in src
     route_key = _type3_nlri(rd, src, grp, originator, nested_length)
     return (
-        struct.pack("!BB", MVPN_TYPE4, MVPN_TYPE4_SPEC_LEN)
+        struct.pack(
+            "!BB", MVPN_TYPE4,
+            MVPN_TYPE4_V6_SPEC_LEN if v6 else MVPN_TYPE4_SPEC_LEN,
+        )
         + route_key
-        + socket.inet_aton(leaf)
+        + _packed_addr(leaf)
     )
 
 
-def build_mvpn_update(local_id, nlri, include_pmsi=False):
+def build_mvpn_update(
+    local_id, nlri, afi=AFI_IP, include_pmsi=False,
+    pmsi_flags=PMSI_FLAG_LEAF_INFO_REQUIRED,
+):
     """UPDATE with ORIGIN, empty AS_PATH (iBGP) and one MCAST-VPN NLRI."""
 
     # MP_REACH_NLRI value: AFI(2) SAFI(1) NHLen(1) NH(4) Reserved(1) NLRI
+    next_hop = _packed_addr(local_id)
     mp_reach_val = (
-        struct.pack("!HB", AFI_IP, SAFI_MCAST_VPN)
-        + struct.pack("!B", 4)
-        + socket.inet_aton(local_id)
+        struct.pack("!HB", afi, SAFI_MCAST_VPN)
+        + struct.pack("!B", len(next_hop))
+        + next_hop
         + struct.pack("!B", 0)
         + nlri
     )
@@ -140,9 +172,9 @@ def build_mvpn_update(local_id, nlri, include_pmsi=False):
     # LOCAL_PREF: well-known transitive, type 5, len 4 (mandatory for iBGP)
     attrs += struct.pack("!BBB", 0x40, 5, 4) + struct.pack("!I", 100)
     if include_pmsi:
-        # Optional-transitive PMSI Tunnel: flags=0, ingress replication,
+        # Optional-transitive PMSI Tunnel: leaf-info flag, ingress replication,
         # label=0, tunnel endpoint=local_id.
-        pmsi = struct.pack("!BB", 0, 6) + b"\x00" * 3 + socket.inet_aton(local_id)
+        pmsi = struct.pack("!BB", pmsi_flags, 6) + b"\x00" * 3 + next_hop
         attrs += struct.pack("!BBB", 0xC0, 22, len(pmsi)) + pmsi
     # MP_REACH_NLRI: optional (0x80), type 14
     attrs += struct.pack("!BBB", 0x80, 14, len(mp_reach_val)) + mp_reach_val
@@ -245,6 +277,35 @@ def main():
             local_id,
             _type3_nlri(zero_rd, SELECTIVE_SRC, SELECTIVE_GRP, TYPE3_ORIGINATOR),
             include_pmsi=True,
+        )
+    )
+    # D2: Type-3 without a usable selective-tunnel binding must be dropped.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type3_nlri(zero_rd, NO_PMSI_SRC, NO_PMSI_GRP, TYPE3_ORIGINATOR),
+        )
+    )
+    # G: dual-stack codec controls in AFI 2, including 16-byte originators.
+    sock.sendall(
+        build_mvpn_update(
+            "2001:db8:1::2",
+            _type3_nlri(
+                zero_rd, V6_SELECTIVE_SRC, V6_SELECTIVE_GRP,
+                V6_TYPE3_ORIGINATOR,
+            ),
+            afi=AFI_IP6,
+            include_pmsi=True,
+        )
+    )
+    sock.sendall(
+        build_mvpn_update(
+            "2001:db8:1::2",
+            _type4_nlri(
+                zero_rd, V6_SELECTIVE_SRC, V6_SELECTIVE_GRP,
+                V6_TYPE3_ORIGINATOR, V6_TYPE4_LEAF,
+            ),
+            afi=AFI_IP6,
         )
     )
     sock.sendall(

@@ -36,6 +36,14 @@
  */
 #define BGP_MVPN_PREFIXLEN (sizeof(struct mvpn_addr) * 8)
 
+static void bgp_mvpn_leaf_from_type3_set(struct bgp *bgp,
+					 const struct prefix_mvpn *type3, bool negate);
+static bool bgp_mvpn_has_local_join(struct bgp *bgp,
+				    const struct ipaddr *src,
+				    const struct ipaddr *grp);
+static bool bgp_mvpn_type3_leaf_required(struct bgp_dest *dest,
+					 const struct bgp *bgp);
+
 /*
  * True if the 8-octet Route Distinguisher is all zero. Under Global Table
  * Multicast (RFC 7716) the RD is always zero (single global table). A non-zero
@@ -310,6 +318,7 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, afi_t afi
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
 	struct attr *attr_new;
+	bool leaf_required = false;
 
 	dest = bgp_afi_node_get(bgp->rib[afi][SAFI_MCAST_VPN], afi, SAFI_MCAST_VPN,
 				(const struct prefix *)p, NULL);
@@ -337,7 +346,22 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, afi_t afi
 	}
 
 	bgp_process(bgp, dest, pi, afi, SAFI_MCAST_VPN);
+	if (p->prefix.route_type == BGP_MVPN_ROUTE_TYPE_S_PMSI_AD &&
+	    peer != bgp->peer_self && sub_type == BGP_ROUTE_NORMAL)
+		leaf_required = bgp_mvpn_type3_leaf_required(dest, bgp);
 	bgp_dest_unlock_node(dest);
+
+	/* A receiver join and its matching Type-3 can arrive in either order,
+	 * especially during bgpd/pimd restart replay. Reconcile when the remote
+	 * Type-3 arrives as well as when pimd reports the join. */
+	if (p->prefix.route_type == BGP_MVPN_ROUTE_TYPE_S_PMSI_AD &&
+	    peer != bgp->peer_self && sub_type == BGP_ROUTE_NORMAL) {
+		bgp_mvpn_leaf_from_type3_set(
+			bgp, p,
+			!leaf_required ||
+				!bgp_mvpn_has_local_join(bgp, &p->prefix.src,
+						 &p->prefix.grp));
+	}
 }
 
 /* Withdraw an MCAST-VPN route matching (peer, sub_type) from the table. */
@@ -346,6 +370,8 @@ static void bgp_mvpn_route_remove(struct bgp *bgp, struct peer *peer, afi_t afi,
 {
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
+	bool reconcile_leaf = false;
+	bool leaf_required = false;
 
 	dest = bgp_safi_node_lookup(bgp->rib[afi][SAFI_MCAST_VPN], SAFI_MCAST_VPN,
 				    (const struct prefix *)p, NULL);
@@ -360,9 +386,21 @@ static void bgp_mvpn_route_remove(struct bgp *bgp, struct peer *peer, afi_t afi,
 		bgp_unlink_nexthop(pi);
 		bgp_path_info_mark_for_delete(dest, pi);
 		bgp_process(bgp, dest, pi, afi, SAFI_MCAST_VPN);
+		if (p->prefix.route_type == BGP_MVPN_ROUTE_TYPE_S_PMSI_AD &&
+		    peer != bgp->peer_self && sub_type == BGP_ROUTE_NORMAL) {
+			reconcile_leaf = true;
+			leaf_required = bgp_mvpn_type3_leaf_required(dest, bgp);
+		}
 	}
 
 	bgp_dest_unlock_node(dest);
+
+	if (reconcile_leaf)
+		bgp_mvpn_leaf_from_type3_set(
+			bgp, p,
+			!leaf_required ||
+				!bgp_mvpn_has_local_join(bgp, &p->prefix.src,
+						 &p->prefix.grp));
 }
 
 /*
@@ -717,21 +755,16 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			continue;
 		}
 
-		/*
-		 * Type-3 (S-PMSI A-D) intentionally has NO equivalent PMSI-Tunnel
-		 * gate here, unlike Type-1 above. Per RFC 6514 Section 5 an S-PMSI
-		 * A-D conveys its selective-tunnel binding via the PMSI Tunnel
-		 * attribute, so a receive-path tunnel-type check is defensible in
-		 * principle. This PR ships the codec + selective-forwarding RIB
-		 * install only; PIM-driven per-(S,G) Type-3/4 origination -- the
-		 * state that would actually consume the tunnel binding -- is the
-		 * next stage (see "Remaining Before Ready"). Gating Type-3 install
-		 * on a tunnel attribute before that origination path exists would
-		 * drop valid selective A-D routes with nothing yet to bind. Deferred
-		 * deliberately: the follow-on PIM-integration task MUST decide
-		 * whether the Type-3 receive path gains the same INGR_REPL gate.
-		 * Tracked: BLO-15578.
-		 */
+		/* An S-PMSI A-D route binds its selective tunnel through the PMSI
+		 * Tunnel attribute (RFC 6514 Section 5). Check installs only so an
+		 * MP_UNREACH can still remove the NLRI by key without attributes. */
+		if (route_type == BGP_MVPN_ROUTE_TYPE_S_PMSI_AD && !is_withdraw &&
+		    bgp_attr_get_pmsi_tnl_type(attr) != PMSI_TNLTYPE_INGR_REPL) {
+			flog_err(EC_BGP_UPDATE_RCV,
+				 "%s [Error] MVPN Type-3 without Ingress-Replication PMSI Tunnel; dropping route",
+				 peer->host);
+			continue;
+		}
 
 		/* Type-1's plane is the AF the NLRI arrived on (RFC 6515 permits a
 		 * v4 originator inside the IPv6 AF); Type-5/7 key off the C-S/C-G
@@ -963,6 +996,49 @@ int bgp_mvpn_source_active_set(struct bgp *bgp, const struct ipaddr *src, const 
 	return CMD_SUCCESS;
 }
 
+int bgp_mvpn_selective_source_set(struct bgp *bgp, const struct ipaddr *src,
+				  const struct ipaddr *grp, bool negate)
+{
+	struct prefix_mvpn p;
+	struct attr attr;
+	struct in6_addr tunn_id = {};
+	struct ipaddr originator;
+
+	/* The current GTM core identifies PEs by the IPv4 BGP router-id. IPv6
+	 * Type-3/4 wire support is independent, but local v6 origination needs an
+	 * explicitly selected IPv6 PE address before it can be enabled safely. */
+	if (IS_IPADDR_V6(src) || bgp->router_id.s_addr == INADDR_ANY ||
+	    !bgp->peer_self)
+		return CMD_SUCCESS;
+
+	originator = mvpn_ipaddr_v4(bgp->router_id);
+	bgp_mvpn_build_prefix_type3(&p, src, grp, &originator);
+	if (negate) {
+		bgp_mvpn_route_remove(bgp, bgp->peer_self, AFI_IP, &p,
+				      BGP_ROUTE_STATIC);
+		return CMD_SUCCESS;
+	}
+
+	bgp_attr_default_set(&attr, bgp, BGP_ORIGIN_IGP);
+	bgp_attr_set(&attr, BGP_ATTR_NEXT_HOP);
+	attr.nexthop = bgp->router_id;
+	attr.mp_nexthop_global_in = bgp->router_id;
+	attr.mp_nexthop_len = IPV4_MAX_BYTELEN;
+	bgp_attr_set(&attr, BGP_ATTR_PMSI_TUNNEL);
+	bgp_attr_set_pmsi_tnl_type(&attr, PMSI_TNLTYPE_INGR_REPL);
+	bgp_attr_set_pmsi_tnl_flags(&attr,
+				    PMSI_TNL_FLAG_LEAF_INFO_REQUIRED);
+	ipv4_to_ipv4_mapped_ipv6(&tunn_id, bgp->router_id);
+	bgp_attr_set_tunn_id(&attr, &tunn_id);
+	attr.label = 0;
+	bgp_mvpn_attach_gtm_rt(&attr);
+	bgp_mvpn_route_install(bgp, bgp->peer_self, AFI_IP, &p, &attr,
+			       BGP_ROUTE_STATIC);
+	bgp_attr_flush(&attr);
+	aspath_unintern(&attr.aspath);
+	return CMD_SUCCESS;
+}
+
 bool bgp_mvpn_gtm_active(struct bgp *bgp)
 {
 	return bgp_afi_safi_peer_exists(bgp, AFI_IP, SAFI_MCAST_VPN) ||
@@ -1151,6 +1227,113 @@ static void bgp_mvpn_route_remove_type7_sg(struct bgp *bgp, struct peer *peer,
 	}
 }
 
+static bool bgp_mvpn_has_local_join(struct bgp *bgp, const struct ipaddr *src,
+				    const struct ipaddr *grp)
+{
+	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
+	struct bgp_table *table = bgp->rib[afi][SAFI_MCAST_VPN];
+	struct bgp_dest *dest;
+
+	if (!table)
+		return false;
+
+	for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
+		const struct prefix_mvpn *p =
+			(const struct prefix_mvpn *)bgp_dest_get_prefix(dest);
+		struct bgp_path_info *pi;
+
+		if (p->family != AF_MVPN ||
+		    p->prefix.route_type != BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN ||
+		    ipaddr_cmp(&p->prefix.src, src) != 0 ||
+		    ipaddr_cmp(&p->prefix.grp, grp) != 0)
+			continue;
+		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
+			if (pi->peer == bgp->peer_self &&
+			    pi->sub_type == BGP_ROUTE_STATIC &&
+			    !CHECK_FLAG(pi->flags, BGP_PATH_REMOVED)) {
+				bgp_dest_unlock_node(dest);
+				return true;
+			}
+	}
+	return false;
+}
+
+static bool bgp_mvpn_type3_leaf_required(struct bgp_dest *dest,
+					 const struct bgp *bgp)
+{
+	const struct bgp_path_info *pi;
+
+	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
+		if (pi->peer != bgp->peer_self &&
+		    pi->sub_type == BGP_ROUTE_NORMAL &&
+		    !CHECK_FLAG(pi->flags, BGP_PATH_REMOVED) &&
+		    bgp_attr_get_pmsi_tnl_type(pi->attr) ==
+			    PMSI_TNLTYPE_INGR_REPL &&
+		    CHECK_FLAG(bgp_attr_get_pmsi_tnl_flags(pi->attr),
+			       PMSI_TNL_FLAG_LEAF_INFO_REQUIRED))
+			return true;
+	return false;
+}
+
+static void bgp_mvpn_leaf_from_type3_set(struct bgp *bgp,
+					 const struct prefix_mvpn *type3, bool negate)
+{
+	struct prefix_mvpn leaf;
+	struct ipaddr leaf_originator;
+	struct attr attr;
+
+	if (IS_IPADDR_V6(&type3->prefix.src) ||
+	    bgp->router_id.s_addr == INADDR_ANY || !bgp->peer_self)
+		return;
+
+	leaf_originator = mvpn_ipaddr_v4(bgp->router_id);
+	bgp_mvpn_build_prefix_type4(&leaf, &type3->prefix.src, &type3->prefix.grp,
+				    &type3->prefix.originator, &leaf_originator);
+	if (negate) {
+		bgp_mvpn_route_remove(bgp, bgp->peer_self, AFI_IP, &leaf,
+				      BGP_ROUTE_STATIC);
+		return;
+	}
+
+	bgp_attr_default_set(&attr, bgp, BGP_ORIGIN_IGP);
+	bgp_attr_set(&attr, BGP_ATTR_NEXT_HOP);
+	attr.nexthop = bgp->router_id;
+	attr.mp_nexthop_global_in = bgp->router_id;
+	attr.mp_nexthop_len = IPV4_MAX_BYTELEN;
+	bgp_mvpn_attach_ip_rt(&attr, type3->prefix.originator.ipaddr_v4);
+	bgp_mvpn_route_install(bgp, bgp->peer_self, AFI_IP, &leaf, &attr,
+			       BGP_ROUTE_STATIC);
+	bgp_attr_flush(&attr);
+	aspath_unintern(&attr.aspath);
+}
+
+static void bgp_mvpn_selective_join_set(struct bgp *bgp,
+					const struct ipaddr *src,
+					const struct ipaddr *grp, bool negate)
+{
+	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
+	struct bgp_table *table = bgp->rib[afi][SAFI_MCAST_VPN];
+	struct bgp_dest *dest;
+
+	if (!table || IS_IPADDR_V6(src))
+		return;
+
+	for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
+		const struct prefix_mvpn *p =
+			(const struct prefix_mvpn *)bgp_dest_get_prefix(dest);
+		bool leaf_required;
+
+		if (p->family != AF_MVPN ||
+		    p->prefix.route_type != BGP_MVPN_ROUTE_TYPE_S_PMSI_AD ||
+		    ipaddr_cmp(&p->prefix.src, src) != 0 ||
+		    ipaddr_cmp(&p->prefix.grp, grp) != 0)
+			continue;
+		leaf_required = bgp_mvpn_type3_leaf_required(dest, bgp);
+		bgp_mvpn_leaf_from_type3_set(bgp, p,
+					     negate || !leaf_required);
+	}
+}
+
 /*
  * Originate or withdraw a local Type-7 (C-multicast Source Tree Join) route,
  * mirroring bgp_mvpn_source_active_set(). This is the pimd-driven join path:
@@ -1175,6 +1358,7 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 		 * originally originated join and strand it, advertised
 		 * indefinitely. */
 		bgp_mvpn_route_remove_type7_sg(bgp, bgp->peer_self, src, grp);
+		bgp_mvpn_selective_join_set(bgp, src, grp, true);
 		return CMD_SUCCESS;
 	}
 
@@ -1215,6 +1399,7 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 
 	bgp_mvpn_route_install(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p), &p, &attr,
 			       BGP_ROUTE_STATIC);
+	bgp_mvpn_selective_join_set(bgp, src, grp, false);
 
 	bgp_attr_flush(&attr);
 	aspath_unintern(&attr.aspath);
@@ -1323,6 +1508,38 @@ void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_
 					    m->route_type == BGP_MVPN_ROUTE_TYPE_LEAF_AD)
 						json_object_string_addf(jr, "originator", "%pIA",
 									&m->originator);
+					if (m->route_type == BGP_MVPN_ROUTE_TYPE_S_PMSI_AD &&
+					    bgp_attr_get_pmsi_tnl_type(pi->attr) ==
+						    PMSI_TNLTYPE_INGR_REPL) {
+						json_object *jp = json_object_new_object();
+						const struct in6_addr *tid =
+							bgp_attr_get_tunn_id(pi->attr);
+
+						json_object_string_add(jp, "type",
+								       "ingressReplication");
+						json_object_int_add(
+							jp, "flags",
+							bgp_attr_get_pmsi_tnl_flags(pi->attr));
+						json_object_boolean_add(
+							jp, "leafInfoRequired",
+							CHECK_FLAG(
+								bgp_attr_get_pmsi_tnl_flags(
+									pi->attr),
+								PMSI_TNL_FLAG_LEAF_INFO_REQUIRED));
+						json_object_int_add(
+							jp, "label",
+							label2vni(&pi->attr->label) >> 4);
+						if (IS_MAPPED_IPV6(tid)) {
+							struct in_addr ep;
+
+							ipv4_mapped_ipv6_to_ipv4(tid, &ep);
+							json_object_string_addf(
+								jp, "endpoint", "%pI4", &ep);
+						} else
+							json_object_string_addf(
+								jp, "endpoint", "%pI6", tid);
+						json_object_object_add(jr, "pmsiTunnel", jp);
+					}
 					if (m->route_type == BGP_MVPN_ROUTE_TYPE_LEAF_AD)
 						json_object_string_addf(jr, "leafOriginator",
 									"%pIA",
