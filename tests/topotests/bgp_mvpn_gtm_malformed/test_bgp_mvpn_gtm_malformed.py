@@ -64,6 +64,7 @@ NO_PMSI_SG = ("10.30.30.9", "232.30.30.9")
 V6_SELECTIVE_SG = ("2001:db8:30::1", "ff3e::30")
 V6_TYPE3_ORIGINATOR = "2001:db8:ffff::2"
 V6_TYPE4_LEAF = "2001:db8:ffff::3"
+SELECTIVE_LABEL = 0x12345
 
 
 def build_topo(tgen):
@@ -229,6 +230,10 @@ def test_valid_type3_and_type4_accepted():
         type3 = next(route for route in routes if route.get("routeType") == 3)
         if not type3.get("pmsiTunnel", {}).get("leafInfoRequired"):
             return "Type-3 PMSI L-bit was not preserved: {}".format(type3)
+        if type3.get("pmsiTunnel", {}).get("label") != SELECTIVE_LABEL:
+            return "Type-3 PMSI label was not decoded from its high 20 bits: {}".format(
+                type3
+            )
         if not _has_selective_route(routes, 4, SELECTIVE_SG, TYPE4_LEAF):
             return "valid Type-4 not installed: {}".format(routes)
         return None

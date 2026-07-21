@@ -47,10 +47,10 @@ MVPN_TYPE4_SPEC_LEN = 28
 MVPN_TYPE5_SPEC_LEN = 18
 MVPN_TYPE3_V6_SPEC_LEN = 58
 MVPN_TYPE4_V6_SPEC_LEN = 76
-MVPN_TYPE5_V6_SPEC_LEN = 42
 IPV4_BITLEN = 32
 IPV6_BITLEN = 128
 PMSI_FLAG_LEAF_INFO_REQUIRED = 1
+SELECTIVE_LABEL = 0x12345
 
 # Crafted (S,G)s. Distinct per case so the test can assert each independently.
 VALID_SRC = "10.9.9.9"
@@ -151,6 +151,7 @@ def _type4_nlri(rd, src, grp, originator, leaf, nested_length=None):
 def build_mvpn_update(
     local_id, nlri, afi=AFI_IP, include_pmsi=False,
     pmsi_flags=PMSI_FLAG_LEAF_INFO_REQUIRED,
+    pmsi_label=0,
 ):
     """UPDATE with ORIGIN, empty AS_PATH (iBGP) and one MCAST-VPN NLRI."""
 
@@ -173,8 +174,9 @@ def build_mvpn_update(
     attrs += struct.pack("!BBB", 0x40, 5, 4) + struct.pack("!I", 100)
     if include_pmsi:
         # Optional-transitive PMSI Tunnel: leaf-info flag, ingress replication,
-        # label=0, tunnel endpoint=local_id.
-        pmsi = struct.pack("!BB", pmsi_flags, 6) + b"\x00" * 3 + next_hop
+        # 20-bit MPLS label in the high bits, tunnel endpoint=local_id.
+        label = struct.pack("!I", pmsi_label << 4)[1:]
+        pmsi = struct.pack("!BB", pmsi_flags, 6) + label + next_hop
         attrs += struct.pack("!BBB", 0xC0, 22, len(pmsi)) + pmsi
     # MP_REACH_NLRI: optional (0x80), type 14
     attrs += struct.pack("!BBB", 0x80, 14, len(mp_reach_val)) + mp_reach_val
@@ -277,6 +279,7 @@ def main():
             local_id,
             _type3_nlri(zero_rd, SELECTIVE_SRC, SELECTIVE_GRP, TYPE3_ORIGINATOR),
             include_pmsi=True,
+            pmsi_label=SELECTIVE_LABEL,
         )
     )
     # D2: Type-3 without a usable selective-tunnel binding must be dropped.
