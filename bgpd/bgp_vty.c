@@ -22389,6 +22389,11 @@ int bgp_config_write(struct vty *vty)
 		if (!bgp->reject_as_sets)
 			vty_out(vty, " no bgp reject-as-sets\n");
 
+		/* GTM MCAST-VPN UMH large community function code point */
+		if (bgp->mvpn_umh_lc_function)
+			vty_out(vty, " bgp mvpn umh-large-community %u\n",
+				bgp->mvpn_umh_lc_function);
+
 		/* Suppress duplicate updates if the route actually not changed
 		 */
 		if (!!CHECK_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_DUPLICATES)
@@ -23333,6 +23338,29 @@ DEFPY (bgp_mvpn_ipmsi_label,
 	return CMD_SUCCESS;
 }
 
+DEFPY (bgp_mvpn_umh_large_community,
+       bgp_mvpn_umh_large_community_cmd,
+       "[no] bgp mvpn umh-large-community (1-4294967295)$fn",
+       NO_STR
+       BGP_STR
+       "Multicast VPN (MCAST-VPN) commands\n"
+       "Resolve the Type-7 UMH from a <sourceAS>:<function>:<UMH-IPv4> large community on the source route (default: disabled)\n"
+       "Function code point identifying the UMH large community\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct prefix all4 = { .family = AF_INET, .prefixlen = 0 };
+	struct prefix all6 = { .family = AF_INET6, .prefixlen = 0 };
+
+	bgp->mvpn_umh_lc_function = no ? 0 : fn;
+
+	/* Existing local Type-7s were resolved under the previous setting;
+	 * re-resolve them all (the zero-length prefixes cover every C-S). */
+	bgp_mvpn_reresolve_joins_for_route(bgp, AFI_IP, &all4);
+	bgp_mvpn_reresolve_joins_for_route(bgp, AFI_IP6, &all6);
+
+	return CMD_SUCCESS;
+}
+
 DEFPY (bgp_mvpn_source_active6,
        bgp_mvpn_source_active6_cmd,
        "[no] bgp mvpn source-active X:X::X:X$source6 group X:X::X:X$group6",
@@ -23848,6 +23876,9 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_source_active_cmd);
 	install_element(BGP_IPV4_MVPN_NODE, &bgp_mvpn_ipmsi_label_cmd);
 	install_element(BGP_IPV6_MVPN_NODE, &bgp_mvpn_source_active6_cmd);
+	/* Instance-wide (BGP_NODE): one setting serves both mvpn AFs -- the
+	 * UMH large community carries a v4 PE address either way. */
+	install_element(BGP_NODE, &bgp_mvpn_umh_large_community_cmd);
 	install_element(VIEW_NODE, &show_bgp_mvpn_cmd);
 
 	/* "no neighbor activate" commands. */

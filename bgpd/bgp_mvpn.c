@@ -26,6 +26,7 @@
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_aspath.h"
 #include "bgpd/bgp_ecommunity.h"
+#include "bgpd/bgp_lcommunity.h"
 #include "bgpd/bgp_packet.h"
 #include "bgpd/bgp_nht.h"
 #include "bgpd/bgp_mvpn.h"
@@ -832,8 +833,7 @@ static void bgp_mvpn_attach_gtm_rt(struct attr *attr)
 }
 
 /*
- * Resolve the RFC 6514 Section 5 communities for a pimd-driven Type-7 from the
- * unicast route toward C-S, in one longest-match lookup and one path walk:
+ * Read the RFC 6514 Section 5 communities off one path's attribute set:
  *
  *   *upstream (Upstream Multicast Hop / upstream PE, Section 5.1): the RT on
  *   the C-multicast join MUST equal the VRF Route Import extended community
@@ -849,9 +849,141 @@ static void bgp_mvpn_attach_gtm_rt(struct attr *attr)
  *   *source_as (Section 4.6): from the Source-AS Extended Community
  *   (Four-Octet-AS-Specific, sub-type ECOMMUNITY_SOURCE_AS; Junos "src-as").
  *
+ * Each output is written only when its community is present.
+ */
+static void bgp_mvpn_resolve_from_ecommunity(struct bgp_path_info *pi, uint32_t *source_as,
+					     struct in_addr *upstream)
+{
+	struct ecommunity *ecom = bgp_attr_get_ecommunity(pi->attr);
+	struct ecommunity_val *eval;
+
+	if (!ecom)
+		return;
+
+	eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_AS4, ECOMMUNITY_SOURCE_AS);
+	if (eval)
+		/* Four-Octet-AS-Specific wire layout: type, subtype, Global
+		 * Administrator (4-octet AS), Local Administrator (2). */
+		ptr_get_be32(&eval->val[2], source_as);
+
+	eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP, ECOMMUNITY_VRF_ROUTE_IMPORT);
+	if (!eval)
+		eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP, ECOMMUNITY_ROUTE_TARGET);
+	if (eval)
+		/* IP-address-specific wire layout: type, subtype, Global
+		 * Administrator (4, network order), Local Administrator (2). */
+		memcpy(&upstream->s_addr, &eval->val[2], IPV4_MAX_BYTELEN);
+}
+
+/*
+ * UMH via a transitive large community (draft-ietf-mboned-dimt, RFC 8092
+ * carrier) in the canonical RFC 8195 ASN:function:parameter layout: Global
+ * Administrator = the Source AS, data1 = the operator-configured function
+ * code point ("bgp mvpn umh-large-community"; IANA has not assigned one),
+ * data2 = the upstream PE's IPv4 address as a 32-bit integer
+ * (10.255.255.254 <-> 184549374). High bits of the function field stay
+ * reserved for the draft's type/preference nibbles. A large community is
+ * TRANSITIVE where the RFC 6514 route-import EC is not -- it survives an IX
+ * route server hop, which is the point of this encoding.
+ *
+ * Selection is atomic: the winning tuple supplies BOTH outputs; when no
+ * tuple wins the outputs are untouched and the caller falls back to the
+ * RFC 6514 extended communities.
+ *
+ * Trust: a tuple counts only when its Global Administrator equals the source
+ * route's origin AS (rightmost AS_PATH entry; the local AS for a local or
+ * empty-AS_PATH iBGP route). A transitive community survives more AS hops
+ * than any one operator can vouch for -- this check is the border-scoping
+ * primitive that bounds who may claim a UMH for a route.
+ *
+ * Ties: large communities are sorted and de-duplicated at attribute parse
+ * (lcommunity_uniq_sort), so candidates iterate in ascending tuple order and
+ * the first valid one -- the lowest tuple -- wins deterministically; any
+ * further matching tuples are logged and ignored.
+ */
+static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_info *pi,
+					     uint32_t *source_as, struct in_addr *upstream)
+{
+	struct lcommunity *lcom = bgp_attr_get_lcommunity(pi->attr);
+	uint32_t origin_as;
+	bool found = false;
+	int i;
+
+	if (!bgp->mvpn_umh_lc_function || !lcom)
+		return false;
+
+	origin_as = aspath_get_last_as(pi->attr->aspath);
+	if (origin_as == 0)
+		origin_as = bgp->as;
+
+	for (i = 0; i < lcom->size; i++) {
+		const uint8_t *lval = lcom->val + i * LCOMMUNITY_SIZE;
+		uint32_t ga, fn, param;
+		struct in_addr umh;
+
+		ptr_get_be32(lval, &ga);
+		ptr_get_be32(lval + 4, &fn);
+		ptr_get_be32(lval + 8, &param);
+
+		if (fn != bgp->mvpn_umh_lc_function)
+			continue;
+
+		if (found) {
+			if (BGP_DEBUG(zebra, ZEBRA))
+				zlog_debug("MVPN UMH large community %u:%u:%u ignored: lower tuple already won",
+					   ga, fn, param);
+			continue;
+		}
+
+		if (ga != origin_as) {
+			if (BGP_DEBUG(zebra, ZEBRA))
+				zlog_debug("MVPN UMH large community %u:%u:%u rejected: Global Administrator != origin AS %u",
+					   ga, fn, param, origin_as);
+			continue;
+		}
+
+		umh.s_addr = htonl(param);
+		if (param == 0 || IPV4_CLASS_D(param) || (param >> 24) == IN_LOOPBACKNET) {
+			if (BGP_DEBUG(zebra, ZEBRA))
+				zlog_debug("MVPN UMH large community %u:%u:%u rejected: %pI4 is not a usable upstream PE address",
+					   ga, fn, param, &umh);
+			continue;
+		}
+
+		*source_as = ga;
+		*upstream = umh;
+		found = true;
+		/* The value-checked "resolved via" line: the live proof greps
+		 * for this under `debug bgp zebra` (an LC-resolved upstream RT
+		 * is byte-identical to an EC-resolved one by design, so the
+		 * log IS the signal). Debug-gated: re-resolution runs on every
+		 * covering unicast best-path change, so an unconditional line
+		 * would flood under route churn. */
+		if (BGP_DEBUG(zebra, ZEBRA))
+			zlog_debug("MVPN UMH resolved via large community %u:%u:%u: upstream PE %pI4, Source AS %u",
+				   ga, fn, param, &umh, ga);
+	}
+
+	return found;
+}
+
+/*
+ * Resolve the RFC 6514 Section 5 communities (Source AS, upstream PE) for a
+ * pimd-driven Type-7 from the unicast route toward C-S, in one longest-match
+ * lookup, reading the selected (best) path only.
+ *
  * The route lives in the v4 or v6 unicast RIB per the C-S family; both
- * communities carry v4-core PE/AS values either way. Each output is written
- * only when still unset and its community is found.
+ * communities carry v4-core PE/AS values either way.
+ *
+ * Both values come off the ONE selected path, as a unit (RFC 6513 Section 5.1
+ * describes UMH selection as picking a route, then reading its attributes): a
+ * non-best path's communities describe an upstream the RIB will not forward
+ * through, and filling each field from whichever path happens to carry it can
+ * yield a (Source AS, upstream) pair no single advertisement carried.
+ *
+ * With "bgp mvpn umh-large-community" configured the UMH large community is
+ * tried first; the extended communities are the fallback whenever no valid
+ * tuple is present (and the only encoding when the knob is unset).
  */
 static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipaddr *src,
 					       uint32_t *source_as, struct in_addr *upstream)
@@ -860,8 +992,6 @@ static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipa
 	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
-	struct ecommunity *ecom;
-	struct ecommunity_val *eval;
 
 	if (IS_IPADDR_V6(src)) {
 		psrc.family = AF_INET6;
@@ -877,38 +1007,28 @@ static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipa
 	if (!dest)
 		return;
 
-	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
-		if (pi->type != ZEBRA_ROUTE_BGP)
-			continue;
-		ecom = bgp_attr_get_ecommunity(pi->attr);
-		if (!ecom)
-			continue;
-
-		if (*source_as == 0) {
-			eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_AS4, ECOMMUNITY_SOURCE_AS);
-			if (eval)
-				/* Four-Octet-AS-Specific wire layout: type,
-				 * subtype, Global Administrator (4-octet AS),
-				 * Local Administrator (2). */
-				ptr_get_be32(&eval->val[2], source_as);
-		}
-
-		if (upstream->s_addr == INADDR_ANY) {
-			eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP,
-						 ECOMMUNITY_VRF_ROUTE_IMPORT);
-			if (!eval)
-				eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP,
-							 ECOMMUNITY_ROUTE_TARGET);
-			if (eval)
-				/* IP-address-specific wire layout: type, subtype,
-				 * Global Administrator (4, network order), Local
-				 * Administrator (2). */
-				memcpy(&upstream->s_addr, &eval->val[2], IPV4_MAX_BYTELEN);
-		}
-
-		if (*source_as != 0 && upstream->s_addr != INADDR_ANY)
+	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
+		if (CHECK_FLAG(pi->flags, BGP_PATH_SELECTED))
 			break;
+
+	if (pi && pi->type == ZEBRA_ROUTE_BGP) {
+		uint32_t ec_as = 0;
+		struct in_addr ec_umh = { .s_addr = INADDR_ANY };
+
+		bgp_mvpn_resolve_from_ecommunity(pi, &ec_as, &ec_umh);
+		if (bgp_mvpn_resolve_from_lcommunity(bgp, pi, source_as, upstream)) {
+			if (BGP_DEBUG(zebra, ZEBRA) &&
+			    ((ec_as != 0 && ec_as != *source_as) ||
+			     (ec_umh.s_addr != INADDR_ANY &&
+			      ec_umh.s_addr != upstream->s_addr)))
+				zlog_debug("MVPN UMH large community disagrees with extended communities (EC: Source AS %u, upstream %pI4)",
+					   ec_as, &ec_umh);
+		} else {
+			*source_as = ec_as;
+			*upstream = ec_umh;
+		}
 	}
+
 	bgp_dest_unlock_node(dest);
 }
 
@@ -1234,17 +1354,20 @@ void bgp_mvpn_handle_router_id_update(struct bgp *bgp, bool withdraw)
 }
 
 /*
- * Remove this PE's local Type-7 (C-multicast Source Tree Join) route for
- * (C-S, C-G) regardless of its Source AS.  source_as is part of the Type-7
- * NLRI key but is re-derived from the source route on withdraw, and that value
- * can differ from origination time -- the Source-AS extended community may have
- * changed, or the source route may be gone by the time the receiver leaves --
- * so an exact-prefix remove would miss the originally originated route.  A PE
- * holds at most one local join per (C-S, C-G), so a match on the C-S/C-G pair
- * is unambiguous.
+ * Remove this PE's local Type-7 (C-multicast Source Tree Join) routes for
+ * (C-S, C-G) whose Source AS differs from keep_source_as (0 = remove all).
+ * source_as is part of the Type-7 NLRI key but is re-derived from the source
+ * route on every (re-)origination and withdraw, and that value can differ
+ * from the one a route was installed under -- the Source-AS extended
+ * community may have changed, or the source route may be gone -- so an
+ * exact-prefix remove would miss the originally originated route.  The
+ * withdraw path removes every key (keep_source_as 0); the (re-)origination
+ * path keeps the freshly derived key and clears any stale one, keeping the
+ * PE at one local join per (C-S, C-G).
  */
 static void bgp_mvpn_route_remove_type7_sg(struct bgp *bgp, struct peer *peer,
-					   const struct ipaddr *src, const struct ipaddr *grp)
+					   const struct ipaddr *src, const struct ipaddr *grp,
+					   uint32_t keep_source_as)
 {
 	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
 	struct bgp_table *table = bgp->rib[afi][SAFI_MCAST_VPN];
@@ -1261,6 +1384,10 @@ static void bgp_mvpn_route_remove_type7_sg(struct bgp *bgp, struct peer *peer,
 		    p->prefix.route_type != BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN)
 			continue;
 		if (ipaddr_cmp(&p->prefix.src, src) != 0 || ipaddr_cmp(&p->prefix.grp, grp) != 0)
+			continue;
+		/* An originated key never carries Source AS 0 (the resolver
+		 * falls back to the local AS), so 0 means "keep none". */
+		if (keep_source_as != 0 && p->prefix.source_as == keep_source_as)
 			continue;
 
 		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
@@ -1410,7 +1537,7 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 		 * exact-prefix remove keyed off the current value would miss the
 		 * originally originated join and strand it, advertised
 		 * indefinitely. */
-		bgp_mvpn_route_remove_type7_sg(bgp, bgp->peer_self, src, grp);
+		bgp_mvpn_route_remove_type7_sg(bgp, bgp->peer_self, src, grp, 0);
 		bgp_mvpn_selective_join_set(bgp, src, grp, true);
 		return CMD_SUCCESS;
 	}
@@ -1423,6 +1550,14 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 	 * (single-AS GTM over iBGP), that is the local AS. */
 	if (source_as == 0)
 		source_as = bgp->as;
+
+	/* A re-resolution (bgp_mvpn_reresolve_joins_for_route) can derive a
+	 * DIFFERENT Source AS than the one this (C-S, C-G) join was last
+	 * originated under -- the NLRI key changes, so installing the new
+	 * route alone would strand the old one, advertised indefinitely.
+	 * Clear any stale-keyed local join first; a same-key re-origination
+	 * skips this walk's remove and stays an attrhash-dedup'd no-op. */
+	bgp_mvpn_route_remove_type7_sg(bgp, bgp->peer_self, src, grp, source_as);
 
 	bgp_mvpn_build_prefix_type7(&p, source_as, src, grp);
 
