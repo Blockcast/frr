@@ -230,6 +230,36 @@ interface r1-eth2
     assert result is None, result
 
 
+def test_bestpath_flip_rekeys_without_strand():
+    """Kill peer2: the best path flips to peer1's (Source AS EC 65005, no
+    route-import). The re-resolution must re-key the Type-7 to Source AS
+    65005 and remove the previously originated local-AS-keyed route -- one
+    local Type-7 per (C-S, C-G), never two."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["peer2"].cmd("kill $(cat {}) 2>/dev/null".format(PID_FILES["peer2"]))
+
+    def _rekeyed():
+        routes = _type7s("r1")
+        stale = [r for r in routes if r.get("sourceAs") == LOCAL_AS]
+        rekeyed = [r for r in routes if r.get("sourceAs") == NONBEST_SRC_AS]
+        if stale:
+            return "stale local-AS Type-7 stranded after bestpath flip: {}".format(
+                stale
+            )
+        if not rekeyed:
+            return "Type-7 not re-keyed to AS {}; have: {}".format(
+                NONBEST_SRC_AS, routes
+            )
+        return None
+
+    _, result = topotest.run_and_expect(_rekeyed, None, count=90, wait=1)
+    assert result is None, result
+
+
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
     sys.exit(pytest.main(args))
