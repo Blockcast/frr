@@ -26,6 +26,7 @@
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_aspath.h"
 #include "bgpd/bgp_ecommunity.h"
+#include "bgpd/bgp_lcommunity.h"
 #include "bgpd/bgp_packet.h"
 #include "bgpd/bgp_nht.h"
 #include "bgpd/bgp_mvpn.h"
@@ -875,6 +876,98 @@ static void bgp_mvpn_resolve_from_ecommunity(struct bgp_path_info *pi, uint32_t 
 }
 
 /*
+ * UMH via a transitive large community (draft-ietf-mboned-dimt, RFC 8092
+ * carrier) in the canonical RFC 8195 ASN:function:parameter layout: Global
+ * Administrator = the Source AS, data1 = the operator-configured function
+ * code point ("bgp mvpn umh-large-community"; IANA has not assigned one),
+ * data2 = the upstream PE's IPv4 address as a 32-bit integer
+ * (10.255.255.254 <-> 184549374). High bits of the function field stay
+ * reserved for the draft's type/preference nibbles. A large community is
+ * TRANSITIVE where the RFC 6514 route-import EC is not -- it survives an IX
+ * route server hop, which is the point of this encoding.
+ *
+ * Selection is atomic: the winning tuple supplies BOTH outputs; when no
+ * tuple wins the outputs are untouched and the caller falls back to the
+ * RFC 6514 extended communities.
+ *
+ * Trust: a tuple counts only when its Global Administrator equals the source
+ * route's origin AS (rightmost AS_PATH entry; the local AS for a local or
+ * empty-AS_PATH iBGP route). A transitive community survives more AS hops
+ * than any one operator can vouch for -- this check is the border-scoping
+ * primitive that bounds who may claim a UMH for a route.
+ *
+ * Ties: large communities are sorted and de-duplicated at attribute parse
+ * (lcommunity_uniq_sort), so candidates iterate in ascending tuple order and
+ * the first valid one -- the lowest tuple -- wins deterministically; any
+ * further matching tuples are logged and ignored.
+ */
+static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_info *pi,
+					     uint32_t *source_as, struct in_addr *upstream)
+{
+	struct lcommunity *lcom = bgp_attr_get_lcommunity(pi->attr);
+	uint32_t origin_as;
+	bool found = false;
+	int i;
+
+	if (!bgp->mvpn_umh_lc_function || !lcom)
+		return false;
+
+	origin_as = aspath_get_last_as(pi->attr->aspath);
+	if (origin_as == 0)
+		origin_as = bgp->as;
+
+	for (i = 0; i < lcom->size; i++) {
+		const uint8_t *lval = lcom->val + i * LCOMMUNITY_SIZE;
+		uint32_t ga, fn, param;
+		struct in_addr umh;
+
+		ptr_get_be32(lval, &ga);
+		ptr_get_be32(lval + 4, &fn);
+		ptr_get_be32(lval + 8, &param);
+
+		if (fn != bgp->mvpn_umh_lc_function)
+			continue;
+
+		if (found) {
+			if (BGP_DEBUG(zebra, ZEBRA))
+				zlog_debug("MVPN UMH large community %u:%u:%u ignored: lower tuple already won",
+					   ga, fn, param);
+			continue;
+		}
+
+		if (ga != origin_as) {
+			if (BGP_DEBUG(zebra, ZEBRA))
+				zlog_debug("MVPN UMH large community %u:%u:%u rejected: Global Administrator != origin AS %u",
+					   ga, fn, param, origin_as);
+			continue;
+		}
+
+		umh.s_addr = htonl(param);
+		if (param == 0 || IPV4_CLASS_D(param) || (param >> 24) == IN_LOOPBACKNET) {
+			if (BGP_DEBUG(zebra, ZEBRA))
+				zlog_debug("MVPN UMH large community %u:%u:%u rejected: %pI4 is not a usable upstream PE address",
+					   ga, fn, param, &umh);
+			continue;
+		}
+
+		*source_as = ga;
+		*upstream = umh;
+		found = true;
+		/* The value-checked "resolved via" line: the live proof greps
+		 * for this under `debug bgp zebra` (an LC-resolved upstream RT
+		 * is byte-identical to an EC-resolved one by design, so the
+		 * log IS the signal). Debug-gated: re-resolution runs on every
+		 * covering unicast best-path change, so an unconditional line
+		 * would flood under route churn. */
+		if (BGP_DEBUG(zebra, ZEBRA))
+			zlog_debug("MVPN UMH resolved via large community %u:%u:%u: upstream PE %pI4, Source AS %u",
+				   ga, fn, param, &umh, ga);
+	}
+
+	return found;
+}
+
+/*
  * Resolve the RFC 6514 Section 5 communities (Source AS, upstream PE) for a
  * pimd-driven Type-7 from the unicast route toward C-S, in one longest-match
  * lookup, reading the selected (best) path only.
@@ -887,6 +980,10 @@ static void bgp_mvpn_resolve_from_ecommunity(struct bgp_path_info *pi, uint32_t 
  * non-best path's communities describe an upstream the RIB will not forward
  * through, and filling each field from whichever path happens to carry it can
  * yield a (Source AS, upstream) pair no single advertisement carried.
+ *
+ * With "bgp mvpn umh-large-community" configured the UMH large community is
+ * tried first; the extended communities are the fallback whenever no valid
+ * tuple is present (and the only encoding when the knob is unset).
  */
 static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipaddr *src,
 					       uint32_t *source_as, struct in_addr *upstream)
@@ -914,8 +1011,23 @@ static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipa
 		if (CHECK_FLAG(pi->flags, BGP_PATH_SELECTED))
 			break;
 
-	if (pi && pi->type == ZEBRA_ROUTE_BGP)
-		bgp_mvpn_resolve_from_ecommunity(pi, source_as, upstream);
+	if (pi && pi->type == ZEBRA_ROUTE_BGP) {
+		uint32_t ec_as = 0;
+		struct in_addr ec_umh = { .s_addr = INADDR_ANY };
+
+		bgp_mvpn_resolve_from_ecommunity(pi, &ec_as, &ec_umh);
+		if (bgp_mvpn_resolve_from_lcommunity(bgp, pi, source_as, upstream)) {
+			if (BGP_DEBUG(zebra, ZEBRA) &&
+			    ((ec_as != 0 && ec_as != *source_as) ||
+			     (ec_umh.s_addr != INADDR_ANY &&
+			      ec_umh.s_addr != upstream->s_addr)))
+				zlog_debug("MVPN UMH large community disagrees with extended communities (EC: Source AS %u, upstream %pI4)",
+					   ec_as, &ec_umh);
+		} else {
+			*source_as = ec_as;
+			*upstream = ec_umh;
+		}
+	}
 
 	bgp_dest_unlock_node(dest);
 }
