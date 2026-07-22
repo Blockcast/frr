@@ -832,8 +832,7 @@ static void bgp_mvpn_attach_gtm_rt(struct attr *attr)
 }
 
 /*
- * Resolve the RFC 6514 Section 5 communities for a pimd-driven Type-7 from the
- * unicast route toward C-S, in one longest-match lookup and one path walk:
+ * Read the RFC 6514 Section 5 communities off one path's attribute set:
  *
  *   *upstream (Upstream Multicast Hop / upstream PE, Section 5.1): the RT on
  *   the C-multicast join MUST equal the VRF Route Import extended community
@@ -849,9 +848,45 @@ static void bgp_mvpn_attach_gtm_rt(struct attr *attr)
  *   *source_as (Section 4.6): from the Source-AS Extended Community
  *   (Four-Octet-AS-Specific, sub-type ECOMMUNITY_SOURCE_AS; Junos "src-as").
  *
+ * Each output is written only when its community is present.
+ */
+static void bgp_mvpn_resolve_from_ecommunity(struct bgp_path_info *pi, uint32_t *source_as,
+					     struct in_addr *upstream)
+{
+	struct ecommunity *ecom = bgp_attr_get_ecommunity(pi->attr);
+	struct ecommunity_val *eval;
+
+	if (!ecom)
+		return;
+
+	eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_AS4, ECOMMUNITY_SOURCE_AS);
+	if (eval)
+		/* Four-Octet-AS-Specific wire layout: type, subtype, Global
+		 * Administrator (4-octet AS), Local Administrator (2). */
+		ptr_get_be32(&eval->val[2], source_as);
+
+	eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP, ECOMMUNITY_VRF_ROUTE_IMPORT);
+	if (!eval)
+		eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP, ECOMMUNITY_ROUTE_TARGET);
+	if (eval)
+		/* IP-address-specific wire layout: type, subtype, Global
+		 * Administrator (4, network order), Local Administrator (2). */
+		memcpy(&upstream->s_addr, &eval->val[2], IPV4_MAX_BYTELEN);
+}
+
+/*
+ * Resolve the RFC 6514 Section 5 communities (Source AS, upstream PE) for a
+ * pimd-driven Type-7 from the unicast route toward C-S, in one longest-match
+ * lookup, reading the selected (best) path only.
+ *
  * The route lives in the v4 or v6 unicast RIB per the C-S family; both
- * communities carry v4-core PE/AS values either way. Each output is written
- * only when still unset and its community is found.
+ * communities carry v4-core PE/AS values either way.
+ *
+ * Both values come off the ONE selected path, as a unit (RFC 6513 Section 5.1
+ * describes UMH selection as picking a route, then reading its attributes): a
+ * non-best path's communities describe an upstream the RIB will not forward
+ * through, and filling each field from whichever path happens to carry it can
+ * yield a (Source AS, upstream) pair no single advertisement carried.
  */
 static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipaddr *src,
 					       uint32_t *source_as, struct in_addr *upstream)
@@ -860,8 +895,6 @@ static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipa
 	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
-	struct ecommunity *ecom;
-	struct ecommunity_val *eval;
 
 	if (IS_IPADDR_V6(src)) {
 		psrc.family = AF_INET6;
@@ -877,38 +910,13 @@ static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipa
 	if (!dest)
 		return;
 
-	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
-		if (pi->type != ZEBRA_ROUTE_BGP)
-			continue;
-		ecom = bgp_attr_get_ecommunity(pi->attr);
-		if (!ecom)
-			continue;
-
-		if (*source_as == 0) {
-			eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_AS4, ECOMMUNITY_SOURCE_AS);
-			if (eval)
-				/* Four-Octet-AS-Specific wire layout: type,
-				 * subtype, Global Administrator (4-octet AS),
-				 * Local Administrator (2). */
-				ptr_get_be32(&eval->val[2], source_as);
-		}
-
-		if (upstream->s_addr == INADDR_ANY) {
-			eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP,
-						 ECOMMUNITY_VRF_ROUTE_IMPORT);
-			if (!eval)
-				eval = ecommunity_lookup(ecom, ECOMMUNITY_ENCODE_IP,
-							 ECOMMUNITY_ROUTE_TARGET);
-			if (eval)
-				/* IP-address-specific wire layout: type, subtype,
-				 * Global Administrator (4, network order), Local
-				 * Administrator (2). */
-				memcpy(&upstream->s_addr, &eval->val[2], IPV4_MAX_BYTELEN);
-		}
-
-		if (*source_as != 0 && upstream->s_addr != INADDR_ANY)
+	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
+		if (CHECK_FLAG(pi->flags, BGP_PATH_SELECTED))
 			break;
-	}
+
+	if (pi && pi->type == ZEBRA_ROUTE_BGP)
+		bgp_mvpn_resolve_from_ecommunity(pi, source_as, upstream);
+
 	bgp_dest_unlock_node(dest);
 }
 

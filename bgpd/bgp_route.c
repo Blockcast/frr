@@ -4189,16 +4189,6 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 	if (safi == SAFI_UNICAST && is_srv6_unicast_enabled(bgp, afi))
 		bgp_srv6_unicast_register_route(bgp, afi, dest, new_select);
 
-	/* GTM (RFC 7716): a unicast route toward a C-S carries the VRF Route
-	 * Import EC / Source AS that a local Type-7 join derives its upstream-PE
-	 * RT from. When that route changes, re-resolve dependent local joins so
-	 * a Type-7 first originated before its source route (RT-less) picks up
-	 * the RT. Gated on GTM being active; a no-op otherwise. */
-	if (safi == SAFI_UNICAST && (afi == AFI_IP || afi == AFI_IP6) &&
-	    bgp_mvpn_gtm_active(bgp))
-		bgp_mvpn_reresolve_joins_for_route(bgp, afi,
-						   bgp_dest_get_prefix(dest));
-
 	if (safi == SAFI_UNICAST || safi == SAFI_LABELED_UNICAST)
 		/* label unicast path :
 		 * Do we need to allocate or free labels?
@@ -4328,6 +4318,19 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 			  new_select);
 	}
 
+	/* GTM (RFC 7716): a unicast route toward a C-S carries the VRF Route
+	 * Import EC / Source AS that a local Type-7 join derives its
+	 * upstream-PE RT from. When the route changes, re-resolve dependent
+	 * local joins so a Type-7 first originated before its source route
+	 * (RT-less) picks up the RT, and one resolved off a now-gone best
+	 * path re-keys to the surviving one. Runs AFTER the BGP_PATH_SELECTED
+	 * flag commit above -- the resolver reads the selected path, and at
+	 * any earlier point the flag still names the PREVIOUS selection.
+	 * Gated on GTM being active; a no-op otherwise. */
+	if (safi == SAFI_UNICAST && (afi == AFI_IP || afi == AFI_IP6) &&
+	    bgp_mvpn_gtm_active(bgp))
+		bgp_mvpn_reresolve_joins_for_route(bgp, afi,
+						   bgp_dest_get_prefix(dest));
 
 #ifdef ENABLE_BGP_VNC
 	if ((afi == AFI_IP || afi == AFI_IP6) && (safi == SAFI_UNICAST)) {
