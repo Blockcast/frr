@@ -24,6 +24,9 @@ Per-prefix scenarios (see r2/bgpd.conf):
   p4 10.10.40.0/24  multicast param   invalid UMH -> EC fallback
   p5 10.10.50.0/24  LC only           no fallback exists: RT proves LC decode
   p6 2001:db8:53::/64 LC only         v6 C-S, v4 UMH (RFC 6515 pattern)
+  p7 10.10.70.0/24  param 0           invalid UMH (0.0.0.0) -> EC fallback
+  p8 10.10.80.0/24  param 127.0.0.1   invalid UMH (loopback) -> EC fallback
+  p9 10.10.90.0/24  wrong function    fn 2 != knob 1, skipped -> EC fallback
 
 The knob is set mid-test (existing joins must re-resolve WITHOUT re-joining),
 changed communities re-originate via the unicast-route reresolve, and the
@@ -66,6 +69,9 @@ JOINS_V4 = {
     "p3": ("10.10.30.10", "232.1.1.3"),
     "p4": ("10.10.40.10", "232.1.1.4"),
     "p5": ("10.10.50.10", "232.1.1.5"),
+    "p7": ("10.10.70.10", "232.1.1.7"),
+    "p8": ("10.10.80.10", "232.1.1.8"),
+    "p9": ("10.10.90.10", "232.1.1.9"),
 }
 JOIN_V6 = ("2001:db8:53::10", "ff3e::232:1")
 
@@ -145,6 +151,42 @@ def _expect_type7(source, group, source_as, rt, v6=False):
     assert result is None, result
 
 
+def _expect_single_type7(source, group, source_as, rt, v6=False):
+    """Like _expect_type7, but also assert EXACTLY ONE Type-7 exists for
+    (S,G). A re-resolution that changes the Source AS must WITHDRAW the old
+    NLRI key, not strand it (the live-observed regression). _expect_type7
+    matches on (source, group) only, so on a strand it passes or fails on RIB
+    sort order; this counts the keys explicitly."""
+
+    def _check():
+        matches = [
+            r
+            for r in _mvpn_routes(v6)
+            if r.get("routeType") == 7
+            and r.get("source") == source
+            and r.get("group") == group
+        ]
+        if len(matches) != 1:
+            return "want exactly 1 Type-7 for ({}, {}), found {}: {}".format(
+                source, group, len(matches), matches
+            )
+        r = matches[0]
+        if r.get("sourceAs") != source_as:
+            return "Type-7 ({}, {}) has Source AS {}, want {}: {}".format(
+                source, group, r.get("sourceAs"), source_as, r
+            )
+        got_rt = r.get("extendedCommunity", {}).get("string")
+        want_rt = "RT:{}:0".format(rt) if rt else None
+        if got_rt != want_rt:
+            return "Type-7 ({}, {}) has RT {}, want {}: {}".format(
+                source, group, got_rt, want_rt, r
+            )
+        return None
+
+    _, result = topotest.run_and_expect(_check, None, count=90, wait=1)
+    assert result is None, result
+
+
 def _join(source, group, v6=False):
     proto = "ipv6 mld" if v6 else "ip igmp"
     get_topogen().gears["r1"].vtysh_cmd(
@@ -207,7 +249,7 @@ router bgp {}
     )
 
     src, grp = JOINS_V4["p1"]
-    _expect_type7(src, grp, PEER_AS, UMH_KAT)
+    _expect_single_type7(src, grp, PEER_AS, UMH_KAT)
 
 
 def test_vty_roundtrip():
@@ -258,6 +300,49 @@ def test_invalid_param_falls_back():
         pytest.skip(tgen.errors)
 
     src, grp = JOINS_V4["p4"]
+    _join(src, grp)
+    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_invalid_param_zero_falls_back():
+    """p7's parameter is 0 -> 0.0.0.0, not a usable upstream PE address; the
+    invalid-parameter check must reject it and fall back to the extended
+    community (the param==0 branch of the UMH validity gate)."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS_V4["p7"]
+    _join(src, grp)
+    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_invalid_param_loopback_falls_back():
+    """p8's parameter is 2130706433 = 127.0.0.1 (loopback) -- not a usable
+    upstream PE address; must fall back to the extended community (the 127/8
+    branch of the UMH validity gate)."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS_V4["p8"]
+    _join(src, grp)
+    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_wrong_function_falls_back():
+    """p9 carries a tuple with function 2 while the knob is 1: the function
+    filter must skip it (no valid tuple) and resolution fall back to the
+    extended community. Guards the fn-mismatch continue that no positive test
+    exercises."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS_V4["p9"]
     _join(src, grp)
     _expect_type7(src, grp, LOCAL_AS, EC_RT)
 
@@ -331,7 +416,7 @@ router bgp {}
     ), "knob still in running-config after no"
 
     src, grp = JOINS_V4["p1"]
-    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+    _expect_single_type7(src, grp, LOCAL_AS, EC_RT)
 
 
 if __name__ == "__main__":

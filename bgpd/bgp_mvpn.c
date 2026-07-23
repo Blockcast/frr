@@ -881,8 +881,9 @@ static void bgp_mvpn_resolve_from_ecommunity(struct bgp_path_info *pi, uint32_t 
  * Administrator = the Source AS, data1 = the operator-configured function
  * code point ("bgp mvpn umh-large-community"; IANA has not assigned one),
  * data2 = the upstream PE's IPv4 address as a 32-bit integer
- * (10.255.255.254 <-> 184549374). High bits of the function field stay
- * reserved for the draft's type/preference nibbles. A large community is
+ * (10.255.255.254 <-> 184549374). The function field is matched in full (a
+ * 32-bit exact compare); should the draft later assign type/preference
+ * nibbles, they must be folded into the configured value. A large community is
  * TRANSITIVE where the RFC 6514 route-import EC is not -- it survives an IX
  * route server hop, which is the point of this encoding.
  *
@@ -912,8 +913,17 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 	if (!bgp->mvpn_umh_lc_function || !lcom)
 		return false;
 
+	/*
+	 * aspath_get_last_as() returns 0 for an empty AS_PATH or one whose
+	 * origin segment is an AS_SET (aggregation). That 0 is genuinely the
+	 * local AS only for an iBGP-learned or locally-originated route; for an
+	 * eBGP path an unresolvable origin must NOT collapse to the local AS,
+	 * or a transitive tuple carrying GA == our own AS could claim a UMH
+	 * across a border. Left at 0 no tuple matches (GA 0 is rejected below).
+	 */
 	origin_as = aspath_get_last_as(pi->attr->aspath);
-	if (origin_as == 0)
+	if (origin_as == 0 &&
+	    (pi->peer == bgp->peer_self || pi->peer->sort == BGP_PEER_IBGP))
 		origin_as = bgp->as;
 
 	for (i = 0; i < lcom->size; i++) {
@@ -935,15 +945,27 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 			continue;
 		}
 
-		if (ga != origin_as) {
-			if (BGP_DEBUG(zebra, ZEBRA))
-				zlog_debug("MVPN UMH large community %u:%u:%u rejected: Global Administrator != origin AS %u",
-					   ga, fn, param, origin_as);
+		if (ga == 0 || ga != origin_as) {
+			/*
+			 * Trust-boundary reject: someone is claiming a UMH for
+			 * this route across an AS they do not originate. Surface
+			 * it at notice (not debug) so a probe is visible in
+			 * production, throttled to once a minute so a flood of
+			 * crafted tuples cannot spam the log.
+			 */
+			static time_t last_untrusted_log;
+			time_t now = monotime(NULL);
+
+			if (now - last_untrusted_log >= 60) {
+				last_untrusted_log = now;
+				zlog_notice("MVPN UMH large community %u:%u:%u rejected: Global Administrator %u != origin AS %u",
+					    ga, fn, param, ga, origin_as);
+			}
 			continue;
 		}
 
 		umh.s_addr = htonl(param);
-		if (param == 0 || IPV4_CLASS_D(param) || (param >> 24) == IN_LOOPBACKNET) {
+		if (!ipv4_unicast_valid(&umh)) {
 			if (BGP_DEBUG(zebra, ZEBRA))
 				zlog_debug("MVPN UMH large community %u:%u:%u rejected: %pI4 is not a usable upstream PE address",
 					   ga, fn, param, &umh);

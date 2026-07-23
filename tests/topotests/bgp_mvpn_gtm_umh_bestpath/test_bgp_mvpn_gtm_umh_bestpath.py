@@ -22,9 +22,12 @@ a combination no single advertisement carried. Reading the selected path
 as a unit yields (local AS 65001 [Section 4.6 fallback, best path has no
 Source AS EC], UMH 10.255.0.9).
 
-The final stage kills peer2: the best path flips to peer1's, and the
-PR #26 re-resolution must re-key the Type-7 to (AS 65005, no upstream RT)
-WITHOUT stranding the previously originated (AS 65001) route.
+Two later stages exercise the re-key: killing peer2 flips the best path to
+peer1's (a withdrawal-driven flip), and restarting peer2 at a higher
+LOCAL_PREF flips it back (an arrival-driven flip). The unicast-route
+re-resolution -- which runs only after the BGP_PATH_SELECTED flag is
+committed -- must re-key the Type-7 each time WITHOUT stranding the
+previously originated route.
 
     +-------+   10.0.0.0/24   +----+   10.0.1.0/24   +-------+
     | peer1 |-----------------| r1 |-----------------| peer2 |
@@ -57,6 +60,9 @@ LOCAL_AS = 65001
 NONBEST_SRC_AS = 65005
 # Carried only by the best path: the upstream PE the Type-7 must target.
 BEST_RT_IMPORT = "10.255.0.9"
+# Carried by the RE-ADDED best path (arrival-driven flip): a different
+# upstream so the re-key to the arriving selection is observable.
+ADD_RT_IMPORT = "10.255.0.11"
 
 PID_FILES = {}
 
@@ -254,9 +260,58 @@ def test_bestpath_flip_rekeys_without_strand():
             return "Type-7 not re-keyed to AS {}; have: {}".format(
                 NONBEST_SRC_AS, routes
             )
+        if len(routes) != 1:
+            return "want exactly 1 Type-7 after flip, have {}: {}".format(
+                len(routes), routes
+            )
+        # peer1 carries no route-import: the re-keyed Type-7 must be RT-less,
+        # not still carrying peer2's stale 10.255.0.9 upstream.
+        got_rt = rekeyed[0].get("extendedCommunity", {}).get("string")
+        if got_rt:
+            return "re-keyed Type-7 still carries upstream RT {} (peer1 has none): {}".format(
+                got_rt, rekeyed[0]
+            )
         return None
 
     _, result = topotest.run_and_expect(_rekeyed, None, count=90, wait=1)
+    assert result is None, result
+
+
+def test_add_driven_flip_rekeys():
+    """A BETTER path ARRIVING (not a withdrawal) must also re-key. Restart
+    peer2 at LOCAL_PREF 300 with a fresh route-import: the arrival becomes
+    best, and the resolver -- running only after the BGP_PATH_SELECTED flag
+    is committed -- must re-key the Type-7 to (local AS, the new upstream),
+    still exactly one Type-7 (peer1's 65005 key must not strand)."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    _start_speaker(
+        tgen,
+        "peer2",
+        "10.0.1.1 {} 10.0.1.2 300 --rt-import {}".format(LOCAL_AS, ADD_RT_IMPORT),
+    )
+
+    def _reflip():
+        routes = _type7s("r1")
+        if len(routes) != 1:
+            return "want exactly 1 Type-7 after arrival flip, have {}: {}".format(
+                len(routes), routes
+            )
+        r = routes[0]
+        if r.get("sourceAs") != LOCAL_AS:
+            return "Type-7 not re-keyed to local AS {} on arrival flip: {}".format(
+                LOCAL_AS, r
+            )
+        got_rt = r.get("extendedCommunity", {}).get("string")
+        want_rt = "RT:{}:0".format(ADD_RT_IMPORT)
+        if got_rt != want_rt:
+            return "Type-7 upstream RT {} != new {}: {}".format(got_rt, want_rt, r)
+        return None
+
+    _, result = topotest.run_and_expect(_reflip, None, count=90, wait=1)
     assert result is None, result
 
 
