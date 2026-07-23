@@ -66,6 +66,7 @@ DECLARE_HOOK(bgp_hook_config_write_vrf, (struct vty *vty, struct vrf *vrf),
 struct update_subgroup;
 struct bpacket;
 struct bgp_pbr_config;
+struct bgp_mvpn_event_sink;
 
 /*
  * Allow the neighbor XXXX remote-as to take internal or external
@@ -978,6 +979,15 @@ struct bgp {
 	 * the RFC 6514 extended communities remain the fallback either way.
 	 */
 	uint32_t mvpn_umh_lc_function;
+
+	/* GTM MCAST-VPN: `bgp mvpn event-socket PATH` -- configured path for
+	 * the settlement-plane Type-7 install/withdraw/origin-change event
+	 * stream (BLO-17645). NULL when unconfigured (the feature is
+	 * opt-in). mvpn_event_sink is opaque to bgpd.h and owned entirely by
+	 * bgp_mvpn_events.c; NULL whenever the listener is not running (no
+	 * path configured, or bind/listen failed). */
+	char *mvpn_event_socket_path;
+	struct bgp_mvpn_event_sink *mvpn_event_sink;
 
 	/* EVPN - use RFC 8365 to auto-derive RT */
 	int advertise_autort_rfc8365;

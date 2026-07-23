@@ -30,6 +30,7 @@
 #include "bgpd/bgp_packet.h"
 #include "bgpd/bgp_nht.h"
 #include "bgpd/bgp_mvpn.h"
+#include "bgpd/bgp_mvpn_events.h"
 #include "bgpd/bgp_zebra.h"
 
 /* Bit-length key covering the whole mvpn_addr (route_type, C-S, C-G). Padding
@@ -1539,6 +1540,7 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 		 * indefinitely. */
 		bgp_mvpn_route_remove_type7_sg(bgp, bgp->peer_self, src, grp, 0);
 		bgp_mvpn_selective_join_set(bgp, src, grp, true);
+		bgp_mvpn_event_withdrawn(bgp, src, grp);
 		return CMD_SUCCESS;
 	}
 
@@ -1584,6 +1586,8 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 	else if (BGP_DEBUG(zebra, ZEBRA))
 		zlog_debug("MVPN Type-7 (%pIA, %pIA): no upstream PE resolved; originating without upstream RT",
 			   src, grp);
+
+	bgp_mvpn_event_join_resolved(bgp, src, grp, source_as, umh);
 
 	bgp_mvpn_route_install(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p), &p, &attr,
 			       BGP_ROUTE_STATIC);
@@ -1672,6 +1676,10 @@ void bgp_mvpn_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t s
 	 */
 	if (afi == AFI_IP && bgp->mvpn_ipmsi_label)
 		vty_out(vty, "  bgp mvpn ipmsi-label %u\n", bgp->mvpn_ipmsi_label);
+
+	/* Instance-wide, like the ipmsi-label knob: write it once under ipv4. */
+	if (afi == AFI_IP)
+		bgp_mvpn_events_config_write(vty, bgp);
 
 	if (!table)
 		return;
