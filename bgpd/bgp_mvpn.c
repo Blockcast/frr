@@ -950,19 +950,15 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 			 * Trust-boundary reject: someone is claiming a UMH for
 			 * this route across an AS they do not originate. Surface
 			 * it at notice (not debug) so a probe is visible in
-			 * production, throttled to once a minute so a flood of
-			 * crafted tuples cannot spam the log. NB: the throttle
-			 * window is process-global, so on a multi-VRF box a probe
-			 * on one instance can suppress this notice for another
-			 * within the same 60s -- the instance name is logged so a
-			 * fired notice is still attributable; a true per-VRF
-			 * limiter would need dedicated storage on struct bgp.
+			 * production, throttled to once a minute per BGP
+			 * instance so a flood of crafted tuples cannot spam the
+			 * log and a probe on one VRF cannot mask a distinct
+			 * probe on another.
 			 */
-			static time_t last_untrusted_log;
 			time_t now = monotime(NULL);
 
-			if (now - last_untrusted_log >= 60) {
-				last_untrusted_log = now;
+			if (now - bgp->mvpn_umh_untrusted_log_last >= 60) {
+				bgp->mvpn_umh_untrusted_log_last = now;
 				zlog_notice("MVPN UMH large community %u:%u:%u rejected on %s: Global Administrator %u != origin AS %u",
 					    ga, fn, param, bgp->name_pretty, ga,
 					    origin_as);

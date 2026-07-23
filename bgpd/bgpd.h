@@ -979,6 +979,12 @@ struct bgp {
 	 */
 	uint32_t mvpn_umh_lc_function;
 
+	/* GTM MCAST-VPN: monotime of the last UMH large-community
+	 * trust-boundary reject notice, for the per-instance once-a-minute
+	 * throttle (0 = never logged; see bgp_mvpn_resolve_from_lcommunity).
+	 */
+	time_t mvpn_umh_untrusted_log_last;
+
 	/* EVPN - use RFC 8365 to auto-derive RT */
 	int advertise_autort_rfc8365;
 
