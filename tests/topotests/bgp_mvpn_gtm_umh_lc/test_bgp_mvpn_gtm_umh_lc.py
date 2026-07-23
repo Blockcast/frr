@@ -27,6 +27,8 @@ Per-prefix scenarios (see r2/bgpd.conf):
   p7 10.10.70.0/24  param 0           invalid UMH (0.0.0.0) -> EC fallback
   p8 10.10.80.0/24  param 127.0.0.1   invalid UMH (loopback) -> EC fallback
   p9 10.10.90.0/24  wrong function    fn 2 != knob 1, skipped -> EC fallback
+  p10 10.10.100.0/24 param 255.255.255.255 Class E/broadcast -> EC fallback
+  p11 10.10.110.0/24 param 240.0.0.1  Class E (240/4) -> EC fallback
 
 The knob is set mid-test (existing joins must re-resolve WITHOUT re-joining),
 changed communities re-originate via the unicast-route reresolve, and the
@@ -72,6 +74,8 @@ JOINS_V4 = {
     "p7": ("10.10.70.10", "232.1.1.7"),
     "p8": ("10.10.80.10", "232.1.1.8"),
     "p9": ("10.10.90.10", "232.1.1.9"),
+    "p10": ("10.10.100.10", "232.1.1.10"),
+    "p11": ("10.10.110.10", "232.1.1.11"),
 }
 JOIN_V6 = ("2001:db8:53::10", "ff3e::232:1")
 
@@ -343,6 +347,35 @@ def test_wrong_function_falls_back():
         pytest.skip(tgen.errors)
 
     src, grp = JOINS_V4["p9"]
+    _join(src, grp)
+    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_invalid_param_broadcast_falls_back():
+    """p10's parameter is 4294967295 = 255.255.255.255 (limited broadcast, in
+    Class E 240/4). ipv4_unicast_valid() treats 240/4 as usable unicast and
+    would let this through; the explicit Class E gate must reject it and fall
+    back to the extended community."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS_V4["p10"]
+    _join(src, grp)
+    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_invalid_param_class_e_falls_back():
+    """p11's parameter is 4026531841 = 240.0.0.1 (Class E, non-broadcast) --
+    the generic 240/4 case the old ipv4_unicast_valid() gate accepted; the
+    explicit Class E reject must fall back to the extended community."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS_V4["p11"]
     _join(src, grp)
     _expect_type7(src, grp, LOCAL_AS, EC_RT)
 

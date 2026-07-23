@@ -951,21 +951,42 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 			 * this route across an AS they do not originate. Surface
 			 * it at notice (not debug) so a probe is visible in
 			 * production, throttled to once a minute so a flood of
-			 * crafted tuples cannot spam the log.
+			 * crafted tuples cannot spam the log. NB: the throttle
+			 * window is process-global, so on a multi-VRF box a probe
+			 * on one instance can suppress this notice for another
+			 * within the same 60s -- the instance name is logged so a
+			 * fired notice is still attributable; a true per-VRF
+			 * limiter would need dedicated storage on struct bgp.
 			 */
 			static time_t last_untrusted_log;
 			time_t now = monotime(NULL);
 
 			if (now - last_untrusted_log >= 60) {
 				last_untrusted_log = now;
-				zlog_notice("MVPN UMH large community %u:%u:%u rejected: Global Administrator %u != origin AS %u",
-					    ga, fn, param, ga, origin_as);
+				zlog_notice("MVPN UMH large community %u:%u:%u rejected on %s: Global Administrator %u != origin AS %u",
+					    ga, fn, param, bgp->name_pretty, ga,
+					    origin_as);
 			}
 			continue;
 		}
 
 		umh.s_addr = htonl(param);
-		if (!ipv4_unicast_valid(&umh)) {
+		/*
+		 * Usable-upstream-PE gate on the parameter. This is a per-route
+		 * trust decision, so the reject set is spelled out here rather
+		 * than deferred to ipv4_unicast_valid(): that helper treats
+		 * Class E (240/4) as usable unicast per draft-schoen-intarea-
+		 * unicast-240, and gates 0/8 + 127/8 on the global
+		 * "allow-reserved-ranges" toggle -- neither is acceptable for a
+		 * UMH target an adversary can put on the wire. Reject, all
+		 * unconditionally:
+		 *   0.0.0.0/8      unspecified / "this network"
+		 *   127.0.0.0/8    loopback
+		 *   224.0.0.0/4    multicast (Class D)
+		 *   240.0.0.0/4    reserved (Class E), incl. 255.255.255.255
+		 */
+		if (IPV4_NET0(param) || IPV4_NET127(param) ||
+		    IPV4_CLASS_D(param) || IPV4_CLASS_E(param)) {
 			if (BGP_DEBUG(zebra, ZEBRA))
 				zlog_debug("MVPN UMH large community %u:%u:%u rejected: %pI4 is not a usable upstream PE address",
 					   ga, fn, param, &umh);
