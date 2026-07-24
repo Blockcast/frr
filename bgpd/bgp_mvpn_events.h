@@ -33,9 +33,11 @@
 extern "C" {
 #endif
 
-/* Start the event-socket listener for a bgp instance if `mvpn_event_socket`
- * is configured and not already running on that path. No-op otherwise.
- * Safe to call repeatedly (e.g. on every AF activation). */
+/* Start the event-socket listener for a bgp instance if
+ * `mvpn_event_socket_path` is configured and not already running on that
+ * path. No-op otherwise, and a no-op re-call while already running on the
+ * same path (a genuine (re)start bumps boot_epoch -- see the .c file header).
+ * Only caller today is bgp_mvpn_events_set_socket(). */
 extern void bgp_mvpn_events_start(struct bgp *bgp);
 
 /* Tear down the listener and all connected clients, and free per-join
@@ -55,7 +57,8 @@ extern void bgp_mvpn_events_set_socket(struct bgp *bgp, const char *path);
  * anything (attrhash dedup is a RIB concern, not an event-identity one).
  *
  * Diffs the newly-resolved values against this join's last-known values:
- *   - no prior state            -> emit "install" (route_version 1)
+ *   - no prior state            -> emit "install" (generation 1, i.e.
+ *                                  route_version "<boot_epoch>.1")
  *   - prior state, unchanged    -> no-op (redundant re-resolve)
  *   - prior state, changed      -> emit "origin_change" (route_version++,
  *                                  prior_route_version carried)
@@ -80,6 +83,13 @@ extern void bgp_mvpn_event_withdrawn(struct bgp *bgp, const struct ipaddr *src,
  * bgp_mvpn_config_write() for AFI_IP only (one setting serves both planes,
  * same convention as the ipmsi-label knob). */
 extern void bgp_mvpn_events_config_write(struct vty *vty, struct bgp *bgp);
+
+/* `show bgp mvpn events [json]`: listener liveness (configured path vs
+ * actually listening), boot_epoch, seq, connected-client count. The
+ * "configured but not listening" state is the operator's only signal that a
+ * bind/listen failure left the stream dead while running-config still
+ * advertises it. */
+extern void bgp_mvpn_events_show(struct vty *vty, struct bgp *bgp, bool use_json);
 
 #ifdef __cplusplus
 }

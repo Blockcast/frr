@@ -52,13 +52,19 @@ is allowed to build claims from.
 
 Every event carries `boot_epoch` and `seq`:
 
-- `seq` is a per-process, in-memory monotonic counter starting at 1. It is
-  **not** fsynced per event.
+- `seq` is a per-listener-instance, in-memory monotonic counter starting at
+  1. It is **not** fsynced per event, and it resets to 1 whenever the listener
+  is (re)created (which always also advances `boot_epoch` -- see below -- so
+  the `(boot_epoch, seq)` *pair* stays strictly ordered; do not rely on `seq`
+  alone across an epoch change).
 - `boot_epoch` is a small integer persisted under `$frr_runstatedir` (e.g.
-  `/var/run/frr/bgpd-mvpn-events-default.epoch`) and incremented exactly
-  once per bgpd process start, under an exclusive file lock. A bare process
-  restart therefore always produces events tagged with a strictly higher
-  `boot_epoch` than anything the process emitted before.
+  `/var/run/frr/bgpd-mvpn-events-default.epoch`) and incremented on every
+  listener start, under an exclusive file lock. A bare `bgpd` process restart
+  is the common cause, but reconfiguring the socket (`no bgp mvpn
+  event-socket` then re-adding it, or changing the path) within one running
+  process also starts a new listener and therefore bumps `boot_epoch`. Either
+  way the new listener's events are tagged with a strictly higher `boot_epoch`
+  than anything emitted before.
 
 A consumer implements the durable cursor described in BLO-17645 ("a durable
 cursor so a restarted consumer can detect gaps") by persisting `(boot_epoch,
@@ -75,11 +81,13 @@ cursor:
   `show bgp mvpn json` polling** (Section header above) -- resync by
   re-deriving current state from a fresh dev-mode poll if you must, but the
   gap itself is billing-relevant and must not be silently absorbed.
-- `boot_epoch` increased: bgpd restarted. Every join in the new boot's first
-  `install` event is a fresh route-entitlement interval (Section 6 of the
-  settlement contract): the consumer's prior windows for this instance
-  should be closed out at the last event of the old epoch it saw, and new
-  windows opened from the new epoch's events.
+- `boot_epoch` increased: the producer's listener restarted -- a `bgpd`
+  restart, or an operator reconfiguring the event socket within one process
+  (see "Durable cursor" above). Treat it as a boot boundary either way: every
+  join in the new epoch's first `install` event is a fresh route-entitlement
+  interval (Section 6 of the settlement contract): the consumer's prior
+  windows for this instance should be closed out at the last event of the old
+  epoch it saw, and new windows opened from the new epoch's events.
 
 `route_version` is the opaque string `"<boot_epoch>.<generation>"`, where
 `generation` is scoped to one `(source, group)` join identity (not global)
@@ -109,7 +117,7 @@ changing this join's resolved values) emits nothing.
 | `schema_version` | int | all | `1`. Bump on any breaking wire-format change. |
 | `event_type` | string | all | `install` \| `withdraw` \| `origin_change`. |
 | `boot_epoch` | int | all | See "Durable cursor" above. |
-| `seq` | int | all | Per-process monotonic sequence, starting at 1. |
+| `seq` | int | all | Per-listener-instance monotonic sequence, starting at 1; resets to 1 whenever `boot_epoch` advances. Use the `(boot_epoch, seq)` pair, not `seq` alone, for gap detection. |
 | `time_ns` | int | all | `CLOCK_REALTIME` nanoseconds since the Unix epoch, at emission time. |
 | `route_type` | int | all | `7` (RFC 6514 C-multicast Source Tree Join). Fixed today; present so a future record kind sharing this socket is distinguishable. |
 | `source` | string | all | C-S, canonical text (v4 or v6). |

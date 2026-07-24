@@ -101,10 +101,22 @@ class EventReader:
     accepted -- exactly the documented "dev-mode `show bgp mvpn json` covers
     bootstrap" behavior in doc/mvpn-events-schema.md)."""
 
-    def __init__(self, path):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(1)
-        self.sock.connect(path)
+    def __init__(self, path, connect_timeout=30):
+        # The listener socket can lag a beat behind bgpd's config apply, so
+        # retry the connect rather than single-shot it (a bare connect races
+        # the bind and flakes with ENOENT/ECONNREFUSED).
+        deadline = time.time() + connect_timeout
+        while True:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(1)
+            try:
+                self.sock.connect(path)
+                break
+            except (FileNotFoundError, ConnectionRefusedError, OSError):
+                self.sock.close()
+                if time.time() >= deadline:
+                    raise
+                time.sleep(0.5)
         self.buf = b""
 
     def close(self):
@@ -206,6 +218,13 @@ router bgp {}
     running = tgen.gears["r1"].vtysh_cmd("show running-config")
     assert " bgp mvpn event-socket {}".format(EVENT_SOCK) in running
 
+    # Liveness surface: "configured" (running-config) is not the same as
+    # "listening" -- a bind/listen failure would leave the config advertising
+    # a dead stream. show bgp mvpn events must report the listener up.
+    status = json.loads(tgen.gears["r1"].vtysh_cmd("show bgp mvpn events json"))
+    assert status.get("listening") is True, status
+    assert status.get("path") == EVENT_SOCK, status
+
 
 def test_install_event():
     """A fresh (S,G) join emits exactly one "install" event: seq 1,
@@ -247,6 +266,7 @@ def test_install_event():
 def test_withdraw_event():
     """Leaving must emit "withdraw" with a bumped, never-reused
     route_version, and seq must be exactly the next integer."""
+    global last_seq
     tgen = get_topogen()
 
     if tgen.routers_have_failure():
@@ -261,8 +281,11 @@ def test_withdraw_event():
     assert ev["route_version"] == "{}.2".format(boot_epoch)
     assert ev["boot_epoch"] == boot_epoch
     assert ev["seq"] == last_seq + 1
+    # A withdraw closes the window: it must not carry a live upstream, or a
+    # consumer would keep billing against a torn-down origin.
+    assert "upstream_peer" not in ev
+    assert "lc_umh_origin" not in ev
 
-    global last_seq
     last_seq = ev["seq"]
 
 
@@ -271,6 +294,7 @@ def test_rejoin_route_version_never_reused():
     route_version continues the same join's generation counter (.3) rather
     than restarting at .1 -- a restarted consumer must never see the same
     route_version mean two different lease windows."""
+    global last_seq
     tgen = get_topogen()
 
     if tgen.routers_have_failure():
@@ -283,7 +307,6 @@ def test_rejoin_route_version_never_reused():
     assert ev["route_version"] == "{}.3".format(boot_epoch)
     assert ev["seq"] == last_seq + 1
 
-    global last_seq
     last_seq = ev["seq"]
 
 

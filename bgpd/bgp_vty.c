@@ -23433,6 +23433,29 @@ DEFPY (show_bgp_mvpn,
 	return CMD_SUCCESS;
 }
 
+DEFPY (show_bgp_mvpn_events,
+       show_bgp_mvpn_events_cmd,
+       "show bgp mvpn events [json$uj]",
+       SHOW_STR
+       BGP_STR
+       "Multicast VPN (MCAST-VPN) commands\n"
+       "Settlement-plane Type-7 event-socket listener status\n"
+       JSON_STR)
+{
+	struct bgp *bgp = bgp_get_default();
+
+	if (!bgp) {
+		if (uj)
+			vty_out(vty, "{}\n");
+		else
+			vty_out(vty, "%% No BGP process configured\n");
+		return CMD_SUCCESS;
+	}
+
+	bgp_mvpn_events_show(vty, bgp, !!uj);
+	return CMD_SUCCESS;
+}
+
 void bgp_vty_init(void)
 {
 	cmd_variable_handler_register(bgp_var_neighbor);
@@ -23903,6 +23926,7 @@ void bgp_vty_init(void)
 	install_element(BGP_NODE, &bgp_mvpn_umh_large_community_cmd);
 	install_element(BGP_NODE, &bgp_mvpn_event_socket_cmd);
 	install_element(VIEW_NODE, &show_bgp_mvpn_cmd);
+	install_element(VIEW_NODE, &show_bgp_mvpn_events_cmd);
 
 	/* "no neighbor activate" commands. */
 	install_element(BGP_NODE, &no_neighbor_activate_hidden_cmd);

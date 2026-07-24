@@ -11,18 +11,20 @@
  * (install/withdraw/origin_change) for a locally-originated (pimd-driven)
  * join, broadcast to every connected reader.
  *
- * Durable cursor: every event carries (boot_epoch, seq). `seq` is a
- * per-process in-memory counter starting at 1 -- it is NOT fsynced per
+ * Durable cursor: every event carries (boot_epoch, seq). Both are scoped to
+ * one *listener instance*: `seq` is an in-memory counter starting at 1 that
+ * resets whenever the listener is (re)created -- it is NOT fsynced per
  * event, because the only thing that must survive a restart is the ability
  * to tell "the producer restarted" apart from "events were lost between two
- * events of the same boot". `boot_epoch` is a small counter persisted under
- * frr_runstatedir and incremented exactly once per bgpd startup, so a
- * restart always produces a fresh, higher epoch: a consumer that tracks
- * (last_epoch, last_seq) detects a gap whenever the next event's (epoch,
- * seq) does not equal (last_epoch, last_seq + 1) exactly -- whether the
- * discontinuity came from a bgpd restart, a dropped/reconnected client
- * socket (see BGP_MVPN_EVENT_SINK_MAX_BACKLOG below), or genuine event loss.
- * Per BLO-17645: "gap -> quarantine, not silent loss".
+ * events of the same epoch". `boot_epoch` is a small counter persisted under
+ * frr_runstatedir and incremented on every listener start -- a bgpd restart
+ * is the common cause, but reconfiguring `bgp mvpn event-socket` (no + re-add,
+ * or a path change) within one process bumps it too. Either way a consumer
+ * that tracks (last_epoch, last_seq) detects a gap whenever the next event's
+ * (epoch, seq) does not equal (last_epoch, last_seq + 1) exactly -- whether
+ * the discontinuity came from a producer (re)start, a dropped/reconnected
+ * client socket (see BGP_MVPN_EVENT_SINK_MAX_BACKLOG below), or genuine
+ * event loss. Per BLO-17645: "gap -> quarantine, not silent loss".
  *
  * route_version is scoped per (src, grp) join identity, not global: it is
  * the opaque string "<boot_epoch>.<generation>", where generation increments
@@ -73,6 +75,7 @@ struct bgp_mvpn_event_client {
 	int fd;
 	struct buffer *wb;
 	size_t pending_bytes; /* upper-bound accounting, see bgp_mvpn_event_broadcast() */
+	struct event *t_read;
 	struct event *t_write;
 	struct bgp_mvpn_event_sink *sink; /* back-pointer for the write callback */
 };
@@ -109,6 +112,7 @@ static void bgp_mvpn_event_client_close(struct bgp_mvpn_event_sink *sink,
 			break;
 		}
 
+	event_cancel(&client->t_read);
 	event_cancel(&client->t_write);
 	buffer_free(client->wb);
 	close(client->fd);
@@ -144,12 +148,18 @@ static void bgp_mvpn_event_client_read(struct event *event)
 	ssize_t n;
 
 	n = read(client->fd, scratch, sizeof(scratch));
-	if (n <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+	/* n == 0 is EOF, unconditionally: read() does not touch errno on a
+	 * clean peer close, so gating it on a (stale) errno value would leave
+	 * a dead client unreaped with its socket perpetually POLLIN-ready --
+	 * a 100% CPU rearm loop. errno is only meaningful for n < 0. */
+	if (n == 0 ||
+	    (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
 		bgp_mvpn_event_client_close(sink, client);
 		return;
 	}
 
-	event_add_read(bm->master, bgp_mvpn_event_client_read, client, client->fd, NULL);
+	event_add_read(bm->master, bgp_mvpn_event_client_read, client, client->fd,
+		       &client->t_read);
 }
 
 static void bgp_mvpn_event_accept(struct event *event)
@@ -169,7 +179,16 @@ static void bgp_mvpn_event_accept(struct event *event)
 		return;
 	}
 
-	set_nonblocking(fd);
+	/* A blocking fd would let a slow consumer stall the whole master
+	 * thread inside buffer_write()'s write(): refuse the client rather
+	 * than let a billing reader wedge routing. */
+	if (set_nonblocking(fd) < 0) {
+		flog_err(EC_LIB_SOCKET,
+			 "MVPN event socket: set_nonblocking(client fd %d) failed: %s -- refusing client",
+			 fd, safe_strerror(errno));
+		close(fd);
+		return;
+	}
 
 	client = XCALLOC(MTYPE_MVPN_EVENT_CLIENT, sizeof(*client));
 	client->fd = fd;
@@ -178,7 +197,7 @@ static void bgp_mvpn_event_accept(struct event *event)
 	client->next = sink->clients;
 	sink->clients = client;
 
-	event_add_read(bm->master, bgp_mvpn_event_client_read, client, fd, NULL);
+	event_add_read(bm->master, bgp_mvpn_event_client_read, client, fd, &client->t_read);
 }
 
 /*
@@ -282,13 +301,21 @@ void bgp_mvpn_events_start(struct bgp *bgp)
 		return;
 	}
 
-	set_nonblocking(fd);
+	if (set_nonblocking(fd) < 0) {
+		flog_err(EC_LIB_SOCKET,
+			 "MVPN event socket: set_nonblocking(%s) failed: %s",
+			 sun.sun_path, safe_strerror(errno));
+		unlink(sun.sun_path);
+		close(fd);
+		return;
+	}
 
 	sink = XCALLOC(MTYPE_MVPN_EVENT_SINK, sizeof(*sink));
 	sink->bgp = bgp;
 	sink->path = XSTRDUP(MTYPE_MVPN_EVENT_PATH, bgp->mvpn_event_socket_path);
 	sink->listen_fd = fd;
-	sink->boot_epoch = bgp_mvpn_event_next_boot_epoch(bgp->name_pretty);
+	sink->boot_epoch = bgp_mvpn_event_next_boot_epoch(bgp->name ? bgp->name
+								    : VRF_DEFAULT_NAME);
 	sink->seq = 0;
 	bgp->mvpn_event_sink = sink;
 
@@ -343,6 +370,51 @@ void bgp_mvpn_events_config_write(struct vty *vty, struct bgp *bgp)
 {
 	if (bgp->mvpn_event_socket_path)
 		vty_out(vty, "  bgp mvpn event-socket %s\n", bgp->mvpn_event_socket_path);
+}
+
+/*
+ * Listener liveness for operators: `bgp mvpn event-socket` in running-config
+ * only proves the path is *configured* -- a bind/listen failure at startup
+ * (stale socket file, parent dir not mounted yet at config replay) leaves the
+ * feature dead while the config still advertises it. "configured but not
+ * listening" here is the alarm the settlement pipeline must page on.
+ */
+void bgp_mvpn_events_show(struct vty *vty, struct bgp *bgp, bool use_json)
+{
+	struct bgp_mvpn_event_sink *sink = bgp->mvpn_event_sink;
+	struct bgp_mvpn_event_client *client;
+	int clients = 0;
+
+	if (sink)
+		for (client = sink->clients; client; client = client->next)
+			clients++;
+
+	if (use_json) {
+		struct json_object *jo = json_object_new_object();
+
+		if (!jo)
+			return;
+		if (bgp->mvpn_event_socket_path)
+			json_object_string_add(jo, "path", bgp->mvpn_event_socket_path);
+		json_object_boolean_add(jo, "listening", sink != NULL);
+		if (sink) {
+			json_object_int_add(jo, "bootEpoch", (int64_t)sink->boot_epoch);
+			json_object_int_add(jo, "seq", (int64_t)sink->seq);
+			json_object_int_add(jo, "clients", clients);
+		}
+		vty_json(vty, jo);
+		return;
+	}
+
+	if (!bgp->mvpn_event_socket_path) {
+		vty_out(vty, "MVPN event socket not configured\n");
+		return;
+	}
+	vty_out(vty, "MVPN event socket %s: %s\n", bgp->mvpn_event_socket_path,
+		sink ? "listening" : "NOT LISTENING (startup failed; see log)");
+	if (sink)
+		vty_out(vty, "  boot_epoch %" PRIu64 ", seq %" PRIu64 ", %d client(s)\n",
+			sink->boot_epoch, sink->seq, clients);
 }
 
 static struct bgp_mvpn_event_join *bgp_mvpn_event_join_find(struct bgp_mvpn_event_sink *sink,
@@ -453,6 +525,16 @@ static struct json_object *bgp_mvpn_event_new(struct bgp_mvpn_event_sink *sink,
 	struct timespec ts;
 	char srcbuf[INET6_ADDRSTRLEN], grpbuf[INET6_ADDRSTRLEN];
 
+	/* json-c uses raw malloc (no FRR abort-on-OOM): on failure, skip the
+	 * event WITHOUT consuming a seq -- otherwise a bare "null" line goes
+	 * on the wire and a sequence number is silently spent. */
+	if (!jo) {
+		flog_err(EC_LIB_SYSTEM_CALL,
+			 "MVPN events: json allocation failed, dropping %s event",
+			 event_type);
+		return NULL;
+	}
+
 	clock_gettime(CLOCK_REALTIME, &ts);
 
 	sink->seq++;
@@ -467,9 +549,10 @@ static struct json_object *bgp_mvpn_event_new(struct bgp_mvpn_event_sink *sink,
 	json_object_string_add(jo, "group", ipaddr2str(grp, grpbuf, sizeof(grpbuf)));
 	json_object_int_add(jo, "source_as", source_as);
 	json_object_string_add(jo, "route_version", route_version);
+	/* bgp->name, not name_pretty: the wire contract says "default", and
+	 * name_pretty is the human "VRF default" (with a space). */
 	json_object_string_add(jo, "vrf",
-			       sink->bgp->name_pretty ? sink->bgp->name_pretty
-						      : VRF_DEFAULT_NAME);
+			       sink->bgp->name ? sink->bgp->name : VRF_DEFAULT_NAME);
 	json_object_int_add(jo, "ipmsi_label", sink->bgp->mvpn_ipmsi_label);
 
 	return jo;
@@ -512,6 +595,8 @@ void bgp_mvpn_event_join_resolved(struct bgp *bgp, const struct ipaddr *src,
 
 	jo = bgp_mvpn_event_new(sink, is_new ? "install" : "origin_change", src, grp, source_as,
 				route_version);
+	if (!jo)
+		return;
 	if (lc_umh_origin[0])
 		json_object_string_add(jo, "lc_umh_origin", lc_umh_origin);
 	if (umh.s_addr != INADDR_ANY) {
@@ -548,7 +633,8 @@ void bgp_mvpn_event_withdrawn(struct bgp *bgp, const struct ipaddr *src,
 				     join->generation);
 
 	jo = bgp_mvpn_event_new(sink, "withdraw", src, grp, join->last_source_as, route_version);
-	bgp_mvpn_event_broadcast(sink, jo);
+	if (jo)
+		bgp_mvpn_event_broadcast(sink, jo);
 
 	join->last_source_as = 0;
 	join->last_umh.s_addr = INADDR_ANY;
