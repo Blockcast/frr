@@ -1587,15 +1587,55 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 		zlog_debug("MVPN Type-7 (%pIA, %pIA): no upstream PE resolved; originating without upstream RT",
 			   src, grp);
 
-	bgp_mvpn_event_join_resolved(bgp, src, grp, source_as, umh);
-
 	bgp_mvpn_route_install(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p), &p, &attr,
 			       BGP_ROUTE_STATIC);
 	bgp_mvpn_selective_join_set(bgp, src, grp, false);
+	/* Settlement consumers must never observe an install/origin change before
+	 * the corresponding Type-7 and selective-route RIB mutations are visible. */
+	bgp_mvpn_event_join_resolved(bgp, src, grp, source_as, umh);
 
 	bgp_attr_flush(&attr);
 	aspath_unintern(&attr.aspath);
 	return CMD_SUCCESS;
+}
+
+void bgp_mvpn_reemit_local_joins(struct bgp *bgp)
+{
+	afi_t afi;
+
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++) {
+		struct bgp_table *table = bgp->rib[afi][SAFI_MCAST_VPN];
+		struct bgp_dest *dest;
+
+		if (!table)
+			continue;
+
+		for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
+			const struct prefix_mvpn *p =
+				(const struct prefix_mvpn *)bgp_dest_get_prefix(dest);
+			struct bgp_path_info *pi;
+			struct in_addr umh = { .s_addr = INADDR_ANY };
+			uint32_t ignored_source_as = 0;
+
+			if (p->family != AF_MVPN ||
+			    p->prefix.route_type != BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN)
+				continue;
+
+			for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
+				if (pi->peer == bgp->peer_self &&
+				    pi->sub_type == BGP_ROUTE_STATIC &&
+				    !CHECK_FLAG(pi->flags, BGP_PATH_REMOVED))
+					break;
+			if (!pi)
+				continue;
+
+			/* The installed Type-7's upstream-node RT is the event's UMH.
+			 * Source AS comes from the NLRI key, not from an optional EC. */
+			bgp_mvpn_resolve_from_ecommunity(pi, &ignored_source_as, &umh);
+			bgp_mvpn_event_join_resolved(bgp, &p->prefix.src, &p->prefix.grp,
+						     p->prefix.source_as, umh);
+		}
+	}
 }
 
 /*

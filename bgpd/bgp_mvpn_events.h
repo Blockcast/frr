@@ -52,9 +52,8 @@ extern void bgp_mvpn_events_set_socket(struct bgp *bgp, const char *path);
 
 /*
  * Called from bgp_mvpn_source_tree_join_set() exactly once per non-withdraw
- * invocation, after (source_as, umh) have been resolved for (src, grp) but
- * before/regardless of whether the BGP route install actually changes
- * anything (attrhash dedup is a RIB concern, not an event-identity one).
+ * invocation, after (source_as, umh) have been resolved for (src, grp) and
+ * after the corresponding BGP and selective-route RIB updates complete.
  *
  * Diffs the newly-resolved values against this join's last-known values:
  *   - no prior state            -> emit "install" (generation 1, i.e.

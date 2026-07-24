@@ -32,13 +32,13 @@ is allowed to build claims from.
   event-socket` (or omitting the knob) means the feature is off. Opt-in,
   like the other GTM MVPN knobs (`bgp mvpn ipmsi-label`, `bgp mvpn
   umh-large-community`).
-- Every connected client receives every event from the moment it connects
-  onward. There is no replay/backlog on connect -- a client that connects
-  after a join is already up will not see that join's install event until
-  something changes it again (a withdraw, a rejoin, or an origin change).
-  This is intentional: bootstrapping full current state on connect is
-  exactly what the dev-mode `show bgp mvpn json` poll is for (see BLO-17650's
-  own reconciliation-cross-check requirement).
+- The first client accepted by a newly-created listener epoch receives an
+  `install` snapshot of every currently active local Type-7 join. This is the
+  epoch handoff: old clients were disconnected when the prior listener
+  stopped, and the snapshot opens replacement entitlement windows without
+  turning a debug/reconciliation poll into a billing artifact. Later clients
+  receive events from connection time onward; there is no general per-client
+  replay/backlog.
 - Wire format: one JSON object per line (`\n`-terminated, no pretty-printing)
   per event, broadcast identically to every connected client.
 - A client that falls behind by more than 8MiB of unflushed output is
@@ -84,7 +84,7 @@ cursor:
 - `boot_epoch` increased: the producer's listener restarted -- a `bgpd`
   restart, or an operator reconfiguring the event socket within one process
   (see "Durable cursor" above). Treat it as a boot boundary either way: every
-  join in the new epoch's first `install` event is a fresh route-entitlement
+  join in the new epoch's first-consumer `install` snapshot is a fresh route-entitlement
   interval (Section 6 of the settlement contract): the consumer's prior
   windows for this instance should be closed out at the last event of the old
   epoch it saw, and new windows opened from the new epoch's events.

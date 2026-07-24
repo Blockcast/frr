@@ -51,6 +51,7 @@ SRC, GRP = "10.10.10.10", "232.1.1.1"
 IPMSI_LABEL = 100
 
 EVENT_SOCK = "/tmp/bgp_mvpn_gtm_events-r1-{}.sock".format(os.getpid())
+EVENT_SOCK_2 = "/tmp/bgp_mvpn_gtm_events-r1-restart-{}.sock".format(os.getpid())
 
 
 def _ip4_to_int(addr):
@@ -90,6 +91,10 @@ def teardown_module(mod):
     get_topogen().stop_topology()
     try:
         os.unlink(EVENT_SOCK)
+    except OSError:
+        pass
+    try:
+        os.unlink(EVENT_SOCK_2)
     except OSError:
         pass
 
@@ -259,6 +264,19 @@ def test_install_event():
     assert ev["seq"] == 1
     assert ev["route_version"] == "{}.1".format(boot_epoch)
 
+    # Event delivery is sequenced after the route mutation: once the event is
+    # observable, the matching Type-7 must already be visible in the RIB.
+    routes = json.loads(
+        tgen.gears["r1"].vtysh_cmd("show bgp ipv4 mvpn json")
+    ).get("routes", [])
+    assert any(
+        route.get("routeType") == 7
+        and route.get("source") == SRC
+        and route.get("group") == GRP
+        and route.get("sourceAs") == LOCAL_AS
+        for route in routes
+    ), routes
+
     global last_seq
     last_seq = ev["seq"]
 
@@ -348,6 +366,38 @@ route-map rtimport permit 10
     assert ev["seq"] == last_seq + 1
 
     reader.close()
+
+
+def test_listener_restart_snapshots_active_join():
+    """Changing the listener creates a new epoch. Its first consumer must
+    receive a replacement install for the still-active join so it can open a
+    new billing window without waiting for unrelated route churn."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    tgen.gears["r1"].vtysh_cmd(
+        """
+configure terminal
+router bgp {}
+ bgp mvpn event-socket {}
+""".format(
+            LOCAL_AS, EVENT_SOCK_2
+        )
+    )
+
+    restarted_reader = EventReader(EVENT_SOCK_2)
+    ev = restarted_reader.read_event()
+    assert ev["event_type"] == "install"
+    assert ev["source"] == SRC
+    assert ev["group"] == GRP
+    assert ev["source_as"] == LOCAL_AS
+    assert ev["upstream_peer"] == UPSTREAM_2
+    assert ev["boot_epoch"] > boot_epoch
+    assert ev["seq"] == 1
+    assert ev["route_version"] == "{}.1".format(ev["boot_epoch"])
+    restarted_reader.close()
 
 
 if __name__ == "__main__":

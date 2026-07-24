@@ -99,6 +99,7 @@ struct bgp_mvpn_event_sink {
 	uint64_t boot_epoch;
 	uint64_t seq;
 	struct bgp_mvpn_event_join *joins;
+	bool snapshot_pending;
 };
 
 static void bgp_mvpn_event_client_close(struct bgp_mvpn_event_sink *sink,
@@ -198,6 +199,18 @@ static void bgp_mvpn_event_accept(struct event *event)
 	sink->clients = client;
 
 	event_add_read(bm->master, bgp_mvpn_event_client_read, client, fd, &client->t_read);
+
+	/* A listener restart closes every old client. The first consumer in the
+	 * new epoch therefore receives a fresh install snapshot of all active
+	 * local joins; later clients retain the normal no-replay semantics. */
+	if (sink->snapshot_pending) {
+		struct bgp_mvpn_event_join *join;
+
+		sink->snapshot_pending = false;
+		for (join = sink->joins; join; join = join->next)
+			join->installed = false;
+		bgp_mvpn_reemit_local_joins(sink->bgp);
+	}
 }
 
 /*
@@ -317,6 +330,7 @@ void bgp_mvpn_events_start(struct bgp *bgp)
 	sink->boot_epoch = bgp_mvpn_event_next_boot_epoch(bgp->name ? bgp->name
 								    : VRF_DEFAULT_NAME);
 	sink->seq = 0;
+	sink->snapshot_pending = true;
 	bgp->mvpn_event_sink = sink;
 
 	event_add_read(bm->master, bgp_mvpn_event_accept, sink, fd, &sink->t_accept);
@@ -521,23 +535,24 @@ static struct json_object *bgp_mvpn_event_new(struct bgp_mvpn_event_sink *sink,
 					      const struct ipaddr *grp, uint32_t source_as,
 					      const char *route_version)
 {
-	struct json_object *jo = json_object_new_object();
+	struct json_object *jo;
 	struct timespec ts;
 	char srcbuf[INET6_ADDRSTRLEN], grpbuf[INET6_ADDRSTRLEN];
 
-	/* json-c uses raw malloc (no FRR abort-on-OOM): on failure, skip the
-	 * event WITHOUT consuming a seq -- otherwise a bare "null" line goes
-	 * on the wire and a sequence number is silently spent. */
+	/* Reserve the cursor before json-c's fallible allocation. If allocation
+	 * fails, the next successful event exposes the missing sequence instead
+	 * of silently losing a settlement transition. */
+	sink->seq++;
+	jo = json_object_new_object();
 	if (!jo) {
 		flog_err(EC_LIB_SYSTEM_CALL,
-			 "MVPN events: json allocation failed, dropping %s event",
-			 event_type);
+			 "MVPN events: json allocation failed, dropping %s event at seq %" PRIu64
+			 " (cursor gap reserved)",
+			 event_type, sink->seq);
 		return NULL;
 	}
 
 	clock_gettime(CLOCK_REALTIME, &ts);
-
-	sink->seq++;
 
 	json_object_int_add(jo, "schema_version", 1);
 	json_object_string_add(jo, "event_type", event_type);
@@ -566,6 +581,7 @@ void bgp_mvpn_event_join_resolved(struct bgp *bgp, const struct ipaddr *src,
 	struct bgp_mvpn_event_join *join;
 	struct json_object *jo;
 	char route_version[32], prior_route_version[32], lc_umh_origin[48];
+	uint32_t next_generation;
 	bool is_new;
 	bool changed;
 
@@ -584,31 +600,31 @@ void bgp_mvpn_event_join_resolved(struct bgp *bgp, const struct ipaddr *src,
 		bgp_mvpn_event_route_version(prior_route_version, sizeof(prior_route_version),
 					     sink->boot_epoch, join->generation);
 
-	join->generation++;
-	join->installed = true;
-	join->last_source_as = source_as;
-	join->last_umh = umh;
-
+	next_generation = join->generation + 1;
 	bgp_mvpn_event_route_version(route_version, sizeof(route_version), sink->boot_epoch,
-				     join->generation);
+				     next_generation);
 	bgp_mvpn_event_lc_umh_origin(lc_umh_origin, sizeof(lc_umh_origin), source_as, umh);
 
 	jo = bgp_mvpn_event_new(sink, is_new ? "install" : "origin_change", src, grp, source_as,
 				route_version);
-	if (!jo)
-		return;
-	if (lc_umh_origin[0])
+	if (jo && lc_umh_origin[0])
 		json_object_string_add(jo, "lc_umh_origin", lc_umh_origin);
-	if (umh.s_addr != INADDR_ANY) {
+	if (jo && umh.s_addr != INADDR_ANY) {
 		char umhbuf[INET_ADDRSTRLEN];
 
 		json_object_string_add(jo, "upstream_peer",
 				       inet_ntop(AF_INET, &umh, umhbuf, sizeof(umhbuf)));
 	}
-	if (changed)
+	if (jo && changed)
 		json_object_string_add(jo, "prior_route_version", prior_route_version);
 
-	bgp_mvpn_event_broadcast(sink, jo);
+	join->generation = next_generation;
+	join->installed = true;
+	join->last_source_as = source_as;
+	join->last_umh = umh;
+
+	if (jo)
+		bgp_mvpn_event_broadcast(sink, jo);
 }
 
 void bgp_mvpn_event_withdrawn(struct bgp *bgp, const struct ipaddr *src,
@@ -618,6 +634,7 @@ void bgp_mvpn_event_withdrawn(struct bgp *bgp, const struct ipaddr *src,
 	struct bgp_mvpn_event_join *join;
 	struct json_object *jo;
 	char route_version[32];
+	uint32_t next_generation;
 
 	if (!sink)
 		return;
@@ -626,16 +643,17 @@ void bgp_mvpn_event_withdrawn(struct bgp *bgp, const struct ipaddr *src,
 	if (!join || !join->installed)
 		return; /* never observed installed by this sink: no window to close */
 
-	join->generation++;
-	join->installed = false;
-
+	next_generation = join->generation + 1;
 	bgp_mvpn_event_route_version(route_version, sizeof(route_version), sink->boot_epoch,
-				     join->generation);
+				     next_generation);
 
 	jo = bgp_mvpn_event_new(sink, "withdraw", src, grp, join->last_source_as, route_version);
-	if (jo)
-		bgp_mvpn_event_broadcast(sink, jo);
 
+	join->generation = next_generation;
+	join->installed = false;
 	join->last_source_as = 0;
 	join->last_umh.s_addr = INADDR_ANY;
+
+	if (jo)
+		bgp_mvpn_event_broadcast(sink, jo);
 }
