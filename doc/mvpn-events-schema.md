@@ -1,7 +1,7 @@
 # MVPN Type-7 Settlement Event Schema (BLO-17645)
 
-**Status:** Implemented, pending topotest verification on devbox and
-downstream FlowSource consumption (BLO-17650)
+**Status:** Implemented and verified by the `bgp_mvpn_gtm_events` topotest;
+pending downstream FlowSource consumption (BLO-17650)
 
 **Paperclip:** [BLO-17645](https://paperclip.blockcast.net/BLO/issues/BLO-17645)
 
@@ -160,21 +160,13 @@ covering both the direct receiver-join case and the
 per BLO-17645, "emission is purely event-driven from the existing join_set/
 remove code path", no timers, no defaults.
 
-## Known gaps (tracked, not silently dropped)
+## Verification and remaining gap
 
-- **Not yet run against the FRR topotest harness.** `tests/topotests/
-  bgp_mvpn_gtm_events/` is written and should be exercised by CI/devbox
-  (this fork's own dev note: build the topotests image locally, upstream
-  libyang is too old in the default toolchain); it was not runnable in the
-  sandbox this feature was authored in (no privileged network namespaces,
-  no FRR build toolchain).
-- **Not yet build-verified.** The sandbox this was authored in lacks
-  autoconf/automake/bison/flex and `libjson-c-dev`; a full `./bootstrap.sh
-  && ./configure && make` was not attempted. The code was written and
-  reviewed against the exact FRR APIs and conventions already used
-  elsewhere in this fork (`zebra/zserv.c`'s accept-loop idiom, `lib/
-  buffer.h`'s `buffer_write`/`buffer_flush_available`, `lib/frrevent.h`'s
-  `event_add_read`/`event_add_write`), but has not compiled.
-- A daemon-restart `boot_epoch` bump is asserted by design/code inspection
-  in this document, not (yet) exercised by an automated test that actually
-  restarts bgpd mid-topotest.
+- The locally built `frrouting/topotests:latest` image completed a full FRR
+  build and `bgp_mvpn_gtm_events/test_bgp_mvpn_gtm_events.py` passed all seven
+  tests, including event-after-RIB ordering and active-join snapshot emission
+  after listener reconfiguration.
+- A full bgpd process restart's `boot_epoch` bump remains asserted by the
+  persisted-counter implementation and code inspection. The automated test
+  covers the equivalent listener restart/path-change boundary, but does not
+  restart bgpd itself mid-topotest.
