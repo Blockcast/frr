@@ -36,6 +36,7 @@
 #include <zebra.h>
 
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
@@ -78,6 +79,10 @@ struct bgp_mvpn_event_client {
 	struct event *t_read;
 	struct event *t_write;
 	struct bgp_mvpn_event_sink *sink; /* back-pointer for the write callback */
+	char read_buf[256];
+	size_t read_len;
+	bool subscribed;
+	uint64_t snapshot_seq;
 };
 
 struct bgp_mvpn_event_join {
@@ -100,6 +105,7 @@ struct bgp_mvpn_event_sink {
 	uint64_t seq;
 	struct bgp_mvpn_event_join *joins;
 	bool snapshot_pending;
+	struct bgp_mvpn_event_client *snapshot_client;
 };
 
 static void bgp_mvpn_event_client_close(struct bgp_mvpn_event_sink *sink,
@@ -112,6 +118,8 @@ static void bgp_mvpn_event_client_close(struct bgp_mvpn_event_sink *sink,
 			*pp = client->next;
 			break;
 		}
+	if (sink->snapshot_client == client)
+		sink->snapshot_client = NULL;
 
 	event_cancel(&client->t_read);
 	event_cancel(&client->t_write);
@@ -139,22 +147,79 @@ static void bgp_mvpn_event_client_write(struct event *event)
 			&client->t_write);
 }
 
-/* Read side exists only to notice the peer went away (POLLHUP/EOF); the
- * protocol is producer -> consumer only, so any inbound byte is ignored. */
+/* The read side handles the small subscribe/snapshot-ack control protocol and
+ * notices peer shutdown. Lifecycle events remain producer -> consumer only. */
 static void bgp_mvpn_event_client_read(struct event *event)
 {
 	struct bgp_mvpn_event_client *client = EVENT_ARG(event);
 	struct bgp_mvpn_event_sink *sink = client->sink;
-	char scratch[256];
 	ssize_t n;
+	char *newline;
 
-	n = read(client->fd, scratch, sizeof(scratch));
+	n = read(client->fd, client->read_buf + client->read_len,
+		 sizeof(client->read_buf) - client->read_len - 1);
 	/* n == 0 is EOF, unconditionally: read() does not touch errno on a
 	 * clean peer close, so gating it on a (stale) errno value would leave
 	 * a dead client unreaped with its socket perpetually POLLIN-ready --
 	 * a 100% CPU rearm loop. errno is only meaningful for n < 0. */
 	if (n == 0 ||
 	    (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+		bgp_mvpn_event_client_close(sink, client);
+		return;
+	}
+	if (n > 0) {
+		client->read_len += n;
+		client->read_buf[client->read_len] = '\0';
+	}
+
+	while ((newline = memchr(client->read_buf, '\n', client->read_len))) {
+		struct json_object *jo;
+		struct json_object *type;
+		struct json_object *epoch;
+		struct json_object *seq;
+		size_t line_len = newline - client->read_buf;
+
+		*newline = '\0';
+		jo = json_tokener_parse(client->read_buf);
+		if (jo && json_object_object_get_ex(jo, "type", &type) &&
+		    strcmp(json_object_get_string(type), "subscribe") == 0) {
+			client->subscribed = true;
+			if (sink->snapshot_pending && !sink->snapshot_client) {
+				struct bgp_mvpn_event_join *join;
+
+				sink->snapshot_client = client;
+				for (join = sink->joins; join; join = join->next)
+					join->installed = false;
+				bgp_mvpn_reemit_local_joins(sink->bgp);
+				client->snapshot_seq = sink->seq;
+				/* An empty snapshot has no state whose loss could blind the
+				 * consumer. Future installs are ordinary live events. */
+				if (client->snapshot_seq == 0) {
+					sink->snapshot_pending = false;
+					sink->snapshot_client = NULL;
+				}
+			}
+		} else if (jo && json_object_object_get_ex(jo, "type", &type) &&
+			   strcmp(json_object_get_string(type), "snapshot_ack") == 0 &&
+			   json_object_object_get_ex(jo, "boot_epoch", &epoch) &&
+			   json_object_object_get_ex(jo, "seq", &seq) &&
+			   sink->snapshot_client == client &&
+			   (uint64_t)json_object_get_int64(epoch) == sink->boot_epoch &&
+			   (uint64_t)json_object_get_int64(seq) == client->snapshot_seq) {
+			sink->snapshot_pending = false;
+			sink->snapshot_client = NULL;
+		}
+		if (jo)
+			json_object_put(jo);
+
+		line_len++;
+		client->read_len -= line_len;
+		memmove(client->read_buf, client->read_buf + line_len, client->read_len);
+		client->read_buf[client->read_len] = '\0';
+	}
+	if (client->read_len == sizeof(client->read_buf) - 1) {
+		zlog_warn("MVPN events: client fd %d sent an oversized control record",
+			  client->fd);
 		bgp_mvpn_event_client_close(sink, client);
 		return;
 	}
@@ -200,17 +265,6 @@ static void bgp_mvpn_event_accept(struct event *event)
 
 	event_add_read(bm->master, bgp_mvpn_event_client_read, client, fd, &client->t_read);
 
-	/* A listener restart closes every old client. The first consumer in the
-	 * new epoch therefore receives a fresh install snapshot of all active
-	 * local joins; later clients retain the normal no-replay semantics. */
-	if (sink->snapshot_pending) {
-		struct bgp_mvpn_event_join *join;
-
-		sink->snapshot_pending = false;
-		for (join = sink->joins; join; join = join->next)
-			join->installed = false;
-		bgp_mvpn_reemit_local_joins(sink->bgp);
-	}
 }
 
 /*
@@ -223,79 +277,171 @@ static void bgp_mvpn_event_accept(struct event *event)
  * epoch to protect against there. A bare `bgpd` process restart -- the case
  * that matters -- always sees runstatedir intact.
  */
-static uint64_t bgp_mvpn_event_next_boot_epoch(const char *instance_name)
+static bool bgp_mvpn_event_next_boot_epoch(const char *instance_name, uint64_t *result)
 {
-	char path[512];
-	int fd;
+	char path[512], lock_path[512], tmp_path[544];
+	int fd = -1, lock_fd = -1, dir_fd = -1;
 	uint64_t epoch = 1;
 	char buf[32];
 	ssize_t n;
+	char *end;
+	bool ok = false;
 
-	snprintf(path, sizeof(path), "%s/bgpd-mvpn-events-%s.epoch", frr_runstatedir,
-		 (instance_name && instance_name[0]) ? instance_name : "default");
+	if (snprintf(path, sizeof(path), "%s/bgpd-mvpn-events-%s.epoch", frr_runstatedir,
+		     (instance_name && instance_name[0]) ? instance_name : "default") >=
+	    (int)sizeof(path) ||
+	    snprintf(lock_path, sizeof(lock_path), "%s.lock", path) >=
+		    (int)sizeof(lock_path)) {
+		flog_err(EC_LIB_SYSTEM_CALL, "MVPN event boot_epoch path is too long");
+		return false;
+	}
 
-	fd = open(path, O_RDWR | O_CREAT, 0600);
-	if (fd < 0) {
+	lock_fd = open(lock_path, O_RDWR | O_CREAT, 0600);
+	if (lock_fd < 0 || lockf(lock_fd, F_LOCK, 0) < 0) {
 		flog_err(EC_LIB_SYSTEM_CALL,
-			 "MVPN event boot_epoch file %s open failed: %s -- falling back to epoch 1 every restart",
-			 path, safe_strerror(errno));
-		return 1;
+			 "MVPN event boot_epoch lock %s failed: %s", lock_path,
+			 safe_strerror(errno));
+		goto out;
 	}
 
-	if (lockf(fd, F_LOCK, 0) < 0)
-		flog_err(EC_LIB_SYSTEM_CALL, "MVPN event boot_epoch file %s lock failed: %s",
-			 path, safe_strerror(errno));
-
-	n = read(fd, buf, sizeof(buf) - 1);
-	if (n > 0) {
+	fd = open(path, O_RDONLY);
+	if (fd >= 0) {
+		n = read(fd, buf, sizeof(buf) - 1);
+		if (n <= 0 || n == (ssize_t)sizeof(buf) - 1) {
+			flog_err(EC_LIB_SYSTEM_CALL,
+				 "MVPN event boot_epoch file %s is empty or oversized", path);
+			goto out;
+		}
 		buf[n] = '\0';
-		epoch = strtoull(buf, NULL, 10) + 1;
+		errno = 0;
+		epoch = strtoull(buf, &end, 10);
+		if (errno || end == buf || *end != '\0' || epoch == UINT64_MAX) {
+			flog_err(EC_LIB_SYSTEM_CALL,
+				 "MVPN event boot_epoch file %s is invalid", path);
+			goto out;
+		}
+		epoch++;
+		close(fd);
+		fd = -1;
+	} else if (errno != ENOENT) {
+		flog_err(EC_LIB_SYSTEM_CALL, "MVPN event boot_epoch file %s open failed: %s",
+			 path, safe_strerror(errno));
+		goto out;
 	}
-	if (epoch == 0)
-		epoch = 1;
 
 	n = snprintf(buf, sizeof(buf), "%" PRIu64, epoch);
-	if (ftruncate(fd, 0) < 0 || lseek(fd, 0, SEEK_SET) < 0 || write(fd, buf, n) != n ||
-	    fsync(fd) < 0)
+	snprintf(tmp_path, sizeof(tmp_path), "%s.XXXXXX", path);
+	fd = mkstemp(tmp_path);
+	if (fd < 0 || fchmod(fd, 0600) < 0 || write(fd, buf, n) != n || fsync(fd) < 0) {
 		flog_err(EC_LIB_SYSTEM_CALL,
-			 "MVPN event boot_epoch file %s update failed: %s -- next restart may reuse an epoch",
+			 "MVPN event boot_epoch file %s update failed: %s",
 			 path, safe_strerror(errno));
+		if (fd >= 0) {
+			close(fd);
+			fd = -1;
+		}
+		unlink(tmp_path);
+		goto out;
+	}
+	if (close(fd) < 0) {
+		fd = -1;
+		flog_err(EC_LIB_SYSTEM_CALL, "MVPN event boot_epoch file %s close failed: %s",
+			 path, safe_strerror(errno));
+		unlink(tmp_path);
+		goto out;
+	}
+	fd = -1;
+	if (rename(tmp_path, path) < 0) {
+		flog_err(EC_LIB_SYSTEM_CALL, "MVPN event boot_epoch rename to %s failed: %s",
+			 path, safe_strerror(errno));
+		unlink(tmp_path);
+		goto out;
+	}
+	dir_fd = open(frr_runstatedir, O_RDONLY | O_DIRECTORY);
+	if (dir_fd < 0 || fsync(dir_fd) < 0) {
+		flog_err(EC_LIB_SYSTEM_CALL, "MVPN event boot_epoch directory sync failed: %s",
+			 safe_strerror(errno));
+		goto out;
+	}
 
-	close(fd); /* releases the lockf() lock */
-	return epoch;
+	*result = epoch;
+	ok = true;
+out:
+	if (fd >= 0)
+		close(fd);
+	if (dir_fd >= 0)
+		close(dir_fd);
+	if (lock_fd >= 0)
+		close(lock_fd);
+	return ok;
 }
 
-void bgp_mvpn_events_start(struct bgp *bgp)
+static struct bgp_mvpn_event_sink *bgp_mvpn_events_start(struct bgp *bgp,
+							 const char *path)
 {
 	struct bgp_mvpn_event_sink *sink;
 	struct sockaddr_un sun;
+	struct stat st;
 	mode_t old_mask;
-	int fd;
+	int fd, probe_fd;
+	uint64_t boot_epoch;
 
-	if (!bgp->mvpn_event_socket_path)
-		return;
-	if (bgp->mvpn_event_sink &&
-	    strcmp(bgp->mvpn_event_sink->path, bgp->mvpn_event_socket_path) == 0)
-		return; /* already running on the configured path */
-
-	bgp_mvpn_events_stop(bgp);
-
-	if (strlen(bgp->mvpn_event_socket_path) >= sizeof(sun.sun_path)) {
+	if (strlen(path) >= sizeof(sun.sun_path)) {
 		flog_err(EC_LIB_SYSTEM_CALL, "MVPN event socket path %s too long",
-			 bgp->mvpn_event_socket_path);
-		return;
+			 path);
+		return NULL;
+	}
+	if (!bgp_mvpn_event_next_boot_epoch(bgp->name ? bgp->name : VRF_DEFAULT_NAME,
+					    &boot_epoch))
+		return NULL;
+
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_family = AF_UNIX;
+	strlcpy(sun.sun_path, path, sizeof(sun.sun_path));
+	if (lstat(path, &st) == 0) {
+		if (!S_ISSOCK(st.st_mode)) {
+			flog_err(EC_LIB_SOCKET, "MVPN event socket path %s is not a socket", path);
+			return NULL;
+		}
+		probe_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (probe_fd < 0 || set_nonblocking(probe_fd) < 0) {
+			if (probe_fd >= 0)
+				close(probe_fd);
+			return NULL;
+		}
+		if (connect(probe_fd, (struct sockaddr *)&sun, sizeof(sun)) == 0) {
+			close(probe_fd);
+			flog_err(EC_LIB_SOCKET, "MVPN event socket path %s is already active", path);
+			return NULL;
+		}
+		if (errno == EINPROGRESS || errno == EAGAIN) {
+			close(probe_fd);
+			flog_err(EC_LIB_SOCKET, "MVPN event socket path %s is already active", path);
+			return NULL;
+		}
+		if (errno != ECONNREFUSED) {
+			flog_err(EC_LIB_SOCKET, "MVPN event socket path %s cannot be probed: %s",
+				 path, safe_strerror(errno));
+			close(probe_fd);
+			return NULL;
+		}
+		close(probe_fd);
+		if (unlink(path) < 0) {
+			flog_err(EC_LIB_SOCKET, "MVPN stale event socket %s cannot be removed: %s",
+				 path, safe_strerror(errno));
+			return NULL;
+		}
+	} else if (errno != ENOENT) {
+		flog_err(EC_LIB_SOCKET, "MVPN event socket path %s cannot be inspected: %s",
+			 path, safe_strerror(errno));
+		return NULL;
 	}
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
 		flog_err(EC_LIB_SOCKET, "MVPN event socket() failed: %s", safe_strerror(errno));
-		return;
+		return NULL;
 	}
-
-	memset(&sun, 0, sizeof(sun));
-	sun.sun_family = AF_UNIX;
-	strlcpy(sun.sun_path, bgp->mvpn_event_socket_path, sizeof(sun.sun_path));
-	unlink(sun.sun_path);
 
 	old_mask = umask(0077);
 	if (bind(fd, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
@@ -303,7 +449,7 @@ void bgp_mvpn_events_start(struct bgp *bgp)
 			 safe_strerror(errno));
 		umask(old_mask);
 		close(fd);
-		return;
+		return NULL;
 	}
 	umask(old_mask);
 
@@ -311,7 +457,8 @@ void bgp_mvpn_events_start(struct bgp *bgp)
 		flog_err(EC_LIB_SOCKET, "MVPN event socket listen(%s) failed: %s", sun.sun_path,
 			 safe_strerror(errno));
 		close(fd);
-		return;
+		unlink(sun.sun_path);
+		return NULL;
 	}
 
 	if (set_nonblocking(fd) < 0) {
@@ -320,23 +467,21 @@ void bgp_mvpn_events_start(struct bgp *bgp)
 			 sun.sun_path, safe_strerror(errno));
 		unlink(sun.sun_path);
 		close(fd);
-		return;
+		return NULL;
 	}
 
 	sink = XCALLOC(MTYPE_MVPN_EVENT_SINK, sizeof(*sink));
 	sink->bgp = bgp;
-	sink->path = XSTRDUP(MTYPE_MVPN_EVENT_PATH, bgp->mvpn_event_socket_path);
+	sink->path = XSTRDUP(MTYPE_MVPN_EVENT_PATH, path);
 	sink->listen_fd = fd;
-	sink->boot_epoch = bgp_mvpn_event_next_boot_epoch(bgp->name ? bgp->name
-								    : VRF_DEFAULT_NAME);
+	sink->boot_epoch = boot_epoch;
 	sink->seq = 0;
 	sink->snapshot_pending = true;
-	bgp->mvpn_event_sink = sink;
-
 	event_add_read(bm->master, bgp_mvpn_event_accept, sink, fd, &sink->t_accept);
 
 	zlog_info("MVPN events: listening on %s (boot_epoch %" PRIu64 ")", sun.sun_path,
 		  sink->boot_epoch);
+	return sink;
 }
 
 void bgp_mvpn_events_stop(struct bgp *bgp)
@@ -367,17 +512,28 @@ void bgp_mvpn_events_stop(struct bgp *bgp)
 	bgp->mvpn_event_sink = NULL;
 }
 
-void bgp_mvpn_events_set_socket(struct bgp *bgp, const char *path)
+int bgp_mvpn_events_set_socket(struct bgp *bgp, const char *path)
 {
-	XFREE(MTYPE_MVPN_EVENT_PATH, bgp->mvpn_event_socket_path);
+	struct bgp_mvpn_event_sink *replacement;
+	char *configured_path;
 
 	if (!path) {
 		bgp_mvpn_events_stop(bgp);
-		return;
+		XFREE(MTYPE_MVPN_EVENT_PATH, bgp->mvpn_event_socket_path);
+		return CMD_SUCCESS;
 	}
+	if (bgp->mvpn_event_sink && strcmp(bgp->mvpn_event_sink->path, path) == 0)
+		return CMD_SUCCESS;
 
-	bgp->mvpn_event_socket_path = XSTRDUP(MTYPE_MVPN_EVENT_PATH, path);
-	bgp_mvpn_events_start(bgp);
+	replacement = bgp_mvpn_events_start(bgp, path);
+	if (!replacement)
+		return CMD_WARNING_CONFIG_FAILED;
+	configured_path = XSTRDUP(MTYPE_MVPN_EVENT_PATH, path);
+	bgp_mvpn_events_stop(bgp);
+	XFREE(MTYPE_MVPN_EVENT_PATH, bgp->mvpn_event_socket_path);
+	bgp->mvpn_event_socket_path = configured_path;
+	bgp->mvpn_event_sink = replacement;
+	return CMD_SUCCESS;
 }
 
 void bgp_mvpn_events_config_write(struct vty *vty, struct bgp *bgp)
@@ -502,6 +658,8 @@ static void bgp_mvpn_event_broadcast(struct bgp_mvpn_event_sink *sink, struct js
 		buffer_status_t status;
 
 		next = client->next;
+		if (!client->subscribed)
+			continue;
 
 		if (client->pending_bytes + linelen > BGP_MVPN_EVENT_SINK_MAX_BACKLOG) {
 			zlog_warn("MVPN events: client fd %d exceeded %u byte backlog, disconnecting (gap signal for reconnect)",

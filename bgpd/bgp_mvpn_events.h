@@ -33,22 +33,16 @@
 extern "C" {
 #endif
 
-/* Start the event-socket listener for a bgp instance if
- * `mvpn_event_socket_path` is configured and not already running on that
- * path. No-op otherwise, and a no-op re-call while already running on the
- * same path (a genuine (re)start bumps boot_epoch -- see the .c file header).
- * Only caller today is bgp_mvpn_events_set_socket(). */
-extern void bgp_mvpn_events_start(struct bgp *bgp);
-
 /* Tear down the listener and all connected clients, and free per-join
  * route-version state. Safe to call when nothing is running. Called from
  * `no bgp mvpn event-socket` and from bgp_delete(). */
 extern void bgp_mvpn_events_stop(struct bgp *bgp);
 
 /* Apply `bgp mvpn event-socket PATH` / `no bgp mvpn event-socket`: stores the
- * path on the bgp instance and (re)starts or stops the listener. Passing NULL
- * stops and clears any configured path. */
-extern void bgp_mvpn_events_set_socket(struct bgp *bgp, const char *path);
+ * path on the bgp instance only after a replacement listener is ready.
+ * Passing NULL stops and clears any configured path. Returns CMD_SUCCESS or
+ * CMD_WARNING_CONFIG_FAILED without disturbing the current listener. */
+extern int bgp_mvpn_events_set_socket(struct bgp *bgp, const char *path);
 
 /*
  * Called from bgp_mvpn_source_tree_join_set() exactly once per non-withdraw

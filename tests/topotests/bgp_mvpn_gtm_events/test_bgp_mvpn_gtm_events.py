@@ -52,6 +52,7 @@ IPMSI_LABEL = 100
 
 EVENT_SOCK = "/tmp/bgp_mvpn_gtm_events-r1-{}.sock".format(os.getpid())
 EVENT_SOCK_2 = "/tmp/bgp_mvpn_gtm_events-r1-restart-{}.sock".format(os.getpid())
+EPOCH_FILE = "/var/run/frr/bgpd-mvpn-events-default.epoch"
 
 
 def _ip4_to_int(addr):
@@ -123,6 +124,7 @@ class EventReader:
                     raise
                 time.sleep(0.5)
         self.buf = b""
+        self.sock.sendall(b'{"type":"subscribe","schema_version":1}\n')
 
     def close(self):
         self.sock.close()
@@ -147,6 +149,20 @@ class EventReader:
             if not chunk:
                 raise AssertionError("event socket closed by bgpd")
             self.buf += chunk
+
+    def acknowledge_snapshot(self, event):
+        self.sock.sendall(
+            (
+                json.dumps(
+                    {
+                        "type": "snapshot_ack",
+                        "boot_epoch": event["boot_epoch"],
+                        "seq": event["seq"],
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
 
 
 def _join():
@@ -368,6 +384,55 @@ route-map rtimport permit 10
     reader.close()
 
 
+def test_failed_reconfiguration_preserves_listener():
+    """Neither an unusable replacement path nor invalid durable epoch state
+    may tear down the healthy listener or replace its running configuration."""
+    tgen = get_topogen()
+    r1 = tgen.gears["r1"]
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r1.vtysh_cmd(
+        """
+configure terminal
+router bgp {}
+ bgp mvpn event-socket /missing/bgp-mvpn-events.sock
+""".format(
+            LOCAL_AS
+        )
+    )
+    status = json.loads(r1.vtysh_cmd("show bgp mvpn events json"))
+    assert status.get("listening") is True, status
+    assert status.get("path") == EVENT_SOCK, status
+
+    saved_epoch = r1.run("cat {}".format(EPOCH_FILE)).strip()
+    assert saved_epoch.isdigit(), saved_epoch
+    r1.net.unet.rootcmd.cmd_raises(
+        "nsenter --mount=/proc/{}/ns/mnt -- runuser -u frr -- "
+        "sh -c 'printf invalid > {}'".format(r1.net.pid, EPOCH_FILE)
+    )
+    assert r1.run("cat {}".format(EPOCH_FILE)).strip() == "invalid"
+    try:
+        r1.vtysh_cmd(
+            """
+configure terminal
+router bgp {}
+ bgp mvpn event-socket {}
+""".format(
+                LOCAL_AS, EVENT_SOCK_2
+            )
+        )
+        status = json.loads(r1.vtysh_cmd("show bgp mvpn events json"))
+        assert status.get("listening") is True, status
+        assert status.get("path") == EVENT_SOCK, status
+    finally:
+        r1.net.unet.rootcmd.cmd_raises(
+            "nsenter --mount=/proc/{}/ns/mnt -- runuser -u frr -- "
+            "sh -c 'printf {} > {}'".format(r1.net.pid, saved_epoch, EPOCH_FILE)
+        )
+
+
 def test_listener_restart_snapshots_active_join():
     """Changing the listener creates a new epoch. Its first consumer must
     receive a replacement install for the still-active join so it can open a
@@ -387,6 +452,16 @@ router bgp {}
         )
     )
 
+    # A connect-only health probe cannot consume the epoch snapshot.
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.connect(EVENT_SOCK_2)
+    probe.close()
+
+    # Nor can a real subscriber that disconnects before acknowledging it.
+    interrupted_reader = EventReader(EVENT_SOCK_2)
+    interrupted = interrupted_reader.read_event()
+    interrupted_reader.close()
+
     restarted_reader = EventReader(EVENT_SOCK_2)
     ev = restarted_reader.read_event()
     assert ev["event_type"] == "install"
@@ -395,8 +470,10 @@ router bgp {}
     assert ev["source_as"] == LOCAL_AS
     assert ev["upstream_peer"] == UPSTREAM_2
     assert ev["boot_epoch"] > boot_epoch
-    assert ev["seq"] == 1
-    assert ev["route_version"] == "{}.1".format(ev["boot_epoch"])
+    assert interrupted["seq"] == 1
+    assert ev["seq"] == interrupted["seq"] + 1
+    assert ev["route_version"] == "{}.2".format(ev["boot_epoch"])
+    restarted_reader.acknowledge_snapshot(ev)
     restarted_reader.close()
 
 

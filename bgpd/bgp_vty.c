@@ -23378,9 +23378,7 @@ DEFPY (bgp_mvpn_event_socket,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	bgp_mvpn_events_set_socket(bgp, no ? NULL : filename);
-
-	return CMD_SUCCESS;
+	return bgp_mvpn_events_set_socket(bgp, no ? NULL : filename);
 }
 
 DEFPY (bgp_mvpn_source_active6,

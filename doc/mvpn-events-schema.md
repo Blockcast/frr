@@ -32,13 +32,20 @@ is allowed to build claims from.
   event-socket` (or omitting the knob) means the feature is off. Opt-in,
   like the other GTM MVPN knobs (`bgp mvpn ipmsi-label`, `bgp mvpn
   umh-large-community`).
-- The first client accepted by a newly-created listener epoch receives an
-  `install` snapshot of every currently active local Type-7 join. This is the
+- A client first sends `{"type":"subscribe","schema_version":1}`. The first
+  subscribed client in a newly-created listener epoch receives an `install`
+  snapshot of every currently active local Type-7 join. This is the
   epoch handoff: old clients were disconnected when the prior listener
   stopped, and the snapshot opens replacement entitlement windows without
   turning a debug/reconciliation poll into a billing artifact. Later clients
-  receive events from connection time onward; there is no general per-client
-  replay/backlog.
+  receive events from subscription time onward; there is no general per-client
+  replay/backlog. The snapshot remains pending until that client sends
+  `{"type":"snapshot_ack","boot_epoch":N,"seq":M}`, identifying the epoch and
+  final snapshot sequence it durably consumed. A connect-only health probe or
+  a client that disconnects before acknowledgment cannot consume the snapshot;
+  the next subscriber receives a replay. An empty snapshot needs no
+  acknowledgment because there is no pre-existing state to lose; future joins
+  are delivered as ordinary live events.
 - Wire format: one JSON object per line (`\n`-terminated, no pretty-printing)
   per event, broadcast identically to every connected client.
 - A client that falls behind by more than 8MiB of unflushed output is
@@ -59,7 +66,9 @@ Every event carries `boot_epoch` and `seq`:
   alone across an epoch change).
 - `boot_epoch` is a small integer persisted under `$frr_runstatedir` (e.g.
   `/var/run/frr/bgpd-mvpn-events-default.epoch`) and incremented on every
-  listener start, under an exclusive file lock. A bare `bgpd` process restart
+  listener start, under an exclusive lock separate from the atomically-renamed
+  state file. Invalid state or any lock/write/fsync/rename failure prevents the
+  listener from starting. A bare `bgpd` process restart
   is the common cause, but reconfiguring the socket (`no bgp mvpn
   event-socket` then re-adding it, or changing the path) within one running
   process also starts a new listener and therefore bumps `boot_epoch`. Either
@@ -163,9 +172,10 @@ remove code path", no timers, no defaults.
 ## Verification and remaining gap
 
 - The locally built `frrouting/topotests:latest` image completed a full FRR
-  build and `bgp_mvpn_gtm_events/test_bgp_mvpn_gtm_events.py` passed all seven
-  tests, including event-after-RIB ordering and active-join snapshot emission
-  after listener reconfiguration.
+  build and `bgp_mvpn_gtm_events/test_bgp_mvpn_gtm_events.py` passed all eight
+  tests, including event-after-RIB ordering, failure-atomic listener
+  replacement, fail-closed epoch persistence, and acknowledged active-join
+  snapshot replay after listener reconfiguration.
 - A full bgpd process restart's `boot_epoch` bump remains asserted by the
   persisted-counter implementation and code inspection. The automated test
   covers the equivalent listener restart/path-change boundary, but does not
