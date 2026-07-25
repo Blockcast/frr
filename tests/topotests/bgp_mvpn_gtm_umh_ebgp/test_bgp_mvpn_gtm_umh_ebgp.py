@@ -5,17 +5,29 @@
 #
 
 """
-test_bgp_mvpn_gtm_umh_ebgp.py: origin-AS trust boundary for the LC-UMH
-resolver over eBGP.
+test_bgp_mvpn_gtm_umh_ebgp.py: general eBGP origin-AS trust validation for the
+LC-UMH resolver.
 
 The UMH large community <sourceAS>:<function>:<UMH> is trusted only when its
 Global Administrator equals the AS that ORIGINATED the covering unicast route
-(bgp_mvpn_resolve_from_lcommunity). An unresolvable origin AS
-(aspath_get_last_as() == 0) is collapsed to the local AS ONLY for an
-iBGP-learned or locally-originated route -- never for an eBGP path, or an
-attacker one hop away could stamp GA == our own AS and have it trusted. This
-suite drives that fail-open guard, which the iBGP-only umh_lc / umh_bestpath
-suites structurally cannot reach.
+(bgp_mvpn_resolve_from_lcommunity). This suite exercises that check over an
+eBGP session -- the case the iBGP-only umh_lc / umh_bestpath suites structurally
+cannot reach -- proving a neighbor cannot stamp GA == our own AS (or GA == 0)
+and be believed, while a legitimate GA == origin is accepted.
+
+SCOPE, read this before "strengthening" it: this suite is NOT a mutation-
+sensitive regression for the `origin_as == 0` fail-open arm, and cannot be.
+aspath_get_last_as() == 0 is produced only by an empty or bare-AS_SET AS_PATH,
+both of which FRR rejects as malformed for eBGP (RFC 7606 treat-as-withdraw)
+before the route enters the RIB or the resolver runs -- verified: the route
+never appears in `show bgp ipv4 unicast`. So the "origin 0 collapses to local
+AS only for iBGP/self" guard is defense-in-depth for iBGP/locally-originated
+paths (where an empty AS_PATH is legal) and is unreachable over eBGP; the only
+eBGP-reachable trust boundary is GA != origin. Reverting the origin-0 arm would
+leave these tests green because that state can't occur on the wire here --
+covering it mutation-sensitively needs a resolver-seam unit test, not a
+topotest. These cases (GA == local-AS, GA == 0, GA == origin over eBGP) are the
+reachable, valuable coverage.
 
 A raw eBGP speaker (peer1, AS 65010) advertises three source-covering routes,
 all with a well-formed AS_SEQUENCE path (origin AS 65010):
