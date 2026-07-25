@@ -914,15 +914,33 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 		return false;
 
 	/*
-	 * aspath_get_last_as() returns 0 for an empty AS_PATH or one whose
-	 * origin segment is an AS_SET (aggregation). That 0 is genuinely the
-	 * local AS only for an iBGP-learned or locally-originated route; for an
-	 * eBGP path an unresolvable origin must NOT collapse to the local AS,
-	 * or a transitive tuple carrying GA == our own AS could claim a UMH
-	 * across a border. Left at 0 no tuple matches (GA 0 is rejected below).
+	 * aspath_get_last_as() walks every segment but only reads AS_SEQUENCE
+	 * (and AS_CONFED_SEQUENCE) members, so it returns 0 in exactly two
+	 * cases: an AS_PATH with no segments at all, and one built only from
+	 * AS_SET segments (`{65002,65003}`, what `aggregate-address ... as-set`
+	 * originates). Those two are not equivalent for trust purposes:
+	 *
+	 *   - No segments means the route has not crossed an AS boundary, so
+	 *     "origin == us" is sound. Substitute the local AS, which is what
+	 *     lets a legitimate in-AS tuple with GA == our AS be honoured.
+	 *
+	 *   - A bare AS_SET means the origin is genuinely unknown: the ASes in
+	 *     the set are the aggregated routes' origins, none of which is us.
+	 *     Such a path reaches us over iBGP with no AS prepended (iBGP does
+	 *     not prepend), so peer->sort alone cannot tell it apart from an
+	 *     internal route -- peer->sort describes who advertised the route,
+	 *     not where it came from. Collapsing this to the local AS would
+	 *     honour a transitive tuple stamped GA == our AS by whichever
+	 *     external AS's route got aggregated. Leave origin_as at 0; no
+	 *     tuple matches (GA 0 is rejected below) and resolution falls back
+	 *     to the extended community.
+	 *
+	 * aspath_count_hops() counts an AS_SET as one hop, which is precisely
+	 * the distinction needed: 0 hops is the empty path, a bare AS_SET is 1.
 	 */
 	origin_as = aspath_get_last_as(pi->attr->aspath);
 	if (origin_as == 0 &&
+	    (!pi->attr->aspath || aspath_count_hops(pi->attr->aspath) == 0) &&
 	    (pi->peer == bgp->peer_self || pi->peer->sort == BGP_PEER_IBGP))
 		origin_as = bgp->as;
 
@@ -956,8 +974,15 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 			 * probe on another.
 			 */
 			time_t now = monotime(NULL);
+			time_t last = bgp->mvpn_umh_untrusted_log_last;
 
-			if (now - bgp->mvpn_umh_untrusted_log_last >= 60) {
+			/* last == 0 is "never logged", tested explicitly:
+			 * monotime() counts from host boot, so a plain
+			 * "now - last >= 60" swallows the very first reject
+			 * whenever uptime is under a minute -- exactly the
+			 * window where a probe against a freshly restarted or
+			 * freshly booted PE would go unseen. */
+			if (last == 0 || now - last >= 60) {
 				bgp->mvpn_umh_untrusted_log_last = now;
 				zlog_notice("MVPN UMH large community %u:%u:%u rejected on %s: Global Administrator %u != origin AS %u",
 					    ga, fn, param, bgp->name_pretty, ga,

@@ -16,18 +16,18 @@ cannot reach -- proving a neighbor cannot stamp GA == our own AS (or GA == 0)
 and be believed, while a legitimate GA == origin is accepted.
 
 SCOPE, read this before "strengthening" it: this suite is NOT a mutation-
-sensitive regression for the `origin_as == 0` fail-open arm, and cannot be.
+sensitive regression for the `origin_as == 0` arm, and cannot be over eBGP.
 aspath_get_last_as() == 0 is produced only by an empty or bare-AS_SET AS_PATH,
 both of which FRR rejects as malformed for eBGP (RFC 7606 treat-as-withdraw)
 before the route enters the RIB or the resolver runs -- verified: the route
-never appears in `show bgp ipv4 unicast`. So the "origin 0 collapses to local
-AS only for iBGP/self" guard is defense-in-depth for iBGP/locally-originated
-paths (where an empty AS_PATH is legal) and is unreachable over eBGP; the only
-eBGP-reachable trust boundary is GA != origin. Reverting the origin-0 arm would
-leave these tests green because that state can't occur on the wire here --
-covering it mutation-sensitively needs a resolver-seam unit test, not a
-topotest. These cases (GA == local-AS, GA == 0, GA == origin over eBGP) are the
-reachable, valuable coverage.
+never appears in `show bgp ipv4 unicast`. So the only eBGP-reachable trust
+boundary is GA != origin, which is what these cases cover.
+
+That arm IS reachable over iBGP, where an aggregate keeps its bare AS_SET
+because iBGP does not prepend, and it is covered mutation-sensitively there --
+see bgp_mvpn_gtm_umh_ibgp, which pins empty-AS_PATH (accept) against
+bare-AS_SET (reject) with an otherwise identical route. Do not try to
+reproduce that here.
 
 A raw eBGP speaker (peer1, AS 65010) advertises three source-covering routes,
 all with a well-formed AS_SEQUENCE path (origin AS 65010):
