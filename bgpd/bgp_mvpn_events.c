@@ -297,7 +297,7 @@ static bool bgp_mvpn_event_next_boot_epoch(const char *instance_name, uint64_t *
 	}
 
 	lock_fd = open(lock_path, O_RDWR | O_CREAT, 0600);
-	if (lock_fd < 0 || lockf(lock_fd, F_LOCK, 0) < 0) {
+	if (lock_fd < 0 || lockf(lock_fd, F_TLOCK, 0) < 0) {
 		flog_err(EC_LIB_SYSTEM_CALL,
 			 "MVPN event boot_epoch lock %s failed: %s", lock_path,
 			 safe_strerror(errno));
