@@ -893,9 +893,11 @@ static void bgp_mvpn_resolve_from_ecommunity(struct bgp_path_info *pi, uint32_t 
  *
  * Trust: a tuple counts only when its Global Administrator equals the source
  * route's origin AS (rightmost AS_PATH entry; the local AS for a local or
- * empty-AS_PATH iBGP route). A transitive community survives more AS hops
- * than any one operator can vouch for -- this check is the border-scoping
- * primitive that bounds who may claim a UMH for a route.
+ * empty-AS_PATH iBGP route), and only when that origin is knowable at all --
+ * an AS_SET/AS_CONFED_SET aggregates several origins, so no tuple on such a
+ * path is trusted. A transitive community survives more AS hops than any one
+ * operator can vouch for -- this check is the border-scoping primitive that
+ * bounds who may claim a UMH for a route.
  *
  * Ties: large communities are sorted and de-duplicated at attribute parse
  * (lcommunity_uniq_sort), so candidates iterate in ascending tuple order and
@@ -907,6 +909,7 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 {
 	struct lcommunity *lcom = bgp_attr_get_lcommunity(pi->attr);
 	uint32_t origin_as;
+	bool origin_ambiguous;
 	bool found = false;
 	int i;
 
@@ -914,33 +917,40 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 		return false;
 
 	/*
-	 * aspath_get_last_as() walks every segment but only reads AS_SEQUENCE
-	 * (and AS_CONFED_SEQUENCE) members, so it returns 0 in exactly two
-	 * cases: an AS_PATH with no segments at all, and one built only from
-	 * AS_SET segments (`{65002,65003}`, what `aggregate-address ... as-set`
-	 * originates). Those two are not equivalent for trust purposes:
+	 * Resolve the origin AS -- and first decide whether it is knowable at
+	 * all.
 	 *
-	 *   - No segments means the route has not crossed an AS boundary, so
-	 *     "origin == us" is sound. Substitute the local AS, which is what
-	 *     lets a legitimate in-AS tuple with GA == our AS be honoured.
+	 * An AS_SET/AS_CONFED_SET is an aggregate of routes with several
+	 * origins, so RFC 4271 leaves such a path with no single origin.
+	 * aspath_get_last_as() cannot express that: it returns the last member
+	 * of the last *sequence* segment and skips set segments outright, so
+	 * it reports
 	 *
-	 *   - A bare AS_SET means the origin is genuinely unknown: the ASes in
-	 *     the set are the aggregated routes' origins, none of which is us.
-	 *     Such a path reaches us over iBGP with no AS prepended (iBGP does
-	 *     not prepend), so peer->sort alone cannot tell it apart from an
-	 *     internal route -- peer->sort describes who advertised the route,
-	 *     not where it came from. Collapsing this to the local AS would
-	 *     honour a transitive tuple stamped GA == our AS by whichever
-	 *     external AS's route got aggregated. Leave origin_as at 0; no
-	 *     tuple matches (GA 0 is rejected below) and resolution falls back
-	 *     to the extended community.
+	 *   65010 {65002,65003}  -> 65010, the AGGREGATOR -- the leftmost AS,
+	 *                           not an origin. Trusting a GA of 65010 here
+	 *                           would let any AS that merely aggregates a
+	 *                           route claim a UMH for an origin it only
+	 *                           transits.
+	 *   {65002,65003}        -> 0, as does a bare AS_CONFED_SET, and 0
+	 *                           must not be read as "no AS_PATH".
 	 *
-	 * aspath_count_hops() counts an AS_SET as one hop, which is precisely
-	 * the distinction needed: 0 hops is the empty path, a bare AS_SET is 1.
+	 * So gate on aspath_check_as_sets(): a set-bearing path is
+	 * origin-ambiguous and no tuple on it is trustworthy. Deliberately not
+	 * aspath_count_hops() -- that counts an AS_SET as one hop but an
+	 * AS_CONFED_SET as zero, leaving a bare AS_CONFED_SET
+	 * indistinguishable from an empty path.
+	 *
+	 * With set-bearing paths excluded, origin_as == 0 means the AS_PATH
+	 * carries no AS whatsoever: the route never crossed an AS boundary, so
+	 * the local AS genuinely is its origin and a tuple stamped GA == our
+	 * AS is legitimate. peer->sort is only a belt-and-braces second gate
+	 * here -- it describes who advertised the route, not where it came
+	 * from -- and an empty AS_PATH is malformed over eBGP anyway (RFC 7606
+	 * treat-as-withdraw at parse).
 	 */
+	origin_ambiguous = aspath_check_as_sets(pi->attr->aspath);
 	origin_as = aspath_get_last_as(pi->attr->aspath);
-	if (origin_as == 0 &&
-	    (!pi->attr->aspath || aspath_count_hops(pi->attr->aspath) == 0) &&
+	if (!origin_ambiguous && origin_as == 0 &&
 	    (pi->peer == bgp->peer_self || pi->peer->sort == BGP_PEER_IBGP))
 		origin_as = bgp->as;
 
@@ -963,7 +973,7 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 			continue;
 		}
 
-		if (ga == 0 || ga != origin_as) {
+		if (origin_ambiguous || ga == 0 || ga != origin_as) {
 			/*
 			 * Trust-boundary reject: someone is claiming a UMH for
 			 * this route across an AS they do not originate. Surface
@@ -984,9 +994,15 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 			 * freshly booted PE would go unseen. */
 			if (last == 0 || now - last >= 60) {
 				bgp->mvpn_umh_untrusted_log_last = now;
-				zlog_notice("MVPN UMH large community %u:%u:%u rejected on %s: Global Administrator %u != origin AS %u",
-					    ga, fn, param, bgp->name_pretty, ga,
-					    origin_as);
+				if (origin_ambiguous)
+					zlog_notice("MVPN UMH large community %u:%u:%u rejected on %s: AS_PATH bears an AS_SET, origin AS is indeterminate",
+						    ga, fn, param,
+						    bgp->name_pretty);
+				else
+					zlog_notice("MVPN UMH large community %u:%u:%u rejected on %s: Global Administrator %u != origin AS %u",
+						    ga, fn, param,
+						    bgp->name_pretty, ga,
+						    origin_as);
 			}
 			continue;
 		}

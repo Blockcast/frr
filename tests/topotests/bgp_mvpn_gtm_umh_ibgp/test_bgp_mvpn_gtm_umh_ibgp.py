@@ -5,40 +5,58 @@
 #
 
 """
-test_bgp_mvpn_gtm_umh_ibgp.py: the LC-UMH origin-AS trust check must not treat
-"unresolvable origin" as "origin is us" just because the route arrived over
-iBGP.
+test_bgp_mvpn_gtm_umh_ibgp.py: the LC-UMH origin-AS trust check must treat any
+AS_SET-bearing path as having no determinable origin, rather than trusting
+whatever a single "last AS" lookup happens to return.
 
-bgp_mvpn_resolve_from_lcommunity() resolves the route's origin with
-aspath_get_last_as(), which reads only AS_SEQUENCE members and so returns 0 for
-two structurally different paths:
+bgp_mvpn_resolve_from_lcommunity() trusts a UMH tuple only when its Global
+Administrator equals the AS that ORIGINATED the covering route. It resolves
+that origin with aspath_get_last_as(), which returns the last member of the
+last AS_SEQUENCE segment and skips set segments outright -- so it misreports
+three different shapes in three different ways:
 
-  empty  10.40.10.0/24  no AS_PATH segments at all. The route never crossed an
-                        AS boundary, so the local AS really is its origin and a
-                        tuple stamped GA == our AS is legitimate -> ACCEPTED,
-                        upstream RT 10.255.255.254 from the tuple.
-  as_set 10.40.20.0/24  one bare AS_SET {65002,65003} -- what
-                        `aggregate-address ... as-set` originates. The origin is
-                        genuinely unknown and is definitely not us, so the same
-                        tuple is a forged claim -> REJECTED, falling back to the
-                        Route Import EC 10.9.9.9.
+  empty      10.40.10.0/24  no segments. The route never crossed an AS
+                            boundary, so the local AS really is its origin and
+                            a tuple stamped GA == our AS is legitimate ->
+                            ACCEPTED, upstream RT 10.255.255.254 from the
+                            tuple.
+  as_set     10.40.20.0/24  bare AS_SET {65002,65003}, what
+                            `aggregate-address ... as-set` originates. Lookup
+                            -> 0, same as empty, but the origin is unknown and
+                            is not us -> REJECTED, EC fallback 10.9.9.9.
+  mixed      10.40.30.0/24  AS_SEQUENCE [65010] + AS_SET {65002,65003}. Lookup
+                            skips the set and returns 65010 -- non-zero, so no
+                            empty-path guard fires -- but 65010 is the
+                            AGGREGATOR, not the origin. GA == 65010 ->
+                            REJECTED.
+  confed_set 10.40.40.0/24  bare AS_CONFED_SET. Lookup -> 0 and
+                            aspath_count_hops() -> 0 as well, since hop
+                            counting scores an AS_SET as one hop but ignores
+                            confederation segments; a hop-count discriminator
+                            reads this as an empty path. GA == our AS ->
+                            REJECTED.
 
-Both routes carry an IDENTICAL large community (GA == 65001, r1's own AS) and an
-identical Route Import EC. The AS_PATH shape is the only difference, so the two
-expectations cannot both hold unless the resolver separates the empty path from
-the bare AS_SET. Collapsing them -- gating only on `peer->sort == BGP_PEER_IBGP`,
-which describes who *advertised* the route rather than where it came from --
-makes the as_set case resolve from the tuple and fails this suite.
+Every route carries the same UMH parameter and an identical Route Import EC;
+only the AS_PATH shape and the stamped GA vary. Accepting `empty` while
+rejecting the other three cannot hold unless the resolver gates on
+aspath_check_as_sets() -- neither "is the lookup zero" nor "how many hops"
+separates all four. In particular, gating on `peer->sort == BGP_PEER_IBGP`
+(who *advertised* the route, not where it came from) fails as_set; a hop-count
+test fails confed_set; and trusting the bare lookup fails mixed.
 
 Reachability matters here, and it is narrower than it first looks. iBGP does
-not prepend, so an aggregate originated inside the AS reaches a PE with its
-bare AS_SET intact -- unlike over eBGP, where RFC 7606 discards a bare-AS_SET
-AS_PATH as malformed before the resolver ever runs (see
-bgp_mvpn_gtm_umh_ebgp, which covers the GA != origin boundary instead).
+not prepend, so an aggregate originated or relayed inside the AS reaches a PE
+with its set segments intact -- unlike over eBGP, where RFC 7606 discards a
+bare-AS_SET AS_PATH as malformed before the resolver ever runs (see
+bgp_mvpn_gtm_umh_ebgp, which covers the GA != origin boundary instead). The
+confederation sanity check in bgp_attr_aspath_check() likewise only fires for
+CONFED and EBGP peers, so an AS_CONFED_SET survives parse on a plain iBGP
+session.
 
-But FRR also sets reject_as_sets=true in bgp_create(), so by default ANY
-AS_SET-bearing path is treated-as-withdraw at attribute parse and never reaches
-the resolver at all. r1 therefore runs `no bgp reject-as-sets` here. That means
+But FRR also sets reject_as_sets=true in bgp_create(), gating on the same
+aspath_check_as_sets(), so by default ANY set-bearing path is
+treated-as-withdraw at attribute parse and never reaches the resolver at all.
+r1 therefore runs `no bgp reject-as-sets` here. That means
 the hole this suite guards is only reachable on a deployment that has turned
 that knob off -- a legitimate configuration for networks still aggregating with
 as-set, but not the default. The default is genuine defense in depth; it is not
@@ -68,15 +86,29 @@ from lib.topolog import logger
 pytestmark = [pytest.mark.bgpd, pytest.mark.pimd]
 
 LOCAL_AS = 65001
-# 184549374 == 10.255.255.254: the UMH both crafted tuples carry.
+# The AS that aggregated the `mixed` route. A transit AS, not an origin -- but
+# it is what aspath_get_last_as() reports for "65010 {65002,65003}".
+AGGREGATOR_AS = 65010
+# 184549374 == 10.255.255.254: the UMH every crafted tuple carries.
 UMH_KAT = "10.255.255.254"
-# Fallback Route Import EC, present on both routes.
+# Fallback Route Import EC, present on every route.
 EC_RT = "10.9.9.9"
 
 # (source, group) per route; sources are covered by the speaker's /24s.
 JOINS = {
     "empty": ("10.40.10.10", "232.4.4.1"),
     "as_set": ("10.40.20.10", "232.4.4.2"),
+    "mixed": ("10.40.30.10", "232.4.4.3"),
+    "confed_set": ("10.40.40.10", "232.4.4.4"),
+}
+
+# Every crafted route must reach the unicast RIB or the trust assertions pass
+# vacuously; the premise guard walks this list.
+PREFIXES = {
+    "empty": "10.40.10.0/24",
+    "as_set": "10.40.20.0/24",
+    "mixed": "10.40.30.0/24",
+    "confed_set": "10.40.40.0/24",
 }
 
 PID_FILE = None
@@ -201,17 +233,19 @@ def test_sessions_established():
     assert result is None, "r1 did not reach Established with the iBGP speaker"
 
 
-def test_both_routes_installed():
-    """Guard the premise: if either crafted route never enters the unicast RIB
-    the trust assertions below would pass vacuously. The bare AS_SET must be
-    accepted over iBGP (it is a legal aggregate) -- unlike over eBGP, where it
-    is malformed and discarded."""
+def test_all_routes_installed():
+    """Guard the premise: if any crafted route never enters the unicast RIB the
+    trust assertions below would pass vacuously. The set-bearing paths must be
+    accepted over iBGP -- an AS_SET aggregate is legal there (unlike over eBGP,
+    where a bare set is malformed and discarded), and the confederation sanity
+    check in bgp_attr_aspath_check() only fires for CONFED and EBGP peers, so
+    an AS_CONFED_SET survives parse on an iBGP session."""
     tgen = get_topogen()
 
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
-    for name, prefix in (("empty", "10.40.10.0/24"), ("as_set", "10.40.20.0/24")):
+    for name, prefix in PREFIXES.items():
 
         def _installed(prefix=prefix):
             out = json.loads(
@@ -253,6 +287,47 @@ def test_bare_as_set_rejects_local_ga():
         pytest.skip(tgen.errors)
 
     src, grp = JOINS["as_set"]
+    _join(src, grp)
+    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_mixed_sequence_set_rejects_aggregator_ga():
+    """AS_SEQUENCE [65010] + AS_SET {65002,65003}: aspath_get_last_as() skips
+    the set and returns 65010, so the origin lookup is NOT 0 and no
+    empty-path/hop-count guard fires. But 65010 aggregated the route, it did
+    not originate it, and RFC 4271 leaves the real origin indeterminate inside
+    the set.
+
+    Mutation-sensitive: trust `last AS` on its own and the GA == 65010 tuple
+    matches, resolving to RT:10.255.255.254:0 with Source AS 65010 -- letting
+    any AS that aggregates a route claim a UMH for an origin it merely
+    transits. The resolver must instead treat the path as origin-ambiguous and
+    fall back to the Route Import EC."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS["mixed"]
+    _join(src, grp)
+    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_bare_confed_set_rejects_local_ga():
+    """A bare AS_CONFED_SET reads as (origin 0, 0 hops): aspath_get_last_as()
+    skips set segments and aspath_count_hops() counts an AS_SET as one hop but
+    ignores confederation segments altogether.
+
+    Mutation-sensitive: discriminate empty-vs-set on hop count and this path
+    is indistinguishable from an empty AS_PATH, so the local AS is substituted
+    and the GA == our-AS tuple is honoured. Only a check that looks for set
+    segments directly (aspath_check_as_sets) separates them."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS["confed_set"]
     _join(src, grp)
     _expect_type7(src, grp, LOCAL_AS, EC_RT)
 

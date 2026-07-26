@@ -2,30 +2,42 @@
 # SPDX-License-Identifier: ISC
 
 """
-umh_ibgp_peer.py: raw iBGP speaker that separates "the AS_PATH is empty" from
-"the AS_PATH is a bare AS_SET" for the LC-UMH origin-AS trust check.
+umh_ibgp_peer.py: four AS_PATH shapes that each defeat a different naive
+origin-AS lookup, for the LC-UMH trust check.
 
-aspath_get_last_as() walks every segment but reads only AS_SEQUENCE members,
-so it returns 0 for BOTH of those paths -- and the resolver used to treat that
-0 as "origin is us" for any iBGP-learned route. The two are not equivalent:
+The resolver trusts a UMH tuple only when its Global Administrator equals the
+AS that ORIGINATED the covering route. Determining that origin from an AS_PATH
+is where the traps are, because aspath_get_last_as() returns the last member of
+the last AS_SEQUENCE segment and skips set segments outright:
 
-  1. empty  : no segments at all. The route has not crossed an AS boundary, so
-              the local AS genuinely is the origin. A tuple stamped
-              GA == our AS must be ACCEPTED.
-  2. as_set : one bare AS_SET segment, `{65002,65003}` -- what
-              `aggregate-address ... as-set` originates. The ASes in the set
-              are the aggregated routes' origins and none of them is us. Such
-              a path arrives over iBGP with no AS prepended (iBGP does not
-              prepend), so the receiving PE cannot tell it apart from an
-              internal route by looking at the peer. A tuple stamped
-              GA == our AS here was stamped by whichever external AS's route
-              got aggregated, and must be REJECTED.
+  1. empty      : no segments. The route has not crossed an AS boundary, so the
+                  local AS genuinely is the origin. A tuple stamped
+                  GA == our AS must be ACCEPTED. (Positive control: without it
+                  the suite could pass by refusing everything.)
+  2. as_set     : one bare AS_SET `{65002,65003}` -- what
+                  `aggregate-address ... as-set` originates. Lookup returns 0,
+                  same as the empty path, but the origin is genuinely unknown
+                  and none of the set members is us. iBGP does not prepend, so
+                  the receiving PE cannot tell this from an internal route by
+                  looking at the peer. GA == our AS must be REJECTED.
+  3. mixed      : AS_SEQUENCE [65010] then AS_SET {65002,65003} -- an aggregate
+                  relayed by 65010. Lookup skips the set and returns 65010, so
+                  it is NOT 0 and a hop-count guard never fires; but 65010 is
+                  the aggregator, a transit AS, not the origin. RFC 4271 gives
+                  this path no determinable origin at all. GA == 65010 must be
+                  REJECTED -- otherwise any AS that aggregates a route can
+                  claim a UMH for an origin it merely transits.
+  4. confed_set : one bare AS_CONFED_SET. Lookup returns 0 AND
+                  aspath_count_hops() returns 0, because hop counting treats an
+                  AS_SET as one hop but ignores confederation segments
+                  entirely. A hop-count test therefore reads this as an empty,
+                  locally-originated path. GA == our AS must be REJECTED.
 
-Both routes carry an identical UMH large community (GA == the PE's own AS) and
-an identical fallback Route Import extended community, so the ONLY thing that
-differs between them is the AS_PATH shape -- which is exactly the condition
-under test. Accepting #1 and rejecting #2 cannot both happen unless the
-resolver distinguishes empty from AS_SET.
+Every route carries an identical fallback Route Import extended community and
+the same UMH parameter, so the AS_PATH shape and the stamped GA are the only
+things that vary. Only shape 1 may resolve from the tuple; 2-4 must fall back
+to the EC. That combination cannot hold unless the resolver treats any
+set-bearing path as origin-ambiguous rather than trusting a single "last AS".
 
 The UMH parameter is the usual endian known-answer (184549374 == 10.255.255.254).
 
@@ -52,6 +64,8 @@ SAFI_MCAST_VPN = 5
 
 AS_SET = 1
 AS_SEQUENCE = 2
+AS_CONFED_SEQUENCE = 3
+AS_CONFED_SET = 4
 
 ECOMMUNITY_ENCODE_IP = 0x01
 ECOMMUNITY_VRF_ROUTE_IMPORT = 0x0B
@@ -68,10 +82,17 @@ RT_IMPORT = "10.9.9.9"
 
 # The ASes an aggregate would carry in its AS_SET. Deliberately not the PE's.
 AS_SET_MEMBERS = [65002, 65003]
+# The AS that performed the aggregation, and so appears as the sole
+# AS_SEQUENCE member to the left of the set in the `mixed` vector. It is a
+# transit AS, NOT the origin -- but it is what aspath_get_last_as() reports.
+AGGREGATOR_AS = 65010
 
+# "ga" is the Global Administrator to stamp: "local" means the PE's own AS.
 ROUTES = [
-    {"prefix": "10.40.10.0", "as_path": "empty"},
-    {"prefix": "10.40.20.0", "as_path": "as_set"},
+    {"prefix": "10.40.10.0", "as_path": "empty", "ga": "local"},
+    {"prefix": "10.40.20.0", "as_path": "as_set", "ga": "local"},
+    {"prefix": "10.40.30.0", "as_path": "mixed", "ga": AGGREGATOR_AS},
+    {"prefix": "10.40.40.0", "as_path": "confed_set", "ga": "local"},
 ]
 PREFIXLEN = 24
 
@@ -95,18 +116,39 @@ def build_keepalive():
     return MARKER + struct.pack("!HB", 19, BGP_KEEPALIVE)
 
 
+def _seg(seg_type, ases):
+    return struct.pack("!BB", seg_type, len(ases)) + b"".join(
+        struct.pack("!I", a) for a in ases
+    )
+
+
 def _as_path_attr(mode):
-    """empty -> a zero-length AS_PATH (no segments), the legal iBGP shape for a
-    route originated inside our own AS. as_set -> a single AS_SET segment, the
-    shape `aggregate-address ... as-set` produces; note there is no preceding
-    AS_SEQUENCE, which is what makes aspath_get_last_as() return 0 rather than
-    the last sequence member."""
+    """Four shapes, all of which defeat a naive origin lookup differently:
+
+    empty      : no segments. The legal iBGP shape for a route originated
+                 inside our own AS -- the only one where "origin == us".
+    as_set     : one bare AS_SET, what `aggregate-address ... as-set`
+                 originates. aspath_get_last_as() -> 0.
+    mixed      : AS_SEQUENCE [65010] then AS_SET {65002,65003} -- an aggregate
+                 relayed by 65010. aspath_get_last_as() skips the set and
+                 returns 65010, the AGGREGATOR, so an unguarded resolver
+                 believes a tuple stamped GA == 65010 even though 65010 did
+                 not originate the route and the true origin is unknowable.
+    confed_set : one bare AS_CONFED_SET. aspath_get_last_as() -> 0 AND
+                 aspath_count_hops() -> 0 (it counts AS_SET as one hop but
+                 ignores confed segments entirely), so a hop-count test reads
+                 this as an empty, locally-originated path.
+    """
     if mode == "empty":
         seg = b""
+    elif mode == "as_set":
+        seg = _seg(AS_SET, AS_SET_MEMBERS)
+    elif mode == "mixed":
+        seg = _seg(AS_SEQUENCE, [AGGREGATOR_AS]) + _seg(AS_SET, AS_SET_MEMBERS)
+    elif mode == "confed_set":
+        seg = _seg(AS_CONFED_SET, AS_SET_MEMBERS)
     else:
-        seg = struct.pack("!BB", AS_SET, len(AS_SET_MEMBERS)) + b"".join(
-            struct.pack("!I", a) for a in AS_SET_MEMBERS
-        )
+        raise ValueError("unknown as_path mode {}".format(mode))
     return struct.pack("!BBB", 0x40, 2, len(seg)) + seg
 
 
@@ -129,9 +171,12 @@ def build_update(route, next_hop, local_as):
     attrs += _as_path_attr(route["as_path"])
     attrs += struct.pack("!BBB", 0x40, 3, 4) + socket.inet_aton(next_hop)  # NEXT_HOP
     attrs += struct.pack("!BBBI", 0x40, 5, 4, 100)  # LOCAL_PREF (iBGP well-known)
-    # GA == the PE's own AS on BOTH routes: legitimate on the empty path,
-    # a forged claim on the aggregate.
-    attrs += _large_community_attr(local_as, FN, UMH_U32)
+    # Each route is stamped with the GA that an unguarded resolver would
+    # believe for its AS_PATH shape: the PE's own AS where the origin lookup
+    # yields 0, the aggregator where the lookup skips the set and yields
+    # 65010. Only the empty path makes that claim truthfully.
+    ga = local_as if route["ga"] == "local" else route["ga"]
+    attrs += _large_community_attr(ga, FN, UMH_U32)
     attrs += _rt_import_attr(RT_IMPORT)
 
     nlri = struct.pack("!B", PREFIXLEN) + socket.inet_aton(route["prefix"])[:3]
@@ -206,8 +251,8 @@ def main():
     for route in ROUTES:
         sock.sendall(build_update(route, args.local_id, args.local_as))
         print(
-            "advertised {}/{} as_path={}".format(
-                route["prefix"], PREFIXLEN, route["as_path"]
+            "advertised {}/{} as_path={} ga={}".format(
+                route["prefix"], PREFIXLEN, route["as_path"], route["ga"]
             ),
             flush=True,
         )
