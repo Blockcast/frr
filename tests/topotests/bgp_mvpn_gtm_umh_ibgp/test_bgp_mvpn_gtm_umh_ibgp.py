@@ -35,14 +35,26 @@ three different shapes in three different ways:
                             confederation segments; a hop-count discriminator
                             reads this as an empty path. GA == our AS ->
                             REJECTED.
+  zero_seq   10.40.50.0/24  AS_SEQUENCE [0]. NOT empty, but AS 0 is an
+                            encodable value rather than an absence sentinel,
+                            so the lookup returns 0 while
+                            aspath_check_as_sets() is false. Concluding
+                            "empty path" from "lookup == 0" substitutes the
+                            local AS. GA == our AS -> REJECTED.
+  zero_confed_seq
+             10.40.60.0/24  AS_CONFED_SEQUENCE [0]. Same collision via the
+                            other sequence type the lookup reads.
+                            GA == our AS -> REJECTED.
 
 Every route carries the same UMH parameter and an identical Route Import EC;
 only the AS_PATH shape and the stamped GA vary. Accepting `empty` while
-rejecting the other three cannot hold unless the resolver gates on
-aspath_check_as_sets() -- neither "is the lookup zero" nor "how many hops"
-separates all four. In particular, gating on `peer->sort == BGP_PEER_IBGP`
-(who *advertised* the route, not where it came from) fails as_set; a hop-count
-test fails confed_set; and trusting the bare lookup fails mixed.
+rejecting the other five cannot hold unless the resolver (a) treats any
+set-bearing or AS-0-bearing path as origin-ambiguous, and (b) keys the
+local-AS substitution on structural emptiness rather than on a zero lookup.
+Gating on `peer->sort == BGP_PEER_IBGP` (who *advertised* the route, not where
+it came from) fails as_set; a hop-count test fails confed_set; trusting the
+bare lookup fails mixed; and treating a zero lookup as emptiness fails both
+zero_* vectors.
 
 Reachability matters here, and it is narrower than it first looks. iBGP does
 not prepend, so an aggregate originated or relayed inside the AS reaches a PE
@@ -100,6 +112,8 @@ JOINS = {
     "as_set": ("10.40.20.10", "232.4.4.2"),
     "mixed": ("10.40.30.10", "232.4.4.3"),
     "confed_set": ("10.40.40.10", "232.4.4.4"),
+    "zero_seq": ("10.40.50.10", "232.4.4.5"),
+    "zero_confed_seq": ("10.40.60.10", "232.4.4.6"),
 }
 
 # Every crafted route must reach the unicast RIB or the trust assertions pass
@@ -109,6 +123,8 @@ PREFIXES = {
     "as_set": "10.40.20.0/24",
     "mixed": "10.40.30.0/24",
     "confed_set": "10.40.40.0/24",
+    "zero_seq": "10.40.50.0/24",
+    "zero_confed_seq": "10.40.60.0/24",
 }
 
 PID_FILE = None
@@ -328,6 +344,42 @@ def test_bare_confed_set_rejects_local_ga():
         pytest.skip(tgen.errors)
 
     src, grp = JOINS["confed_set"]
+    _join(src, grp)
+    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_zero_as_sequence_rejects_local_ga():
+    """AS_SEQUENCE [0] is NOT an empty path, but its stored value is 0, so
+    aspath_get_last_as() returns 0 while aspath_check_as_sets() returns false.
+
+    Mutation-sensitive: infer "the path is empty" from "the origin lookup
+    returned 0" and the local AS is substituted, making the GA == our-AS tuple
+    match and resolve to RT:10.255.255.254:0. AS 0 is an encodable value, not
+    just an absence sentinel, so the substitution must key on structural
+    emptiness (aspath->segments == NULL) and a non-empty AS-0 path must be
+    rejected as origin-ambiguous."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS["zero_seq"]
+    _join(src, grp)
+    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_zero_as_confed_sequence_rejects_local_ga():
+    """AS_CONFED_SEQUENCE [0] reaches the same sentinel collision through the
+    other sequence type aspath_get_last_as() reads.
+
+    Reachable because bgp_attr_aspath_check() rejects AS 0 only for eBGP peers
+    (bgpd/bgp_attr.c), so the shape survives parse on a plain iBGP session."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS["zero_confed_seq"]
     _join(src, grp)
     _expect_type7(src, grp, LOCAL_AS, EC_RT)
 

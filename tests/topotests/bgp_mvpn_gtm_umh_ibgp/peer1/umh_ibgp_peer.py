@@ -32,12 +32,23 @@ the last AS_SEQUENCE segment and skips set segments outright:
                   AS_SET as one hop but ignores confederation segments
                   entirely. A hop-count test therefore reads this as an empty,
                   locally-originated path. GA == our AS must be REJECTED.
+  5. zero_seq   : AS_SEQUENCE [0]. NOT empty -- but AS 0 is an encodable value,
+                  not just an absence sentinel, so the lookup returns 0 while
+                  aspath_check_as_sets() says false. Any check that concludes
+                  "empty path" from "lookup == 0" substitutes the local AS and
+                  honours the forged tuple. GA == our AS must be REJECTED.
+  6. zero_confed_seq : AS_CONFED_SEQUENCE [0]. The same collision reached via
+                  the other sequence type aspath_get_last_as() reads.
+                  bgp_attr_aspath_check() rejects AS 0 only for eBGP peers, so
+                  both zero shapes survive parse on a plain iBGP session.
+                  GA == our AS must be REJECTED.
 
 Every route carries an identical fallback Route Import extended community and
 the same UMH parameter, so the AS_PATH shape and the stamped GA are the only
-things that vary. Only shape 1 may resolve from the tuple; 2-4 must fall back
+things that vary. Only shape 1 may resolve from the tuple; 2-6 must fall back
 to the EC. That combination cannot hold unless the resolver treats any
-set-bearing path as origin-ambiguous rather than trusting a single "last AS".
+set-bearing or AS-0-bearing path as origin-ambiguous AND keys the local-AS
+substitution on structural emptiness rather than on a zero lookup.
 
 The UMH parameter is the usual endian known-answer (184549374 == 10.255.255.254).
 
@@ -93,6 +104,8 @@ ROUTES = [
     {"prefix": "10.40.20.0", "as_path": "as_set", "ga": "local"},
     {"prefix": "10.40.30.0", "as_path": "mixed", "ga": AGGREGATOR_AS},
     {"prefix": "10.40.40.0", "as_path": "confed_set", "ga": "local"},
+    {"prefix": "10.40.50.0", "as_path": "zero_seq", "ga": "local"},
+    {"prefix": "10.40.60.0", "as_path": "zero_confed_seq", "ga": "local"},
 ]
 PREFIXLEN = 24
 
@@ -138,6 +151,13 @@ def _as_path_attr(mode):
                  aspath_count_hops() -> 0 (it counts AS_SET as one hop but
                  ignores confed segments entirely), so a hop-count test reads
                  this as an empty, locally-originated path.
+    zero_seq   : AS_SEQUENCE [0] -- NOT empty, but its stored value IS 0, so
+                 aspath_get_last_as() returns 0 while aspath_check_as_sets()
+                 says false. Any check that infers "the path is empty" from
+                 "the origin lookup returned 0" is fooled. AS 0 is an
+                 encodable value, not merely an absence sentinel.
+    zero_confed_seq : AS_CONFED_SEQUENCE [0] -- same collision via the other
+                 sequence type that aspath_get_last_as() reads.
     """
     if mode == "empty":
         seg = b""
@@ -147,6 +167,10 @@ def _as_path_attr(mode):
         seg = _seg(AS_SEQUENCE, [AGGREGATOR_AS]) + _seg(AS_SET, AS_SET_MEMBERS)
     elif mode == "confed_set":
         seg = _seg(AS_CONFED_SET, AS_SET_MEMBERS)
+    elif mode == "zero_seq":
+        seg = _seg(AS_SEQUENCE, [0])
+    elif mode == "zero_confed_seq":
+        seg = _seg(AS_CONFED_SEQUENCE, [0])
     else:
         raise ValueError("unknown as_path mode {}".format(mode))
     return struct.pack("!BBB", 0x40, 2, len(seg)) + seg
