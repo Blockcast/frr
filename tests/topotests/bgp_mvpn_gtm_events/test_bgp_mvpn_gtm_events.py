@@ -238,6 +238,9 @@ router bgp {}
 
     running = tgen.gears["r1"].vtysh_cmd("show running-config")
     assert " bgp mvpn event-socket {}".format(EVENT_SOCK) in running
+    assert running.index(" bgp mvpn event-socket {}".format(EVENT_SOCK)) < running.index(
+        " address-family ipv4 mvpn"
+    ), running
 
     # Liveness surface: "configured" (running-config) is not the same as
     # "listening" -- a bind/listen failure would leave the config advertising
@@ -245,6 +248,16 @@ router bgp {}
     status = json.loads(tgen.gears["r1"].vtysh_cmd("show bgp mvpn events json"))
     assert status.get("listening") is True, status
     assert status.get("path") == EVENT_SOCK, status
+
+    # A syntactically valid control record with a non-string type must not
+    # dereference NULL in bgpd. Keep the connection local and verify the
+    # daemon still answers immediately afterward.
+    malformed = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    malformed.connect(EVENT_SOCK)
+    malformed.sendall(b'{"type":null}\n')
+    malformed.close()
+    status = json.loads(tgen.gears["r1"].vtysh_cmd("show bgp mvpn events json"))
+    assert status.get("listening") is True, status
 
 
 def test_install_event():
@@ -462,6 +475,9 @@ router bgp {}
     interrupted = interrupted_reader.read_event()
     interrupted_reader.close()
 
+    # A subscribed observer that does not own the replay must not receive a
+    # duplicate install when the interrupted snapshot is retried.
+    observer = EventReader(EVENT_SOCK_2)
     restarted_reader = EventReader(EVENT_SOCK_2)
     ev = restarted_reader.read_event()
     assert ev["event_type"] == "install"
@@ -472,8 +488,12 @@ router bgp {}
     assert ev["boot_epoch"] > boot_epoch
     assert interrupted["seq"] == 1
     assert ev["seq"] == interrupted["seq"] + 1
-    assert ev["route_version"] == "{}.2".format(ev["boot_epoch"])
+    assert ev["route_version"] == "{}.1".format(ev["boot_epoch"])
+    observer.sock.settimeout(0.5)
+    with pytest.raises(socket.timeout):
+        observer.sock.recv(4096)
     restarted_reader.acknowledge_snapshot(ev)
+    observer.close()
     restarted_reader.close()
 
 

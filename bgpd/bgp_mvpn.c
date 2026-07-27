@@ -1717,10 +1717,6 @@ void bgp_mvpn_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t s
 	if (afi == AFI_IP && bgp->mvpn_ipmsi_label)
 		vty_out(vty, "  bgp mvpn ipmsi-label %u\n", bgp->mvpn_ipmsi_label);
 
-	/* Instance-wide, like the ipmsi-label knob: write it once under ipv4. */
-	if (afi == AFI_IP)
-		bgp_mvpn_events_config_write(vty, bgp);
-
 	if (!table)
 		return;
 

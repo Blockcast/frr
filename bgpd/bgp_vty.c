@@ -22778,6 +22778,10 @@ int bgp_config_write(struct vty *vty)
 			vty_out(vty, " sid vpn per-vrf export %u\n", tovpn_sid_index);
 		}
 
+		/* Instance-wide MVPN settlement socket command. The parser is in
+		 * BGP_NODE, so serialize it before entering any address-family. */
+		bgp_mvpn_events_config_write(vty, bgp);
+
 		/* IPv4 unicast configuration.  */
 		bgp_config_write_family(vty, bgp, AFI_IP, SAFI_UNICAST);
 

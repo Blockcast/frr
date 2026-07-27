@@ -105,6 +105,7 @@ struct bgp_mvpn_event_sink {
 	uint64_t seq;
 	struct bgp_mvpn_event_join *joins;
 	bool snapshot_pending;
+	bool snapshot_replay_active;
 	struct bgp_mvpn_event_client *snapshot_client;
 };
 
@@ -182,15 +183,14 @@ static void bgp_mvpn_event_client_read(struct event *event)
 		*newline = '\0';
 		jo = json_tokener_parse(client->read_buf);
 		if (jo && json_object_object_get_ex(jo, "type", &type) &&
+		    json_object_is_type(type, json_type_string) &&
 		    strcmp(json_object_get_string(type), "subscribe") == 0) {
 			client->subscribed = true;
 			if (sink->snapshot_pending && !sink->snapshot_client) {
-				struct bgp_mvpn_event_join *join;
-
 				sink->snapshot_client = client;
-				for (join = sink->joins; join; join = join->next)
-					join->installed = false;
+				sink->snapshot_replay_active = true;
 				bgp_mvpn_reemit_local_joins(sink->bgp);
+				sink->snapshot_replay_active = false;
 				client->snapshot_seq = sink->seq;
 				/* An empty snapshot has no state whose loss could blind the
 				 * consumer. Future installs are ordinary live events. */
@@ -200,6 +200,7 @@ static void bgp_mvpn_event_client_read(struct event *event)
 				}
 			}
 		} else if (jo && json_object_object_get_ex(jo, "type", &type) &&
+			   json_object_is_type(type, json_type_string) &&
 			   strcmp(json_object_get_string(type), "snapshot_ack") == 0 &&
 			   json_object_object_get_ex(jo, "boot_epoch", &epoch) &&
 			   json_object_object_get_ex(jo, "seq", &seq) &&
@@ -640,7 +641,9 @@ static void bgp_mvpn_event_route_version(char *buf, size_t buflen, uint64_t boot
 	snprintf(buf, buflen, "%" PRIu64 ".%u", boot_epoch, generation);
 }
 
-static void bgp_mvpn_event_broadcast(struct bgp_mvpn_event_sink *sink, struct json_object *jo)
+static void bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
+				   struct bgp_mvpn_event_client *target,
+				   struct json_object *jo)
 {
 	const char *text;
 	char *line;
@@ -658,7 +661,7 @@ static void bgp_mvpn_event_broadcast(struct bgp_mvpn_event_sink *sink, struct js
 		buffer_status_t status;
 
 		next = client->next;
-		if (!client->subscribed)
+		if (!client->subscribed || (target && client != target))
 			continue;
 
 		if (client->pending_bytes + linelen > BGP_MVPN_EVENT_SINK_MAX_BACKLOG) {
@@ -686,6 +689,12 @@ static void bgp_mvpn_event_broadcast(struct bgp_mvpn_event_sink *sink, struct js
 
 	XFREE(MTYPE_MVPN_EVENT_LINE, line);
 	json_object_free(jo);
+}
+
+static void bgp_mvpn_event_broadcast(struct bgp_mvpn_event_sink *sink,
+				     struct json_object *jo)
+{
+	bgp_mvpn_event_deliver(sink, NULL, jo);
 }
 
 static struct json_object *bgp_mvpn_event_new(struct bgp_mvpn_event_sink *sink,
@@ -751,19 +760,26 @@ void bgp_mvpn_event_join_resolved(struct bgp *bgp, const struct ipaddr *src,
 	changed = !is_new &&
 		  (join->last_source_as != source_as || join->last_umh.s_addr != umh.s_addr);
 
-	if (!is_new && !changed)
+	if (!is_new && !changed && !sink->snapshot_replay_active)
 		return; /* redundant re-resolve: same origin as last emitted */
 
 	if (!is_new)
 		bgp_mvpn_event_route_version(prior_route_version, sizeof(prior_route_version),
 					     sink->boot_epoch, join->generation);
 
-	next_generation = join->generation + 1;
+	/* A snapshot describes current state to one subscriber; it is not a
+	 * producer lifecycle transition and must not mint a new route_version. */
+	next_generation = sink->snapshot_replay_active && !is_new && !changed
+				  ? join->generation
+				  : join->generation + 1;
 	bgp_mvpn_event_route_version(route_version, sizeof(route_version), sink->boot_epoch,
 				     next_generation);
 	bgp_mvpn_event_lc_umh_origin(lc_umh_origin, sizeof(lc_umh_origin), source_as, umh);
 
-	jo = bgp_mvpn_event_new(sink, is_new ? "install" : "origin_change", src, grp, source_as,
+	jo = bgp_mvpn_event_new(sink,
+				sink->snapshot_replay_active || is_new ? "install"
+								       : "origin_change",
+				src, grp, source_as,
 				route_version);
 	if (jo && lc_umh_origin[0])
 		json_object_string_add(jo, "lc_umh_origin", lc_umh_origin);
@@ -781,8 +797,12 @@ void bgp_mvpn_event_join_resolved(struct bgp *bgp, const struct ipaddr *src,
 	join->last_source_as = source_as;
 	join->last_umh = umh;
 
-	if (jo)
-		bgp_mvpn_event_broadcast(sink, jo);
+	if (jo) {
+		if (sink->snapshot_replay_active)
+			bgp_mvpn_event_deliver(sink, sink->snapshot_client, jo);
+		else
+			bgp_mvpn_event_broadcast(sink, jo);
+	}
 }
 
 void bgp_mvpn_event_withdrawn(struct bgp *bgp, const struct ipaddr *src,
