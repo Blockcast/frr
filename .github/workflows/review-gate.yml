@@ -1,0 +1,66 @@
+name: review-gate
+
+# Makes a missing Ally review VISIBLE. Ally's review is event-driven and can
+# silently never happen for a given push; without this gate the PR then shows
+# all-green CI and a missing review is indistinguishable from a clean one.
+# This posts a `review/ally-complete` commit status on the exact head, so an
+# unreviewed head reads `pending` instead of nothing at all.
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - review_requested
+      - review_request_removed
+      - labeled
+      - unlabeled
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: review-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ally-complete:
+    # The job's check-run is named after `name:`. It MUST NOT equal the
+    # STATUS_CONTEXT the script posts (review/ally-complete): a check-run
+    # sharing the required status context collides with the commit-status
+    # gate. This job exits 0 unless the script hits an API error, so an
+    # identically-named check-run would always be green and could mask a
+    # `pending`/`failure` gate status on the same required context -- letting
+    # an un-reviewed PR look (or merge) green. Keep this an informational
+    # name distinct from the context; the commit-status is the sole gate.
+    name: Ally review gate
+    if: github.event.pull_request.draft == false
+    runs-on: default
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # The gate is a merge control, so run the checker from the protected
+          # branch rather than from the PR under review. pull_request_target
+          # carries write-scoped credentials; never execute PR-authored code.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Self-test the gate logic
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+
+      - name: Require Ally review on current head
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ALLY_REVIEWER_LOGINS: allyblockcast[bot],app/allyblockcast,allyblockcast
+          STATUS_TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 .github/scripts/require-ally-review.py
