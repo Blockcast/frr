@@ -113,14 +113,43 @@ def has_blocking_count(body):
     return (critical is not None and critical > 0) or (important is not None and important > 0)
 
 
-def contains_head_sha(body, head_sha):
-    """Require the FULL 40-character OID.
+# The immutable head attestation Ally writes into every consolidated body:
+# a standalone "Reviewed head: <40 lowercase hex>" line. This is what binds a
+# signal to a revision -- NOT review.commit_id, and NOT a substring scan.
+REVIEWED_HEAD_PATTERN = re.compile(
+    r"^[ \t]*Reviewed head:[ \t]*([0-9a-f]{40})[ \t]*$", re.IGNORECASE | re.MULTILINE
+)
 
-    A 7-character prefix is 28 bits of entropy and therefore grindable: an
-    attacker who can get any commit into the repo could aim a stale clean Ally
-    comment at a later head via a prefix collision. Ally's own consolidated
-    comments carry the full OID ("Reviewed head: <40 hex>"), so demanding the
-    whole thing costs nothing against real traffic.
+
+def parse_reviewed_head(body):
+    """Return the single attested head OID, or None.
+
+    Requires EXACTLY ONE standalone attestation line. Zero means the body makes
+    no claim about which revision it covers; more than one is ambiguous. Both
+    fail closed -- the caller treats them as "not a signal for this head",
+    which leaves the gate pending rather than clearing it.
+    """
+    matches = REVIEWED_HEAD_PATTERN.findall(body or "")
+    if len(matches) != 1:
+        return None
+    return matches[0].lower()
+
+
+def attests_head(body, head_sha):
+    """Exact equality against the parsed attestation.
+
+    Deliberately not a substring test: a body that reviewed revision X but
+    happens to mention revision Y in prose ("superseded by Y") must not count
+    as a signal for Y.
+    """
+    attested = parse_reviewed_head(body)
+    return attested is not None and attested == head_sha.lower()
+
+
+def contains_head_sha(body, head_sha):
+    """Kept only for the issue-link comment shape, which carries no
+    attestation line. Requires the FULL 40-character OID -- a 7-character
+    prefix is 28 bits and grindable.
     """
     return head_sha in body
 
@@ -129,11 +158,17 @@ def is_consolidated_ally_comment_for_head(body, head_sha):
     return (
         body.startswith("## Ally")
         and "Consolidated PR Review" in body
-        and contains_head_sha(body, head_sha)
+        and attests_head(body, head_sha)
     )
 
 
 def is_issue_link_ally_comment_for_head(body, head_sha):
+    """An informational "Links Paperclip issues:" comment.
+
+    Recognised so it is not mistaken for an unrelated comment, but it carries
+    NO review verdict -- see comment_signals_for_head, where it is deliberately
+    not a success signal.
+    """
     return (
         body.startswith("Links Paperclip issues:")
         and re.search(r"\bBLO-\d+\b", body) is not None
@@ -169,12 +204,20 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
         login = (review.get("user") or {}).get("login")
         if not isinstance(login, str) or login not in ally:
             continue
-        if review.get("commit_id") != head_sha or review.get("state") == "DISMISSED":
+        if review.get("state") == "DISMISSED":
+            continue
+
+        body = str(review.get("body") or "")
+        # Bind to the body attestation, NOT review.commit_id. commit_id is
+        # GitHub-managed state about the review, so it is not something Ally
+        # itself asserted; the attestation line is immutable text Ally wrote
+        # naming the revision it actually examined. Requiring it also fails
+        # closed on a body that makes no claim at all.
+        if not attests_head(body, head_sha):
             continue
 
         at = str(review.get("submitted_at") or "")
         state = review.get("state")
-        body = str(review.get("body") or "")
 
         # Self-review cannot approve its own PR, but its machine-readable
         # blocking findings must still fail closed and stay un-overridable.
@@ -306,17 +349,14 @@ def distinct_reviewer_signals_for_head(
             and login != pr_author_login
             and (login not in ally or user.get("type") == "User")
         )
-        # The permission lookup is AUTHORITATIVE when it completed. Falling
-        # back to author_association unconditionally (an OR) meant a
-        # collaborator holding only `read` or `triage` -- whose lookup
-        # succeeded and said "not trusted" -- was still trusted via the
-        # COLLABORATOR association, letting a read-only account clear an
-        # Ally-authored PR. association is only consulted when the lookup
-        # itself failed and we have nothing better.
-        if isinstance(login, str) and login in permission_resolved_logins:
-            is_trusted = login in permission_trusted_logins
-        else:
-            is_trusted = association in TRUSTED_REVIEWER_ASSOCIATIONS
+        # The permission lookup is AUTHORITATIVE, and an unresolved lookup is
+        # UNTRUSTED. Falling back to author_association on error failed open:
+        # COLLABORATOR can mean read or triage, so a transient API, auth or
+        # rate-limit failure would let an account without write access clear an
+        # Ally-authored PR. Success is reserved for an authoritative
+        # write/maintain/admin result; anything else leaves the gate pending,
+        # which is the safe direction for a merge control.
+        is_trusted = isinstance(login, str) and login in permission_trusted_logins
         if not (
             is_distinct
             and is_trusted
@@ -362,10 +402,10 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
         body = str(comment.get("body") or "")
         if not isinstance(login, str) or login not in ally:
             continue
-        if not (
-            is_consolidated_ally_comment_for_head(body, head_sha)
-            or is_issue_link_ally_comment_for_head(body, head_sha)
-        ):
+
+        is_consolidated = is_consolidated_ally_comment_for_head(body, head_sha)
+        is_issue_link = is_issue_link_ally_comment_for_head(body, head_sha)
+        if not (is_consolidated or is_issue_link):
             continue
 
         at = str(comment.get("created_at") or "")
@@ -382,6 +422,14 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
                     "status": "failure",
                 }
             )
+            continue
+
+        # An issue-link comment is informational -- it announces which
+        # Paperclip issues a PR touches and carries NO review verdict. Treating
+        # it as success let a bookkeeping comment clear the gate with no review
+        # having happened. It is recognised (so a blocking count in one still
+        # fails closed above) but contributes no positive signal.
+        if is_issue_link and not is_consolidated:
             continue
 
         if is_self_review:
@@ -407,9 +455,16 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
             )
             continue
 
-        # Otherwise non-blocking: an explicit "Merge" verdict, an issue-link
-        # comment, or explicit zero counts. Absence of a count heading is not
-        # treated as guilt.
+        # Positive only on an affirmative verdict: an explicit pass, or
+        # validated zero blocking counts. Silence is not consent -- a
+        # consolidated body with neither is ambiguous and stays pending.
+        has_zero_counts = (
+            extract_issue_count(body, "Critical Issues") == 0
+            and extract_issue_count(body, "Important Issues") == 0
+        )
+        if verdict != "pass" and not has_zero_counts:
+            continue
+
         signals.append(
             {
                 "at": at,

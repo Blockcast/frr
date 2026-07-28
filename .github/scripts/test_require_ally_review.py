@@ -28,8 +28,19 @@ HUMAN = "kkroo"
 OVERRIDE = "review-gate-override"
 
 
-def review(state, commit=HEAD, body="", login="allyblockcast[bot]", at="2026-07-27T10:00:00Z",
+def attest(head=HEAD, extra=""):
+    """A consolidated Ally body carrying the standalone head attestation.
+
+    Binding is on this line, not review.commit_id, so fixtures must state the
+    revision the body claims to cover.
+    """
+    return "## Ally \u2014 Consolidated PR Review\n\nReviewed head: %s\n\n%s" % (head, extra)
+
+
+def review(state, commit=HEAD, body=None, login="allyblockcast[bot]", at="2026-07-27T10:00:00Z",
            assoc="NONE", utype="Bot"):
+    if body is None:
+        body = attest(commit)
     return {
         "state": state,
         "commit_id": commit,
@@ -59,7 +70,11 @@ def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=
     )
 
 
-CONSOLIDATED = "## Ally — Consolidated PR Review\n\nReviewed head: %s\n\n" % HEAD
+CONSOLIDATED = attest(HEAD)
+# An affirmative clean body: validated zero counts. Silence is no longer
+# consent, so a consolidated body with neither a pass verdict nor explicit
+# zero counts is ambiguous and stays pending.
+CLEAN = attest(HEAD, "### Critical Issues (0)\n\n### Important Issues (0)\n")
 
 
 class TestNoSignal(unittest.TestCase):
@@ -73,7 +88,7 @@ class TestNoSignal(unittest.TestCase):
 
     def test_review_on_a_previous_head_does_not_count(self):
         # The PR #30 shape exactly: five reviews existed, none on this head.
-        state, desc = decide(reviews=[review("COMMENTED", commit=OTHER, body=CONSOLIDATED)])
+        state, desc = decide(reviews=[review("COMMENTED", commit=OTHER, body=attest(OTHER))])
         self.assertEqual(state, "pending")
         self.assertIn("Waiting for Ally review", desc)
 
@@ -184,6 +199,7 @@ class TestSelfReview(unittest.TestCase):
                 ),
             ],
             author="app/allyblockcast",
+            trusted={HUMAN},
         )
         self.assertEqual(state, "success")
         self.assertIn("distinct reviewer", desc)
@@ -234,9 +250,15 @@ class TestSelfReview(unittest.TestCase):
 class TestCommentSignals(unittest.TestCase):
     """Consolidated / issue-link comments count as signals for the head."""
 
-    def test_consolidated_comment_for_head_is_clean(self):
-        state, _ = decide(comments=[comment(CONSOLIDATED)])
+    def test_consolidated_comment_with_zero_counts_is_clean(self):
+        state, _ = decide(comments=[comment(CLEAN)])
         self.assertEqual(state, "success")
+
+    def test_consolidated_comment_without_a_verdict_stays_pending(self):
+        """Silence is not consent: no pass verdict and no zero counts is
+        ambiguous, so it must not clear the gate."""
+        state, _ = decide(comments=[comment(CONSOLIDATED)])
+        self.assertEqual(state, "pending")
 
     def test_consolidated_comment_for_other_head_is_ignored(self):
         body = "## Ally — Consolidated PR Review\n\nReviewed head: %s\n" % OTHER
@@ -244,10 +266,19 @@ class TestCommentSignals(unittest.TestCase):
         self.assertEqual(state, "pending")
         self.assertIn("Waiting for Ally review", desc)
 
-    def test_issue_link_comment_counts(self):
+    def test_issue_link_comment_does_not_clear_the_gate(self):
+        """Informational bookkeeping, not a review verdict. Treating it as
+        success let a link comment clear the gate with no review at all."""
         body = "Links Paperclip issues: BLO-18353 for head %s\n" % HEAD
+        state, desc = decide(comments=[comment(body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+
+    def test_issue_link_comment_with_blocking_count_still_fails(self):
+        body = ("Links Paperclip issues: BLO-1 for head %s\n"
+                "### Important Issues (1)\n" % HEAD)
         state, _ = decide(comments=[comment(body)])
-        self.assertEqual(state, "success")
+        self.assertEqual(state, "failure")
 
     def test_unrelated_comment_is_not_a_signal(self):
         state, _ = decide(comments=[comment("looks good to me, head %s" % HEAD)])
@@ -265,7 +296,7 @@ class TestFullShaAttestation(unittest.TestCase):
         self.assertIn("Waiting for Ally review", desc)
 
     def test_full_sha_comment_counts(self):
-        state, _ = decide(comments=[comment(CONSOLIDATED)])
+        state, _ = decide(comments=[comment(CLEAN)])
         self.assertEqual(state, "success")
 
 
@@ -287,8 +318,11 @@ class TestPermissionLookupIsAuthoritative(unittest.TestCase):
         )
         self.assertEqual(state, "pending")
 
-    def test_association_still_used_when_lookup_failed(self):
-        # Login absent from `resolved` => the lookup itself errored.
+    def test_unresolved_lookup_fails_closed(self):
+        """A lookup that errored is UNTRUSTED, not an invitation to fall back
+        to author_association: COLLABORATOR can mean read or triage, so a
+        transient API failure would otherwise let a read-only account clear an
+        Ally-authored PR."""
         state, _ = decide(
             reviews=[
                 review("APPROVED", login=HUMAN, utype="User", assoc="MEMBER",
@@ -298,7 +332,7 @@ class TestPermissionLookupIsAuthoritative(unittest.TestCase):
             trusted=set(),
             resolved=set(),
         )
-        self.assertEqual(state, "success")
+        self.assertEqual(state, "pending")
 
 
 class TestConflictingReviewers(unittest.TestCase):
@@ -314,6 +348,7 @@ class TestConflictingReviewers(unittest.TestCase):
                        assoc="MEMBER", at="2026-07-27T12:00:00Z"),
             ],
             author="app/allyblockcast",
+            trusted={"reviewer-a", "reviewer-b"},
         )
         self.assertEqual(state, "failure")
 
@@ -326,6 +361,7 @@ class TestConflictingReviewers(unittest.TestCase):
                        assoc="MEMBER", at="2026-07-27T12:00:00Z"),
             ],
             author="app/allyblockcast",
+            trusted={"reviewer-a"},
         )
         self.assertEqual(state, "success")
 
