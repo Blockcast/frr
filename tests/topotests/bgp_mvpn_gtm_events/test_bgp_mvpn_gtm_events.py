@@ -283,6 +283,11 @@ def test_install_event():
     global reader
     reader = EventReader(EVENT_SOCK)
 
+    snapshot, snapshot_end = reader.read_snapshot()
+    assert snapshot == []
+    assert snapshot_end["seq"] == 0
+    reader.acknowledge_snapshot(snapshot_end)
+
     _join()
 
     ev = reader.read_event()
@@ -301,7 +306,8 @@ def test_install_event():
 
     global boot_epoch
     boot_epoch = ev["boot_epoch"]
-    assert ev["seq"] == 1
+    assert boot_epoch == snapshot_end["boot_epoch"]
+    assert ev["seq"] == snapshot_end["seq"] + 1
     assert ev["route_version"] == "{}.1".format(boot_epoch)
 
     # Event delivery is sequenced after the route mutation: once the event is
@@ -481,12 +487,13 @@ router bgp {}
     probe.connect(EVENT_SOCK_2)
     probe.close()
 
-    # Nor can a real subscriber that disconnects before acknowledging it.
+    # A subscriber may remain connected without acknowledging its baseline.
+    # That must not hold the listener-global handoff lock indefinitely.
     interrupted_reader = EventReader(EVENT_SOCK_2)
     interrupted_events, interrupted_end = interrupted_reader.read_snapshot()
 
-    # Retain two subscribers before interrupting the owner. Both must stay out
-    # of the live stream until each has received its own private snapshot.
+    # Later subscribers still receive independent snapshots while the first
+    # client's ACK is pending.
     observer = EventReader(EVENT_SOCK_2)
     replacement = EventReader(EVENT_SOCK_2)
     _, synced = topotest.run_and_expect(
@@ -498,21 +505,6 @@ router bgp {}
         wait=0.1,
     )
     assert synced == 3
-
-    # Live transitions after snapshot_end remain ordered for the owner, but
-    # cannot leak to prospective handoff clients before their baseline.
-    _leave()
-    owner_withdraw = interrupted_reader.read_event()
-    assert owner_withdraw["event_type"] == "withdraw"
-    _join()
-    owner_install = interrupted_reader.read_event()
-    assert owner_install["event_type"] == "install"
-    for pending in (observer, replacement):
-        pending.sock.settimeout(0.5)
-        with pytest.raises(socket.timeout):
-            pending.sock.recv(4096)
-
-    interrupted_reader.close()
 
     replacement_events, replacement_end = replacement.read_snapshot()
     assert len(interrupted_events) == 1
@@ -527,8 +519,6 @@ router bgp {}
     assert ev["boot_epoch"] > boot_epoch
     assert interrupted["seq"] == 0
     assert interrupted_end["seq"] == interrupted["seq"]
-    assert ev["seq"] == owner_install["seq"]
-    assert ev["route_version"] == owner_install["route_version"]
     assert replacement_end["seq"] == ev["seq"]
     replacement.acknowledge_snapshot(replacement_end)
 
@@ -542,14 +532,17 @@ router bgp {}
     assert observer_end["seq"] == replacement_end["seq"]
     observer.acknowledge_snapshot(observer_end)
 
-    # Once both baselines are acknowledged, a real transition is contiguous
-    # and byte-identical for both retained subscribers.
+    # A real transition follows snapshot_end in socket order for all clients,
+    # including the first client whose ACK is intentionally still pending.
     _leave()
+    interrupted_live = interrupted_reader.read_event()
     replacement_live = replacement.read_event()
     observer_live = observer.read_event()
     assert replacement_live["event_type"] == "withdraw"
+    assert interrupted_live == replacement_live
     assert observer_live == replacement_live
     assert replacement_live["seq"] == replacement_end["seq"] + 1
+    interrupted_reader.close()
     observer.close()
     replacement.close()
 

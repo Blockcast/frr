@@ -82,6 +82,7 @@ struct bgp_mvpn_event_client {
 	char read_buf[256];
 	size_t read_len;
 	bool subscribed;
+	bool snapshot_offered;
 	bool snapshot_ready;
 	uint64_t snapshot_seq;
 };
@@ -162,10 +163,11 @@ static bool bgp_mvpn_event_snapshot_offer(struct bgp_mvpn_event_sink *sink,
 	struct json_object *end;
 
 	if (!sink->snapshot_pending || sink->snapshot_client ||
-	    !client->subscribed || client->snapshot_ready)
+	    !client->subscribed || client->snapshot_offered)
 		return true;
 
 	sink->snapshot_client = client;
+	client->snapshot_offered = true;
 	client->snapshot_seq = sink->seq;
 	sink->snapshot_replay_active = true;
 	sink->snapshot_delivery_failed = false;
@@ -195,7 +197,17 @@ static bool bgp_mvpn_event_snapshot_offer(struct bgp_mvpn_event_sink *sink,
 	json_object_int_add(end, "boot_epoch", (int64_t)sink->boot_epoch);
 	json_object_int_add(end, "seq", (int64_t)client->snapshot_seq);
 	json_object_int_add(end, "snapshot_count", (int64_t)sink->snapshot_index);
-	return bgp_mvpn_event_deliver(sink, client, end);
+	if (!bgp_mvpn_event_deliver(sink, client, end))
+		return false;
+
+	/* Waiting for one client's durable ACK must not stall snapshot handoff to
+	 * every later subscriber. The client's socket remains ordered: live events
+	 * follow snapshot_end while the next private replay is offered separately. */
+	if (sink->snapshot_client == client) {
+		sink->snapshot_client = NULL;
+		bgp_mvpn_event_snapshot_schedule(sink);
+	}
+	return true;
 }
 
 static void bgp_mvpn_event_snapshot_offer_next(struct bgp_mvpn_event_sink *sink)
@@ -206,7 +218,7 @@ static void bgp_mvpn_event_snapshot_offer_next(struct bgp_mvpn_event_sink *sink)
 	    sink->snapshot_replay_active)
 		return;
 	for (client = sink->clients; client; client = client->next)
-		if (client->subscribed && !client->snapshot_ready) {
+		if (client->subscribed && !client->snapshot_offered) {
 			(void)bgp_mvpn_event_snapshot_offer(sink, client);
 			return;
 		}
@@ -276,12 +288,10 @@ static void bgp_mvpn_event_client_read(struct event *event)
 			   strcmp(json_object_get_string(type), "snapshot_ack") == 0 &&
 			   json_object_object_get_ex(jo, "boot_epoch", &epoch) &&
 			   json_object_object_get_ex(jo, "seq", &seq) &&
-			   sink->snapshot_client == client &&
+			   client->snapshot_offered &&
 			   (uint64_t)json_object_get_int64(epoch) == sink->boot_epoch &&
 			   (uint64_t)json_object_get_int64(seq) == client->snapshot_seq) {
 			client->snapshot_ready = true;
-			sink->snapshot_client = NULL;
-			bgp_mvpn_event_snapshot_schedule(sink);
 		}
 		/* Private delivery can synchronously close and free its owner. Do not
 		 * touch the read buffer or rearm an event against that stale pointer. */
@@ -759,12 +769,9 @@ static bool bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
 		next = client->next;
 		if (!client->subscribed || (target && client != target))
 			continue;
-		/* A queued subscriber must receive its private snapshot baseline before
-		 * joining the live stream. The current owner may receive live records:
-		 * socket ordering places them after snapshot_end, and a failed owner is
-		 * replaced with a fresh snapshot at the then-current cursor. */
-		if (!target && !client->snapshot_ready &&
-		    client != sink->snapshot_client)
+		/* Once snapshot_end is queued, socket ordering keeps subsequent live
+		 * records behind that baseline even while its durable ACK is pending. */
+		if (!target && !client->snapshot_ready && !client->snapshot_offered)
 			continue;
 
 		if (client->pending_bytes + linelen > BGP_MVPN_EVENT_SINK_MAX_BACKLOG) {

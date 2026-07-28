@@ -34,10 +34,12 @@ is allowed to build claims from.
   umh-large-community`).
 - A client first sends `{"type":"subscribe","schema_version":1}`. Every
   subscribed client receives a private `install` snapshot of every currently
-  active local Type-7 join before joining the live broadcast stream. Snapshots
-  are serialized between clients so replay cannot mutate the producer's join
-  state concurrently. This is the epoch handoff: old clients were disconnected
-  when the prior listener stopped, and the snapshot opens replacement
+  active local Type-7 join before joining the live broadcast stream. Snapshot
+  construction is serialized between clients so replay cannot mutate the
+  producer's join state concurrently, but a missing acknowledgment does not
+  block later subscribers: once one client's `snapshot_end` is queued, the next
+  private replay is offered. This is the epoch handoff: old clients were
+  disconnected when the prior listener stopped, and the snapshot opens replacement
   entitlement windows without turning a debug/reconciliation poll into a
   billing artifact. A client's snapshot remains pending until it sends
   `{"type":"snapshot_ack","boot_epoch":N,"seq":M}` after receiving the
@@ -46,15 +48,16 @@ is allowed to build claims from.
   global `seq` baseline rather than consuming lifecycle sequence numbers. The
   `snapshot_end` frame carries that baseline and `snapshot_count`. A
   connect-only health probe or a client that disconnects before acknowledgment
-  cannot consume the snapshot; the next queued subscriber receives its own
-  replay. Empty snapshots still end with `snapshot_end` and require
-  acknowledgment, establishing an explicit cursor baseline before future live
-  joins are delivered.
+  cannot consume the snapshot; a reconnect receives its own replay. Empty
+  snapshots still end with `snapshot_end` and require acknowledgment. Live
+  records may be queued while that acknowledgment is pending, but AF_UNIX stream
+  ordering guarantees they follow `snapshot_end` for that client. No timeout is
+  required, and one non-acknowledging client cannot starve another subscriber.
 - Wire format: one JSON object per line (`\n`-terminated, no pretty-printing)
   per event. Live lifecycle events are broadcast identically to every
-  snapshot-ready client and to the active snapshot owner (after its
-  `snapshot_end`, by socket ordering); queued clients receive no live records
-  before their baseline. Snapshot records are private to the handoff owner.
+  client whose private `snapshot_end` has been queued (by socket ordering);
+  queued clients receive no live records before their baseline. Snapshot records
+  are private to the handoff owner.
 - A client that falls behind by more than 8MiB of unflushed output is
   disconnected rather than buffered without bound. This is deliberate, not a
   bug: an unbounded queue would turn a stalled consumer into unbounded bgpd
