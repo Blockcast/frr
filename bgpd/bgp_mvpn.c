@@ -905,6 +905,37 @@ static void bgp_mvpn_resolve_from_ecommunity(struct bgp_path_info *pi, uint32_t 
  * the first valid one -- the lowest tuple -- wins deterministically; any
  * further matching tuples are logged and ignored.
  */
+/*
+ * True when the segment aspath_get_last_as() ultimately reads from is a
+ * confederation sequence -- i.e. the origin it reports is a confederation-local
+ * member ASN rather than a globally meaningful one.
+ *
+ * This mirrors that function's iteration exactly: it walks every segment and
+ * overwrites its answer from ANY sequence type, so the winner is simply the
+ * last non-empty AS_SEQUENCE or AS_CONFED_SEQUENCE. Counting hops is not
+ * enough -- "AS_SEQUENCE [65010] AS_CONFED_SEQUENCE [65003]" has a nonzero hop
+ * count yet still resolves to the confederation member 65003. RFC 5065 puts
+ * confederation segments leftmost, so that ordering is malformed, but
+ * bgp_attr_aspath_check() only enforces shape for eBGP peers and a plain iBGP
+ * peer can put it on the wire.
+ */
+static bool bgp_mvpn_origin_is_confed(struct aspath *aspath)
+{
+	struct assegment *seg;
+	bool confed = false;
+
+	for (seg = aspath ? aspath->segments : NULL; seg; seg = seg->next) {
+		if (seg->length == 0)
+			continue;
+		if (seg->type == AS_SEQUENCE)
+			confed = false;
+		else if (seg->type == AS_CONFED_SEQUENCE)
+			confed = true;
+	}
+
+	return confed;
+}
+
 static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_info *pi,
 					     uint32_t *source_as, struct in_addr *upstream)
 {
@@ -977,23 +1008,21 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 	 * a path whose sequence content is ENTIRELY confederation, where the
 	 * lookup yields a member ASN.
 	 *
-	 * aspath_count_hops() is the exact discriminator for that, which is
-	 * worth stating plainly because an earlier revision of this code
-	 * removed it as the "wrong instrument": it counts AS_SEQUENCE members
-	 * and scores an AS_SET as one hop, while ignoring confederation
-	 * segments entirely. That made it wrong for separating an empty path
-	 * from a bare AS_CONFED_SET -- and makes it exactly right here. Sets
-	 * are already rejected by the branch above, so on a non-empty path
-	 * count_hops() == 0 means "no AS_SEQUENCE content at all", i.e.
-	 * confederation-only.
+	 * Hop counting is NOT sufficient to detect that: a mixed path such as
+	 * "AS_SEQUENCE [65010] AS_CONFED_SEQUENCE [65003]" has a nonzero hop
+	 * count, yet the lookup still lands on the confederation member 65003.
+	 * bgp_mvpn_origin_is_confed() therefore asks the precise question --
+	 * is the segment the lookup actually resolves from a confederation
+	 * one -- which covers both the confederation-only path and the mixed
+	 * trailing case.
 	 */
 	path_is_empty = (aspath == NULL || aspath->segments == NULL);
 	if (aspath_check_as_sets(aspath))
 		ambiguous_reason = "AS_PATH bears an AS_SET";
 	else if (!path_is_empty && aspath_check_as_zero(aspath))
 		ambiguous_reason = "AS_PATH carries AS 0";
-	else if (!path_is_empty && aspath_count_hops(aspath) == 0)
-		ambiguous_reason = "AS_PATH has only confederation segments";
+	else if (!path_is_empty && bgp_mvpn_origin_is_confed(aspath))
+		ambiguous_reason = "AS_PATH origin is a confederation member AS";
 	origin_ambiguous = (ambiguous_reason != NULL);
 	origin_as = aspath_get_last_as(aspath);
 	if (!origin_ambiguous && path_is_empty &&

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: ISC
 
 """
-umh_ibgp_peer.py: four AS_PATH shapes that each defeat a different naive
+umh_ibgp_peer.py: nine AS_PATH shapes that each defeat a different naive
 origin-AS lookup, for the LC-UMH trust check.
 
 The resolver trusts a UMH tuple only when its Global Administrator equals the
@@ -43,9 +43,23 @@ the last AS_SEQUENCE segment and skips set segments outright:
                   both zero shapes survive parse on a plain iBGP session.
                   GA == our AS must be REJECTED.
 
+  7. confed_seq : a bare AS_CONFED_SEQUENCE carrying real, nonzero member
+                  ASNs. No set, no zero, not empty -- yet the lookup reports a
+                  confederation-local ASN that is not a globally meaningful
+                  Source AS. GA == that member ASN must be REJECTED.
+  8. zero_mid   : AS_SEQUENCE [0, 65010]. AS 0 is present but NOT in the
+                  resolved position, so the lookup returns 65010 and matches
+                  the GA. Pins the rule to "AS 0 anywhere" rather than
+                  "resolved value is 0". REJECTED.
+  9. seq_then_confed : AS_SEQUENCE [65010] then AS_CONFED_SEQUENCE [65003].
+                  Hop count is nonzero so a confederation-only test does not
+                  fire, but the lookup overwrites from both sequence types and
+                  lands on the trailing member 65003. GA == 65003 must be
+                  REJECTED.
+
 Every route carries an identical fallback Route Import extended community and
 the same UMH parameter, so the AS_PATH shape and the stamped GA are the only
-things that vary. Only shape 1 may resolve from the tuple; 2-6 must fall back
+things that vary. Only shape 1 may resolve from the tuple; 2-9 must fall back
 to the EC. That combination cannot hold unless the resolver treats any
 set-bearing or AS-0-bearing path as origin-ambiguous AND keys the local-AS
 substitution on structural emptiness rather than on a zero lookup.
@@ -112,6 +126,9 @@ ROUTES = [
     # AS 0 is NOT in the resolved-last-AS position here: the lookup returns
     # 65010 and matches the GA, so only an "AS 0 anywhere" rule rejects it.
     {"prefix": "10.40.80.0", "as_path": "zero_mid", "ga": AGGREGATOR_AS},
+    # Hop count is nonzero here, so a confederation-ONLY test does not fire;
+    # the lookup still lands on the trailing confed member.
+    {"prefix": "10.40.90.0", "as_path": "seq_then_confed", "ga": AS_SET_MEMBERS[-1]},
 ]
 PREFIXLEN = 24
 
@@ -181,6 +198,10 @@ def _as_path_attr(mode):
         seg = _seg(AS_CONFED_SEQUENCE, AS_SET_MEMBERS)
     elif mode == "zero_mid":
         seg = _seg(AS_SEQUENCE, [0, AGGREGATOR_AS])
+    elif mode == "seq_then_confed":
+        seg = _seg(AS_SEQUENCE, [AGGREGATOR_AS]) + _seg(
+            AS_CONFED_SEQUENCE, [AS_SET_MEMBERS[-1]]
+        )
     else:
         raise ValueError("unknown as_path mode {}".format(mode))
     return struct.pack("!BBB", 0x40, 2, len(seg)) + seg

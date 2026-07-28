@@ -116,6 +116,7 @@ JOINS = {
     "zero_confed_seq": ("10.40.60.10", "232.4.4.6"),
     "confed_seq": ("10.40.70.10", "232.4.4.7"),
     "zero_mid": ("10.40.80.10", "232.4.4.8"),
+    "seq_then_confed": ("10.40.90.10", "232.4.4.9"),
 }
 
 # Every crafted route must reach the unicast RIB or the trust assertions pass
@@ -129,6 +130,7 @@ PREFIXES = {
     "zero_confed_seq": "10.40.60.0/24",
     "confed_seq": "10.40.70.0/24",
     "zero_mid": "10.40.80.0/24",
+    "seq_then_confed": "10.40.90.0/24",
 }
 
 PID_FILE = None
@@ -432,6 +434,28 @@ def test_as_zero_mid_path_rejects_matching_ga():
         pytest.skip(tgen.errors)
 
     src, grp = JOINS["zero_mid"]
+    _join(src, grp)
+    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_trailing_confed_sequence_rejects_member_ga():
+    """AS_SEQUENCE [65010] then AS_CONFED_SEQUENCE [65003].
+
+    Mutation-sensitive against the confederation-ONLY form of the check: the
+    hop count is nonzero (the regular sequence contributes one), so a
+    "count_hops() == 0" test never fires -- but aspath_get_last_as() overwrites
+    its answer from ANY sequence type, so it lands on the trailing
+    confederation member 65003. The tuple is stamped GA == 65003 to match.
+
+    RFC 5065 puts confederation segments leftmost, so this ordering is
+    malformed; bgp_attr_aspath_check() only enforces shape for eBGP peers, so a
+    plain iBGP peer can still put it on the wire."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS["seq_then_confed"]
     _join(src, grp)
     _expect_type7(src, grp, LOCAL_AS, EC_RT)
 

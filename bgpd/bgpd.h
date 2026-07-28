@@ -981,7 +981,8 @@ struct bgp {
 
 	/* GTM MCAST-VPN: monotime of the last UMH large-community
 	 * trust-boundary reject notice, for the per-instance once-a-minute
-	 * throttle (0 = never logged; see bgp_mvpn_resolve_from_lcommunity).
+	 * throttle (see bgp_mvpn_resolve_from_lcommunity). Validity is carried
+	 * by mvpn_umh_untrusted_log_seen below, not by a zero sentinel.
 	 */
 	time_t mvpn_umh_untrusted_log_last;
 
