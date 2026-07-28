@@ -145,7 +145,15 @@ jobs:
     needs: Prepare-MIB-Cache
     name: ${{ matrix.cfg.name }}
     # Guardrail in case a build leg hangs.
-    timeout-minutes: 45
+    #
+    # PRs read cache but never write it, so a warm PR build is fast and 45m is a
+    # tight, useful bound -- it is what surfaced the shared-cache defect instead
+    # of hiding it behind a slow green. Only master writes `cache-to`, and any
+    # change to the Dockerfile's shared layers makes that first master build cold
+    # by definition. Giving the cache-seeding build room avoids a deadlock where
+    # the seeding run times out, never publishes cache, and leaves every
+    # subsequent PR cold.
+    timeout-minutes: ${{ github.ref == 'refs/heads/master' && 90 || 45 }}
     strategy:
       # Keep all matrix legs running so we get full failure signal.
       fail-fast: false
