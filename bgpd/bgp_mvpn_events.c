@@ -756,12 +756,6 @@ static void bgp_mvpn_event_broadcast(struct bgp_mvpn_event_sink *sink,
 	(void)bgp_mvpn_event_deliver(sink, NULL, jo);
 }
 
-static void bgp_mvpn_event_broadcast(struct bgp_mvpn_event_sink *sink,
-				     struct json_object *jo)
-{
-	bgp_mvpn_event_deliver(sink, NULL, jo);
-}
-
 static struct json_object *bgp_mvpn_event_new(struct bgp_mvpn_event_sink *sink,
 					      const char *event_type, const struct ipaddr *src,
 					      const struct ipaddr *grp, uint32_t source_as,
