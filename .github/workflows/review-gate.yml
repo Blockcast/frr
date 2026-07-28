@@ -43,6 +43,13 @@ jobs:
     # `pending`/`failure` gate status on the same required context -- letting
     # an un-reviewed PR look (or merge) green. Keep this an informational
     # name distinct from the context; the commit-status is the sole gate.
+    # This job does exactly one thing: post the status. The gate's own unit
+    # tests deliberately live in a SEPARATE workflow
+    # (review-gate-selftest.yml). Running them here as a prior step meant a
+    # self-test failure aborted the job before the status was posted -- and a
+    # gate whose failure mode is "post nothing" reproduces the silent hole it
+    # exists to close. Kept apart, a broken checker shows up as its own red
+    # check while this job still reports what it can.
     name: Ally review gate
     if: github.event.pull_request.draft == false
     runs-on: default
@@ -55,12 +62,21 @@ jobs:
           # carries write-scoped credentials; never execute PR-authored code.
           ref: ${{ github.event.repository.default_branch }}
 
-      - name: Self-test the gate logic
-        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
-
       - name: Require Ally review on current head
         env:
           GITHUB_TOKEN: ${{ github.token }}
           ALLY_REVIEWER_LOGINS: allyblockcast[bot],app/allyblockcast,allyblockcast
           STATUS_TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: python3 .github/scripts/require-ally-review.py
+          # Via env rather than inlined into the run block: never interpolate
+          # event data straight into a shell command.
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # Bootstrap: until this change merges, the base branch has no gate
+          # to enforce. Exit clean rather than red -- a red here would be
+          # indistinguishable from a real gate failure, and every repo in the
+          # rollout hits this same one-time window.
+          if [ ! -f .github/scripts/require-ally-review.py ]; then
+            echo "review-gate is not yet present on ${BASE_BRANCH}; nothing to enforce."
+            exit 0
+          fi
+          python3 .github/scripts/require-ally-review.py

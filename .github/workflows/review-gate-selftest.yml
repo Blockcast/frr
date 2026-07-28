@@ -1,0 +1,42 @@
+name: review-gate-selftest
+
+# The review gate is a merge control that was hand-ported from JavaScript, so
+# its decision logic is unit-tested. These tests run in their OWN workflow,
+# separate from review-gate.yml, for a reason learned the hard way: when the
+# self-test ran as a step inside the gate job, a self-test failure aborted the
+# job before any commit status was posted -- and a gate that posts nothing on
+# failure recreates the silent hole it exists to close.
+#
+# Unlike the gate, this runs from the PULL REQUEST's code, because the point is
+# to validate the proposed change to the checker. It is a plain `pull_request`
+# (not `pull_request_target`) with read-only permissions and no secrets, so
+# executing PR-authored code here carries no write-scoped credentials.
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/require-ally-review.py'
+      - '.github/scripts/test_require_ally_review.py'
+      - '.github/workflows/review-gate.yml'
+      - '.github/workflows/review-gate-selftest.yml'
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/scripts/require-ally-review.py'
+      - '.github/scripts/test_require_ally_review.py'
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: Review gate self-test
+    runs-on: default
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Run gate decision-logic tests
+        # -v so a regression names the exact protected branch it broke.
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
