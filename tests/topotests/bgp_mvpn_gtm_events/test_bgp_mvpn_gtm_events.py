@@ -485,27 +485,28 @@ router bgp {}
     interrupted_reader = EventReader(EVENT_SOCK_2)
     interrupted_events, interrupted_end = interrupted_reader.read_snapshot()
 
-    # Retain a second subscriber before interrupting the owner. Waiting for
-    # subscribedClients makes this mutation-sensitive: a broadcast replay
-    # cannot pass merely because bgpd had not processed observer's subscribe.
+    # Retain two subscribers before interrupting the owner. The newest one is
+    # the replacement candidate; bgpd must promote it after processing the
+    # old owner's EOF even though its subscribe was processed while ownership
+    # was still occupied. The other subscriber pins replay privacy.
     observer = EventReader(EVENT_SOCK_2)
+    replacement = EventReader(EVENT_SOCK_2)
     _, synced = topotest.run_and_expect(
         lambda: json.loads(
             tgen.gears["r1"].vtysh_cmd("show bgp mvpn events json")
         ).get("subscribedClients"),
-        2,
+        3,
         count=30,
         wait=0.1,
     )
-    assert synced == 2
+    assert synced == 3
     interrupted_reader.close()
 
-    restarted_reader = EventReader(EVENT_SOCK_2)
-    restarted_events, restarted_end = restarted_reader.read_snapshot()
+    replacement_events, replacement_end = replacement.read_snapshot()
     assert len(interrupted_events) == 1
-    assert len(restarted_events) == 1
+    assert len(replacement_events) == 1
     interrupted = interrupted_events[0]
-    ev = restarted_events[0]
+    ev = replacement_events[0]
     assert ev["event_type"] == "install"
     assert ev["source"] == SRC
     assert ev["group"] == GRP
@@ -516,22 +517,22 @@ router bgp {}
     assert interrupted_end["seq"] == interrupted["seq"]
     assert ev["seq"] == interrupted["seq"]
     assert ev["route_version"] == "{}.1".format(ev["boot_epoch"])
-    assert restarted_end["seq"] == ev["seq"]
+    assert replacement_end["seq"] == ev["seq"]
     observer.sock.settimeout(0.5)
     with pytest.raises(socket.timeout):
         observer.sock.recv(4096)
-    restarted_reader.acknowledge_snapshot(restarted_end)
+    replacement.acknowledge_snapshot(replacement_end)
 
     # A real transition after replay remains contiguous for both retained
     # subscribers; private snapshot retries did not consume global seq.
     _leave()
-    restarted_live = restarted_reader.read_event()
+    replacement_live = replacement.read_event()
     observer_live = observer.read_event()
-    assert restarted_live["event_type"] == "withdraw"
-    assert observer_live == restarted_live
-    assert restarted_live["seq"] == restarted_end["seq"] + 1
+    assert replacement_live["event_type"] == "withdraw"
+    assert observer_live == replacement_live
+    assert replacement_live["seq"] == replacement_end["seq"] + 1
     observer.close()
-    restarted_reader.close()
+    replacement.close()
 
 
 def test_failed_initial_configuration_preserves_intent():

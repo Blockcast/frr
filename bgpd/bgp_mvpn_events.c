@@ -114,18 +114,20 @@ struct bgp_mvpn_event_sink {
 static bool bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
 				   struct bgp_mvpn_event_client *target,
 				   struct json_object *jo);
+static void bgp_mvpn_event_snapshot_offer_next(struct bgp_mvpn_event_sink *sink);
 
 static void bgp_mvpn_event_client_close(struct bgp_mvpn_event_sink *sink,
 					struct bgp_mvpn_event_client *client)
 {
 	struct bgp_mvpn_event_client **pp;
+	bool snapshot_owner = sink->snapshot_client == client;
 
 	for (pp = &sink->clients; *pp; pp = &(*pp)->next)
 		if (*pp == client) {
 			*pp = client->next;
 			break;
 		}
-	if (sink->snapshot_client == client)
+	if (snapshot_owner)
 		sink->snapshot_client = NULL;
 
 	event_cancel(&client->t_read);
@@ -133,6 +135,73 @@ static void bgp_mvpn_event_client_close(struct bgp_mvpn_event_sink *sink,
 	buffer_free(client->wb);
 	close(client->fd);
 	XFREE(MTYPE_MVPN_EVENT_CLIENT, client);
+
+	if (snapshot_owner && sink->snapshot_pending &&
+	    !sink->snapshot_replay_active)
+		bgp_mvpn_event_snapshot_offer_next(sink);
+}
+
+static bool bgp_mvpn_event_snapshot_offer(struct bgp_mvpn_event_sink *sink,
+					  struct bgp_mvpn_event_client *client)
+{
+	struct json_object *end;
+
+	if (!sink->snapshot_pending || sink->snapshot_client ||
+	    !client->subscribed)
+		return true;
+
+	sink->snapshot_client = client;
+	client->snapshot_seq = sink->seq;
+	sink->snapshot_replay_active = true;
+	sink->snapshot_delivery_failed = false;
+	sink->snapshot_index = 0;
+	bgp_mvpn_reemit_local_joins(sink->bgp);
+	sink->snapshot_replay_active = false;
+
+	/* Private delivery may synchronously close the owner. Promote another
+	 * already-subscribed client instead of waiting for a second subscribe. */
+	if (sink->snapshot_client != client) {
+		bgp_mvpn_event_snapshot_offer_next(sink);
+		return false;
+	}
+	if (sink->snapshot_delivery_failed) {
+		bgp_mvpn_event_client_close(sink, client);
+		return false;
+	}
+	/* An empty snapshot has no state whose loss could blind the consumer.
+	 * Future installs are ordinary live events. */
+	if (sink->snapshot_index == 0) {
+		sink->snapshot_pending = false;
+		sink->snapshot_client = NULL;
+		return true;
+	}
+
+	end = json_object_new_object();
+	if (!end) {
+		sink->snapshot_delivery_failed = true;
+		bgp_mvpn_event_client_close(sink, client);
+		return false;
+	}
+	json_object_int_add(end, "schema_version", 1);
+	json_object_string_add(end, "type", "snapshot_end");
+	json_object_int_add(end, "boot_epoch", (int64_t)sink->boot_epoch);
+	json_object_int_add(end, "seq", (int64_t)client->snapshot_seq);
+	json_object_int_add(end, "snapshot_count", (int64_t)sink->snapshot_index);
+	return bgp_mvpn_event_deliver(sink, client, end);
+}
+
+static void bgp_mvpn_event_snapshot_offer_next(struct bgp_mvpn_event_sink *sink)
+{
+	struct bgp_mvpn_event_client *client;
+
+	if (!sink->snapshot_pending || sink->snapshot_client ||
+	    sink->snapshot_replay_active)
+		return;
+	for (client = sink->clients; client; client = client->next)
+		if (client->subscribed) {
+			(void)bgp_mvpn_event_snapshot_offer(sink, client);
+			return;
+		}
 }
 
 static void bgp_mvpn_event_client_write(struct event *event)
@@ -193,44 +262,7 @@ static void bgp_mvpn_event_client_read(struct event *event)
 		    json_object_is_type(type, json_type_string) &&
 		    strcmp(json_object_get_string(type), "subscribe") == 0) {
 			client->subscribed = true;
-			if (sink->snapshot_pending && !sink->snapshot_client) {
-				sink->snapshot_client = client;
-				client->snapshot_seq = sink->seq;
-				sink->snapshot_replay_active = true;
-				sink->snapshot_delivery_failed = false;
-				sink->snapshot_index = 0;
-				bgp_mvpn_reemit_local_joins(sink->bgp);
-				sink->snapshot_replay_active = false;
-				/* An empty snapshot has no state whose loss could blind the
-				 * consumer. Future installs are ordinary live events. */
-				if (sink->snapshot_client == client &&
-				    sink->snapshot_delivery_failed) {
-					bgp_mvpn_event_client_close(sink, client);
-				} else if (sink->snapshot_client == client &&
-					   sink->snapshot_index == 0) {
-					sink->snapshot_pending = false;
-					sink->snapshot_client = NULL;
-				} else if (sink->snapshot_client == client) {
-					struct json_object *end = json_object_new_object();
-
-					if (!end) {
-						sink->snapshot_delivery_failed = true;
-						bgp_mvpn_event_client_close(sink, client);
-					} else {
-						json_object_int_add(end, "schema_version", 1);
-						json_object_string_add(end, "type", "snapshot_end");
-						json_object_int_add(end, "boot_epoch",
-								    (int64_t)sink->boot_epoch);
-						json_object_int_add(end, "seq",
-								    (int64_t)client->snapshot_seq);
-						json_object_int_add(end, "snapshot_count",
-								    (int64_t)sink->snapshot_index);
-						(void)bgp_mvpn_event_deliver(sink, client, end);
-					}
-				}
-				client_closed = sink->snapshot_delivery_failed &&
-						sink->snapshot_client != client;
-			}
+			client_closed = !bgp_mvpn_event_snapshot_offer(sink, client);
 		} else if (jo && json_object_object_get_ex(jo, "type", &type) &&
 			   json_object_is_type(type, json_type_string) &&
 			   strcmp(json_object_get_string(type), "snapshot_ack") == 0 &&
@@ -532,6 +564,7 @@ void bgp_mvpn_events_stop(struct bgp *bgp)
 	if (!sink)
 		return;
 
+	sink->snapshot_pending = false;
 	while (sink->clients)
 		bgp_mvpn_event_client_close(sink, sink->clients);
 

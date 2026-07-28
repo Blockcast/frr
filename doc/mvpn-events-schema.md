@@ -133,21 +133,25 @@ changing this join's resolved values) emits nothing.
 
 | Field | Type | Present on | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | int | all | `1`. Bump on any breaking wire-format change. |
-| `event_type` | string | all | `install` \| `withdraw` \| `origin_change`. |
-| `boot_epoch` | int | all | See "Durable cursor" above. |
-| `seq` | int | all | Per-listener-instance monotonic sequence, starting at 1; resets to 1 whenever `boot_epoch` advances. Use the `(boot_epoch, seq)` pair, not `seq` alone, for gap detection. |
-| `time_ns` | int | all | `CLOCK_REALTIME` nanoseconds since the Unix epoch, at emission time. |
-| `route_type` | int | all | `7` (RFC 6514 C-multicast Source Tree Join). Fixed today; present so a future record kind sharing this socket is distinguishable. |
-| `source` | string | all | C-S, canonical text (v4 or v6). |
-| `group` | string | all | C-G, canonical text (v4 or v6). |
-| `source_as` | int | all | RFC 6514 Section 4.6 Source AS from the Type-7 NLRI key (falls back to the local AS per RFC 6514 Section 4.6 when the source route carries no Source-AS community). |
-| `route_version` | string | all | Opaque, per-join monotonic. See above. |
+| `schema_version` | int | all output records | `1`. Bump on any breaking wire-format change. |
+| `type` | string | `snapshot_end` only | `snapshot_end`; distinguishes the framing record from lifecycle-shaped snapshot installs. |
+| `event_type` | string | live lifecycle and snapshot install records | `install` \| `withdraw` \| `origin_change`. Snapshot records are always `install`. |
+| `boot_epoch` | int | all output records | See "Durable cursor" above. |
+| `seq` | int | all output records | Live lifecycle sequence, starting at 1. Snapshot records and `snapshot_end` retain the current baseline, which may be 0 before the first live event. Use the `(boot_epoch, seq)` pair, not `seq` alone, for gap detection. |
+| `snapshot` | bool | snapshot install records only | `true`; identifies a private point-in-time install rather than a live lifecycle transition. |
+| `snapshot_index` | int | snapshot install records only | One-based position of this install in the current snapshot frame. |
+| `snapshot_count` | int | `snapshot_end` only | Number of snapshot install records preceding this frame. |
+| `time_ns` | int | live lifecycle and snapshot install records | `CLOCK_REALTIME` nanoseconds since the Unix epoch, at emission time. |
+| `route_type` | int | live lifecycle and snapshot install records | `7` (RFC 6514 C-multicast Source Tree Join). Fixed today; present so a future record kind sharing this socket is distinguishable. |
+| `source` | string | live lifecycle and snapshot install records | C-S, canonical text (v4 or v6). |
+| `group` | string | live lifecycle and snapshot install records | C-G, canonical text (v4 or v6). |
+| `source_as` | int | live lifecycle and snapshot install records | RFC 6514 Section 4.6 Source AS from the Type-7 NLRI key (falls back to the local AS per RFC 6514 Section 4.6 when the source route carries no Source-AS community). |
+| `route_version` | string | live lifecycle and snapshot install records | Opaque, per-join monotonic. See above. |
 | `prior_route_version` | string | `origin_change` only | The join's `route_version` immediately before this transition -- lets a consumer close the old billing window and open a new one at the same instant. |
 | `lc_umh_origin` | string | when an upstream PE was resolved | `"<sourceAS>:1:<UMH-u32>"`, byte-for-byte the settlement contract's `SessionLease.lc_umh_origin` format. The literal function code point `1` here is a settlement-contract convention for the resolved-origin attestation; it is independent of the operator-configured `bgp mvpn umh-large-community <function>` decode knob, which selects which function code point bgpd itself trusts on the wire. Absent when no upstream PE could be resolved (RT-less origination; see `bgp_mvpn_source_tree_join_set()`). |
 | `upstream_peer` | string | when an upstream PE was resolved | The resolved upstream PE's IPv4 address (the RFC 7716 upstream-node-identifying Route Target's Global Administrator, or the large-community UMH when `bgp mvpn umh-large-community` is configured). This is the "peer/leaf next-hop" BLO-17645 and BLO-17650 refer to for counter identity. |
-| `ipmsi_label` | int | all | This bgp instance's configured `bgp mvpn ipmsi-label` (0 = unlabeled GTM tunnel, RFC 6514 Section 5). The "MPLS label" BLO-17650's counter-identity key refers to. |
-| `vrf` | string | all | The bgp instance's `name_pretty` (VRF/view name, or `default`). |
+| `ipmsi_label` | int | live lifecycle and snapshot install records | This bgp instance's configured `bgp mvpn ipmsi-label` (0 = unlabeled GTM tunnel, RFC 6514 Section 5). The "MPLS label" BLO-17650's counter-identity key refers to. |
+| `vrf` | string | live lifecycle and snapshot install records | The bgp instance name, or `default`. |
 
 ## Example
 
