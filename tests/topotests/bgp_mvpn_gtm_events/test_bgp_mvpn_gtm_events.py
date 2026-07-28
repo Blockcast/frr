@@ -458,9 +458,9 @@ router bgp {}
 
 
 def test_listener_restart_snapshots_active_join():
-    """Changing the listener creates a new epoch. Its first consumer must
-    receive a replacement install for the still-active join so it can open a
-    new billing window without waiting for unrelated route churn."""
+    """Changing the listener creates a new epoch. Each consumer must receive
+    a replacement install for the still-active join before live delivery so it
+    can open a billing window without waiting for unrelated route churn."""
     tgen = get_topogen()
 
     if tgen.routers_have_failure():
@@ -485,10 +485,8 @@ router bgp {}
     interrupted_reader = EventReader(EVENT_SOCK_2)
     interrupted_events, interrupted_end = interrupted_reader.read_snapshot()
 
-    # Retain two subscribers before interrupting the owner. The newest one is
-    # the replacement candidate; bgpd must promote it after processing the
-    # old owner's EOF even though its subscribe was processed while ownership
-    # was still occupied. The other subscriber pins replay privacy.
+    # Retain two subscribers before interrupting the owner. Both must stay out
+    # of the live stream until each has received its own private snapshot.
     observer = EventReader(EVENT_SOCK_2)
     replacement = EventReader(EVENT_SOCK_2)
     _, synced = topotest.run_and_expect(
@@ -500,6 +498,20 @@ router bgp {}
         wait=0.1,
     )
     assert synced == 3
+
+    # Live transitions after snapshot_end remain ordered for the owner, but
+    # cannot leak to prospective handoff clients before their baseline.
+    _leave()
+    owner_withdraw = interrupted_reader.read_event()
+    assert owner_withdraw["event_type"] == "withdraw"
+    _join()
+    owner_install = interrupted_reader.read_event()
+    assert owner_install["event_type"] == "install"
+    for pending in (observer, replacement):
+        pending.sock.settimeout(0.5)
+        with pytest.raises(socket.timeout):
+            pending.sock.recv(4096)
+
     interrupted_reader.close()
 
     replacement_events, replacement_end = replacement.read_snapshot()
@@ -515,16 +527,23 @@ router bgp {}
     assert ev["boot_epoch"] > boot_epoch
     assert interrupted["seq"] == 0
     assert interrupted_end["seq"] == interrupted["seq"]
-    assert ev["seq"] == interrupted["seq"]
-    assert ev["route_version"] == "{}.1".format(ev["boot_epoch"])
+    assert ev["seq"] == owner_install["seq"]
+    assert ev["route_version"] == owner_install["route_version"]
     assert replacement_end["seq"] == ev["seq"]
-    observer.sock.settimeout(0.5)
-    with pytest.raises(socket.timeout):
-        observer.sock.recv(4096)
     replacement.acknowledge_snapshot(replacement_end)
 
-    # A real transition after replay remains contiguous for both retained
-    # subscribers; private snapshot retries did not consume global seq.
+    observer_events, observer_end = observer.read_snapshot()
+    assert len(observer_events) == 1
+    observer_snapshot = observer_events[0]
+    for field in ("event_type", "source", "group", "source_as", "upstream_peer"):
+        assert observer_snapshot[field] == ev[field]
+    assert observer_snapshot["route_version"] == ev["route_version"]
+    assert observer_snapshot["seq"] == ev["seq"]
+    assert observer_end["seq"] == replacement_end["seq"]
+    observer.acknowledge_snapshot(observer_end)
+
+    # Once both baselines are acknowledged, a real transition is contiguous
+    # and byte-identical for both retained subscribers.
     _leave()
     replacement_live = replacement.read_event()
     observer_live = observer.read_event()

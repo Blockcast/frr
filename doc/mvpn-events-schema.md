@@ -32,27 +32,29 @@ is allowed to build claims from.
   event-socket` (or omitting the knob) means the feature is off. Opt-in,
   like the other GTM MVPN knobs (`bgp mvpn ipmsi-label`, `bgp mvpn
   umh-large-community`).
-- A client first sends `{"type":"subscribe","schema_version":1}`. The first
-  subscribed client in a newly-created listener epoch receives an `install`
-  snapshot of every currently active local Type-7 join. This is the
-  epoch handoff: old clients were disconnected when the prior listener
-  stopped, and the snapshot opens replacement entitlement windows without
-  turning a debug/reconciliation poll into a billing artifact. Later clients
-  receive events from subscription time onward; there is no general per-client
-  replay/backlog. The snapshot remains pending until that client sends
+- A client first sends `{"type":"subscribe","schema_version":1}`. Every
+  subscribed client receives a private `install` snapshot of every currently
+  active local Type-7 join before joining the live broadcast stream. Snapshots
+  are serialized between clients so replay cannot mutate the producer's join
+  state concurrently. This is the epoch handoff: old clients were disconnected
+  when the prior listener stopped, and the snapshot opens replacement
+  entitlement windows without turning a debug/reconciliation poll into a
+  billing artifact. A client's snapshot remains pending until it sends
   `{"type":"snapshot_ack","boot_epoch":N,"seq":M}` after receiving the
   `{"type":"snapshot_end",...}` frame. Snapshot install records carry
   `"snapshot":true` and a one-based `snapshot_index`; they retain the current
   global `seq` baseline rather than consuming lifecycle sequence numbers. The
   `snapshot_end` frame carries that baseline and `snapshot_count`. A
-  connect-only health probe or
-  a client that disconnects before acknowledgment cannot consume the snapshot;
-  the next subscriber receives a replay. An empty snapshot needs no
-  acknowledgment because there is no pre-existing state to lose; future joins
-  are delivered as ordinary live events.
+  connect-only health probe or a client that disconnects before acknowledgment
+  cannot consume the snapshot; the next queued subscriber receives its own
+  replay. Empty snapshots still end with `snapshot_end` and require
+  acknowledgment, establishing an explicit cursor baseline before future live
+  joins are delivered.
 - Wire format: one JSON object per line (`\n`-terminated, no pretty-printing)
   per event. Live lifecycle events are broadcast identically to every
-  subscribed client; snapshot records are private to the handoff owner.
+  snapshot-ready client and to the active snapshot owner (after its
+  `snapshot_end`, by socket ordering); queued clients receive no live records
+  before their baseline. Snapshot records are private to the handoff owner.
 - A client that falls behind by more than 8MiB of unflushed output is
   disconnected rather than buffered without bound. This is deliberate, not a
   bug: an unbounded queue would turn a stalled consumer into unbounded bgpd
@@ -103,7 +105,7 @@ persisted cursor. Snapshot records are applied as a framed set through
 - `boot_epoch` increased: the producer's listener restarted -- a `bgpd`
   restart, or an operator reconfiguring the event socket within one process
   (see "Durable cursor" above). Treat it as a boot boundary either way: every
-  join in the new epoch's first-consumer `install` snapshot is a fresh route-entitlement
+  join in the new epoch's per-consumer `install` snapshot is a fresh route-entitlement
   interval (Section 6 of the settlement contract): the consumer's prior
   windows for this instance should be closed out at the last event of the old
   epoch it saw, and new windows opened from the new epoch's events.

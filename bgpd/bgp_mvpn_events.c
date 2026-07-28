@@ -82,6 +82,7 @@ struct bgp_mvpn_event_client {
 	char read_buf[256];
 	size_t read_len;
 	bool subscribed;
+	bool snapshot_ready;
 	uint64_t snapshot_seq;
 };
 
@@ -109,12 +110,26 @@ struct bgp_mvpn_event_sink {
 	bool snapshot_delivery_failed;
 	uint64_t snapshot_index;
 	struct bgp_mvpn_event_client *snapshot_client;
+	struct event *t_snapshot_offer;
 };
 
 static bool bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
 				   struct bgp_mvpn_event_client *target,
 				   struct json_object *jo);
 static void bgp_mvpn_event_snapshot_offer_next(struct bgp_mvpn_event_sink *sink);
+
+static void bgp_mvpn_event_snapshot_offer_event(struct event *event)
+{
+	struct bgp_mvpn_event_sink *sink = EVENT_ARG(event);
+
+	bgp_mvpn_event_snapshot_offer_next(sink);
+}
+
+static void bgp_mvpn_event_snapshot_schedule(struct bgp_mvpn_event_sink *sink)
+{
+	event_add_event(bm->master, bgp_mvpn_event_snapshot_offer_event, sink, 0,
+			&sink->t_snapshot_offer);
+}
 
 static void bgp_mvpn_event_client_close(struct bgp_mvpn_event_sink *sink,
 					struct bgp_mvpn_event_client *client)
@@ -138,7 +153,7 @@ static void bgp_mvpn_event_client_close(struct bgp_mvpn_event_sink *sink,
 
 	if (snapshot_owner && sink->snapshot_pending &&
 	    !sink->snapshot_replay_active)
-		bgp_mvpn_event_snapshot_offer_next(sink);
+		bgp_mvpn_event_snapshot_schedule(sink);
 }
 
 static bool bgp_mvpn_event_snapshot_offer(struct bgp_mvpn_event_sink *sink,
@@ -147,7 +162,7 @@ static bool bgp_mvpn_event_snapshot_offer(struct bgp_mvpn_event_sink *sink,
 	struct json_object *end;
 
 	if (!sink->snapshot_pending || sink->snapshot_client ||
-	    !client->subscribed)
+	    !client->subscribed || client->snapshot_ready)
 		return true;
 
 	sink->snapshot_client = client;
@@ -158,24 +173,17 @@ static bool bgp_mvpn_event_snapshot_offer(struct bgp_mvpn_event_sink *sink,
 	bgp_mvpn_reemit_local_joins(sink->bgp);
 	sink->snapshot_replay_active = false;
 
-	/* Private delivery may synchronously close the owner. Promote another
-	 * already-subscribed client instead of waiting for a second subscribe. */
+	/* Private delivery may synchronously close the owner. Defer promotion so
+	 * an outer client-list traversal can unwind before another replay closes
+	 * or unlinks clients. */
 	if (sink->snapshot_client != client) {
-		bgp_mvpn_event_snapshot_offer_next(sink);
+		bgp_mvpn_event_snapshot_schedule(sink);
 		return false;
 	}
 	if (sink->snapshot_delivery_failed) {
 		bgp_mvpn_event_client_close(sink, client);
 		return false;
 	}
-	/* An empty snapshot has no state whose loss could blind the consumer.
-	 * Future installs are ordinary live events. */
-	if (sink->snapshot_index == 0) {
-		sink->snapshot_pending = false;
-		sink->snapshot_client = NULL;
-		return true;
-	}
-
 	end = json_object_new_object();
 	if (!end) {
 		sink->snapshot_delivery_failed = true;
@@ -198,7 +206,7 @@ static void bgp_mvpn_event_snapshot_offer_next(struct bgp_mvpn_event_sink *sink)
 	    sink->snapshot_replay_active)
 		return;
 	for (client = sink->clients; client; client = client->next)
-		if (client->subscribed) {
+		if (client->subscribed && !client->snapshot_ready) {
 			(void)bgp_mvpn_event_snapshot_offer(sink, client);
 			return;
 		}
@@ -271,8 +279,9 @@ static void bgp_mvpn_event_client_read(struct event *event)
 			   sink->snapshot_client == client &&
 			   (uint64_t)json_object_get_int64(epoch) == sink->boot_epoch &&
 			   (uint64_t)json_object_get_int64(seq) == client->snapshot_seq) {
-			sink->snapshot_pending = false;
-				sink->snapshot_client = NULL;
+			client->snapshot_ready = true;
+			sink->snapshot_client = NULL;
+			bgp_mvpn_event_snapshot_schedule(sink);
 		}
 		/* Private delivery can synchronously close and free its owner. Do not
 		 * touch the read buffer or rearm an event against that stale pointer. */
@@ -565,6 +574,7 @@ void bgp_mvpn_events_stop(struct bgp *bgp)
 		return;
 
 	sink->snapshot_pending = false;
+	event_cancel(&sink->t_snapshot_offer);
 	while (sink->clients)
 		bgp_mvpn_event_client_close(sink, sink->clients);
 
@@ -748,6 +758,13 @@ static bool bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
 
 		next = client->next;
 		if (!client->subscribed || (target && client != target))
+			continue;
+		/* A queued subscriber must receive its private snapshot baseline before
+		 * joining the live stream. The current owner may receive live records:
+		 * socket ordering places them after snapshot_end, and a failed owner is
+		 * replaced with a fresh snapshot at the then-current cursor. */
+		if (!target && !client->snapshot_ready &&
+		    client != sink->snapshot_client)
 			continue;
 
 		if (client->pending_bytes + linelen > BGP_MVPN_EVENT_SINK_MAX_BACKLOG) {

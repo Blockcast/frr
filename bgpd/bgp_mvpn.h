@@ -138,8 +138,8 @@ extern void bgp_mvpn_withdraw_type1(struct bgp *bgp, afi_t afi);
 extern int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 					 const struct ipaddr *grp, bool negate);
 
-/* Re-emit every currently installed local Type-7 into a newly-created event
- * listener epoch. Called once when that epoch accepts its first consumer. */
+/* Re-emit every currently installed local Type-7 as a private snapshot for a
+ * subscribed event-socket consumer before it joins the live stream. */
 extern void bgp_mvpn_reemit_local_joins(struct bgp *bgp);
 
 /*
