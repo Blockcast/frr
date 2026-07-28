@@ -285,6 +285,25 @@ class TestCommentSignals(unittest.TestCase):
         self.assertEqual(state, "pending")
 
 
+class TestAttestationAsymmetry(unittest.TestCase):
+    """Attestation gates CLEARING the gate, never blocking it. Applying it
+    symmetrically downgraded an unattested CHANGES_REQUESTED to pending --
+    weaker than the red it replaced. hang-mmt-fec's suite caught this."""
+
+    def test_unattested_changes_requested_still_blocks(self):
+        state, _ = decide(reviews=[review("CHANGES_REQUESTED", body="")])
+        self.assertEqual(state, "failure")
+
+    def test_unattested_blocking_counts_still_fail(self):
+        body = "## Ally — Consolidated PR Review\n\n### Important Issues (1)\n"
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "failure")
+
+    def test_unattested_approval_does_not_clear(self):
+        state, _ = decide(reviews=[review("APPROVED", body="")])
+        self.assertEqual(state, "pending")
+
+
 class TestFullShaAttestation(unittest.TestCase):
     """A 7-char prefix is 28 bits — grindable. Only the full OID may bind a
     comment to a head."""

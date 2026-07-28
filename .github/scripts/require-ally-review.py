@@ -208,12 +208,19 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             continue
 
         body = str(review.get("body") or "")
-        # Bind to the body attestation, NOT review.commit_id. commit_id is
-        # GitHub-managed state about the review, so it is not something Ally
-        # itself asserted; the attestation line is immutable text Ally wrote
-        # naming the revision it actually examined. Requiring it also fails
-        # closed on a body that makes no claim at all.
-        if not attests_head(body, head_sha):
+        # Attestation gates CLEARING the gate, never BLOCKING it.
+        #
+        # Binding positive signals to the body attestation is the hardening:
+        # commit_id is GitHub-managed state about the review, while the
+        # attestation is text Ally itself wrote naming the revision it
+        # examined. But applying it symmetrically is a regression -- an
+        # unattested CHANGES_REQUESTED would stop counting and the gate would
+        # fall back to pending, which is weaker than the red it replaced.
+        # hang-mmt-fec's suite caught exactly that. So blocking signals bind on
+        # commit_id, and only the positive branches additionally require the
+        # attestation.
+        attested = attests_head(body, head_sha)
+        if review.get("commit_id") != head_sha and not attested:
             continue
 
         at = str(review.get("submitted_at") or "")
@@ -241,6 +248,8 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             continue
 
         if state == "APPROVED":
+            if not attested:
+                continue
             signals.append(
                 {
                     "at": at,
@@ -284,6 +293,8 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
                         "status": "failure",
                     }
                 )
+                continue
+            if not attested:
                 continue
             signals.append(
                 {
