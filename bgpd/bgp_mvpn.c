@@ -965,12 +965,35 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 	 * NB: aspath_check_as_zero() dereferences aspath->segments with no
 	 * NULL guard of its own, so the !path_is_empty short-circuit below is
 	 * load-bearing rather than cosmetic.
+	 *
+	 * Confederations are the third way the origin fails to be globally
+	 * meaningful. aspath_get_last_as() reads AS_CONFED_SEQUENCE as
+	 * readily as AS_SEQUENCE, but a confederation member-AS number is
+	 * local to that confederation (RFC 5065, typically a private ASN) and
+	 * is NOT the globally scoped Source AS a UMH tuple's Global
+	 * Administrator claims to be. A path that still carries a real
+	 * AS_SEQUENCE is fine -- "(64512 64513) 65010" resolves to 65010,
+	 * because the lookup takes the last sequence segment. The bad case is
+	 * a path whose sequence content is ENTIRELY confederation, where the
+	 * lookup yields a member ASN.
+	 *
+	 * aspath_count_hops() is the exact discriminator for that, which is
+	 * worth stating plainly because an earlier revision of this code
+	 * removed it as the "wrong instrument": it counts AS_SEQUENCE members
+	 * and scores an AS_SET as one hop, while ignoring confederation
+	 * segments entirely. That made it wrong for separating an empty path
+	 * from a bare AS_CONFED_SET -- and makes it exactly right here. Sets
+	 * are already rejected by the branch above, so on a non-empty path
+	 * count_hops() == 0 means "no AS_SEQUENCE content at all", i.e.
+	 * confederation-only.
 	 */
 	path_is_empty = (aspath == NULL || aspath->segments == NULL);
 	if (aspath_check_as_sets(aspath))
 		ambiguous_reason = "AS_PATH bears an AS_SET";
 	else if (!path_is_empty && aspath_check_as_zero(aspath))
 		ambiguous_reason = "AS_PATH carries AS 0";
+	else if (!path_is_empty && aspath_count_hops(aspath) == 0)
+		ambiguous_reason = "AS_PATH has only confederation segments";
 	origin_ambiguous = (ambiguous_reason != NULL);
 	origin_as = aspath_get_last_as(aspath);
 	if (!origin_ambiguous && path_is_empty &&
@@ -1009,13 +1032,16 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 			time_t now = monotime(NULL);
 			time_t last = bgp->mvpn_umh_untrusted_log_last;
 
-			/* last == 0 is "never logged", tested explicitly:
-			 * monotime() counts from host boot, so a plain
-			 * "now - last >= 60" swallows the very first reject
-			 * whenever uptime is under a minute -- exactly the
-			 * window where a probe against a freshly restarted or
-			 * freshly booted PE would go unseen. */
-			if (last == 0 || now - last >= 60) {
+			/* Track "have we ever logged" in its own flag rather
+			 * than treating a zero timestamp as the sentinel:
+			 * monotime() counts from host boot, so 0 is a real
+			 * time during the first second of uptime. Overloading
+			 * it swallowed the very first reject on a freshly
+			 * booted PE in one direction, and left every reject in
+			 * that opening tick unthrottled in the other. */
+			if (!bgp->mvpn_umh_untrusted_log_seen ||
+			    now - last >= 60) {
+				bgp->mvpn_umh_untrusted_log_seen = true;
 				bgp->mvpn_umh_untrusted_log_last = now;
 				if (origin_ambiguous)
 					zlog_notice("MVPN UMH large community %u:%u:%u rejected on %s: %s, origin AS is indeterminate",

@@ -106,6 +106,12 @@ ROUTES = [
     {"prefix": "10.40.40.0", "as_path": "confed_set", "ga": "local"},
     {"prefix": "10.40.50.0", "as_path": "zero_seq", "ga": "local"},
     {"prefix": "10.40.60.0", "as_path": "zero_confed_seq", "ga": "local"},
+    # GA is the member ASN aspath_get_last_as() reports for a confed-only
+    # path -- globally meaningless, so it must not be believed.
+    {"prefix": "10.40.70.0", "as_path": "confed_seq", "ga": AS_SET_MEMBERS[-1]},
+    # AS 0 is NOT in the resolved-last-AS position here: the lookup returns
+    # 65010 and matches the GA, so only an "AS 0 anywhere" rule rejects it.
+    {"prefix": "10.40.80.0", "as_path": "zero_mid", "ga": AGGREGATOR_AS},
 ]
 PREFIXLEN = 24
 
@@ -171,6 +177,10 @@ def _as_path_attr(mode):
         seg = _seg(AS_SEQUENCE, [0])
     elif mode == "zero_confed_seq":
         seg = _seg(AS_CONFED_SEQUENCE, [0])
+    elif mode == "confed_seq":
+        seg = _seg(AS_CONFED_SEQUENCE, AS_SET_MEMBERS)
+    elif mode == "zero_mid":
+        seg = _seg(AS_SEQUENCE, [0, AGGREGATOR_AS])
     else:
         raise ValueError("unknown as_path mode {}".format(mode))
     return struct.pack("!BBB", 0x40, 2, len(seg)) + seg

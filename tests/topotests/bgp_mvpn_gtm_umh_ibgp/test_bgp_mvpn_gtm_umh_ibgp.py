@@ -114,6 +114,8 @@ JOINS = {
     "confed_set": ("10.40.40.10", "232.4.4.4"),
     "zero_seq": ("10.40.50.10", "232.4.4.5"),
     "zero_confed_seq": ("10.40.60.10", "232.4.4.6"),
+    "confed_seq": ("10.40.70.10", "232.4.4.7"),
+    "zero_mid": ("10.40.80.10", "232.4.4.8"),
 }
 
 # Every crafted route must reach the unicast RIB or the trust assertions pass
@@ -125,6 +127,8 @@ PREFIXES = {
     "confed_set": "10.40.40.0/24",
     "zero_seq": "10.40.50.0/24",
     "zero_confed_seq": "10.40.60.0/24",
+    "confed_seq": "10.40.70.0/24",
+    "zero_mid": "10.40.80.0/24",
 }
 
 PID_FILE = None
@@ -386,6 +390,48 @@ def test_zero_as_confed_sequence_rejects_local_ga():
         pytest.skip(tgen.errors)
 
     src, grp = JOINS["zero_confed_seq"]
+    _join(src, grp)
+    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_confed_only_sequence_rejects_member_ga():
+    """A bare AS_CONFED_SEQUENCE {65002,65003} carries a real, nonzero ASN --
+    but a confederation member-AS number is local to that confederation
+    (RFC 5065, usually a private ASN) and is not the globally scoped Source AS
+    a UMH tuple's Global Administrator claims to be.
+
+    Mutation-sensitive, and it slips past every other guard:
+    aspath_check_as_sets() sees no set, aspath_check_as_zero() sees no zero,
+    and the path is not structurally empty -- while aspath_get_last_as()
+    happily reports 65003 because it reads AS_CONFED_SEQUENCE. The tuple is
+    stamped GA == 65003 to match, so without a confederation-only check it
+    resolves to RT:10.255.255.254:0."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS["confed_seq"]
+    _join(src, grp)
+    _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_as_zero_mid_path_rejects_matching_ga():
+    """AS_SEQUENCE [0, 65010]: AS 0 is present but NOT in the position the
+    origin lookup resolves, so aspath_get_last_as() returns 65010 and the
+    tuple's GA == 65010 matches.
+
+    This is what pins the rule to "AS 0 anywhere in the path"
+    (aspath_check_as_zero scans every segment) rather than merely
+    "origin_as == 0". The zero_seq / zero_confed_seq vectors both put the
+    zero in the resolved position, so they would stay green under a check
+    that only looked at the resolved value."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS["zero_mid"]
     _join(src, grp)
     _expect_type7(src, grp, LOCAL_AS, EC_RT)
 

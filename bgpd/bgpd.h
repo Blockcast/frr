@@ -985,6 +985,13 @@ struct bgp {
 	 */
 	time_t mvpn_umh_untrusted_log_last;
 
+	/* Whether mvpn_umh_untrusted_log_last holds a real timestamp yet.
+	 * monotime() counts from host boot, so 0 is a legitimate value during
+	 * the first second of uptime and cannot double as "never logged":
+	 * using it as a sentinel leaves every reject in that tick unthrottled.
+	 */
+	bool mvpn_umh_untrusted_log_seen;
+
 	/* EVPN - use RFC 8365 to auto-derive RT */
 	int advertise_autort_rfc8365;
 
