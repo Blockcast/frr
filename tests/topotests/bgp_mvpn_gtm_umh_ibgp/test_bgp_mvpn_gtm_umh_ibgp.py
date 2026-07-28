@@ -189,24 +189,30 @@ def _mvpn_routes():
     return out.get("routes", [])
 
 
-def _type7(source, group):
-    for r in _mvpn_routes():
-        if (
-            r.get("routeType") == 7
-            and r.get("source") == source
-            and r.get("group") == group
-        ):
-            return r
-    return None
-
-
 def _expect_type7(source, group, source_as, rt):
-    """Wait for the (S,G) Type-7 with exactly this Source AS and upstream RT."""
+    """Wait for EXACTLY ONE (S,G) Type-7, with this Source AS and upstream RT.
+
+    Counting matters as much as matching. Returning the first hit would let a
+    trust test pass while a second Type-7 carrying the forged Source AS/RT is
+    still installed -- whether it passed or failed would depend on RIB
+    iteration order. A re-resolution that changes the Source AS must WITHDRAW
+    the old NLRI key, not strand it, so assert the key count explicitly.
+    Mirrors _expect_single_type7() in the umh_lc suite.
+    """
 
     def _check():
-        r = _type7(source, group)
-        if r is None:
-            return "no Type-7 for ({}, {})".format(source, group)
+        matches = [
+            r
+            for r in _mvpn_routes()
+            if r.get("routeType") == 7
+            and r.get("source") == source
+            and r.get("group") == group
+        ]
+        if len(matches) != 1:
+            return "want exactly 1 Type-7 for ({}, {}), found {}: {}".format(
+                source, group, len(matches), matches
+            )
+        r = matches[0]
         if r.get("sourceAs") != source_as:
             return "Type-7 ({}, {}) Source AS {}, want {}: {}".format(
                 source, group, r.get("sourceAs"), source_as, r

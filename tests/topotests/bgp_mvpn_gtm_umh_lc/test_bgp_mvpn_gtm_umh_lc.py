@@ -29,6 +29,8 @@ Per-prefix scenarios (see r2/bgpd.conf):
   p9 10.10.90.0/24  wrong function    fn 2 != knob 1, skipped -> EC fallback
   p10 10.10.100.0/24 param 255.255.255.255 Class E/broadcast -> EC fallback
   p11 10.10.110.0/24 param 240.0.0.1  Class E (240/4) -> EC fallback
+  p12 10.10.120.0/24 param 169.254.0.1 link-local (169.254/16) -> EC fallback
+  p13 10.10.130.0/24 param 0.0.0.1    nonzero 0/8 -> EC fallback
 
 The knob is set mid-test (existing joins must re-resolve WITHOUT re-joining),
 changed communities re-originate via the unicast-route reresolve, and the
@@ -76,6 +78,8 @@ JOINS_V4 = {
     "p9": ("10.10.90.10", "232.1.1.9"),
     "p10": ("10.10.100.10", "232.1.1.10"),
     "p11": ("10.10.110.10", "232.1.1.11"),
+    "p12": ("10.10.120.10", "232.1.1.12"),
+    "p13": ("10.10.130.10", "232.1.1.13"),
 }
 JOIN_V6 = ("2001:db8:53::10", "ff3e::232:1")
 
@@ -378,6 +382,40 @@ def test_invalid_param_class_e_falls_back():
     src, grp = JOINS_V4["p11"]
     _join(src, grp)
     _expect_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_invalid_param_link_local_falls_back():
+    """p12's parameter is 2851995649 = 169.254.0.1 (link-local, 169.254/16).
+    A link-local address has interface-local scope and is not globally unique,
+    so as a UMH it either names nothing reachable or collides with a different
+    box on some other link. Neither ipv4_unicast_valid() nor the 0/8, 127/8,
+    Class D and Class E rejects cover it, so it needs its own gate; resolution
+    must fall back to the extended community."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS_V4["p12"]
+    _join(src, grp)
+    _expect_single_type7(src, grp, LOCAL_AS, EC_RT)
+
+
+def test_invalid_param_net0_nonzero_falls_back():
+    """p13's parameter is 1 = 0.0.0.1: inside 0/8 but NOT zero.
+
+    Mutation-sensitive by construction. p7 only covers 0.0.0.0, so replacing
+    the IPV4_NET0() prefix test with a bare `param == 0` comparison would keep
+    p7 green while quietly re-admitting the rest of 0/8. This vector is what
+    pins the gate to the prefix rather than to the single zero value."""
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    src, grp = JOINS_V4["p13"]
+    _join(src, grp)
+    _expect_single_type7(src, grp, LOCAL_AS, EC_RT)
 
 
 def test_lc_only_no_fallback():

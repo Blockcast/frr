@@ -1043,11 +1043,16 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 		 * unconditionally:
 		 *   0.0.0.0/8      unspecified / "this network"
 		 *   127.0.0.0/8    loopback
+		 *   169.254.0.0/16 link-local: interface-scoped and NOT
+		 *                  globally unique, so it either names nothing
+		 *                  reachable or collides with a different box
+		 *                  on some other link
 		 *   224.0.0.0/4    multicast (Class D)
 		 *   240.0.0.0/4    reserved (Class E), incl. 255.255.255.255
 		 */
 		if (IPV4_NET0(param) || IPV4_NET127(param) ||
-		    IPV4_CLASS_D(param) || IPV4_CLASS_E(param)) {
+		    IPV4_LINKLOCAL(param) || IPV4_CLASS_D(param) ||
+		    IPV4_CLASS_E(param)) {
 			if (BGP_DEBUG(zebra, ZEBRA))
 				zlog_debug("MVPN UMH large community %u:%u:%u rejected: %pI4 is not a usable upstream PE address",
 					   ga, fn, param, &umh);
