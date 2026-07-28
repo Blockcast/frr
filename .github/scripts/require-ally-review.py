@@ -114,7 +114,15 @@ def has_blocking_count(body):
 
 
 def contains_head_sha(body, head_sha):
-    return head_sha in body or short_sha(head_sha) in body
+    """Require the FULL 40-character OID.
+
+    A 7-character prefix is 28 bits of entropy and therefore grindable: an
+    attacker who can get any commit into the repo could aim a stale clean Ally
+    comment at a later head via a prefix collision. Ally's own consolidated
+    comments carry the full OID ("Reviewed head: <40 hex>"), so demanding the
+    whole thing costs nothing against real traffic.
+    """
+    return head_sha in body
 
 
 def is_consolidated_ally_comment_for_head(body, head_sha):
@@ -220,7 +228,9 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             # An explicit changes-requested verdict, OR a machine-readable
             # count > 0, is a real negative -- stays red, label or not.
             # Incidental security/"blocking" prose does NOT match.
-            if verdict == "changes-requested" or ACTION_REQUIRED_COMMENT_PATTERN.search(body):
+            if verdict == "changes-requested" or (
+                verdict is None and ACTION_REQUIRED_COMMENT_PATTERN.search(body)
+            ):
                 signals.append(
                     {
                         "at": at,
@@ -267,9 +277,15 @@ def distinct_reviewer_candidate_logins(reviews, head_sha, ally_logins, pr_author
 
 
 def distinct_reviewer_signals_for_head(
-    reviews, head_sha, ally_logins, pr_author_login, permission_trusted_logins
+    reviews,
+    head_sha,
+    ally_logins,
+    pr_author_login,
+    permission_trusted_logins,
+    permission_resolved_logins=None,
 ):
     ally = set(ally_logins)
+    permission_resolved_logins = permission_resolved_logins or set()
     signals = []
 
     for review in reviews:
@@ -290,12 +306,17 @@ def distinct_reviewer_signals_for_head(
             and login != pr_author_login
             and (login not in ally or user.get("type") == "User")
         )
-        # Trust via EITHER signal: a direct collaborator-permission grant
-        # (primary, requester-view-independent) OR the association allowlist
-        # (fallback, in case the permission lookup itself failed).
-        is_trusted = association in TRUSTED_REVIEWER_ASSOCIATIONS or (
-            isinstance(login, str) and login in permission_trusted_logins
-        )
+        # The permission lookup is AUTHORITATIVE when it completed. Falling
+        # back to author_association unconditionally (an OR) meant a
+        # collaborator holding only `read` or `triage` -- whose lookup
+        # succeeded and said "not trusted" -- was still trusted via the
+        # COLLABORATOR association, letting a read-only account clear an
+        # Ally-authored PR. association is only consulted when the lookup
+        # itself failed and we have nothing better.
+        if isinstance(login, str) and login in permission_resolved_logins:
+            is_trusted = login in permission_trusted_logins
+        else:
+            is_trusted = association in TRUSTED_REVIEWER_ASSOCIATIONS
         if not (
             is_distinct
             and is_trusted
@@ -372,7 +393,9 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
         # marker, a machine-readable count > 0, or the legacy action-required
         # phrasing. A positive review that merely *mentions* security /
         # "blocking" / "unsafe" / "finding" never fails here.
-        if verdict == "changes-requested" or ACTION_REQUIRED_COMMENT_PATTERN.search(body):
+        if verdict == "changes-requested" or (
+            verdict is None and ACTION_REQUIRED_COMMENT_PATTERN.search(body)
+        ):
             signals.append(
                 {
                     "at": at,
@@ -406,6 +429,29 @@ def latest_signal(signals):
     return sorted(signals, key=lambda entry: str(entry.get("at")), reverse=True)[0]
 
 
+def reduce_distinct_reviewer_signals(signals):
+    """Reduce to each reviewer's CURRENT state, then fail if any reviewer is
+    currently requesting changes.
+
+    Taking the single globally-latest signal is wrong with more than one
+    reviewer: reviewer B approving after reviewer A requested changes would
+    erase A's still-active objection and clear the gate. GitHub itself treats
+    an outstanding CHANGES_REQUESTED as blocking regardless of who reviewed
+    later, and so does this.
+    """
+    latest_by_author = {}
+    for signal in signals:
+        current = latest_by_author.get(signal["author"])
+        if current is None or str(signal["at"]) > str(current["at"]):
+            latest_by_author[signal["author"]] = signal
+
+    current_states = list(latest_by_author.values())
+    blocking = [s for s in current_states if s["status"] == "failure"]
+    if blocking:
+        return latest_signal(blocking)
+    return latest_signal(current_states)
+
+
 def decide(
     reviews,
     comments,
@@ -415,12 +461,17 @@ def decide(
     labels,
     override_label,
     permission_trusted_logins=None,
+    permission_resolved_logins=None,
 ):
     """Pure decision core: returns (state, description).
 
     Split out from main() so the whole policy is testable without network.
     """
     permission_trusted_logins = permission_trusted_logins or set()
+    # A login cannot be trusted without its lookup having completed, so treat
+    # trusted as implying resolved. Keeps the authoritative-lookup rule correct
+    # even if a caller supplies only the trusted set.
+    permission_resolved_logins = (permission_resolved_logins or set()) | permission_trusted_logins
     is_self_review = isinstance(pr_author_login, str) and pr_author_login in set(ally_logins)
 
     ally_signals = review_signals_for_head(
@@ -429,7 +480,12 @@ def decide(
 
     distinct_signals = (
         distinct_reviewer_signals_for_head(
-            reviews, head_sha, ally_logins, pr_author_login, permission_trusted_logins
+            reviews,
+            head_sha,
+            ally_logins,
+            pr_author_login,
+            permission_trusted_logins,
+            permission_resolved_logins,
         )
         if is_self_review
         else []
@@ -440,9 +496,12 @@ def decide(
     # demotion (or absent) -- never when Ally already flagged blocking findings
     # on this exact head.
     ally_has_failure = any(entry["status"] == "failure" for entry in ally_signals)
-    signal = latest_signal(
-        distinct_signals if (is_self_review and distinct_signals and not ally_has_failure) else ally_signals
-    )
+    if is_self_review and distinct_signals and not ally_has_failure:
+        # Per-reviewer reduction: one reviewer's later approval must not erase
+        # another's outstanding change request.
+        signal = reduce_distinct_reviewer_signals(distinct_signals)
+    else:
+        signal = latest_signal(ally_signals)
 
     has_override = bool(override_label) and override_label in labels
 
@@ -522,14 +581,21 @@ def fetch_collaborator_permission(api_base_url, owner, repo, username, token):
 
 
 def fetch_trusted_permission_logins(api_base_url, owner, repo, token, candidate_logins):
-    """A per-login lookup failure is logged and that login simply falls back to
-    the author_association check -- it does not abort the whole gate run.
+    """Return (trusted, resolved).
+
+    `resolved` is the set of logins whose lookup actually COMPLETED -- including
+    a 404 "not a collaborator", which is a real answer of "no permission". Only
+    a login missing from `resolved` (the lookup itself errored) falls back to
+    author_association; otherwise the lookup is authoritative, so a read-only
+    collaborator cannot be rescued by a COLLABORATOR association.
     """
     trusted = set()
+    resolved = set()
     for login in candidate_logins:
         try:
             permission = fetch_collaborator_permission(api_base_url, owner, repo, login, token)
             print("collaborator-permission: %s -> %s" % (login, permission or "(not a collaborator)"))
+            resolved.add(login)
             if permission in TRUSTED_COLLABORATOR_PERMISSIONS:
                 trusted.add(login)
         except Exception as error:  # noqa: BLE001 - non-fatal by design
@@ -538,7 +604,7 @@ def fetch_trusted_permission_logins(api_base_url, owner, repo, token, candidate_
                 "author_association: %s" % (login, error),
                 file=sys.stderr,
             )
-    return trusted
+    return trusted, resolved
 
 
 def set_commit_status(api_base_url, owner, repo, sha, token, state, description, target_url):
@@ -563,11 +629,6 @@ def main():
     with open(event_path, encoding="utf8") as handle:
         event = json.load(handle)
 
-    pull_request = event.get("pull_request")
-    if not pull_request:
-        print("No pull_request payload found; nothing to gate.")
-        return
-
     full_name = os.environ.get("GITHUB_REPOSITORY") or (event.get("repository") or {}).get(
         "full_name"
     )
@@ -579,6 +640,30 @@ def main():
         raise RuntimeError("GITHUB_TOKEN is required")
 
     owner, repo = full_name.split("/", 1)
+    api_base_url = os.environ.get("GITHUB_API_URL") or "https://api.github.com"
+
+    pull_request = event.get("pull_request")
+    if not pull_request:
+        # issue_comment fires on PR comments too, but its payload carries an
+        # `issue` (with a `pull_request` link) rather than the PR itself. The
+        # policy treats Ally issue comments as signals, so without resolving
+        # here that fallback could never re-evaluate and the head status would
+        # stay stale until some unrelated PR event happened to fire.
+        issue = event.get("issue") or {}
+        if issue.get("pull_request") and issue.get("number"):
+            pull_request = _request(
+                "%s/repos/%s/%s/pulls/%d"
+                % (api_base_url.rstrip("/"), owner, repo, issue["number"]),
+                token,
+            )
+        if not pull_request:
+            print("No pull_request payload found; nothing to gate.")
+            return
+
+    if pull_request.get("draft"):
+        print("PR is a draft; nothing to gate.")
+        return
+
     head_sha = (pull_request.get("head") or {}).get("sha")
     if not head_sha:
         raise RuntimeError("pull_request.head.sha is required")
@@ -587,7 +672,6 @@ def main():
     ally_logins = parse_list(os.environ.get("ALLY_REVIEWER_LOGINS"), DEFAULT_ALLY_LOGINS)
     pr_author_login = (pull_request.get("user") or {}).get("login")
     is_self_review = isinstance(pr_author_login, str) and pr_author_login in set(ally_logins)
-    api_base_url = os.environ.get("GITHUB_API_URL") or "https://api.github.com"
 
     reviews = fetch_paginated(api_base_url, "/repos/%s/%s/pulls/%d/reviews" % (owner, repo, pull_number), token)
     comments = fetch_paginated(api_base_url, "/repos/%s/%s/issues/%d/comments" % (owner, repo, pull_number), token)
@@ -610,14 +694,16 @@ def main():
     print("Fetched %d issue comment(s) for PR #%d." % (len(comments), pull_number))
 
     permission_trusted_logins = set()
+    permission_resolved_logins = set()
     if is_self_review:
         candidates = distinct_reviewer_candidate_logins(
             reviews, head_sha, ally_logins, pr_author_login
         )
         if candidates:
-            permission_trusted_logins = fetch_trusted_permission_logins(
-                api_base_url, owner, repo, token, candidates
-            )
+            (
+                permission_trusted_logins,
+                permission_resolved_logins,
+            ) = fetch_trusted_permission_logins(api_base_url, owner, repo, token, candidates)
 
     override_label = (os.environ.get("REVIEW_GATE_OVERRIDE_LABEL") or "review-gate-override").strip()
     raw_labels = pull_request.get("labels")
@@ -637,6 +723,7 @@ def main():
         labels=labels,
         override_label=override_label,
         permission_trusted_logins=permission_trusted_logins,
+        permission_resolved_logins=permission_resolved_logins,
     )
 
     set_commit_status(

@@ -22,6 +22,14 @@ on:
       - submitted
       - edited
       - dismissed
+  # The policy accepts Ally *issue comments* as head signals, so without this
+  # trigger that fallback could never re-evaluate: the head status would stay
+  # stale until some unrelated PR event happened to fire. The payload carries
+  # an `issue`, not a `pull_request`, so the script resolves the PR itself.
+  issue_comment:
+    types:
+      - created
+      - edited
 
 permissions:
   contents: read
@@ -30,7 +38,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: review-gate-${{ github.event.pull_request.number || github.ref }}
+  group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -51,7 +59,13 @@ jobs:
     # exists to close. Kept apart, a broken checker shows up as its own red
     # check while this job still reports what it can.
     name: Ally review gate
-    if: github.event.pull_request.draft == false
+    # issue_comment has no pull_request payload, so the draft check cannot be
+    # expressed here for that event; the script re-checks draft after it
+    # resolves the PR. Comments on plain issues are filtered out by requiring
+    # issue.pull_request.
+    if: >-
+      (github.event_name != 'issue_comment' && github.event.pull_request.draft == false) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)
     runs-on: default
     steps:
       - name: Checkout

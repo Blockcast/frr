@@ -44,7 +44,8 @@ def comment(body, login="allyblockcast[bot]", at="2026-07-27T10:00:00Z"):
     return {"body": body, "user": {"login": login}, "created_at": at}
 
 
-def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=None):
+def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=None,
+           resolved=None):
     return gate.decide(
         reviews=list(reviews),
         comments=list(comments),
@@ -54,6 +55,7 @@ def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=
         labels=list(labels),
         override_label=OVERRIDE,
         permission_trusted_logins=trusted or set(),
+        permission_resolved_logins=resolved or set(),
     )
 
 
@@ -252,10 +254,96 @@ class TestCommentSignals(unittest.TestCase):
         self.assertEqual(state, "pending")
 
 
+class TestFullShaAttestation(unittest.TestCase):
+    """A 7-char prefix is 28 bits — grindable. Only the full OID may bind a
+    comment to a head."""
+
+    def test_short_sha_only_comment_does_not_count(self):
+        body = "## Ally — Consolidated PR Review\n\nReviewed head: %s\n" % HEAD[:7]
+        state, desc = decide(comments=[comment(body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+
+    def test_full_sha_comment_counts(self):
+        state, _ = decide(comments=[comment(CONSOLIDATED)])
+        self.assertEqual(state, "success")
+
+
+class TestPermissionLookupIsAuthoritative(unittest.TestCase):
+    """When the collaborator-permission lookup COMPLETES it is the answer;
+    author_association is only a fallback for a lookup that errored."""
+
+    def test_read_only_collaborator_cannot_clear_a_self_review_pr(self):
+        # Association says COLLABORATOR, but the lookup resolved and did not
+        # grant write/maintain/admin.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login=HUMAN, utype="User", assoc="COLLABORATOR",
+                       at="2026-07-27T11:00:00Z")
+            ],
+            author="app/allyblockcast",
+            trusted=set(),
+            resolved={HUMAN},
+        )
+        self.assertEqual(state, "pending")
+
+    def test_association_still_used_when_lookup_failed(self):
+        # Login absent from `resolved` => the lookup itself errored.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login=HUMAN, utype="User", assoc="MEMBER",
+                       at="2026-07-27T11:00:00Z")
+            ],
+            author="app/allyblockcast",
+            trusted=set(),
+            resolved=set(),
+        )
+        self.assertEqual(state, "success")
+
+
+class TestConflictingReviewers(unittest.TestCase):
+    """One reviewer's later approval must not erase another's outstanding
+    change request."""
+
+    def test_later_approval_does_not_erase_earlier_changes_requested(self):
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="reviewer-a", utype="User",
+                       assoc="MEMBER", at="2026-07-27T10:00:00Z"),
+                review("APPROVED", login="reviewer-b", utype="User",
+                       assoc="MEMBER", at="2026-07-27T12:00:00Z"),
+            ],
+            author="app/allyblockcast",
+        )
+        self.assertEqual(state, "failure")
+
+    def test_same_reviewer_may_supersede_their_own_objection(self):
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="reviewer-a", utype="User",
+                       assoc="MEMBER", at="2026-07-27T10:00:00Z"),
+                review("APPROVED", login="reviewer-a", utype="User",
+                       assoc="MEMBER", at="2026-07-27T12:00:00Z"),
+            ],
+            author="app/allyblockcast",
+        )
+        self.assertEqual(state, "success")
+
+
 class TestApprovalAndRecency(unittest.TestCase):
     def test_ally_approval_on_head_succeeds(self):
         state, _ = decide(reviews=[review("APPROVED")])
         self.assertEqual(state, "success")
+
+    def test_explicit_pass_suppresses_the_prose_heuristic(self):
+        # "no action required" contains the action-required keyword; an
+        # explicit merge verdict must win over the heuristic.
+        body = (
+            CONSOLIDATED
+            + "### Recommended Action\n\nMerge.\n\nNothing else: no action required.\n"
+        )
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertNotEqual(state, "failure")
 
     def test_latest_signal_wins(self):
         clean = CONSOLIDATED
