@@ -164,6 +164,17 @@ class EventReader:
             ).encode("utf-8")
         )
 
+    def read_snapshot(self):
+        events = []
+        while True:
+            event = self.read_event()
+            if event.get("type") == "snapshot_end":
+                assert event["snapshot_count"] == len(events), event
+                return events, event
+            assert event.get("snapshot") is True, event
+            assert event["snapshot_index"] == len(events) + 1, event
+            events.append(event)
+
 
 def _join():
     get_topogen().gears["r1"].vtysh_cmd(
@@ -472,29 +483,81 @@ router bgp {}
 
     # Nor can a real subscriber that disconnects before acknowledging it.
     interrupted_reader = EventReader(EVENT_SOCK_2)
-    interrupted = interrupted_reader.read_event()
+    interrupted_events, interrupted_end = interrupted_reader.read_snapshot()
+
+    # Retain a second subscriber before interrupting the owner. Waiting for
+    # subscribedClients makes this mutation-sensitive: a broadcast replay
+    # cannot pass merely because bgpd had not processed observer's subscribe.
+    observer = EventReader(EVENT_SOCK_2)
+    _, synced = topotest.run_and_expect(
+        lambda: json.loads(
+            tgen.gears["r1"].vtysh_cmd("show bgp mvpn events json")
+        ).get("subscribedClients"),
+        2,
+        count=30,
+        wait=0.1,
+    )
+    assert synced == 2
     interrupted_reader.close()
 
-    # A subscribed observer that does not own the replay must not receive a
-    # duplicate install when the interrupted snapshot is retried.
-    observer = EventReader(EVENT_SOCK_2)
     restarted_reader = EventReader(EVENT_SOCK_2)
-    ev = restarted_reader.read_event()
+    restarted_events, restarted_end = restarted_reader.read_snapshot()
+    assert len(interrupted_events) == 1
+    assert len(restarted_events) == 1
+    interrupted = interrupted_events[0]
+    ev = restarted_events[0]
     assert ev["event_type"] == "install"
     assert ev["source"] == SRC
     assert ev["group"] == GRP
     assert ev["source_as"] == LOCAL_AS
     assert ev["upstream_peer"] == UPSTREAM_2
     assert ev["boot_epoch"] > boot_epoch
-    assert interrupted["seq"] == 1
-    assert ev["seq"] == interrupted["seq"] + 1
+    assert interrupted["seq"] == 0
+    assert interrupted_end["seq"] == interrupted["seq"]
+    assert ev["seq"] == interrupted["seq"]
     assert ev["route_version"] == "{}.1".format(ev["boot_epoch"])
+    assert restarted_end["seq"] == ev["seq"]
     observer.sock.settimeout(0.5)
     with pytest.raises(socket.timeout):
         observer.sock.recv(4096)
-    restarted_reader.acknowledge_snapshot(ev)
+    restarted_reader.acknowledge_snapshot(restarted_end)
+
+    # A real transition after replay remains contiguous for both retained
+    # subscribers; private snapshot retries did not consume global seq.
+    _leave()
+    restarted_live = restarted_reader.read_event()
+    observer_live = observer.read_event()
+    assert restarted_live["event_type"] == "withdraw"
+    assert observer_live == restarted_live
+    assert restarted_live["seq"] == restarted_end["seq"] + 1
     observer.close()
     restarted_reader.close()
+
+
+def test_failed_initial_configuration_preserves_intent():
+    """A failed startup without a healthy listener remains visible in
+    running-config and the liveness surface for operator remediation."""
+    tgen = get_topogen()
+    r1 = tgen.gears["r1"]
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r1.vtysh_cmd(
+        """
+configure terminal
+router bgp {}
+ no bgp mvpn event-socket
+ bgp mvpn event-socket /missing/bgp-mvpn-events.sock
+""".format(
+            LOCAL_AS
+        )
+    )
+    status = json.loads(r1.vtysh_cmd("show bgp mvpn events json"))
+    assert status.get("path") == "/missing/bgp-mvpn-events.sock", status
+    assert status.get("listening") is False, status
+    running = r1.vtysh_cmd("show running-config")
+    assert " bgp mvpn event-socket /missing/bgp-mvpn-events.sock" in running
 
 
 if __name__ == "__main__":

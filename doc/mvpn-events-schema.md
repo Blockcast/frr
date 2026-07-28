@@ -40,14 +40,19 @@ is allowed to build claims from.
   turning a debug/reconciliation poll into a billing artifact. Later clients
   receive events from subscription time onward; there is no general per-client
   replay/backlog. The snapshot remains pending until that client sends
-  `{"type":"snapshot_ack","boot_epoch":N,"seq":M}`, identifying the epoch and
-  final snapshot sequence it durably consumed. A connect-only health probe or
+  `{"type":"snapshot_ack","boot_epoch":N,"seq":M}` after receiving the
+  `{"type":"snapshot_end",...}` frame. Snapshot install records carry
+  `"snapshot":true` and a one-based `snapshot_index`; they retain the current
+  global `seq` baseline rather than consuming lifecycle sequence numbers. The
+  `snapshot_end` frame carries that baseline and `snapshot_count`. A
+  connect-only health probe or
   a client that disconnects before acknowledgment cannot consume the snapshot;
   the next subscriber receives a replay. An empty snapshot needs no
   acknowledgment because there is no pre-existing state to lose; future joins
   are delivered as ordinary live events.
 - Wire format: one JSON object per line (`\n`-terminated, no pretty-printing)
-  per event, broadcast identically to every connected client.
+  per event. Live lifecycle events are broadcast identically to every
+  subscribed client; snapshot records are private to the handoff owner.
 - A client that falls behind by more than 8MiB of unflushed output is
   disconnected rather than buffered without bound. This is deliberate, not a
   bug: an unbounded queue would turn a stalled consumer into unbounded bgpd
@@ -57,13 +62,17 @@ is allowed to build claims from.
 
 ## Durable cursor and gap detection
 
-Every event carries `boot_epoch` and `seq`:
+Every lifecycle event and snapshot frame carries `boot_epoch` and `seq`:
 
 - `seq` is a per-listener-instance, in-memory monotonic counter starting at
   1. It is **not** fsynced per event, and it resets to 1 whenever the listener
   is (re)created (which always also advances `boot_epoch` -- see below -- so
   the `(boot_epoch, seq)` *pair* stays strictly ordered; do not rely on `seq`
   alone across an epoch change).
+- Snapshot records do not advance `seq`: they describe current state at the
+  `snapshot_end.seq` baseline (zero when no live event has occurred in the new
+  epoch). After durably applying and acknowledging the snapshot, the consumer
+  persists that baseline; the next live event must be exactly `seq + 1`.
 - `boot_epoch` is a small integer persisted under `$frr_runstatedir` (e.g.
   `/var/run/frr/bgpd-mvpn-events-default.epoch`) and incremented on every
   listener start, under an exclusive lock separate from the atomically-renamed
@@ -80,8 +89,9 @@ cursor so a restarted consumer can detect gaps") by persisting `(boot_epoch,
 seq)` of the last event it has fully processed, on its own side (this is the
 consumer's responsibility -- see BLO-17650's restart-checkpoint
 requirement). On reconnect, or on the next event after any connection, the
-consumer compares the incoming event's `(boot_epoch, seq)` to its persisted
-cursor:
+consumer compares each incoming live event's `(boot_epoch, seq)` to its
+persisted cursor. Snapshot records are applied as a framed set through
+`snapshot_end`, not run through the live-event increment check:
 
 - `boot_epoch` unchanged, `seq == last_seq + 1`: contiguous, no gap.
 - `boot_epoch` unchanged, `seq > last_seq + 1`: a genuine gap (the connection

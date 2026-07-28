@@ -106,8 +106,14 @@ struct bgp_mvpn_event_sink {
 	struct bgp_mvpn_event_join *joins;
 	bool snapshot_pending;
 	bool snapshot_replay_active;
+	bool snapshot_delivery_failed;
+	uint64_t snapshot_index;
 	struct bgp_mvpn_event_client *snapshot_client;
 };
+
+static bool bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
+				   struct bgp_mvpn_event_client *target,
+				   struct json_object *jo);
 
 static void bgp_mvpn_event_client_close(struct bgp_mvpn_event_sink *sink,
 					struct bgp_mvpn_event_client *client)
@@ -179,6 +185,7 @@ static void bgp_mvpn_event_client_read(struct event *event)
 		struct json_object *epoch;
 		struct json_object *seq;
 		size_t line_len = newline - client->read_buf;
+		bool client_closed = false;
 
 		*newline = '\0';
 		jo = json_tokener_parse(client->read_buf);
@@ -188,16 +195,41 @@ static void bgp_mvpn_event_client_read(struct event *event)
 			client->subscribed = true;
 			if (sink->snapshot_pending && !sink->snapshot_client) {
 				sink->snapshot_client = client;
+				client->snapshot_seq = sink->seq;
 				sink->snapshot_replay_active = true;
+				sink->snapshot_delivery_failed = false;
+				sink->snapshot_index = 0;
 				bgp_mvpn_reemit_local_joins(sink->bgp);
 				sink->snapshot_replay_active = false;
-				client->snapshot_seq = sink->seq;
 				/* An empty snapshot has no state whose loss could blind the
 				 * consumer. Future installs are ordinary live events. */
-				if (client->snapshot_seq == 0) {
+				if (sink->snapshot_client == client &&
+				    sink->snapshot_delivery_failed) {
+					bgp_mvpn_event_client_close(sink, client);
+				} else if (sink->snapshot_client == client &&
+					   sink->snapshot_index == 0) {
 					sink->snapshot_pending = false;
 					sink->snapshot_client = NULL;
+				} else if (sink->snapshot_client == client) {
+					struct json_object *end = json_object_new_object();
+
+					if (!end) {
+						sink->snapshot_delivery_failed = true;
+						bgp_mvpn_event_client_close(sink, client);
+					} else {
+						json_object_int_add(end, "schema_version", 1);
+						json_object_string_add(end, "type", "snapshot_end");
+						json_object_int_add(end, "boot_epoch",
+								    (int64_t)sink->boot_epoch);
+						json_object_int_add(end, "seq",
+								    (int64_t)client->snapshot_seq);
+						json_object_int_add(end, "snapshot_count",
+								    (int64_t)sink->snapshot_index);
+						(void)bgp_mvpn_event_deliver(sink, client, end);
+					}
 				}
+				client_closed = sink->snapshot_delivery_failed &&
+						sink->snapshot_client != client;
 			}
 		} else if (jo && json_object_object_get_ex(jo, "type", &type) &&
 			   json_object_is_type(type, json_type_string) &&
@@ -208,7 +240,14 @@ static void bgp_mvpn_event_client_read(struct event *event)
 			   (uint64_t)json_object_get_int64(epoch) == sink->boot_epoch &&
 			   (uint64_t)json_object_get_int64(seq) == client->snapshot_seq) {
 			sink->snapshot_pending = false;
-			sink->snapshot_client = NULL;
+				sink->snapshot_client = NULL;
+		}
+		/* Private delivery can synchronously close and free its owner. Do not
+		 * touch the read buffer or rearm an event against that stale pointer. */
+		if (client_closed) {
+			if (jo)
+				json_object_put(jo);
+			return;
 		}
 		if (jo)
 			json_object_put(jo);
@@ -527,8 +566,17 @@ int bgp_mvpn_events_set_socket(struct bgp *bgp, const char *path)
 		return CMD_SUCCESS;
 
 	replacement = bgp_mvpn_events_start(bgp, path);
-	if (!replacement)
+	if (!replacement) {
+		/* Preserve operator intent after failed initial/config-replay startup so
+		 * running-config and `show` expose configured-but-not-listening. A failed
+		 * replacement must retain the healthy listener and its old path. */
+		if (!bgp->mvpn_event_sink) {
+			configured_path = XSTRDUP(MTYPE_MVPN_EVENT_PATH, path);
+			XFREE(MTYPE_MVPN_EVENT_PATH, bgp->mvpn_event_socket_path);
+			bgp->mvpn_event_socket_path = configured_path;
+		}
 		return CMD_WARNING_CONFIG_FAILED;
+	}
 	configured_path = XSTRDUP(MTYPE_MVPN_EVENT_PATH, path);
 	bgp_mvpn_events_stop(bgp);
 	XFREE(MTYPE_MVPN_EVENT_PATH, bgp->mvpn_event_socket_path);
@@ -554,11 +602,14 @@ void bgp_mvpn_events_show(struct vty *vty, struct bgp *bgp, bool use_json)
 {
 	struct bgp_mvpn_event_sink *sink = bgp->mvpn_event_sink;
 	struct bgp_mvpn_event_client *client;
-	int clients = 0;
+	int clients = 0, subscribed_clients = 0;
 
 	if (sink)
-		for (client = sink->clients; client; client = client->next)
+		for (client = sink->clients; client; client = client->next) {
 			clients++;
+			if (client->subscribed)
+				subscribed_clients++;
+		}
 
 	if (use_json) {
 		struct json_object *jo = json_object_new_object();
@@ -572,6 +623,7 @@ void bgp_mvpn_events_show(struct vty *vty, struct bgp *bgp, bool use_json)
 			json_object_int_add(jo, "bootEpoch", (int64_t)sink->boot_epoch);
 			json_object_int_add(jo, "seq", (int64_t)sink->seq);
 			json_object_int_add(jo, "clients", clients);
+			json_object_int_add(jo, "subscribedClients", subscribed_clients);
 		}
 		vty_json(vty, jo);
 		return;
@@ -641,7 +693,7 @@ static void bgp_mvpn_event_route_version(char *buf, size_t buflen, uint64_t boot
 	snprintf(buf, buflen, "%" PRIu64 ".%u", boot_epoch, generation);
 }
 
-static void bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
+static bool bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
 				   struct bgp_mvpn_event_client *target,
 				   struct json_object *jo)
 {
@@ -649,6 +701,7 @@ static void bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
 	char *line;
 	size_t textlen, linelen;
 	struct bgp_mvpn_event_client *client, *next;
+	bool delivered = target == NULL;
 
 	text = json_object_to_json_string_ext(jo, JSON_C_TO_STRING_PLAIN);
 	textlen = strlen(text);
@@ -667,15 +720,20 @@ static void bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
 		if (client->pending_bytes + linelen > BGP_MVPN_EVENT_SINK_MAX_BACKLOG) {
 			zlog_warn("MVPN events: client fd %d exceeded %u byte backlog, disconnecting (gap signal for reconnect)",
 				  client->fd, BGP_MVPN_EVENT_SINK_MAX_BACKLOG);
+			if (client == target)
+				sink->snapshot_delivery_failed = true;
 			bgp_mvpn_event_client_close(sink, client);
 			continue;
 		}
 
 		status = buffer_write(client->wb, client->fd, line, linelen);
 		if (status == BUFFER_ERROR) {
+			if (client == target)
+				sink->snapshot_delivery_failed = true;
 			bgp_mvpn_event_client_close(sink, client);
 			continue;
 		}
+		delivered = true;
 		if (status == BUFFER_EMPTY) {
 			client->pending_bytes = 0;
 			continue;
@@ -689,6 +747,13 @@ static void bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
 
 	XFREE(MTYPE_MVPN_EVENT_LINE, line);
 	json_object_free(jo);
+	return delivered;
+}
+
+static void bgp_mvpn_event_broadcast(struct bgp_mvpn_event_sink *sink,
+				     struct json_object *jo)
+{
+	(void)bgp_mvpn_event_deliver(sink, NULL, jo);
 }
 
 static void bgp_mvpn_event_broadcast(struct bgp_mvpn_event_sink *sink,
@@ -706,12 +771,17 @@ static struct json_object *bgp_mvpn_event_new(struct bgp_mvpn_event_sink *sink,
 	struct timespec ts;
 	char srcbuf[INET6_ADDRSTRLEN], grpbuf[INET6_ADDRSTRLEN];
 
+	/* Snapshot replay is private point-in-time framing at the current global
+	 * cursor baseline. Only producer lifecycle transitions advance seq. */
+	if (!sink->snapshot_replay_active)
+		sink->seq++;
 	/* Reserve the cursor before json-c's fallible allocation. If allocation
 	 * fails, the next successful event exposes the missing sequence instead
 	 * of silently losing a settlement transition. */
-	sink->seq++;
 	jo = json_object_new_object();
 	if (!jo) {
+		if (sink->snapshot_replay_active)
+			sink->snapshot_delivery_failed = true;
 		flog_err(EC_LIB_SYSTEM_CALL,
 			 "MVPN events: json allocation failed, dropping %s event at seq %" PRIu64
 			 " (cursor gap reserved)",
@@ -725,6 +795,11 @@ static struct json_object *bgp_mvpn_event_new(struct bgp_mvpn_event_sink *sink,
 	json_object_string_add(jo, "event_type", event_type);
 	json_object_int_add(jo, "boot_epoch", (int64_t)sink->boot_epoch);
 	json_object_int_add(jo, "seq", (int64_t)sink->seq);
+	if (sink->snapshot_replay_active) {
+		sink->snapshot_index++;
+		json_object_boolean_add(jo, "snapshot", true);
+		json_object_int_add(jo, "snapshot_index", (int64_t)sink->snapshot_index);
+	}
 	json_object_int_add(jo, "time_ns", (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec);
 	json_object_int_add(jo, "route_type", BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN);
 	json_object_string_add(jo, "source", ipaddr2str(src, srcbuf, sizeof(srcbuf)));
@@ -753,6 +828,9 @@ void bgp_mvpn_event_join_resolved(struct bgp *bgp, const struct ipaddr *src,
 	bool changed;
 
 	if (!sink)
+		return;
+	if (sink->snapshot_replay_active &&
+	    (!sink->snapshot_client || sink->snapshot_delivery_failed))
 		return;
 
 	join = bgp_mvpn_event_join_get(sink, src, grp);
@@ -799,7 +877,7 @@ void bgp_mvpn_event_join_resolved(struct bgp *bgp, const struct ipaddr *src,
 
 	if (jo) {
 		if (sink->snapshot_replay_active)
-			bgp_mvpn_event_deliver(sink, sink->snapshot_client, jo);
+			(void)bgp_mvpn_event_deliver(sink, sink->snapshot_client, jo);
 		else
 			bgp_mvpn_event_broadcast(sink, jo);
 	}
