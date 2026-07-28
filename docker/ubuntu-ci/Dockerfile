@@ -109,11 +109,6 @@ RUN for i in $(seq 1 ${APT_RETRIES}); do \
     python3 -m pip install xmltodict && \
     python3 -m pip install git+https://github.com/Exa-Networks/exabgp@0659057837cd6c6351579e9f0fa47e9fb7de7311
 
-# LTTng tracing dependencies (conditional)
-RUN if [ "$ENABLE_LTTNG" = "true" ]; then \
-        apt-get install -y liblttng-ust-dev; \
-    fi
-
 COPY docker/ubuntu-ci/ /tmp/ubuntu-ci-assets/
 
 RUN if [ "$UBUNTU_VERSION" = "24.04" ]; then \
@@ -187,6 +182,18 @@ RUN cd && pwd && ls -al && \
     make -j $(nproc) && \
     sudo make install
 RUN python3 -m pip install 'libyang<4'
+
+# LTTng tracing dependencies (conditional).
+#
+# Deliberately the LAST root layer. ENABLE_LTTNG is a cache-key input for every
+# instruction after the one that consumes it, so placing this earlier forked the
+# layer chain for the two Ubuntu 24.04 legs ahead of the MIB fetch, the apt
+# keyring setup and the pip installs -- and made those expensive layers
+# unshareable between them. Keep any new conditional-on-ENABLE_LTTNG work below
+# this line, not above it.
+RUN if [ "$ENABLE_LTTNG" = "true" ]; then \
+        apt-get install -y liblttng-ust-dev; \
+    fi
 
 USER frr:frr
 
