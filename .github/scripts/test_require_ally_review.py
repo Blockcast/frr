@@ -646,6 +646,70 @@ class TestDescriptionLength(unittest.TestCase):
         self.assertEqual(gate.clamp_description("short"), "short")
 
 
+class TestContradictoryCounts(unittest.TestCase):
+    """A body carrying duplicate count headings must fail closed on the max.
+    First-match parsing read 'Critical Issues (0) ... Critical Issues (2)' as
+    clean. Ported from hang-mmt-fec's gate."""
+
+    def test_zero_then_nonzero_heading_fails(self):
+        body = CLEAN + "\n### Critical Issues (2)\n"
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "failure")
+
+    def test_contradictory_counts_with_explicit_pass_still_fail(self):
+        """The load-bearing case: an explicit 'Merge.' verdict suppresses the
+        keyword fallback, so first-match counts reading the (0) was the ONLY
+        thing between this body and a clean signal."""
+        body = attest(
+            HEAD,
+            "### Critical Issues (0)\n\n### Critical Issues (2)\n\n"
+            "### Recommended Action\n\nMerge.\n",
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+    def test_nonzero_then_zero_heading_still_fails(self):
+        body = attest(HEAD, "### Important Issues (3)\n\n### Important Issues (0)\n")
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+    def test_duplicate_zero_headings_stay_clean(self):
+        body = CLEAN + "\n### Critical Issues (0)\n"
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+
+
+class TestSameTimestampTies(unittest.TestCase):
+    """Opposite signals at the same second must not let API list order pick
+    between red and green. Ported from hang-mmt-fec's same-second rule."""
+
+    def test_global_tie_prefers_blocking_regardless_of_list_order(self):
+        blocking = CONSOLIDATED + "### Important Issues (1)\n"
+        at = "2026-07-27T10:00:00Z"
+        for ordering in (
+            [comment(CLEAN, at=at), comment(blocking, at=at)],
+            [comment(blocking, at=at), comment(CLEAN, at=at)],
+        ):
+            state, _ = decide(comments=ordering)
+            self.assertEqual(state, "failure")
+
+    def test_per_reviewer_tie_prefers_changes_requested(self):
+        at = "2026-07-27T11:00:00Z"
+        for first, second in (
+            ("APPROVED", "CHANGES_REQUESTED"),
+            ("CHANGES_REQUESTED", "APPROVED"),
+        ):
+            state, _ = decide(
+                reviews=[
+                    review(first, login=HUMAN, utype="User", assoc="MEMBER", at=at),
+                    review(second, login=HUMAN, utype="User", assoc="MEMBER", at=at),
+                ],
+                author="app/allyblockcast",
+                trusted={HUMAN},
+            )
+            self.assertEqual(state, "failure", "order %s,%s" % (first, second))
+
+
 class TestApprovalAndRecency(unittest.TestCase):
     def test_ally_approval_on_head_succeeds(self):
         state, _ = decide(reviews=[review("APPROVED")])

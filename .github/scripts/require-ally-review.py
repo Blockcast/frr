@@ -110,8 +110,17 @@ def short_sha(sha):
 
 
 def extract_issue_count(body, label):
-    match = re.search(r"%s \((\d+)\)" % re.escape(label), body)
-    return int(match.group(1)) if match else None
+    """Max across every matching heading, not the first.
+
+    A body carrying contradictory counts ("Critical Issues (0)" early,
+    "Critical Issues (2)" later -- a re-edited or concatenated consolidated
+    body) must fail closed. First-match returned the 0 and the findings
+    vanished. Ported from hang-mmt-fec's gate.
+    """
+    matches = re.findall(r"%s \((\d+)\)" % re.escape(label), body)
+    if not matches:
+        return None
+    return max(int(count) for count in matches)
 
 
 def has_blocking_count(body):
@@ -533,7 +542,15 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
 def latest_signal(signals):
     if not signals:
         return None
-    return sorted(signals, key=lambda entry: str(entry.get("at")), reverse=True)[0]
+
+    def order(entry):
+        # Recency first; on an exact timestamp tie the blocking signal wins.
+        # Without the tie-break, Python's stable sort hands the decision to
+        # API list order -- red vs green decided by pagination. Ported from
+        # hang-mmt-fec's same-second fail-closed rule.
+        return (str(entry.get("at")), 1 if entry.get("status") == "failure" else 0)
+
+    return sorted(signals, key=order)[-1]
 
 
 def reduce_distinct_reviewer_signals(signals):
@@ -549,7 +566,16 @@ def reduce_distinct_reviewer_signals(signals):
     latest_by_author = {}
     for signal in signals:
         current = latest_by_author.get(signal["author"])
-        if current is None or str(signal["at"]) > str(current["at"]):
+        newer = current is None or str(signal["at"]) > str(current["at"])
+        # Same-second tie between opposite states from one reviewer: fail
+        # closed rather than let list order pick.
+        tie_blocking = (
+            current is not None
+            and str(signal["at"]) == str(current["at"])
+            and signal["status"] == "failure"
+            and current["status"] != "failure"
+        )
+        if newer or tie_blocking:
             latest_by_author[signal["author"]] = signal
 
     current_states = list(latest_by_author.values())

@@ -42,8 +42,19 @@ permissions:
   pull-requests: read
   statuses: write
 
+# PR events (push, review) share a per-PR group with cancellation: a new head
+# legitimately supersedes an in-flight evaluation of the old one.
+#
+# issue_comment events get a PER-RUN group instead. In the shared group, ANY
+# commenter could cancel an in-flight gate run -- including one about to post
+# a failure. hang-mmt-fec's gate diverts only untrusted commenters and skips
+# their runs entirely; frr cannot copy that, because maintainer (non-Ally)
+# override comments are load-bearing signals here and must still trigger
+# evaluation. Per-run groups make comment runs uncancellable and non-cancelling;
+# every run recomputes from the full current state, so concurrent writers
+# converge on the same verdict.
 concurrency:
-  group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  group: review-gate-${{ github.event_name == 'issue_comment' && format('comment-{0}', github.run_id) || format('pr-{0}', github.event.pull_request.number || github.ref) }}
   cancel-in-progress: true
 
 jobs:
