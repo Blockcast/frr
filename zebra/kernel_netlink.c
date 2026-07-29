@@ -1182,7 +1182,11 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 		if (status == -1 || status == 0) {
 			while ((ctx = dplane_ctx_dequeue(&(bth->ctx_list))) !=
 			       NULL) {
-				if (status == -1)
+				if (status == -1 ||
+				    dplane_ctx_get_op(ctx) ==
+					    DPLANE_OP_DIMT_TUNNEL_ADD ||
+				    dplane_ctx_get_op(ctx) ==
+					    DPLANE_OP_DIMT_TUNNEL_DEL)
 					dplane_ctx_set_status(
 						ctx,
 						ZEBRA_DPLANE_REQUEST_FAILURE);
@@ -1274,7 +1278,15 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 			int err = netlink_parse_error(nl, h, bth->zns->is_cmd,
 						      false);
 
-			if (err == -1)
+			if (dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_ADD ||
+			    dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_DEL)
+				dplane_ctx_set_status(
+					ctx, err == 1
+						     ? ZEBRA_DPLANE_REQUEST_SUCCESS
+						     : ZEBRA_DPLANE_REQUEST_FAILURE);
+			else if (err == -1)
 				dplane_ctx_set_status(
 					ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
 
@@ -1283,6 +1295,11 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 					   __func__, h->nlmsg_seq);
 			continue;
 		}
+
+		if (dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_ADD ||
+		    dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL)
+			dplane_ctx_set_status(ctx,
+					      ZEBRA_DPLANE_REQUEST_FAILURE);
 
 		/*
 		 * If we get here then we did not receive neither the ack nor
@@ -1502,6 +1519,9 @@ static enum netlink_msg_status nl_put_msg(struct nl_batch *bth,
 
 	case DPLANE_OP_GRE_SET:
 		return netlink_put_gre_set_msg(bth, ctx);
+	case DPLANE_OP_DIMT_TUNNEL_ADD:
+	case DPLANE_OP_DIMT_TUNNEL_DEL:
+		return netlink_put_dimt_tunnel_msg(bth, ctx);
 
 	case DPLANE_OP_INTF_ADDR_ADD:
 	case DPLANE_OP_INTF_ADDR_DEL:
@@ -1554,11 +1574,13 @@ void kernel_update_multi(struct dplane_ctx_list_head *ctx_list)
 		    && batch.zns->ns_id != dplane_ctx_get_ns(ctx)->ns_id)
 			nl_batch_send(&batch);
 
-		/*
-		 * Assume all messages will succeed and then mark only the ones
-		 * that failed.
-		 */
-		dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_SUCCESS);
+		/* DIMT requires a matching positive ACK; other operations retain
+		 * the historical optimistic-success behavior. */
+		dplane_ctx_set_status(
+			ctx, dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_ADD ||
+				     dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL
+			     ? ZEBRA_DPLANE_REQUEST_FAILURE
+			     : ZEBRA_DPLANE_REQUEST_SUCCESS);
 
 		res = nl_put_msg(&batch, ctx);
 

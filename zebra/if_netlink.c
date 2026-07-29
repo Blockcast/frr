@@ -388,6 +388,134 @@ netlink_gre_set_msg_encoder(struct zebra_dplane_ctx *ctx, void *buf,
 	return NLMSG_ALIGN(req->n.nlmsg_len);
 }
 
+static ssize_t netlink_dimt_tunnel_msg_encoder(struct zebra_dplane_ctx *ctx,
+					       void *buf, size_t buflen)
+{
+	struct {
+		struct nlmsghdr n;
+		struct ifinfomsg ifi;
+		char buf[];
+	} *req = buf;
+	const struct zebra_dimt_tunnel_ctx *dimt;
+	const struct zapi_dimt_tunnel *tunnel;
+	struct rtattr *rta_info, *rta_data;
+	const char *kind;
+	uint16_t gre_key_flag = GRE_KEY;
+	uint32_t key;
+	int bytelen;
+
+	if (buflen < sizeof(*req))
+		return 0;
+	memset(req, 0, sizeof(*req));
+	dimt = dplane_ctx_get_dimt_tunnel(ctx);
+	tunnel = &dimt->tunnel;
+
+	if (dimt->phase == ZEBRA_DIMT_TUNNEL_ADDRESS) {
+		struct {
+			struct nlmsghdr n;
+			struct ifaddrmsg ifa;
+			char buf[];
+		} *addr = buf;
+
+		if (buflen < sizeof(*addr))
+			return 0;
+		memset(addr, 0, sizeof(*addr));
+		bytelen = IS_IPADDR_V4(&tunnel->inner_local) ? 4 : 16;
+		addr->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifaddrmsg));
+		addr->n.nlmsg_type = RTM_NEWADDR;
+		addr->n.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE |
+					      NLM_F_EXCL | NLM_F_ACK;
+		addr->ifa.ifa_family = IS_IPADDR_V4(&tunnel->inner_local)
+					       ? AF_INET
+					       : AF_INET6;
+		addr->ifa.ifa_prefixlen = IS_IPADDR_V4(&tunnel->inner_local)
+						  ? IPV4_MAX_BITLEN
+						  : IPV6_MAX_BITLEN;
+		addr->ifa.ifa_index = dimt->delete_ifindex;
+		if (!nl_attr_put(&addr->n, buflen, IFA_LOCAL,
+				 IS_IPADDR_V4(&tunnel->inner_local)
+					 ? (void *)&tunnel->inner_local.ipaddr_v4
+					 : (void *)&tunnel->inner_local.ipaddr_v6,
+				 bytelen) ||
+		    !nl_attr_put(&addr->n, buflen, IFA_ADDRESS,
+				 IS_IPADDR_V4(&tunnel->inner_peer)
+					 ? (void *)&tunnel->inner_peer.ipaddr_v4
+					 : (void *)&tunnel->inner_peer.ipaddr_v6,
+				 bytelen))
+			return 0;
+		return NLMSG_ALIGN(addr->n.nlmsg_len);
+	}
+
+	req->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+	req->n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+
+	if (dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL) {
+		req->n.nlmsg_type = RTM_DELLINK;
+		req->ifi.ifi_index = dimt->delete_ifindex;
+		return NLMSG_ALIGN(req->n.nlmsg_len);
+	}
+
+	req->n.nlmsg_type = RTM_NEWLINK;
+	req->n.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+	req->ifi.ifi_index = 0;
+	req->ifi.ifi_flags = IFF_UP;
+	req->ifi.ifi_change = IFF_UP;
+	if (!nl_attr_put(&req->n, buflen, IFLA_IFNAME, dimt->ifname,
+			 strlen(dimt->ifname) + 1))
+		return 0;
+	if ((tunnel->options & ZAPI_DIMT_TUNNEL_MTU_PRESENT) &&
+	    !nl_attr_put32(&req->n, buflen, IFLA_MTU, tunnel->mtu))
+		return 0;
+
+	rta_info = nl_attr_nest(&req->n, buflen, IFLA_LINKINFO);
+	if (!rta_info)
+		return 0;
+	kind = IS_IPADDR_V6(&tunnel->outer_local) ? "ip6gre" : "gre";
+	if (!nl_attr_put(&req->n, buflen, IFLA_INFO_KIND, kind,
+			 strlen(kind) + 1))
+		return 0;
+	rta_data = nl_attr_nest(&req->n, buflen, IFLA_INFO_DATA);
+	if (!rta_data)
+		return 0;
+
+	if (IS_IPADDR_V4(&tunnel->outer_local)) {
+		if (!nl_attr_put32(&req->n, buflen, IFLA_GRE_LOCAL,
+				   tunnel->outer_local.ipaddr_v4.s_addr) ||
+		    !nl_attr_put32(&req->n, buflen, IFLA_GRE_REMOTE,
+				   tunnel->outer_remote.ipaddr_v4.s_addr))
+			return 0;
+	} else if (!nl_attr_put(&req->n, buflen, IFLA_GRE_LOCAL,
+				&tunnel->outer_local.ipaddr_v6,
+				sizeof(struct in6_addr)) ||
+		   !nl_attr_put(&req->n, buflen, IFLA_GRE_REMOTE,
+				&tunnel->outer_remote.ipaddr_v6,
+				sizeof(struct in6_addr)))
+		return 0;
+
+	if (tunnel->options & ZAPI_DIMT_TUNNEL_KEY_PRESENT) {
+		key = htonl(tunnel->key);
+		if (!nl_attr_put16(&req->n, buflen, IFLA_GRE_IFLAGS,
+				   gre_key_flag) ||
+		    !nl_attr_put16(&req->n, buflen, IFLA_GRE_OFLAGS,
+				   gre_key_flag) ||
+		    !nl_attr_put32(&req->n, buflen, IFLA_GRE_IKEY, key) ||
+		    !nl_attr_put32(&req->n, buflen, IFLA_GRE_OKEY, key))
+			return 0;
+	}
+
+	if (tunnel->encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU &&
+	    (!nl_attr_put16(&req->n, buflen, IFLA_GRE_ENCAP_TYPE,
+			    TUNNEL_ENCAP_FOU) ||
+	     !nl_attr_put16(&req->n, buflen, IFLA_GRE_ENCAP_SPORT, 0) ||
+	     !nl_attr_put16(&req->n, buflen, IFLA_GRE_ENCAP_DPORT,
+			    htons(tunnel->dport))))
+		return 0;
+
+	nl_attr_nest_end(&req->n, rta_data);
+	nl_attr_nest_end(&req->n, rta_info);
+	return NLMSG_ALIGN(req->n.nlmsg_len);
+}
+
 static int netlink_extract_bridge_info(struct rtattr *link_data,
 				       struct zebra_l2info_bridge *bridge_info)
 {
@@ -847,6 +975,16 @@ netlink_put_gre_set_msg(struct nl_batch *bth, struct zebra_dplane_ctx *ctx)
 	ret = netlink_batch_add_msg(bth, ctx, netlink_gre_set_msg_encoder, false);
 
 	return ret;
+}
+
+enum netlink_msg_status
+netlink_put_dimt_tunnel_msg(struct nl_batch *bth,
+			    struct zebra_dplane_ctx *ctx)
+{
+	assert(dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_ADD ||
+	       dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL);
+	return netlink_batch_add_msg(bth, ctx,
+				     netlink_dimt_tunnel_msg_encoder, false);
 }
 
 /* Interface lookup by netlink socket. */

@@ -244,6 +244,10 @@ typedef enum {
 	ZEBRA_TC_FILTER_DELETE,
 	ZEBRA_OPAQUE_NOTIFY,
 	ZEBRA_SRV6_SID_NOTIFY,
+	ZEBRA_DIMT_TUNNEL_ADD,
+	ZEBRA_DIMT_TUNNEL_DEL,
+	ZEBRA_DIMT_TUNNEL_NOTIFY_OWNER,
+	ZEBRA_MESSAGE_MAX,
 } zebra_message_types_t;
 /* Zebra message types. Please update the corresponding
  * command_types array with any changes!
@@ -722,6 +726,40 @@ struct zapi_umh {
 	struct ipaddr umh;    /* Global Admin field: the UMH address */
 	uint8_t umh_type;     /* enum zapi_umh_type */
 	uint8_t preference;   /* 0..ZAPI_UMH_PREF_MAX, higher preferred */
+};
+
+enum zapi_dimt_tunnel_encap {
+	ZAPI_DIMT_TUNNEL_ENCAP_GRE = 1,
+	ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU = 2,
+};
+
+#define ZAPI_DIMT_TUNNEL_KEY_PRESENT (1 << 0)
+#define ZAPI_DIMT_TUNNEL_MTU_PRESENT (1 << 1)
+
+struct zapi_dimt_tunnel {
+	uint32_t tunnel_id;
+	struct ipaddr inner_local;
+	struct ipaddr inner_peer;
+	struct ipaddr outer_local;
+	struct ipaddr outer_remote;
+	uint8_t encap; /* enum zapi_dimt_tunnel_encap */
+	uint16_t dport;
+	uint8_t options;
+	uint32_t key;
+	uint32_t mtu;
+};
+
+enum zapi_dimt_tunnel_notify_owner {
+	ZAPI_DIMT_TUNNEL_INSTALLED,
+	ZAPI_DIMT_TUNNEL_FAIL_INSTALL,
+	ZAPI_DIMT_TUNNEL_REMOVED,
+	ZAPI_DIMT_TUNNEL_REMOVE_FAIL,
+};
+
+struct zapi_dimt_tunnel_notify {
+	uint32_t tunnel_id;
+	ifindex_t ifindex;
+	uint8_t result; /* enum zapi_dimt_tunnel_notify_owner */
 };
 
 struct zapi_pw {
@@ -1203,6 +1241,16 @@ extern int zapi_mvpn_sg_decode(struct stream *s, struct zapi_mvpn_sg *sg);
 extern int zapi_umh_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
 			   const struct zapi_umh *umh);
 extern int zapi_umh_decode(struct stream *s, struct zapi_umh *umh);
+extern int zapi_dimt_tunnel_encode(struct stream *s, int cmd,
+				   vrf_id_t vrf_id,
+				   const struct zapi_dimt_tunnel *tunnel);
+extern int zapi_dimt_tunnel_decode(struct stream *s, int cmd,
+				   struct zapi_dimt_tunnel *tunnel);
+extern int zapi_dimt_tunnel_notify_encode(
+	struct stream *s, vrf_id_t vrf_id,
+	const struct zapi_dimt_tunnel_notify *notify);
+extern int zapi_dimt_tunnel_notify_decode(
+	struct stream *s, struct zapi_dimt_tunnel_notify *notify);
 
 extern enum zclient_send_status zebra_send_mpls_labels(struct zclient *zclient,
 						       int cmd,

@@ -16,6 +16,7 @@
 #include "zebra_nhg.h"
 #include "zebra_neigh.h"
 #include "zebra/zebra_tc.h"
+#include "zebra/zebra_dimt.h"
 #include "debug.h"
 #include "zebra_script.h"
 #include "wheel.h"
@@ -269,6 +270,7 @@ void zebra_router_terminate(void)
 	hash_clean_and_free(&zrouter.filter_hash, (void (*)(void *)) zebra_tc_filter_free);
 	hash_clean_and_free(&zrouter.qdisc_hash, (void (*)(void *)) zebra_tc_qdisc_free);
 	hash_clean_and_free(&zrouter.class_hash, (void (*)(void *)) zebra_tc_class_free);
+	zebra_dimt_tunnel_cleanup();
 
 #ifdef HAVE_SCRIPTING
 	zebra_script_destroy();
@@ -311,6 +313,7 @@ void zebra_router_init(bool asic_offload, bool notify_on_ack, bool v6_with_v4_ne
 	zebra_vxlan_init();
 	zebra_mlag_init();
 	zebra_neigh_init();
+	zebra_dimt_tunnel_init();
 
 	zrouter.rules_hash = hash_create_size(8, zebra_pbr_rules_hash_key,
 					      zebra_pbr_rules_hash_equal,

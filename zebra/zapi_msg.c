@@ -54,6 +54,7 @@
 #include "zebra/zebra_srte.h"
 #include "zebra/zebra_srv6.h"
 #include "zebra/zebra_neigh.h"
+#include "zebra/zebra_dimt.h"
 
 DEFINE_MTYPE_STATIC(ZEBRA, RE_OPAQUE, "Route Opaque Data");
 
@@ -4391,6 +4392,8 @@ void (*const zserv_handlers[])(ZAPI_HANDLER_ARGS) = {
 	[ZEBRA_TC_CLASS_DELETE] = zread_tc_class,
 	[ZEBRA_TC_FILTER_ADD] = zread_tc_filter,
 	[ZEBRA_TC_FILTER_DELETE] = zread_tc_filter,
+	[ZEBRA_DIMT_TUNNEL_ADD] = zebra_dimt_tunnel_request,
+	[ZEBRA_DIMT_TUNNEL_DEL] = zebra_dimt_tunnel_request,
 };
 
 /*

@@ -511,6 +511,7 @@ struct zebra_dplane_ctx {
 		struct dplane_macfdb_read_info macfdb_read;
 		struct dplane_neigh_read_info neigh_read;
 		struct dplane_tc_qdisc_notify_info tc_qdisc_notify;
+		struct zebra_dimt_tunnel_ctx dimt_tunnel;
 	} u;
 
 	/* Namespace info, used especially for netlink kernel communication */
@@ -985,6 +986,8 @@ static void dplane_ctx_free_internal(struct zebra_dplane_ctx *ctx)
 	case DPLANE_OP_NEIGH_READ:
 	case DPLANE_OP_TC_QDISC_READ:
 	case DPLANE_OP_TC_QDISC_NOTIFY:
+	case DPLANE_OP_DIMT_TUNNEL_ADD:
+	case DPLANE_OP_DIMT_TUNNEL_DEL:
 		break;
 	}
 }
@@ -1298,6 +1301,10 @@ const char *dplane_op2str(enum dplane_op_e op)
 		return "TC_QDISC_READ";
 	case DPLANE_OP_TC_QDISC_NOTIFY:
 		return "TC_QDISC_NOTIFY";
+	case DPLANE_OP_DIMT_TUNNEL_ADD:
+		return "DIMT_TUNNEL_ADD";
+	case DPLANE_OP_DIMT_TUNNEL_DEL:
+		return "DIMT_TUNNEL_DEL";
 	}
 
 	return "UNKNOWN";
@@ -3319,6 +3326,13 @@ dplane_ctx_gre_get_info(const struct zebra_dplane_ctx *ctx)
 	DPLANE_CTX_VALID(ctx);
 
 	return &ctx->u.gre.info;
+}
+
+const struct zebra_dimt_tunnel_ctx *
+dplane_ctx_get_dimt_tunnel(const struct zebra_dplane_ctx *ctx)
+{
+	DPLANE_CTX_VALID(ctx);
+	return &ctx->u.dimt_tunnel;
 }
 
 /***********************************************************************
@@ -6479,6 +6493,51 @@ done:
 	return result;
 }
 
+static enum zebra_dplane_result dplane_dimt_tunnel_update(
+	enum dplane_op_e op, vrf_id_t vrf_id,
+	const struct zebra_dimt_tunnel_ctx *tunnel)
+{
+	struct zebra_dplane_ctx *ctx;
+	struct zebra_ns *zns;
+	struct zebra_vrf *zvrf;
+
+	ctx = dplane_ctx_alloc();
+	ctx->zd_op = op;
+	ctx->zd_vrf_id = vrf_id;
+	ctx->u.dimt_tunnel = *tunnel;
+	dplane_ctx_set_ifname(ctx, tunnel->ifname);
+	if (op == DPLANE_OP_DIMT_TUNNEL_DEL)
+		dplane_ctx_set_ifindex(ctx, tunnel->delete_ifindex);
+
+	zvrf = zebra_vrf_lookup_by_id(vrf_id);
+	zns = zvrf ? zvrf->zns : NULL;
+	if (!zns) {
+		dplane_ctx_free(&ctx);
+		return ZEBRA_DPLANE_REQUEST_FAILURE;
+	}
+	dplane_ctx_ns_init(ctx, zns, false);
+
+	if (dplane_update_enqueue(ctx) != AOK) {
+		dplane_ctx_free(&ctx);
+		return ZEBRA_DPLANE_REQUEST_FAILURE;
+	}
+	return ZEBRA_DPLANE_REQUEST_QUEUED;
+}
+
+enum zebra_dplane_result dplane_dimt_tunnel_add(
+	vrf_id_t vrf_id, const struct zebra_dimt_tunnel_ctx *tunnel)
+{
+	return dplane_dimt_tunnel_update(DPLANE_OP_DIMT_TUNNEL_ADD, vrf_id,
+					 tunnel);
+}
+
+enum zebra_dplane_result dplane_dimt_tunnel_del(
+	vrf_id_t vrf_id, const struct zebra_dimt_tunnel_ctx *tunnel)
+{
+	return dplane_dimt_tunnel_update(DPLANE_OP_DIMT_TUNNEL_DEL, vrf_id,
+					 tunnel);
+}
+
 /*
  * Common helper api for SRv6 encapsulation source address set
  */
@@ -7463,7 +7522,14 @@ static void kernel_dplane_log_detail(struct zebra_dplane_ctx *ctx)
 				   ? "new"
 				   : "del",
 			   dplane_ctx_tc_qdisc_notify_get_major_handle(ctx),
-			   dplane_ctx_get_startup(ctx));
+				   dplane_ctx_get_startup(ctx));
+		break;
+	case DPLANE_OP_DIMT_TUNNEL_ADD:
+	case DPLANE_OP_DIMT_TUNNEL_DEL:
+		zlog_debug("Dplane %s tunnel %u if %s",
+			   dplane_op2str(dplane_ctx_get_op(ctx)),
+			   ctx->u.dimt_tunnel.tunnel.tunnel_id,
+			   ctx->u.dimt_tunnel.ifname);
 		break;
 	}
 }
@@ -7655,6 +7721,8 @@ static void kernel_dplane_handle_result(struct zebra_dplane_ctx *ctx)
 	case DPLANE_OP_NEIGH_READ:
 	case DPLANE_OP_TC_QDISC_READ:
 	case DPLANE_OP_TC_QDISC_NOTIFY:
+	case DPLANE_OP_DIMT_TUNNEL_ADD:
+	case DPLANE_OP_DIMT_TUNNEL_DEL:
 		break;
 	}
 }

@@ -53,6 +53,7 @@
 #include "zebra/zebra_neigh.h"
 #include "zebra/zebra_script.h"
 #include "zebra/zebra_tc.h"
+#include "zebra/zebra_dimt.h"
 
 DEFINE_MGROUP(ZEBRA, "zebra");
 
@@ -5309,6 +5310,10 @@ static void rib_process_dplane_results(struct event *event)
 
 			case DPLANE_OP_TC_QDISC_NOTIFY:
 				zebra_tc_qdisc_handle_notify(ctx);
+				break;
+			case DPLANE_OP_DIMT_TUNNEL_ADD:
+			case DPLANE_OP_DIMT_TUNNEL_DEL:
+				zebra_dimt_tunnel_dplane_result(ctx);
 				break;
 
 			/* Some op codes not handled here */

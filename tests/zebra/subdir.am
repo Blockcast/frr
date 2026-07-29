@@ -12,6 +12,7 @@ tests_zebra_test_lm_plugin_CPPFLAGS = $(TESTS_CPPFLAGS)
 tests_zebra_test_lm_plugin_LDADD = $(ZEBRA_TEST_LDADD)
 tests_zebra_test_lm_plugin_SOURCES = tests/zebra/test_lm_plugin.c
 EXTRA_DIST += \
+	tests/zebra/test_dimt_lifecycle.py \
 	tests/zebra/test_lm_plugin.py \
 	tests/zebra/test_lm_plugin.refout \
 	# end

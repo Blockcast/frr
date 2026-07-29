@@ -176,6 +176,8 @@ struct zebra_router {
 	struct hash *qdisc_hash;
 	struct hash *class_hash;
 	struct hash *filter_hash;
+	/* Interfaces created by the acknowledged DIMT lifecycle. */
+	struct list *dimt_tunnels;
 
 	/* A sequence number used for tracking routes */
 	_Atomic uint32_t sequence_num;
