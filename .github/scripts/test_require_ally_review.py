@@ -51,8 +51,16 @@ def review(state, commit=HEAD, body=None, login="allyblockcast[bot]", at="2026-0
     }
 
 
-def comment(body, login="allyblockcast[bot]", at="2026-07-27T10:00:00Z"):
-    return {"body": body, "user": {"login": login}, "created_at": at}
+def comment(body, login="allyblockcast[bot]", at="2026-07-27T10:00:00Z", updated=None):
+    row = {"body": body, "user": {"login": login}, "created_at": at}
+    if updated is not None:
+        row["updated_at"] = updated
+    return row
+
+
+def override_body(sha):
+    """A maintainer's head-bound override authorization."""
+    return "Reviewer never ran; overriding.\n\nreview-gate-override: %s\n" % sha
 
 
 def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=None,
@@ -106,9 +114,22 @@ class TestCleanCommented(unittest.TestCase):
         self.assertIn("no blocking findings", desc)
         self.assertIn(OVERRIDE, desc)
 
-    def test_clean_commented_clears_with_override_label(self):
+    def test_clean_commented_label_alone_does_not_clear(self):
+        """The label is PR-scoped and survives `synchronize`. On its own it
+        would clear every later unreviewed head, so it is necessary but not
+        sufficient."""
         state, desc = decide(
             reviews=[review("COMMENTED", body=CONSOLIDATED)], labels=[OVERRIDE]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("review-gate-override: %s" % HEAD, desc)
+
+    def test_clean_commented_clears_with_label_and_head_attestation(self):
+        state, desc = decide(
+            reviews=[review("COMMENTED", body=CONSOLIDATED)],
+            comments=[comment(override_body(HEAD), login=HUMAN)],
+            labels=[OVERRIDE],
+            trusted={HUMAN},
         )
         self.assertEqual(state, "success")
         self.assertIn("overridden", desc)
@@ -383,6 +404,95 @@ class TestConflictingReviewers(unittest.TestCase):
             trusted={"reviewer-a"},
         )
         self.assertEqual(state, "success")
+
+
+class TestOverrideIsHeadBound(unittest.TestCase):
+    """The override label is PR-scoped and survives `synchronize`. Left on its
+    own it cleared every subsequent unreviewed head -- defeating the gate on
+    exactly the push-then-review cycle it exists to protect. Authorization now
+    needs the label AND a comment naming the full head SHA, so pushing new code
+    revokes it."""
+
+    def test_attestation_for_a_previous_head_does_not_carry_over(self):
+        # The regression itself: override granted for OTHER, then a new push.
+        state, desc = decide(
+            comments=[comment(override_body(OTHER), login=HUMAN)],
+            labels=[OVERRIDE],
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+
+    def test_label_without_attestation_names_the_required_comment(self):
+        state, desc = decide(labels=[OVERRIDE], trusted={HUMAN})
+        self.assertEqual(state, "pending")
+        self.assertIn("review-gate-override: %s" % HEAD, desc)
+
+    def test_attestation_without_label_does_not_clear(self):
+        state, _ = decide(
+            comments=[comment(override_body(HEAD), login=HUMAN)], trusted={HUMAN}
+        )
+        self.assertEqual(state, "pending")
+
+    def test_untrusted_author_cannot_authorize_an_override(self):
+        state, _ = decide(
+            comments=[comment(override_body(HEAD), login="drive-by")],
+            labels=[OVERRIDE],
+            trusted=set(),
+        )
+        self.assertEqual(state, "pending")
+
+    def test_short_sha_attestation_is_rejected(self):
+        # 7 chars is 28 bits: grindable, same reason review attestations
+        # require the full OID.
+        state, _ = decide(
+            comments=[comment(override_body(HEAD[:7]), login=HUMAN)],
+            labels=[OVERRIDE],
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "pending")
+
+    def test_override_still_never_bypasses_blocking_findings(self):
+        body = CONSOLIDATED + "### Critical Issues (1)\n"
+        state, _ = decide(
+            reviews=[review("COMMENTED", body=body)],
+            comments=[comment(override_body(HEAD), login=HUMAN)],
+            labels=[OVERRIDE],
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "failure")
+
+
+class TestEditedCommentOrdering(unittest.TestCase):
+    """created_at is immutable across edits, so ordering on it let an older
+    comment edited to ADD findings lose to a newer clean signal."""
+
+    def test_edited_older_comment_with_findings_beats_newer_clean_signal(self):
+        edited = CONSOLIDATED + "### Important Issues (1)\n"
+        state, _ = decide(
+            comments=[
+                # Created first, edited last -> its findings are the current word.
+                comment(edited, at="2026-07-27T09:00:00Z", updated="2026-07-27T15:00:00Z"),
+                comment(CLEAN, at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_unedited_ordering_is_unchanged(self):
+        blocking = CONSOLIDATED + "### Important Issues (1)\n"
+        state, _ = decide(
+            comments=[
+                comment(blocking, at="2026-07-27T09:00:00Z"),
+                comment(CLEAN, at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_missing_updated_at_falls_back_to_created_at(self):
+        self.assertEqual(
+            gate.comment_signal_time({"created_at": "2026-07-27T09:00:00Z"}),
+            "2026-07-27T09:00:00Z",
+        )
 
 
 class TestApprovalAndRecency(unittest.TestCase):

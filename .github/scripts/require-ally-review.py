@@ -403,6 +403,17 @@ def distinct_reviewer_signals_for_head(
     return signals
 
 
+def comment_signal_time(comment):
+    """Effective ordering key for a comment: the later of created_at/updated_at.
+
+    Timestamps are ISO-8601 UTC ("2026-07-28T10:00:00Z") and therefore sort
+    correctly as plain strings, which is what latest_signal() compares.
+    """
+    created = str(comment.get("created_at") or "")
+    updated = str(comment.get("updated_at") or "")
+    return max(created, updated)
+
+
 def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
     ally = set(ally_logins)
     short_head = short_sha(head_sha)
@@ -419,7 +430,12 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
         if not (is_consolidated or is_issue_link):
             continue
 
-        at = str(comment.get("created_at") or "")
+        # Order on the LATER of created_at/updated_at. GitHub keeps created_at
+        # immutable across edits, so an older clean comment edited to add
+        # blocking findings would otherwise keep losing latest_signal() to a
+        # newer clean signal and leave the gate green on a review that now says
+        # the opposite.
+        at = comment_signal_time(comment)
 
         # Self-review cannot approve its own PR, but machine-readable blocking
         # findings must still fail closed and remain impossible to override.
@@ -518,6 +534,33 @@ def reduce_distinct_reviewer_signals(signals):
     return latest_signal(current_states)
 
 
+def override_attestation_logins(comments, head_sha):
+    """Logins that authorized an override of THIS exact head.
+
+    The label alone is PR-scoped and survives `synchronize`, so on its own it
+    turns every future unreviewed head green -- which defeats the gate on
+    precisely the push-then-review cycle it exists to protect. Pair it with a
+    comment naming the full head SHA so the authorization dies with the commit
+    it was granted for. Full SHA only, for the same reason attestations require
+    one: a 7-char prefix is 28 bits and grindable.
+    """
+    logins = set()
+    if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha or ""):
+        return logins
+
+    pattern = re.compile(
+        r"^[ \t]*review-gate-override:[ \t]*%s[ \t]*$" % re.escape(head_sha),
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for comment in comments or []:
+        login = (comment.get("user") or {}).get("login")
+        if not isinstance(login, str):
+            continue
+        if pattern.search(str(comment.get("body") or "")):
+            logins.add(login)
+    return logins
+
+
 def decide(
     reviews,
     comments,
@@ -569,31 +612,49 @@ def decide(
     else:
         signal = latest_signal(ally_signals)
 
-    has_override = bool(override_label) and override_label in labels
-
     # Escape hatch: Ally does not reliably auto-review, so a "Waiting for Ally
-    # review" pending can deadlock a PR forever. A maintainer can apply an
-    # explicit override label -- but the override NEVER bypasses a review that
-    # flagged issues: a `failure` on the current head stays red even with the
-    # label. It only rescues the reviewer-never-ran case.
+    # review" pending can deadlock a PR forever. A maintainer can override --
+    # but the override NEVER bypasses a review that flagged issues: a `failure`
+    # on the current head stays red regardless. It only rescues the
+    # reviewer-never-ran case.
+    #
+    # Two independent conditions, because the label alone is PR-scoped and
+    # survives `synchronize`: it would silently clear every later unreviewed
+    # head. The label carries the authorization (only maintainers can apply
+    # one); a comment naming the full head SHA binds that authorization to a
+    # specific revision, so pushing new code revokes it automatically.
+    has_label = bool(override_label) and override_label in labels
+    override_logins = override_attestation_logins(comments, head_sha)
+    has_head_attestation = bool(override_logins & set(permission_trusted_logins))
+    has_override = has_label and has_head_attestation
+
     if has_override and (signal is None or signal["status"] != "failure"):
         return (
             "success",
-            "Ally review gate overridden by '%s' label on head %s."
-            % (override_label, short_sha(head_sha)),
+            "Ally review gate overridden for head %s (label '%s' + head-bound authorization)."
+            % (short_sha(head_sha), override_label),
         )
 
     if signal is None:
+        if has_label and not has_head_attestation:
+            return (
+                "pending",
+                "Waiting for Ally review of head %s. The '%s' label is present but "
+                "not authorized for this head: comment 'review-gate-override: %s' "
+                "to override this revision."
+                % (short_sha(head_sha), override_label, head_sha),
+            )
         return "pending", "Waiting for Ally review of head %s." % short_sha(head_sha)
 
-    # A clean COMMENTED review (override didn't fire => no label) is not a
-    # GitHub status state. Not blocked by findings, but not an auto-pass
-    # either: stay `pending` and tell the maintainer to apply the label.
+    # A clean COMMENTED review (override didn't fire) is not a GitHub status
+    # state. Not blocked by findings, but not an auto-pass either: stay
+    # `pending` and tell the maintainer exactly what to do.
     if signal["status"] == CLEAN_COMMENTED_STATUS:
         return (
             "pending",
-            "Ally reviewed head %s with no blocking findings; apply '%s' to merge."
-            % (short_sha(head_sha), override_label),
+            "Ally reviewed head %s with no blocking findings; apply '%s' and comment "
+            "'review-gate-override: %s' to merge."
+            % (short_sha(head_sha), override_label, head_sha),
         )
 
     return signal["status"], signal["description"]
@@ -739,6 +800,23 @@ def main():
     pr_author_login = (pull_request.get("user") or {}).get("login")
     is_self_review = isinstance(pr_author_login, str) and pr_author_login in set(ally_logins)
 
+    # Claim the context as `pending` BEFORE the fallible reads below. Everything
+    # from here on can raise (network, rate limit, malformed payload), and a
+    # re-evaluation that dies after an earlier same-head `success` would
+    # otherwise leave the required context green while only the separately-named
+    # workflow check goes red -- the merge control failing open on exactly the
+    # kind of error it should hold for. Overwritten with the real verdict below.
+    set_commit_status(
+        api_base_url,
+        owner,
+        repo,
+        head_sha,
+        token,
+        "pending",
+        "Evaluating Ally review of head %s..." % short_sha(head_sha),
+        os.environ.get("STATUS_TARGET_URL"),
+    )
+
     reviews = fetch_paginated(api_base_url, "/repos/%s/%s/pulls/%d/reviews" % (owner, repo, pull_number), token)
     comments = fetch_paginated(api_base_url, "/repos/%s/%s/issues/%d/comments" % (owner, repo, pull_number), token)
 
@@ -759,18 +837,6 @@ def main():
         )
     print("Fetched %d issue comment(s) for PR #%d." % (len(comments), pull_number))
 
-    permission_trusted_logins = set()
-    permission_resolved_logins = set()
-    if is_self_review:
-        candidates = distinct_reviewer_candidate_logins(
-            reviews, head_sha, ally_logins, pr_author_login
-        )
-        if candidates:
-            (
-                permission_trusted_logins,
-                permission_resolved_logins,
-            ) = fetch_trusted_permission_logins(api_base_url, owner, repo, token, candidates)
-
     override_label = (os.environ.get("REVIEW_GATE_OVERRIDE_LABEL") or "review-gate-override").strip()
     raw_labels = pull_request.get("labels")
     labels = []
@@ -779,6 +845,26 @@ def main():
             name = label if isinstance(label, str) else (label or {}).get("name")
             if name:
                 labels.append(name)
+
+    permission_trusted_logins = set()
+    permission_resolved_logins = set()
+    # Two independent reasons to resolve write permission: clearing a
+    # self-authored PR via a distinct reviewer, and authorizing a head-bound
+    # override. Resolve both candidate sets in one pass -- an override author
+    # whose permission was never looked up is untrusted, so omitting them here
+    # would make the escape hatch permanently inert.
+    candidates = set()
+    if is_self_review:
+        candidates |= set(
+            distinct_reviewer_candidate_logins(reviews, head_sha, ally_logins, pr_author_login)
+        )
+    if override_label and override_label in labels:
+        candidates |= override_attestation_logins(comments, head_sha)
+    if candidates:
+        (
+            permission_trusted_logins,
+            permission_resolved_logins,
+        ) = fetch_trusted_permission_logins(api_base_url, owner, repo, token, sorted(candidates))
 
     state, description = decide(
         reviews=reviews,
