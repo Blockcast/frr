@@ -61,6 +61,7 @@
 #include "bgpd/bgp_io.h"
 #include "bgpd/bgp_evpn.h"
 #include "bgpd/bgp_mvpn.h"
+#include "bgpd/bgp_mvpn_events.h"
 #include "bgpd/bgp_evpn_vty.h"
 #include "bgpd/bgp_evpn_mh.h"
 #include "bgpd/bgp_addpath.h"
@@ -22777,6 +22778,10 @@ int bgp_config_write(struct vty *vty)
 			vty_out(vty, " sid vpn per-vrf export %u\n", tovpn_sid_index);
 		}
 
+		/* Instance-wide MVPN settlement socket command. The parser is in
+		 * BGP_NODE, so serialize it before entering any address-family. */
+		bgp_mvpn_events_config_write(vty, bgp);
+
 		/* IPv4 unicast configuration.  */
 		bgp_config_write_family(vty, bgp, AFI_IP, SAFI_UNICAST);
 
@@ -23361,6 +23366,25 @@ DEFPY (bgp_mvpn_umh_large_community,
 	return CMD_SUCCESS;
 }
 
+DEFPY (bgp_mvpn_event_socket,
+       bgp_mvpn_event_socket_cmd,
+       "[no] bgp mvpn event-socket [FILENAME]",
+       NO_STR
+       BGP_STR
+       "Multicast VPN (MCAST-VPN) commands\n"
+       "Settlement-plane Type-7 install/withdraw/origin-change event stream: AF_UNIX SOCK_STREAM listener, one JSON object per line per connected reader (BLO-17645)\n"
+       "Absolute path to bind the listening socket at\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+
+	if (!no && !filename) {
+		vty_out(vty, "%% Must specify a socket path\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	return bgp_mvpn_events_set_socket(bgp, no ? NULL : filename);
+}
+
 DEFPY (bgp_mvpn_source_active6,
        bgp_mvpn_source_active6_cmd,
        "[no] bgp mvpn source-active X:X::X:X$source6 group X:X::X:X$group6",
@@ -23408,6 +23432,29 @@ DEFPY (show_bgp_mvpn,
 	}
 
 	bgp_mvpn_show_routes(vty, bgp, afi, !!uj);
+	return CMD_SUCCESS;
+}
+
+DEFPY (show_bgp_mvpn_events,
+       show_bgp_mvpn_events_cmd,
+       "show bgp mvpn events [json$uj]",
+       SHOW_STR
+       BGP_STR
+       "Multicast VPN (MCAST-VPN) commands\n"
+       "Settlement-plane Type-7 event-socket listener status\n"
+       JSON_STR)
+{
+	struct bgp *bgp = bgp_get_default();
+
+	if (!bgp) {
+		if (uj)
+			vty_out(vty, "{}\n");
+		else
+			vty_out(vty, "%% No BGP process configured\n");
+		return CMD_SUCCESS;
+	}
+
+	bgp_mvpn_events_show(vty, bgp, !!uj);
 	return CMD_SUCCESS;
 }
 
@@ -23879,7 +23926,9 @@ void bgp_vty_init(void)
 	/* Instance-wide (BGP_NODE): one setting serves both mvpn AFs -- the
 	 * UMH large community carries a v4 PE address either way. */
 	install_element(BGP_NODE, &bgp_mvpn_umh_large_community_cmd);
+	install_element(BGP_NODE, &bgp_mvpn_event_socket_cmd);
 	install_element(VIEW_NODE, &show_bgp_mvpn_cmd);
+	install_element(VIEW_NODE, &show_bgp_mvpn_events_cmd);
 
 	/* "no neighbor activate" commands. */
 	install_element(BGP_NODE, &no_neighbor_activate_hidden_cmd);

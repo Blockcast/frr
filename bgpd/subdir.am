@@ -61,6 +61,7 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_mpath.c \
 	bgpd/bgp_mplsvpn.c \
 	bgpd/bgp_mvpn.c \
+	bgpd/bgp_mvpn_events.c \
 	bgpd/bgp_dimt.c \
 	bgpd/bgp_network.c \
 	bgpd/bgp_nexthop.c \
@@ -153,6 +154,7 @@ noinst_HEADERS += \
 	bgpd/bgp_mplsvpn.h \
 	bgpd/bgp_mplsvpn_snmp.h \
 	bgpd/bgp_mvpn.h \
+	bgpd/bgp_mvpn_events.h \
 	bgpd/bgp_dimt.h \
 	bgpd/bgp_network.h \
 	bgpd/bgp_nexthop.h \

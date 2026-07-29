@@ -98,6 +98,16 @@ char *buffer_getstr(struct buffer *b)
 	return s;
 }
 
+size_t buffer_pending(const struct buffer *b)
+{
+	const struct buffer_data *data;
+	size_t pending = 0;
+
+	for (data = b->head; data; data = data->next)
+		pending += data->cp - data->sp;
+	return pending;
+}
+
 /* Clear and free all allocated data. */
 void buffer_reset(struct buffer *b)
 {
