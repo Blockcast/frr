@@ -234,6 +234,72 @@ jobs:
         if: ${{ always() }}
         run: rm -rf test-results-${{ matrix.cfg.platform }}* /tmp/frr-${{ matrix.cfg.platform }}.tar
 
+  Unit-Test:
+    runs-on: default
+    needs: Build
+    name: ${{ matrix.cfg.name }}
+    timeout-minutes: 20
+    env:
+      UNIT_TEST_CONTAINER: frr-${{ matrix.cfg.platform }}-unit-${{ github.run_id }}-${{ github.run_attempt }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg:
+        -  { name: 'Ubuntu 22.04 amd64 Unit Test', platform: 'amd64_u22' }
+        -  { name: 'Ubuntu 24.04 amd64 Unit Test', platform: 'amd64_u24' }
+    steps:
+      - name: Fetch docker image artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ matrix.cfg.platform }}-image
+          path: /tmp
+      - name: Load docker image
+        run: docker load --input /tmp/frr-${{ matrix.cfg.platform }}.tar
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=1m 15m \
+          docker run --init --name "${UNIT_TEST_CONTAINER}" \
+            frr-${{ matrix.cfg.platform }} \
+            bash -lc '
+              cd ~/frr
+              rm -f tests/tests.xml
+              make check
+              status=$?
+              if [ ! -s tests/tests.xml ]; then
+                echo "ERROR: make check did not produce tests/tests.xml" >&2
+                exit 125
+              fi
+              touch /tmp/frr-unit-test-report-ready
+              exit "${status}"
+            '
+      - name: Gather unit test results
+        id: gather_unit_test_results
+        if: ${{ always() }}
+        run: |
+          rm -rf unit-test-results-${{ matrix.cfg.platform }}
+          mkdir unit-test-results-${{ matrix.cfg.platform }}
+          docker cp \
+            "${UNIT_TEST_CONTAINER}":/tmp/frr-unit-test-report-ready \
+            unit-test-results-${{ matrix.cfg.platform }}/report-ready
+          docker cp \
+            "${UNIT_TEST_CONTAINER}":/home/frr/frr/tests/tests.xml \
+            unit-test-results-${{ matrix.cfg.platform }}/tests.xml
+          test -s unit-test-results-${{ matrix.cfg.platform }}/tests.xml
+      - name: Upload unit test results
+        if: ${{ always() && steps.gather_unit_test_results.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-test-results-${{ matrix.cfg.platform }}
+          path: unit-test-results-${{ matrix.cfg.platform }}/tests.xml
+          retention-days: 14
+          if-no-files-found: error
+      - name: Cleanup
+        if: ${{ always() }}
+        run: |
+          rm -rf unit-test-results-${{ matrix.cfg.platform }} /tmp/frr-${{ matrix.cfg.platform }}.tar
+          docker rm -f "${UNIT_TEST_CONTAINER}" || true
+
   Test:
     runs-on: default
     needs: Build
