@@ -239,6 +239,8 @@ jobs:
     needs: Build
     name: ${{ matrix.cfg.name }}
     timeout-minutes: 20
+    env:
+      UNIT_TEST_CONTAINER: frr-${{ matrix.cfg.platform }}-unit-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:
@@ -256,16 +258,32 @@ jobs:
       - name: Run unit tests
         run: |
           set -euo pipefail
-          docker run --init --name frr-${{ matrix.cfg.platform }}-unit \
+          timeout --signal=TERM --kill-after=1m 15m \
+          docker run --init --name "${UNIT_TEST_CONTAINER}" \
             frr-${{ matrix.cfg.platform }} \
-            bash -lc 'cd ~/frr && make check'
+            bash -lc '
+              cd ~/frr
+              rm -f tests/tests.xml
+              make check
+              status=$?
+              if [ ! -s tests/tests.xml ]; then
+                echo "ERROR: make check did not produce tests/tests.xml" >&2
+                exit 125
+              fi
+              touch /tmp/frr-unit-test-report-ready
+              exit "${status}"
+            '
       - name: Gather unit test results
         if: ${{ always() }}
         run: |
           mkdir -p unit-test-results-${{ matrix.cfg.platform }}
           docker cp \
-            frr-${{ matrix.cfg.platform }}-unit:/home/frr/frr/tests/tests.xml \
+            "${UNIT_TEST_CONTAINER}":/tmp/frr-unit-test-report-ready \
+            unit-test-results-${{ matrix.cfg.platform }}/report-ready
+          docker cp \
+            "${UNIT_TEST_CONTAINER}":/home/frr/frr/tests/tests.xml \
             unit-test-results-${{ matrix.cfg.platform }}/tests.xml
+          test -s unit-test-results-${{ matrix.cfg.platform }}/tests.xml
       - name: Upload unit test results
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
@@ -278,7 +296,7 @@ jobs:
         if: ${{ always() }}
         run: |
           rm -rf unit-test-results-${{ matrix.cfg.platform }} /tmp/frr-${{ matrix.cfg.platform }}.tar
-          docker rm -f frr-${{ matrix.cfg.platform }}-unit || true
+          docker rm -f "${UNIT_TEST_CONTAINER}" || true
 
   Test:
     runs-on: default
