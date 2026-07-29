@@ -4,6 +4,7 @@
  */
 
 #include <zebra.h>
+#include <fcntl.h>
 #include <memory.h>
 #include <lib_vty.h>
 #include <buffer.h>
