@@ -59,6 +59,7 @@
 #endif
 #include "bgpd/bgp_evpn.h"
 #include "bgpd/bgp_mvpn.h"
+#include "bgpd/bgp_mvpn_events.h"
 #include "bgpd/bgp_dimt.h"
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_network.h"
@@ -4614,6 +4615,7 @@ int bgp_delete(struct bgp *bgp)
 	 * are discarded. The helper is safe when either route is already absent. */
 	bgp_mvpn_withdraw_type1(bgp, AFI_IP);
 	bgp_mvpn_withdraw_type1(bgp, AFI_IP6);
+	bgp_mvpn_events_set_socket(bgp, NULL);
 
 	/*
 	 * Iterate the pending dest list and remove all the dest pertaining to

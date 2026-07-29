@@ -138,6 +138,10 @@ extern void bgp_mvpn_withdraw_type1(struct bgp *bgp, afi_t afi);
 extern int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 					 const struct ipaddr *grp, bool negate);
 
+/* Re-emit every currently installed local Type-7 as a private snapshot for a
+ * subscribed event-socket consumer before it joins the live stream. */
+extern void bgp_mvpn_reemit_local_joins(struct bgp *bgp);
+
 /*
  * Re-resolve locally-originated Type-7 joins whose C-S is covered by a changed
  * unicast prefix, so the upstream-PE RT and Source AS (read from the unicast
