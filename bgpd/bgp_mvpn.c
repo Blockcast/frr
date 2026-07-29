@@ -881,8 +881,9 @@ static void bgp_mvpn_resolve_from_ecommunity(struct bgp_path_info *pi, uint32_t 
  * Administrator = the Source AS, data1 = the operator-configured function
  * code point ("bgp mvpn umh-large-community"; IANA has not assigned one),
  * data2 = the upstream PE's IPv4 address as a 32-bit integer
- * (10.255.255.254 <-> 184549374). High bits of the function field stay
- * reserved for the draft's type/preference nibbles. A large community is
+ * (10.255.255.254 <-> 184549374). The function field is matched in full (a
+ * 32-bit exact compare); should the draft later assign type/preference
+ * nibbles, they must be folded into the configured value. A large community is
  * TRANSITIVE where the RFC 6514 route-import EC is not -- it survives an IX
  * route server hop, which is the point of this encoding.
  *
@@ -891,29 +892,141 @@ static void bgp_mvpn_resolve_from_ecommunity(struct bgp_path_info *pi, uint32_t 
  * RFC 6514 extended communities.
  *
  * Trust: a tuple counts only when its Global Administrator equals the source
- * route's origin AS (rightmost AS_PATH entry; the local AS for a local or
- * empty-AS_PATH iBGP route). A transitive community survives more AS hops
- * than any one operator can vouch for -- this check is the border-scoping
- * primitive that bounds who may claim a UMH for a route.
+ * route's origin AS (rightmost AS_PATH entry; the local AS for a local route
+ * or one whose AS_PATH is structurally empty), and only when that origin is
+ * knowable at all -- an AS_SET/AS_CONFED_SET aggregates several origins, and
+ * a path carrying AS 0 names no real one, so no tuple on either is trusted.
+ * A transitive community survives more AS hops than any one operator can
+ * vouch for -- this check is the border-scoping primitive that bounds who may
+ * claim a UMH for a route.
  *
  * Ties: large communities are sorted and de-duplicated at attribute parse
  * (lcommunity_uniq_sort), so candidates iterate in ascending tuple order and
  * the first valid one -- the lowest tuple -- wins deterministically; any
  * further matching tuples are logged and ignored.
  */
+/*
+ * True when the segment aspath_get_last_as() ultimately reads from is a
+ * confederation sequence -- i.e. the origin it reports is a confederation-local
+ * member ASN rather than a globally meaningful one.
+ *
+ * This mirrors that function's iteration exactly: it walks every segment and
+ * overwrites its answer from ANY sequence type, so the winner is simply the
+ * last non-empty AS_SEQUENCE or AS_CONFED_SEQUENCE. Counting hops is not
+ * enough -- "AS_SEQUENCE [65010] AS_CONFED_SEQUENCE [65003]" has a nonzero hop
+ * count yet still resolves to the confederation member 65003. RFC 5065 puts
+ * confederation segments leftmost, so that ordering is malformed, but
+ * bgp_attr_aspath_check() only enforces shape for eBGP peers and a plain iBGP
+ * peer can put it on the wire.
+ */
+static bool bgp_mvpn_origin_is_confed(struct aspath *aspath)
+{
+	struct assegment *seg;
+	bool confed = false;
+
+	for (seg = aspath ? aspath->segments : NULL; seg; seg = seg->next) {
+		if (seg->length == 0)
+			continue;
+		if (seg->type == AS_SEQUENCE)
+			confed = false;
+		else if (seg->type == AS_CONFED_SEQUENCE)
+			confed = true;
+	}
+
+	return confed;
+}
+
 static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_info *pi,
 					     uint32_t *source_as, struct in_addr *upstream)
 {
 	struct lcommunity *lcom = bgp_attr_get_lcommunity(pi->attr);
+	struct aspath *aspath = pi->attr->aspath;
+	const char *ambiguous_reason = NULL;
 	uint32_t origin_as;
+	bool origin_ambiguous;
+	bool path_is_empty;
 	bool found = false;
 	int i;
 
 	if (!bgp->mvpn_umh_lc_function || !lcom)
 		return false;
 
-	origin_as = aspath_get_last_as(pi->attr->aspath);
-	if (origin_as == 0)
+	/*
+	 * Resolve the origin AS -- and first decide whether it is knowable at
+	 * all.
+	 *
+	 * An AS_SET/AS_CONFED_SET is an aggregate of routes with several
+	 * origins, so RFC 4271 leaves such a path with no single origin.
+	 * aspath_get_last_as() cannot express that: it returns the last member
+	 * of the last *sequence* segment and skips set segments outright, so
+	 * it reports
+	 *
+	 *   65010 {65002,65003}  -> 65010, the AGGREGATOR -- the leftmost AS,
+	 *                           not an origin. Trusting a GA of 65010 here
+	 *                           would let any AS that merely aggregates a
+	 *                           route claim a UMH for an origin it only
+	 *                           transits.
+	 *   {65002,65003}        -> 0, as does a bare AS_CONFED_SET.
+	 *
+	 * So gate on aspath_check_as_sets(): a set-bearing path is
+	 * origin-ambiguous and no tuple on it is trustworthy. Deliberately not
+	 * aspath_count_hops() -- that counts an AS_SET as one hop but an
+	 * AS_CONFED_SET as zero, leaving a bare AS_CONFED_SET
+	 * indistinguishable from an empty path.
+	 *
+	 * The local-AS substitution then keys on the AS_PATH being STRUCTURALLY
+	 * empty, not on the origin lookup returning 0. Those are different
+	 * things: AS 0 is an encodable value, not merely an absence sentinel,
+	 * so AS_SEQUENCE [0] and AS_CONFED_SEQUENCE [0] are non-empty paths
+	 * that aspath_get_last_as() also reports as 0 while
+	 * aspath_check_as_sets() says false. Keying on the lookup would let
+	 * either shape claim "originated locally" and honour a tuple forged
+	 * with GA == our own AS. bgp_attr_aspath_check() only rejects AS 0 for
+	 * eBGP peers, so both shapes survive parse on a plain iBGP session.
+	 * A non-empty path carrying AS 0 anywhere is therefore treated as
+	 * origin-ambiguous in its own right.
+	 *
+	 * An empty AS_PATH means the route never crossed an AS boundary, so
+	 * the local AS genuinely is its origin and a tuple stamped GA == our
+	 * AS is legitimate. peer->sort is only a belt-and-braces second gate
+	 * here -- it describes who advertised the route, not where it came
+	 * from -- and an empty AS_PATH is malformed over eBGP anyway (RFC 7606
+	 * treat-as-withdraw at parse).
+	 *
+	 * NB: aspath_check_as_zero() dereferences aspath->segments with no
+	 * NULL guard of its own, so the !path_is_empty short-circuit below is
+	 * load-bearing rather than cosmetic.
+	 *
+	 * Confederations are the third way the origin fails to be globally
+	 * meaningful. aspath_get_last_as() reads AS_CONFED_SEQUENCE as
+	 * readily as AS_SEQUENCE, but a confederation member-AS number is
+	 * local to that confederation (RFC 5065, typically a private ASN) and
+	 * is NOT the globally scoped Source AS a UMH tuple's Global
+	 * Administrator claims to be. A path that still carries a real
+	 * AS_SEQUENCE is fine -- "(64512 64513) 65010" resolves to 65010,
+	 * because the lookup takes the last sequence segment. The bad case is
+	 * a path whose sequence content is ENTIRELY confederation, where the
+	 * lookup yields a member ASN.
+	 *
+	 * Hop counting is NOT sufficient to detect that: a mixed path such as
+	 * "AS_SEQUENCE [65010] AS_CONFED_SEQUENCE [65003]" has a nonzero hop
+	 * count, yet the lookup still lands on the confederation member 65003.
+	 * bgp_mvpn_origin_is_confed() therefore asks the precise question --
+	 * is the segment the lookup actually resolves from a confederation
+	 * one -- which covers both the confederation-only path and the mixed
+	 * trailing case.
+	 */
+	path_is_empty = (aspath == NULL || aspath->segments == NULL);
+	if (aspath_check_as_sets(aspath))
+		ambiguous_reason = "AS_PATH bears an AS_SET";
+	else if (!path_is_empty && aspath_check_as_zero(aspath))
+		ambiguous_reason = "AS_PATH carries AS 0";
+	else if (!path_is_empty && bgp_mvpn_origin_is_confed(aspath))
+		ambiguous_reason = "AS_PATH origin is a confederation member AS";
+	origin_ambiguous = (ambiguous_reason != NULL);
+	origin_as = aspath_get_last_as(aspath);
+	if (!origin_ambiguous && path_is_empty &&
+	    (pi->peer == bgp->peer_self || pi->peer->sort == BGP_PEER_IBGP))
 		origin_as = bgp->as;
 
 	for (i = 0; i < lcom->size; i++) {
@@ -935,15 +1048,66 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 			continue;
 		}
 
-		if (ga != origin_as) {
-			if (BGP_DEBUG(zebra, ZEBRA))
-				zlog_debug("MVPN UMH large community %u:%u:%u rejected: Global Administrator != origin AS %u",
-					   ga, fn, param, origin_as);
+		if (origin_ambiguous || ga == 0 || ga != origin_as) {
+			/*
+			 * Trust-boundary reject: someone is claiming a UMH for
+			 * this route across an AS they do not originate. Surface
+			 * it at notice (not debug) so a probe is visible in
+			 * production, throttled to once a minute per BGP
+			 * instance so a flood of crafted tuples cannot spam the
+			 * log and a probe on one VRF cannot mask a distinct
+			 * probe on another.
+			 */
+			time_t now = monotime(NULL);
+			time_t last = bgp->mvpn_umh_untrusted_log_last;
+
+			/* Track "have we ever logged" in its own flag rather
+			 * than treating a zero timestamp as the sentinel:
+			 * monotime() counts from host boot, so 0 is a real
+			 * time during the first second of uptime. Overloading
+			 * it swallowed the very first reject on a freshly
+			 * booted PE in one direction, and left every reject in
+			 * that opening tick unthrottled in the other. */
+			if (!bgp->mvpn_umh_untrusted_log_seen ||
+			    now - last >= 60) {
+				bgp->mvpn_umh_untrusted_log_seen = true;
+				bgp->mvpn_umh_untrusted_log_last = now;
+				if (origin_ambiguous)
+					zlog_notice("MVPN UMH large community %u:%u:%u rejected on %s: %s, origin AS is indeterminate",
+						    ga, fn, param,
+						    bgp->name_pretty,
+						    ambiguous_reason);
+				else
+					zlog_notice("MVPN UMH large community %u:%u:%u rejected on %s: Global Administrator %u != origin AS %u",
+						    ga, fn, param,
+						    bgp->name_pretty, ga,
+						    origin_as);
+			}
 			continue;
 		}
 
 		umh.s_addr = htonl(param);
-		if (param == 0 || IPV4_CLASS_D(param) || (param >> 24) == IN_LOOPBACKNET) {
+		/*
+		 * Usable-upstream-PE gate on the parameter. This is a per-route
+		 * trust decision, so the reject set is spelled out here rather
+		 * than deferred to ipv4_unicast_valid(): that helper treats
+		 * Class E (240/4) as usable unicast per draft-schoen-intarea-
+		 * unicast-240, and gates 0/8 + 127/8 on the global
+		 * "allow-reserved-ranges" toggle -- neither is acceptable for a
+		 * UMH target an adversary can put on the wire. Reject, all
+		 * unconditionally:
+		 *   0.0.0.0/8      unspecified / "this network"
+		 *   127.0.0.0/8    loopback
+		 *   169.254.0.0/16 link-local: interface-scoped and NOT
+		 *                  globally unique, so it either names nothing
+		 *                  reachable or collides with a different box
+		 *                  on some other link
+		 *   224.0.0.0/4    multicast (Class D)
+		 *   240.0.0.0/4    reserved (Class E), incl. 255.255.255.255
+		 */
+		if (IPV4_NET0(param) || IPV4_NET127(param) ||
+		    IPV4_LINKLOCAL(param) || IPV4_CLASS_D(param) ||
+		    IPV4_CLASS_E(param)) {
 			if (BGP_DEBUG(zebra, ZEBRA))
 				zlog_debug("MVPN UMH large community %u:%u:%u rejected: %pI4 is not a usable upstream PE address",
 					   ga, fn, param, &umh);
