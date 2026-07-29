@@ -67,9 +67,16 @@ EXPLICIT_MERGE_VERDICT_PATTERN = re.compile(
     r"^\s*(?:_|\*|#|>|-|\s)*ally-verdict:\s*pass\b", re.IGNORECASE | re.MULTILINE
 )
 # The current Ally prose verdict line ("Recommended Action\nMerge." or
-# "Recommended Action: Merge"). Anchored to the verdict section, not free prose.
+# "Recommended Action: Merge"). Anchored to the verdict section, not free
+# prose, and the verdict must be a COMPLETE standalone "Merge" -- anything
+# trailing it ("Merge only after requested changes are addressed", "Merge
+# after fixes") is a qualified verdict, and an explicit pass here suppresses
+# the fallback action-required scan, so a loose match would launder a
+# qualified negative into a clean signal. Qualified verdicts fall through to
+# None and land pending, never success.
 RECOMMENDED_MERGE_PATTERN = re.compile(
-    r"recommended action[:\s]*\n?\s*(?:_|\*|>|-|\s)*merge\b", re.IGNORECASE
+    r"recommended action[:\s]*\n?\s*(?:_|\*|>|-|[ \t])*merge[.!]?[ \t]*(?:\r?\n|$)",
+    re.IGNORECASE,
 )
 RECOMMENDED_CHANGES_PATTERN = re.compile(
     r"recommended action[:\s]*\n?\s*(?:_|\*|>|-|\s)*"
@@ -196,6 +203,24 @@ def self_review_signal(at, author, head_sha):
     }
 
 
+def review_signal_time(review):
+    """Effective ordering key for a formal review: the later of submitted_at
+    and last_edited_at.
+
+    GitHub keeps submitted_at immutable across body edits, so ordering on it
+    alone lets an older review edited to ADD blocking findings keep losing to
+    a newer clean signal -- the same defect comments had before
+    comment_signal_time(). The REST reviews payload carries no edit timestamp;
+    main() enriches each review with `last_edited_at` from GraphQL. Absent
+    (never edited, or a pure-decide fixture), this degrades to submitted_at.
+
+    ISO-8601 UTC strings sort correctly as plain strings.
+    """
+    submitted = str(review.get("submitted_at") or "")
+    edited = str(review.get("last_edited_at") or "")
+    return max(submitted, edited)
+
+
 def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
     ally = set(ally_logins)
     signals = []
@@ -223,7 +248,7 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
         if review.get("commit_id") != head_sha and not attested:
             continue
 
-        at = str(review.get("submitted_at") or "")
+        at = review_signal_time(review)
         state = review.get("state")
 
         # Self-review cannot approve its own PR, but its machine-readable
@@ -639,10 +664,9 @@ def decide(
         if has_label and not has_head_attestation:
             return (
                 "pending",
-                "Waiting for Ally review of head %s. The '%s' label is present but "
-                "not authorized for this head: comment 'review-gate-override: %s' "
-                "to override this revision."
-                % (short_sha(head_sha), override_label, head_sha),
+                "Waiting for Ally review of head %s; label '%s' needs a "
+                "'review-gate-override: <full head SHA>' comment."
+                % (short_sha(head_sha), override_label),
             )
         return "pending", "Waiting for Ally review of head %s." % short_sha(head_sha)
 
@@ -652,9 +676,9 @@ def decide(
     if signal["status"] == CLEAN_COMMENTED_STATUS:
         return (
             "pending",
-            "Ally reviewed head %s with no blocking findings; apply '%s' and comment "
-            "'review-gate-override: %s' to merge."
-            % (short_sha(head_sha), override_label, head_sha),
+            "Ally reviewed head %s, no blocking findings; apply '%s' and comment "
+            "'review-gate-override: <full head SHA>'."
+            % (short_sha(head_sha), override_label),
         )
 
     return signal["status"], signal["description"]
@@ -734,6 +758,26 @@ def fetch_trusted_permission_logins(api_base_url, owner, repo, token, candidate_
     return trusted, resolved
 
 
+STATUS_DESCRIPTION_LIMIT = 140
+
+
+def clamp_description(description):
+    """GitHub rejects status descriptions over 140 chars with a 422.
+
+    That 422 lands on the FINAL status write, after the early `pending`
+    claim -- so an over-length string doesn't just lose a message, it leaves
+    the gate stuck at "Evaluating..." with a failed workflow. Every authored
+    description is tested to fit (TestDescriptionLength); this clamp is the
+    backstop for the untested inputs (operator-configured label names, an
+    upstream change to the limit going unnoticed), where a truncated tail
+    beats a stuck gate.
+    """
+    description = str(description or "")
+    if len(description) <= STATUS_DESCRIPTION_LIMIT:
+        return description
+    return description[: STATUS_DESCRIPTION_LIMIT - 3] + "..."
+
+
 def set_commit_status(api_base_url, owner, repo, sha, token, state, description, target_url):
     url = "%s/repos/%s/%s/statuses/%s" % (api_base_url.rstrip("/"), owner, repo, sha)
     _request(
@@ -742,11 +786,71 @@ def set_commit_status(api_base_url, owner, repo, sha, token, state, description,
         method="POST",
         payload={
             "context": STATUS_CONTEXT,
-            "description": description,
+            "description": clamp_description(description),
             "state": state,
             "target_url": target_url,
         },
     )
+
+
+def enrich_reviews_with_edit_times(api_base_url, owner, repo, pull_number, token, reviews):
+    """Attach GraphQL `lastEditedAt` to each REST review as `last_edited_at`.
+
+    The REST reviews payload exposes only the immutable submitted_at, so
+    without this an older review edited to add blocking findings keeps losing
+    to a newer clean signal (see review_signal_time()). GraphQL is the only
+    place GitHub exposes a review-body edit timestamp.
+
+    Fail-closed on error: this feeds signal ORDERING, and the failure
+    direction of skipping it is a stale green -- the one direction a merge
+    control must not fail. Raising here leaves the context at the
+    already-posted "Evaluating..." pending, which any re-trigger clears.
+    Matches the permission-lookup rule: an unresolved input is not a
+    permissive default.
+    """
+    query = (
+        "query($owner:String!,$repo:String!,$number:Int!,$cursor:String){"
+        "repository(owner:$owner,name:$repo){pullRequest(number:$number){"
+        "reviews(first:100,after:$cursor){pageInfo{hasNextPage endCursor}"
+        "nodes{databaseId lastEditedAt}}}}}"
+    )
+    edited_at_by_id = {}
+    cursor = None
+    while True:
+        data = _request(
+            "%s/graphql" % api_base_url.rstrip("/"),
+            token,
+            method="POST",
+            payload={
+                "query": query,
+                "variables": {
+                    "owner": owner,
+                    "repo": repo,
+                    "number": pull_number,
+                    "cursor": cursor,
+                },
+            },
+        )
+        if not isinstance(data, dict) or data.get("errors"):
+            raise RuntimeError(
+                "GraphQL lastEditedAt lookup failed: %s"
+                % ((data or {}).get("errors") if isinstance(data, dict) else data)
+            )
+        connection = (
+            ((data.get("data") or {}).get("repository") or {}).get("pullRequest") or {}
+        ).get("reviews") or {}
+        for node in connection.get("nodes") or []:
+            if node.get("databaseId") is not None and node.get("lastEditedAt"):
+                edited_at_by_id[node["databaseId"]] = node["lastEditedAt"]
+        page = connection.get("pageInfo") or {}
+        if not page.get("hasNextPage"):
+            break
+        cursor = page.get("endCursor")
+
+    for review in reviews:
+        edited = edited_at_by_id.get(review.get("id"))
+        if edited:
+            review["last_edited_at"] = edited
 
 
 def main():
@@ -819,6 +923,7 @@ def main():
 
     reviews = fetch_paginated(api_base_url, "/repos/%s/%s/pulls/%d/reviews" % (owner, repo, pull_number), token)
     comments = fetch_paginated(api_base_url, "/repos/%s/%s/issues/%d/comments" % (owner, repo, pull_number), token)
+    enrich_reviews_with_edit_times(api_base_url, owner, repo, pull_number, token, reviews)
 
     print("Fetched %d review(s) for PR #%d @ head %s:" % (len(reviews), pull_number, short_sha(head_sha)))
     for review in reviews:
@@ -877,6 +982,10 @@ def main():
         permission_trusted_logins=permission_trusted_logins,
         permission_resolved_logins=permission_resolved_logins,
     )
+
+    # Status descriptions fit GitHub's 140-char cap, so they name the override
+    # command generically. The copy-pasteable form lives here in the log.
+    print("Head-bound override command: review-gate-override: %s" % head_sha)
 
     set_commit_status(
         api_base_url,

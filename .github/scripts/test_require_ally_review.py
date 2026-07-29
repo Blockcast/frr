@@ -38,10 +38,10 @@ def attest(head=HEAD, extra=""):
 
 
 def review(state, commit=HEAD, body=None, login="allyblockcast[bot]", at="2026-07-27T10:00:00Z",
-           assoc="NONE", utype="Bot"):
+           assoc="NONE", utype="Bot", edited=None):
     if body is None:
         body = attest(commit)
-    return {
+    row = {
         "state": state,
         "commit_id": commit,
         "body": body,
@@ -49,6 +49,9 @@ def review(state, commit=HEAD, body=None, login="allyblockcast[bot]", at="2026-0
         "submitted_at": at,
         "author_association": assoc,
     }
+    if edited is not None:
+        row["last_edited_at"] = edited
+    return row
 
 
 def comment(body, login="allyblockcast[bot]", at="2026-07-27T10:00:00Z", updated=None):
@@ -122,7 +125,7 @@ class TestCleanCommented(unittest.TestCase):
             reviews=[review("COMMENTED", body=CONSOLIDATED)], labels=[OVERRIDE]
         )
         self.assertEqual(state, "pending")
-        self.assertIn("review-gate-override: %s" % HEAD, desc)
+        self.assertIn("review-gate-override: <full head SHA>", desc)
 
     def test_clean_commented_clears_with_label_and_head_attestation(self):
         state, desc = decide(
@@ -465,7 +468,7 @@ class TestOverrideIsHeadBound(unittest.TestCase):
     def test_label_without_attestation_names_the_required_comment(self):
         state, desc = decide(labels=[OVERRIDE], trusted={HUMAN})
         self.assertEqual(state, "pending")
-        self.assertIn("review-gate-override: %s" % HEAD, desc)
+        self.assertIn("review-gate-override: <full head SHA>", desc)
 
     def test_attestation_without_label_does_not_clear(self):
         state, _ = decide(
@@ -532,6 +535,115 @@ class TestEditedCommentOrdering(unittest.TestCase):
             gate.comment_signal_time({"created_at": "2026-07-27T09:00:00Z"}),
             "2026-07-27T09:00:00Z",
         )
+
+
+class TestEditedReviewOrdering(unittest.TestCase):
+    """The formal-review twin of TestEditedCommentOrdering: submitted_at is
+    immutable across body edits, so an older review edited to ADD findings
+    must not lose to a newer clean signal. last_edited_at arrives via GraphQL
+    enrichment in main(); fixtures inject it directly."""
+
+    def test_edited_older_review_with_findings_beats_newer_clean_review(self):
+        blocking = CONSOLIDATED + "### Important Issues (1)\n"
+        state, _ = decide(
+            reviews=[
+                review("COMMENTED", body=blocking, at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T15:00:00Z"),
+                review("COMMENTED", body=CONSOLIDATED, at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_unedited_review_ordering_is_unchanged(self):
+        blocking = CONSOLIDATED + "### Important Issues (1)\n"
+        state, _ = decide(
+            reviews=[
+                review("COMMENTED", body=blocking, at="2026-07-27T09:00:00Z"),
+                review("COMMENTED", body=CONSOLIDATED, at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")  # newest is clean-commented
+
+    def test_missing_last_edited_at_falls_back_to_submitted_at(self):
+        self.assertEqual(
+            gate.review_signal_time({"submitted_at": "2026-07-27T09:00:00Z"}),
+            "2026-07-27T09:00:00Z",
+        )
+
+
+class TestQualifiedMergeVerdicts(unittest.TestCase):
+    """An explicit pass suppresses the fallback action-required scan, so the
+    'Recommended Action: Merge' matcher must only accept a COMPLETE standalone
+    Merge. A loose prefix match laundered 'Merge only after requested changes
+    are addressed' into a clean signal that cleared the gate."""
+
+    def _comment_state(self, verdict_line):
+        body = attest(HEAD, "### Recommended Action\n\n%s\n" % verdict_line)
+        state, _ = decide(comments=[comment(body)])
+        return state
+
+    def test_standalone_merge_is_a_pass(self):
+        self.assertEqual(self._comment_state("Merge."), "success")
+
+    def test_merge_only_after_changes_is_not_a_pass(self):
+        self.assertEqual(
+            self._comment_state("Merge only after requested changes are addressed."),
+            "pending",
+        )
+
+    def test_merge_after_fixes_is_not_a_pass(self):
+        self.assertEqual(self._comment_state("Merge after fixes"), "pending")
+
+    def test_merge_must_be_blocked_is_not_a_pass(self):
+        self.assertEqual(self._comment_state("Merge must be blocked"), "pending")
+
+
+class TestDescriptionLength(unittest.TestCase):
+    """GitHub 422s status descriptions over 140 chars -- on the FINAL write,
+    after the early pending claim, leaving the gate stuck at 'Evaluating...'.
+    Every branch's authored description must fit; clamp_description is the
+    backstop for unvetted inputs like operator-configured label names."""
+
+    LIMIT = 140
+
+    def assertFits(self, result):
+        _, desc = result
+        self.assertLessEqual(len(desc), self.LIMIT, "%d chars: %r" % (len(desc), desc))
+
+    def test_every_decide_branch_fits(self):
+        blocking = CONSOLIDATED + "### Critical Issues (1)\n"
+        scenarios = [
+            decide(),  # waiting
+            decide(labels=[OVERRIDE], trusted={HUMAN}),  # label, no attestation
+            decide(reviews=[review("COMMENTED", body=CONSOLIDATED)]),  # clean commented
+            decide(  # override success
+                reviews=[review("COMMENTED", body=CONSOLIDATED)],
+                comments=[comment(override_body(HEAD), login=HUMAN)],
+                labels=[OVERRIDE],
+                trusted={HUMAN},
+            ),
+            decide(reviews=[review("COMMENTED", body=blocking)]),  # failure
+            decide(reviews=[review("CHANGES_REQUESTED")]),  # changes requested
+            decide(reviews=[review("APPROVED")]),  # approved
+            decide(reviews=[review("APPROVED")], author="app/allyblockcast"),  # self demoted
+            decide(  # distinct reviewer success
+                reviews=[review("APPROVED", login=HUMAN, utype="User", assoc="MEMBER",
+                                at="2026-07-27T11:00:00Z")],
+                author="app/allyblockcast",
+                trusted={HUMAN},
+            ),
+            decide(comments=[comment(CLEAN)]),  # comment-clean success
+        ]
+        for result in scenarios:
+            self.assertFits(result)
+
+    def test_clamp_truncates_over_length_input(self):
+        clamped = gate.clamp_description("x" * 300)
+        self.assertEqual(len(clamped), self.LIMIT)
+        self.assertTrue(clamped.endswith("..."))
+
+    def test_clamp_passes_short_input_through(self):
+        self.assertEqual(gate.clamp_description("short"), "short")
 
 
 class TestApprovalAndRecency(unittest.TestCase):

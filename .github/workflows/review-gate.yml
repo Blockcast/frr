@@ -30,6 +30,11 @@ on:
     types:
       - created
       - edited
+      # A deleted comment can be the thing that AUTHORIZED the current green --
+      # a clean consolidated signal or a head-bound override attestation.
+      # Without re-evaluating on deletion, the status outlives its evidence.
+      # The script fetches current comments, so the deleted one is simply gone.
+      - deleted
 
 permissions:
   contents: read
