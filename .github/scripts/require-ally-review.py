@@ -925,23 +925,40 @@ def main():
     owner, repo = full_name.split("/", 1)
     api_base_url = os.environ.get("GITHUB_API_URL") or "https://api.github.com"
 
-    pull_request = event.get("pull_request")
-    if not pull_request:
+    # Resolve the PR NUMBER from whatever payload the event carries, then
+    # refetch the PR itself for EVERY event. The embedded pull_request object
+    # is a snapshot from event-emission time, and GitHub does not guarantee
+    # event ordering: a delayed review/label event for head A can start after
+    # `synchronize` moved the PR to head B (its cancel-in-progress run having
+    # cancelled B's run), and evaluating the snapshot would post only for the
+    # stale A -- leaving the CURRENT head with no status until some later
+    # trigger. Refetching means every run, whatever woke it, evaluates and
+    # posts for the head/labels/draft/author that exist NOW, so a stale-event
+    # run is harmless rather than wrong.
+    pull_number = (event.get("pull_request") or {}).get("number")
+    if not pull_number:
         # issue_comment fires on PR comments too, but its payload carries an
-        # `issue` (with a `pull_request` link) rather than the PR itself. The
-        # policy treats Ally issue comments as signals, so without resolving
-        # here that fallback could never re-evaluate and the head status would
-        # stay stale until some unrelated PR event happened to fire.
+        # `issue` (with a `pull_request` link) rather than the PR itself.
         issue = event.get("issue") or {}
-        if issue.get("pull_request") and issue.get("number"):
-            pull_request = _request(
-                "%s/repos/%s/%s/pulls/%d"
-                % (api_base_url.rstrip("/"), owner, repo, issue["number"]),
-                token,
-            )
-        if not pull_request:
-            print("No pull_request payload found; nothing to gate.")
-            return
+        if issue.get("pull_request"):
+            pull_number = issue.get("number")
+    if not pull_number:
+        print("No pull_request payload found; nothing to gate.")
+        return
+
+    pull_request = _request(
+        "%s/repos/%s/%s/pulls/%d" % (api_base_url.rstrip("/"), owner, repo, pull_number),
+        token,
+    )
+    if not pull_request:
+        print("PR #%s could not be fetched; nothing to gate." % pull_number)
+        return
+
+    if pull_request.get("state") and pull_request.get("state") != "open":
+        # A delayed event can arrive after merge/close; there is no head left
+        # to gate and a status write would be noise on a settled PR.
+        print("PR #%s is %s; nothing to gate." % (pull_number, pull_request["state"]))
+        return
 
     if pull_request.get("draft"):
         print("PR is a draft; nothing to gate.")
