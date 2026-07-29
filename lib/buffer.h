@@ -44,6 +44,9 @@ char *buffer_getstr(struct buffer *b);
 /* Returns 1 if there is no pending data in the buffer.  Otherwise returns 0. */
 int buffer_empty(struct buffer *b);
 
+/* Returns the exact number of bytes waiting to be flushed. */
+size_t buffer_pending(const struct buffer *b);
+
 typedef enum {
 	/* An I/O error occurred.  The buffer should be destroyed and the
 	   file descriptor should be closed. */

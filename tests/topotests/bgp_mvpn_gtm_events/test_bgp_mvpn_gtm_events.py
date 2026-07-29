@@ -52,7 +52,7 @@ IPMSI_LABEL = 100
 
 EVENT_SOCK = "/tmp/bgp_mvpn_gtm_events-r1-{}.sock".format(os.getpid())
 EVENT_SOCK_2 = "/tmp/bgp_mvpn_gtm_events-r1-restart-{}.sock".format(os.getpid())
-EPOCH_FILE = "/var/run/frr/bgpd-mvpn-events-default.epoch"
+EPOCH_FILE = "/var/lib/frr/bgpd-mvpn-events-default.epoch"
 
 
 def _ip4_to_int(addr):
@@ -107,7 +107,7 @@ class EventReader:
     accepted -- exactly the documented "dev-mode `show bgp mvpn json` covers
     bootstrap" behavior in doc/mvpn-events-schema.md)."""
 
-    def __init__(self, path, connect_timeout=30):
+    def __init__(self, path, cursor=None, connect_timeout=30):
         # The listener socket can lag a beat behind bgpd's config apply, so
         # retry the connect rather than single-shot it (a bare connect races
         # the bind and flakes with ENOENT/ECONNREFUSED).
@@ -124,7 +124,10 @@ class EventReader:
                     raise
                 time.sleep(0.5)
         self.buf = b""
-        self.sock.sendall(b'{"type":"subscribe","schema_version":1}\n')
+        subscribe = {"type": "subscribe", "schema_version": 1}
+        if cursor is not None:
+            subscribe["last_boot_epoch"], subscribe["last_seq"] = cursor
+        self.sock.sendall((json.dumps(subscribe) + "\n").encode("utf-8"))
 
     def close(self):
         self.sock.close()
@@ -380,6 +383,7 @@ def test_origin_change_event():
     -- no withdraw/re-join -- and emit "origin_change" carrying both the
     prior and new route_version so a consumer can split its billing
     window."""
+    global last_seq
     tgen = get_topogen()
 
     if tgen.routers_have_failure():
@@ -411,7 +415,27 @@ route-map rtimport permit 10
     assert ev["prior_route_version"] == "{}.3".format(boot_epoch)
     assert ev["seq"] == last_seq + 1
 
+    last_seq = ev["seq"]
     reader.close()
+
+
+def test_reconnect_snapshot_exposes_same_epoch_gap():
+    """A reconnect snapshot baseline must classify events missed after the
+    durable cursor as a gap before the consumer applies the snapshot."""
+    global last_seq
+
+    _leave()
+    reconnect = EventReader(EVENT_SOCK, cursor=(boot_epoch, last_seq))
+    snapshot, snapshot_end = reconnect.read_snapshot()
+    assert snapshot == []
+    assert snapshot_end["boot_epoch"] == boot_epoch
+    assert snapshot_end["seq"] == last_seq + 1
+    assert snapshot_end["cursor_status"] == "gap"
+    reconnect.acknowledge_snapshot(snapshot_end)
+    reconnect.close()
+
+    last_seq = snapshot_end["seq"]
+    _join()
 
 
 def test_failed_reconfiguration_preserves_listener():

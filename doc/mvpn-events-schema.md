@@ -32,7 +32,10 @@ is allowed to build claims from.
   event-socket` (or omitting the knob) means the feature is off. Opt-in,
   like the other GTM MVPN knobs (`bgp mvpn ipmsi-label`, `bgp mvpn
   umh-large-community`).
-- A client first sends `{"type":"subscribe","schema_version":1}`. Every
+- A client first sends `{"type":"subscribe","schema_version":1}`. A
+  reconnecting client also sends its durable cursor as `last_boot_epoch` and
+  `last_seq`; omitting both means first bootstrap, while sending only one or a
+  negative/non-integer value closes the connection. Every
   subscribed client receives a private `install` snapshot of every currently
   active local Type-7 join before joining the live broadcast stream. Snapshot
   construction is serialized between clients so replay cannot mutate the
@@ -46,7 +49,8 @@ is allowed to build claims from.
   `{"type":"snapshot_end",...}` frame. Snapshot install records carry
   `"snapshot":true` and a one-based `snapshot_index`; they retain the current
   global `seq` baseline rather than consuming lifecycle sequence numbers. The
-  `snapshot_end` frame carries that baseline and `snapshot_count`. A
+  `snapshot_end` frame carries that baseline, `snapshot_count`, and a producer-
+  computed `cursor_status`. A
   connect-only health probe or a client that disconnects before acknowledgment
   cannot consume the snapshot; a reconnect receives its own replay. Empty
   snapshots still end with `snapshot_end` and require acknowledgment. Live
@@ -78,8 +82,9 @@ Every lifecycle event and snapshot frame carries `boot_epoch` and `seq`:
   `snapshot_end.seq` baseline (zero when no live event has occurred in the new
   epoch). After durably applying and acknowledging the snapshot, the consumer
   persists that baseline; the next live event must be exactly `seq + 1`.
-- `boot_epoch` is a small integer persisted under `$frr_runstatedir` (e.g.
-  `/var/run/frr/bgpd-mvpn-events-default.epoch`) and incremented on every
+- `boot_epoch` is a small integer persisted under reboot-durable
+  `$frr_libstatedir` (e.g. `/var/lib/frr/bgpd-mvpn-events-default.epoch`) and
+  incremented on every
   listener start, under an exclusive lock separate from the atomically-renamed
   state file. Invalid state or any lock/write/fsync/rename failure prevents the
   listener from starting. A bare `bgpd` process restart
@@ -94,9 +99,12 @@ cursor so a restarted consumer can detect gaps") by persisting `(boot_epoch,
 seq)` of the last event it has fully processed, on its own side (this is the
 consumer's responsibility -- see BLO-17650's restart-checkpoint
 requirement). On reconnect, or on the next event after any connection, the
-consumer compares each incoming live event's `(boot_epoch, seq)` to its
-persisted cursor. Snapshot records are applied as a framed set through
-`snapshot_end`, not run through the live-event increment check:
+consumer supplies that cursor in its subscribe record. Before applying any
+snapshot records, it reads the complete frame through `snapshot_end` and checks
+`cursor_status`. Snapshot records are not run through the live-event increment
+check, but their baseline is still compared with the persisted cursor; a
+consumer MUST quarantine on `gap` or `rollback` and MUST NOT acknowledge or
+apply that snapshot as contiguous state:
 
 - `boot_epoch` unchanged, `seq == last_seq + 1`: contiguous, no gap.
 - `boot_epoch` unchanged, `seq > last_seq + 1`: a genuine gap (the connection
@@ -112,6 +120,18 @@ persisted cursor. Snapshot records are applied as a framed set through
   interval (Section 6 of the settlement contract): the consumer's prior
   windows for this instance should be closed out at the last event of the old
   epoch it saw, and new windows opened from the new epoch's events.
+- `cursor_status == "gap"`: the supplied epoch matches, but `snapshot_end.seq`
+  is greater than `last_seq`; one or more live records were missed. Quarantine
+  before applying the snapshot. This is the reconnect form of the same-epoch
+  live-event gap rule, not a reconciliation shortcut.
+- `cursor_status == "rollback"`: the supplied epoch/sequence is ahead of the
+  producer baseline. Quarantine; either durable producer state regressed or the
+  consumer connected to the wrong instance.
+- `cursor_status == "contiguous"`: the supplied cursor exactly equals the
+  snapshot baseline. The framed snapshot may be applied and acknowledged.
+- `cursor_status == "boot_boundary"`: the producer epoch increased. Apply the
+  boot-boundary transition above, then acknowledge. `bootstrap` is the same
+  framing path without a prior cursor and is valid only for initial enrollment.
 
 `route_version` is the opaque string `"<boot_epoch>.<generation>"`, where
 `generation` is scoped to one `(source, group)` join identity (not global)
@@ -146,6 +166,7 @@ changing this join's resolved values) emits nothing.
 | `snapshot` | bool | snapshot install records only | `true`; identifies a private point-in-time install rather than a live lifecycle transition. |
 | `snapshot_index` | int | snapshot install records only | One-based position of this install in the current snapshot frame. |
 | `snapshot_count` | int | `snapshot_end` only | Number of snapshot install records preceding this frame. |
+| `cursor_status` | string | `snapshot_end` only | Producer comparison of the subscribe cursor with this snapshot baseline: `bootstrap`, `contiguous`, `gap`, `boot_boundary`, or `rollback`. `gap` and `rollback` require quarantine before snapshot application. |
 | `time_ns` | int | live lifecycle and snapshot install records | `CLOCK_REALTIME` nanoseconds since the Unix epoch, at emission time. |
 | `route_type` | int | live lifecycle and snapshot install records | `7` (RFC 6514 C-multicast Source Tree Join). Fixed today; present so a future record kind sharing this socket is distinguishable. |
 | `source` | string | live lifecycle and snapshot install records | C-S, canonical text (v4 or v6). |

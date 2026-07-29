@@ -17,7 +17,7 @@
  * event, because the only thing that must survive a restart is the ability
  * to tell "the producer restarted" apart from "events were lost between two
  * events of the same epoch". `boot_epoch` is a small counter persisted under
- * frr_runstatedir and incremented on every listener start -- a bgpd restart
+ * frr_libstatedir and incremented on every listener start -- a bgpd restart
  * is the common cause, but reconfiguring `bgp mvpn event-socket` (no + re-add,
  * or a path change) within one process bumps it too. Either way a consumer
  * that tracks (last_epoch, last_seq) detects a gap whenever the next event's
@@ -75,7 +75,6 @@ struct bgp_mvpn_event_client {
 	struct bgp_mvpn_event_client *next;
 	int fd;
 	struct buffer *wb;
-	size_t pending_bytes; /* upper-bound accounting, see bgp_mvpn_event_broadcast() */
 	struct event *t_read;
 	struct event *t_write;
 	struct bgp_mvpn_event_sink *sink; /* back-pointer for the write callback */
@@ -84,6 +83,9 @@ struct bgp_mvpn_event_client {
 	bool subscribed;
 	bool snapshot_offered;
 	bool snapshot_ready;
+	bool has_cursor;
+	uint64_t cursor_boot_epoch;
+	uint64_t cursor_seq;
 	uint64_t snapshot_seq;
 };
 
@@ -130,6 +132,21 @@ static void bgp_mvpn_event_snapshot_schedule(struct bgp_mvpn_event_sink *sink)
 {
 	event_add_event(bm->master, bgp_mvpn_event_snapshot_offer_event, sink, 0,
 			&sink->t_snapshot_offer);
+}
+
+static const char *bgp_mvpn_event_cursor_status(const struct bgp_mvpn_event_sink *sink,
+						 const struct bgp_mvpn_event_client *client)
+{
+	if (!client->has_cursor)
+		return "bootstrap";
+	if (client->cursor_boot_epoch < sink->boot_epoch)
+		return "boot_boundary";
+	if (client->cursor_boot_epoch > sink->boot_epoch ||
+	    client->cursor_seq > client->snapshot_seq)
+		return "rollback";
+	if (client->cursor_seq < client->snapshot_seq)
+		return "gap";
+	return "contiguous";
 }
 
 static void bgp_mvpn_event_client_close(struct bgp_mvpn_event_sink *sink,
@@ -197,6 +214,8 @@ static bool bgp_mvpn_event_snapshot_offer(struct bgp_mvpn_event_sink *sink,
 	json_object_int_add(end, "boot_epoch", (int64_t)sink->boot_epoch);
 	json_object_int_add(end, "seq", (int64_t)client->snapshot_seq);
 	json_object_int_add(end, "snapshot_count", (int64_t)sink->snapshot_index);
+	json_object_string_add(end, "cursor_status",
+			       bgp_mvpn_event_cursor_status(sink, client));
 	if (!bgp_mvpn_event_deliver(sink, client, end))
 		return false;
 
@@ -235,10 +254,8 @@ static void bgp_mvpn_event_client_write(struct event *event)
 		bgp_mvpn_event_client_close(sink, client);
 		return;
 	}
-	if (status == BUFFER_EMPTY) {
-		client->pending_bytes = 0;
+	if (status == BUFFER_EMPTY)
 		return;
-	}
 	event_add_write(bm->master, bgp_mvpn_event_client_write, client, client->fd,
 			&client->t_write);
 }
@@ -273,6 +290,8 @@ static void bgp_mvpn_event_client_read(struct event *event)
 		struct json_object *type;
 		struct json_object *epoch;
 		struct json_object *seq;
+		struct json_object *cursor_epoch;
+		struct json_object *cursor_seq;
 		size_t line_len = newline - client->read_buf;
 		bool client_closed = false;
 
@@ -281,8 +300,32 @@ static void bgp_mvpn_event_client_read(struct event *event)
 		if (jo && json_object_object_get_ex(jo, "type", &type) &&
 		    json_object_is_type(type, json_type_string) &&
 		    strcmp(json_object_get_string(type), "subscribe") == 0) {
-			client->subscribed = true;
-			client_closed = !bgp_mvpn_event_snapshot_offer(sink, client);
+			bool have_epoch = json_object_object_get_ex(
+				jo, "last_boot_epoch", &cursor_epoch);
+			bool have_seq = json_object_object_get_ex(jo, "last_seq", &cursor_seq);
+
+			if (have_epoch != have_seq ||
+			    (have_epoch &&
+			     (!json_object_is_type(cursor_epoch, json_type_int) ||
+			      !json_object_is_type(cursor_seq, json_type_int) ||
+			      json_object_get_int64(cursor_epoch) < 0 ||
+			      json_object_get_int64(cursor_seq) < 0))) {
+				zlog_warn("MVPN events: client fd %d sent an invalid durable cursor",
+					  client->fd);
+				bgp_mvpn_event_client_close(sink, client);
+				client_closed = true;
+			} else {
+				client->has_cursor = have_epoch;
+				if (have_epoch) {
+					client->cursor_boot_epoch =
+						(uint64_t)json_object_get_int64(cursor_epoch);
+					client->cursor_seq =
+						(uint64_t)json_object_get_int64(cursor_seq);
+				}
+				client->subscribed = true;
+				client_closed =
+					!bgp_mvpn_event_snapshot_offer(sink, client);
+			}
 		} else if (jo && json_object_object_get_ex(jo, "type", &type) &&
 			   json_object_is_type(type, json_type_string) &&
 			   strcmp(json_object_get_string(type), "snapshot_ack") == 0 &&
@@ -359,14 +402,12 @@ static void bgp_mvpn_event_accept(struct event *event)
 }
 
 /*
- * The durable half of the cursor: a small text file under frr_runstatedir
+ * The durable half of the cursor: a small text file under frr_libstatedir
  * holding the next boot_epoch to hand out, read-incremented-written under an
  * exclusive lock so two bgpd processes (or bgpd + a stray leftover) can never
- * be handed the same epoch. runstatedir is ephemeral across a host *reboot*
- * (may be tmpfs) but that is exactly the boundary this scheme needs: a bare
- * reboot restarts every downstream consumer too, so there is nothing for the
- * epoch to protect against there. A bare `bgpd` process restart -- the case
- * that matters -- always sees runstatedir intact.
+ * be handed the same epoch. libstatedir is persistent across host reboot, so a
+ * producer cannot reuse an epoch while a durable downstream cursor still
+ * references it. Persistence failure is fail-closed: no listener is started.
  */
 static bool bgp_mvpn_event_next_boot_epoch(const char *instance_name, uint64_t *result)
 {
@@ -378,7 +419,7 @@ static bool bgp_mvpn_event_next_boot_epoch(const char *instance_name, uint64_t *
 	char *end;
 	bool ok = false;
 
-	if (snprintf(path, sizeof(path), "%s/bgpd-mvpn-events-%s.epoch", frr_runstatedir,
+	if (snprintf(path, sizeof(path), "%s/bgpd-mvpn-events-%s.epoch", frr_libstatedir,
 		     (instance_name && instance_name[0]) ? instance_name : "default") >=
 	    (int)sizeof(path) ||
 	    snprintf(lock_path, sizeof(lock_path), "%s.lock", path) >=
@@ -448,7 +489,7 @@ static bool bgp_mvpn_event_next_boot_epoch(const char *instance_name, uint64_t *
 		unlink(tmp_path);
 		goto out;
 	}
-	dir_fd = open(frr_runstatedir, O_RDONLY | O_DIRECTORY);
+	dir_fd = open(frr_libstatedir, O_RDONLY | O_DIRECTORY);
 	if (dir_fd < 0 || fsync(dir_fd) < 0) {
 		flog_err(EC_LIB_SYSTEM_CALL, "MVPN event boot_epoch directory sync failed: %s",
 			 safe_strerror(errno));
@@ -774,7 +815,8 @@ static bool bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
 		if (!target && !client->snapshot_ready && !client->snapshot_offered)
 			continue;
 
-		if (client->pending_bytes + linelen > BGP_MVPN_EVENT_SINK_MAX_BACKLOG) {
+		if (buffer_pending(client->wb) + linelen >
+		    BGP_MVPN_EVENT_SINK_MAX_BACKLOG) {
 			zlog_warn("MVPN events: client fd %d exceeded %u byte backlog, disconnecting (gap signal for reconnect)",
 				  client->fd, BGP_MVPN_EVENT_SINK_MAX_BACKLOG);
 			if (client == target)
@@ -791,12 +833,9 @@ static bool bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
 			continue;
 		}
 		delivered = true;
-		if (status == BUFFER_EMPTY) {
-			client->pending_bytes = 0;
+		if (status == BUFFER_EMPTY)
 			continue;
-		}
 
-		client->pending_bytes += linelen;
 		if (!client->t_write)
 			event_add_write(bm->master, bgp_mvpn_event_client_write, client,
 					client->fd, &client->t_write);
