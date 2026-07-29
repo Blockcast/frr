@@ -359,7 +359,13 @@ def distinct_reviewer_candidate_logins(reviews, head_sha, ally_logins, pr_author
             and login != pr_author_login
             and (login not in ally or user.get("type") == "User")
         )
-        if is_distinct and review.get("commit_id") == head_sha and review.get("state") != "DISMISSED":
+        # commit_id match OR a body attestation of this head: the signal pass
+        # accepts either as head-relevance, so the permission lookup must cover
+        # both or an attested-but-drifted approval could never become trusted.
+        matches_head = review.get("commit_id") == head_sha or attests_head(
+            str(review.get("body") or ""), head_sha
+        )
+        if is_distinct and matches_head and review.get("state") != "DISMISSED":
             logins.add(login)
     return logins
 
@@ -371,9 +377,11 @@ def distinct_reviewer_signals_for_head(
     pr_author_login,
     permission_trusted_logins,
     permission_resolved_logins=None,
+    head_authorized_logins=None,
 ):
     ally = set(ally_logins)
     permission_resolved_logins = permission_resolved_logins or set()
+    head_authorized_logins = head_authorized_logins or set()
     signals = []
 
     for review in reviews:
@@ -405,13 +413,30 @@ def distinct_reviewer_signals_for_head(
         if not (
             is_distinct
             and is_trusted
-            and review.get("commit_id") == head_sha
             and review.get("state") != "DISMISSED"
         ):
             continue
 
+        body = str(review.get("body") or "")
+        attested = attests_head(body, head_sha)
+        matches_head = review.get("commit_id") == head_sha or attested
+        if not matches_head:
+            continue
+
+        # commit_id is MUTABLE: observed on frr#29, an approval submitted
+        # against one head later reported commit_id equal to a newer head it
+        # had never covered (a revert made the trees identical). So the
+        # POSITIVE path must not rest on commit_id alone -- it needs immutable
+        # current-head evidence: the full head SHA attested in the review body
+        # ("Reviewed head: <sha>"), or a 'review-gate-override: <sha>' comment
+        # by the same trusted login. Blocking signals keep binding on
+        # commit_id; a drifting commit_id may add red, never green.
+        positively_bound = attested or login in head_authorized_logins
+
         at = str(review.get("submitted_at") or "")
         if review.get("state") == "APPROVED":
+            if not positively_bound:
+                continue
             signals.append(
                 {
                     "at": at,
@@ -646,6 +671,7 @@ def decide(
             pr_author_login,
             permission_trusted_logins,
             permission_resolved_logins,
+            head_authorized_logins=override_attestation_logins(comments, head_sha),
         )
         if is_self_review
         else []
@@ -989,6 +1015,10 @@ def main():
         candidates |= set(
             distinct_reviewer_candidate_logins(reviews, head_sha, ally_logins, pr_author_login)
         )
+        # Head-bound authorization comments can positively bind a distinct
+        # approval even without the override label, so their authors need
+        # permission resolution whenever the distinct-reviewer path is live.
+        candidates |= override_attestation_logins(comments, head_sha)
     if override_label and override_label in labels:
         candidates |= override_attestation_logins(comments, head_sha)
     if candidates:

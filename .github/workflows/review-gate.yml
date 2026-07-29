@@ -42,20 +42,23 @@ permissions:
   pull-requests: read
   statuses: write
 
-# PR events (push, review) share a per-PR group with cancellation: a new head
-# legitimately supersedes an in-flight evaluation of the old one.
-#
-# issue_comment events get a PER-RUN group instead. In the shared group, ANY
-# commenter could cancel an in-flight gate run -- including one about to post
-# a failure. hang-mmt-fec's gate diverts only untrusted commenters and skips
-# their runs entirely; frr cannot copy that, because maintainer (non-Ally)
-# override comments are load-bearing signals here and must still trigger
-# evaluation. Per-run groups make comment runs uncancellable and non-cancelling;
-# every run recomputes from the full current state, so concurrent writers
-# converge on the same verdict.
+# One shared group per PR, but only non-comment events cancel the in-flight
+# run. Third design for this block; each prior failure is this one's spec:
+#   v1: shared group, always cancel -- ANY commenter could cancel a run about
+#       to post a failure.
+#   v2: per-run groups for comments -- uncancellable but CONCURRENT: a run
+#       holding stale evidence could write success AFTER a deletion-triggered
+#       run wrote pending, leaving green backed by deleted evidence.
+# Serialize instead: comment-triggered runs queue behind the active run and
+# never cancel it, so evaluation order matches event order and the last
+# writer always evaluated the newest evidence. GitHub keeps only the newest
+# queued run per group; collapsed intermediates are fine because every run
+# recomputes from full current state. Push/review events still cancel: a new
+# head or review legitimately supersedes the in-flight evaluation, and the
+# superseding run itself posts the verdict.
 concurrency:
-  group: review-gate-${{ github.event_name == 'issue_comment' && format('comment-{0}', github.run_id) || format('pr-{0}', github.event.pull_request.number || github.ref) }}
-  cancel-in-progress: true
+  group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'issue_comment' }}
 
 jobs:
   ally-complete:

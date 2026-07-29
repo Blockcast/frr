@@ -710,6 +710,80 @@ class TestSameTimestampTies(unittest.TestCase):
             self.assertEqual(state, "failure", "order %s,%s" % (first, second))
 
 
+class TestDistinctReviewerHeadBinding(unittest.TestCase):
+    """The distinct-reviewer POSITIVE path must not rest on mutable commit_id.
+
+    Round 4 pinned this for the Ally path and left this one open -- the very
+    path where the #29 drift actually happened (a trusted human approval's
+    commit_id moved onto a head the reviewer never saw). Positives need
+    immutable evidence: a body attestation or a head-bound authorization
+    comment by the same trusted login. Blocking keeps binding on commit_id --
+    drift may add red, never green.
+    """
+
+    def _approve(self, body, commit=HEAD):
+        return review("APPROVED", commit=commit, body=body, login=HUMAN,
+                      utype="User", assoc="MEMBER", at="2026-07-27T11:00:00Z")
+
+    def test_drifted_commit_id_with_foreign_attestation_does_not_clear(self):
+        # Ally's focused reproduction: commit_id says current head, body says
+        # another head. The approval never covered this code.
+        state, _ = decide(
+            reviews=[self._approve(attest(OTHER))],
+            author="app/allyblockcast",
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "pending")
+
+    def test_empty_body_approval_alone_does_not_clear(self):
+        state, _ = decide(
+            reviews=[self._approve("")],
+            author="app/allyblockcast",
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "pending")
+
+    def test_attested_approval_clears_even_when_commit_id_drifts(self):
+        # The inverse guarantee: immutable evidence wins over a stale
+        # commit_id, so a legitimate approval survives GitHub's rewriting.
+        state, _ = decide(
+            reviews=[self._approve(attest(HEAD), commit=OTHER)],
+            author="app/allyblockcast",
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "success")
+
+    def test_authorization_comment_binds_an_empty_body_approval(self):
+        state, _ = decide(
+            reviews=[self._approve("")],
+            comments=[comment(override_body(HEAD), login=HUMAN)],
+            author="app/allyblockcast",
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "success")
+
+    def test_authorization_by_a_different_login_does_not_bind(self):
+        # The approver must bind their own approval; a third party's
+        # authorization comment is not evidence of what THIS reviewer saw.
+        state, _ = decide(
+            reviews=[self._approve("")],
+            comments=[comment(override_body(HEAD), login="someone-else")],
+            author="app/allyblockcast",
+            trusted={HUMAN, "someone-else"},
+        )
+        self.assertEqual(state, "pending")
+
+    def test_changes_requested_still_binds_on_commit_id_alone(self):
+        state, _ = decide(
+            reviews=[review("CHANGES_REQUESTED", body="", login=HUMAN,
+                            utype="User", assoc="MEMBER",
+                            at="2026-07-27T11:00:00Z")],
+            author="app/allyblockcast",
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "failure")
+
+
 class TestApprovalAndRecency(unittest.TestCase):
     def test_ally_approval_on_head_succeeds(self):
         state, _ = decide(reviews=[review("APPROVED")])
