@@ -1,0 +1,122 @@
+name: review-gate
+
+# Makes a missing Ally review VISIBLE. Ally's review is event-driven and can
+# silently never happen for a given push; without this gate the PR then shows
+# all-green CI and a missing review is indistinguishable from a clean one.
+# This posts a `review/ally-complete` commit status on the exact head, so an
+# unreviewed head reads `pending` instead of nothing at all.
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - review_requested
+      - review_request_removed
+      - labeled
+      - unlabeled
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
+  # The policy accepts Ally *issue comments* as head signals, so without this
+  # trigger that fallback could never re-evaluate: the head status would stay
+  # stale until some unrelated PR event happened to fire. The payload carries
+  # an `issue`, not a `pull_request`, so the script resolves the PR itself.
+  issue_comment:
+    types:
+      - created
+      - edited
+      # A deleted comment can be the thing that AUTHORIZED the current green --
+      # a clean consolidated signal or a head-bound override attestation.
+      # Without re-evaluating on deletion, the status outlives its evidence.
+      # The script fetches current comments, so the deleted one is simply gone.
+      - deleted
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  statuses: write
+
+# One shared group per PR, but only non-comment events cancel the in-flight
+# run. Third design for this block; each prior failure is this one's spec:
+#   v1: shared group, always cancel -- ANY commenter could cancel a run about
+#       to post a failure.
+#   v2: per-run groups for comments -- uncancellable but CONCURRENT: a run
+#       holding stale evidence could write success AFTER a deletion-triggered
+#       run wrote pending, leaving green backed by deleted evidence.
+# Serialize instead: comment-triggered runs queue behind the active run and
+# never cancel it, so evaluation order matches event order and the last
+# writer always evaluated the newest evidence. GitHub keeps only the newest
+# queued run per group; collapsed intermediates are fine because every run
+# recomputes from full current state. Push/review events still cancel: a new
+# head or review legitimately supersedes the in-flight evaluation, and the
+# superseding run itself posts the verdict.
+concurrency:
+  group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'issue_comment' }}
+
+jobs:
+  ally-complete:
+    # The job's check-run is named after `name:`. It MUST NOT equal the
+    # STATUS_CONTEXT the script posts (review/ally-complete): a check-run
+    # sharing the required status context collides with the commit-status
+    # gate. This job exits 0 unless the script hits an API error, so an
+    # identically-named check-run would always be green and could mask a
+    # `pending`/`failure` gate status on the same required context -- letting
+    # an un-reviewed PR look (or merge) green. Keep this an informational
+    # name distinct from the context; the commit-status is the sole gate.
+    # This job does exactly one thing: post the status. The gate's own unit
+    # tests deliberately live in a SEPARATE workflow
+    # (review-gate-selftest.yml). Running them here as a prior step meant a
+    # self-test failure aborted the job before the status was posted -- and a
+    # gate whose failure mode is "post nothing" reproduces the silent hole it
+    # exists to close. Kept apart, a broken checker shows up as its own red
+    # check while this job still reports what it can.
+    name: Ally review gate
+    # Only one payload fact is consulted here: whether an issue_comment sits
+    # on a PR at all (plain-issue comments have no PR to gate; comment events
+    # never cancel the group, so a stale one can only queue, never silence).
+    # Every other predicate -- draft state, labels, head -- belongs to the
+    # script, which refetches the PR before deciding. Round 7 removed the
+    # payload draft check that lived here: a delayed PR event whose stale
+    # snapshot still said `draft: true` first cancelled the in-flight
+    # ready-PR run (non-comment events cancel the shared group above), then
+    # skipped this job on that same stale snapshot -- leaving the current
+    # head with no status at all. Any event allowed to cancel the active run
+    # must be unconditionally willing to replace it.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      github.event.issue.pull_request != null
+    runs-on: default
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # The gate is a merge control, so run the checker from the protected
+          # branch rather than from the PR under review. pull_request_target
+          # carries write-scoped credentials; never execute PR-authored code.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Require Ally review on current head
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ALLY_REVIEWER_LOGINS: allyblockcast[bot],app/allyblockcast,allyblockcast
+          STATUS_TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Via env rather than inlined into the run block: never interpolate
+          # event data straight into a shell command.
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # Bootstrap: until this change merges, the base branch has no gate
+          # to enforce. Exit clean rather than red -- a red here would be
+          # indistinguishable from a real gate failure, and every repo in the
+          # rollout hits this same one-time window.
+          if [ ! -f .github/scripts/require-ally-review.py ]; then
+            echo "review-gate is not yet present on ${BASE_BRANCH}; nothing to enforce."
+            exit 0
+          fi
+          python3 .github/scripts/require-ally-review.py
