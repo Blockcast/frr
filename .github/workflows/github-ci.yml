@@ -145,7 +145,7 @@ jobs:
     needs: Prepare-MIB-Cache
     name: ${{ matrix.cfg.name }}
     # Guardrail in case a build leg hangs.
-    timeout-minutes: 60
+    timeout-minutes: 45
     strategy:
       # Keep all matrix legs running so we get full failure signal.
       fail-fast: false
