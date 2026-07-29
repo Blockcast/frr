@@ -340,6 +340,45 @@ class TestFullShaAttestation(unittest.TestCase):
         self.assertEqual(state, "success")
 
 
+class TestCommitIdIsNotProofOfCoverage(unittest.TestCase):
+    """review.commit_id can name a head the reviewer never saw.
+
+    Observed on Blockcast/frr#29 on 2026-07-28: an approval submitted against
+    015670897f later reported commit_id a256a868a3, the then-current head. The
+    intervening commit had been reverted, so the two trees were identical --
+    but the review had still never been made against the commit it now named,
+    and the PR read as freshly approved because of it.
+
+    The body attestation is what actually binds a signal to a revision: Ally
+    writes the SHA into text, and text does not move. These fixtures pin that
+    the positive path trusts the attestation rather than commit_id alone, so a
+    commit_id that drifts onto the current head cannot manufacture coverage.
+    """
+
+    def test_approval_on_head_attesting_another_head_does_not_clear(self):
+        state, desc = decide(reviews=[review("APPROVED", commit=HEAD, body=attest(OTHER))])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+
+    def test_clean_commented_on_head_attesting_another_head_does_not_clear(self):
+        state, _ = decide(
+            reviews=[review("COMMENTED", commit=HEAD, body=attest(OTHER))],
+            comments=[comment(override_body(HEAD), login=HUMAN)],
+            labels=[OVERRIDE],
+            trusted={HUMAN},
+        )
+        # The override cannot rescue it either: with no signal for this head the
+        # gate is still deciding about an unreviewed revision.
+        self.assertNotEqual(state, "failure")
+
+    def test_blocking_findings_still_fail_when_commit_id_drifts(self):
+        # Fail-closed is unconditional: a drifting commit_id must never be a
+        # way to shed a negative verdict.
+        body = attest(OTHER) + "### Critical Issues (1)\n"
+        state, _ = decide(reviews=[review("COMMENTED", commit=HEAD, body=body)])
+        self.assertEqual(state, "failure")
+
+
 class TestPermissionLookupIsAuthoritative(unittest.TestCase):
     """When the collaborator-permission lookup COMPLETES it is the answer;
     author_association is only a fallback for a lookup that errored."""
