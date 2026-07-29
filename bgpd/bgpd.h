@@ -989,6 +989,20 @@ struct bgp {
 	char *mvpn_event_socket_path;
 	struct bgp_mvpn_event_sink *mvpn_event_sink;
 
+	/* GTM MCAST-VPN: monotime of the last UMH large-community
+	 * trust-boundary reject notice, for the per-instance once-a-minute
+	 * throttle (see bgp_mvpn_resolve_from_lcommunity). Validity is carried
+	 * by mvpn_umh_untrusted_log_seen below, not by a zero sentinel.
+	 */
+	time_t mvpn_umh_untrusted_log_last;
+
+	/* Whether mvpn_umh_untrusted_log_last holds a real timestamp yet.
+	 * monotime() counts from host boot, so 0 is a legitimate value during
+	 * the first second of uptime and cannot double as "never logged":
+	 * using it as a sentinel leaves every reject in that tick unthrottled.
+	 */
+	bool mvpn_umh_untrusted_log_seen;
+
 	/* EVPN - use RFC 8365 to auto-derive RT */
 	int advertise_autort_rfc8365;
 
