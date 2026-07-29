@@ -210,9 +210,20 @@ receiver_wants() {
 #   vtysh$ show ip pim upstream
 #   Iif        Source        Group      State ...
 #   dimt-0-47  69.25.95.102  232.0.0.1  J     ...
+# Presence alone is NOT usable: the BGP UMH route gives every
+# advertised source an RPF interface, and when the BGP session rides a
+# pim-passive overlay (tailscale0) pimd holds a J upstream whose joins
+# are never sent -- a structural black hole that must not suppress the
+# tunnel build.  Usable means the Iif is a dimt-* tunnel (pim-light,
+# hello-less, so neighbor count is always 0 there) or an interface
+# with a real PIM neighbor.
 upstream_usable() { # <S> <G>
-	vtysh -c 'show ip pim upstream' 2>/dev/null | awk -v s="$1" -v g="$2" '
-		$2 == s && $3 == g && $1 != "Unknown" { found = 1 }
+	iif=$(vtysh -c 'show ip pim upstream' 2>/dev/null | awk -v s="$1" -v g="$2" '
+		$2 == s && $3 == g && $1 != "Unknown" { print $1; exit }')
+	[ -n "$iif" ] || return 1
+	case "$iif" in dimt-*) return 0 ;; esac
+	vtysh -c 'show ip pim neighbor' 2>/dev/null | awk -v i="$iif" '
+		$1 == i { found = 1 }
 		END { exit found ? 0 : 1 }
 	'
 }
@@ -324,8 +335,12 @@ receiver_wants6() {
 }
 
 upstream_usable6() { # <S6> <G6>
-	vtysh -c 'show ipv6 pim upstream' 2>/dev/null | awk -v s="$1" -v g="$2" '
-		$2 == s && $3 == g && $1 != "Unknown" { found = 1 }
+	iif=$(vtysh -c 'show ipv6 pim upstream' 2>/dev/null | awk -v s="$1" -v g="$2" '
+		$2 == s && $3 == g && $1 != "Unknown" { print $1; exit }')
+	[ -n "$iif" ] || return 1
+	case "$iif" in dimt-*) return 0 ;; esac
+	vtysh -c 'show ipv6 pim neighbor' 2>/dev/null | awk -v i="$iif" '
+		$1 == i { found = 1 }
 		END { exit found ? 0 : 1 }
 	'
 }

@@ -184,6 +184,76 @@ check "O2: amt-only UMH -> no peer, no mroute" \
 # cleanup for the source-pe block
 rm -f "$TESTDIR/show-bgp-ipv4-unicast-69.25.95.102-32" "$STATE"/mroute-* "$STATE"/seen-*
 
+# --- receiver mode: upstream usability ---------------------------------
+# An existing (S,G) upstream must only suppress the tunnel build when it
+# can actually pull traffic.  The BGP UMH route gives every advertised
+# source an RPF interface; when the BGP session rides a pim-passive
+# overlay (tailscale0), pimd holds a J upstream whose joins are never
+# sent.  Regression for the 2026-07 PoP outage where that black-hole
+# upstream kept v3 idle forever.
+
+cat > "$TESTDIR/show-ip-igmp-sources" <<'EOF'
+Interface        Group           Source          Timer Fwd Uptime
+br-lan           232.0.0.1       69.25.95.102    04:10   Y 00:00:17
+EOF
+echo "69.25.95.102 100.64.0.47" > "$TESTDIR/source-peers"
+
+# black-hole upstream: Iif is a non-dimt iface with no PIM neighbor
+cat > "$TESTDIR/show-ip-pim-upstream" <<'EOF'
+ Iif         Source         Group            State  Uptime    JoinTimer
+ tailscale0  69.25.95.102   232.0.0.1        J      02:05:46  00:00:15
+EOF
+cat > "$TESTDIR/show-ip-pim-neighbor" <<'EOF'
+Interface         Neighbor        Uptime    Holdtime  DR Pri
+EOF
+rm -f "$STATE"/mroute-* "$STATE"/seen-*
+: > "$TESTDIR/vty.log"
+$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once >/dev/null 2>&1
+
+check "usable: neighbor-less non-dimt upstream does NOT suppress build" \
+	grep -q "ip mroute 69.25.95.102/32 10.99.0.47" "$TESTDIR/vty.log"
+
+# dimt-* upstream (pim-light, hello-less: 0 neighbors) IS usable
+cat > "$TESTDIR/show-ip-pim-upstream" <<'EOF'
+ Iif         Source         Group            State  Uptime    JoinTimer
+ dimt-0-47   69.25.95.102   232.0.0.1        J      02:05:46  00:00:15
+EOF
+rm -f "$STATE"/mroute-* "$STATE"/seen-*
+: > "$TESTDIR/vty.log"
+$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once >/dev/null 2>&1
+
+check "usable: dimt-* upstream suppresses build despite 0 neighbors" \
+	sh -c "! grep -q 'ip mroute' '$TESTDIR/vty.log'"
+
+# native upstream with a real PIM neighbor IS usable
+cat > "$TESTDIR/show-ip-pim-upstream" <<'EOF'
+ Iif         Source         Group            State  Uptime    JoinTimer
+ br-lan      69.25.95.102   232.0.0.1        J      02:05:46  00:00:15
+EOF
+cat > "$TESTDIR/show-ip-pim-neighbor" <<'EOF'
+Interface         Neighbor        Uptime    Holdtime  DR Pri
+br-lan            192.168.1.5     00:10:00  00:01:45  1
+EOF
+rm -f "$STATE"/mroute-* "$STATE"/seen-*
+: > "$TESTDIR/vty.log"
+$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once >/dev/null 2>&1
+
+check "usable: upstream via iface with a PIM neighbor suppresses build" \
+	sh -c "! grep -q 'ip mroute' '$TESTDIR/vty.log'"
+
+# restore the neutral upstream/neighbor fixtures for later blocks
+cat > "$TESTDIR/show-ip-pim-upstream" <<'EOF'
+ Iif        Source        Group            State  Uptime    JoinTimer
+ Unknown    *             239.255.255.250  NotJ   05:40:55  --:--:--
+EOF
+rm -f "$TESTDIR/show-ip-pim-neighbor" "$STATE"/mroute-* "$STATE"/seen-*
+
 # --- receiver mode: v6 (MLDv2) -----------------------------------------
 
 cat > "$TESTDIR/show-ip-igmp-sources" <<'EOF'
