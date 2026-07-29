@@ -11,8 +11,11 @@ Run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 """
 
 import importlib.util
+import json
 import os
+import tempfile
 import unittest
+import unittest.mock as mock
 
 _SPEC = importlib.util.spec_from_file_location(
     "require_ally_review",
@@ -810,6 +813,89 @@ class TestApprovalAndRecency(unittest.TestCase):
         )
         # Newest is clean -> pending (not failure): recency governs.
         self.assertEqual(state, "pending")
+
+
+class TestStalePayloadOrchestration(unittest.TestCase):
+    """The workflow cancels the active run on any PR event, so main() must be
+    unconditionally willing to replace what it cancelled. Round 7: a delayed
+    event whose stale snapshot still said draft:true cancelled the in-flight
+    ready-PR run and then skipped the job on a workflow-level payload
+    predicate -- the current head was left with no status. The predicate is
+    gone; these fixtures prove the script layer makes that safe in BOTH stale
+    directions by reading only the PR number from the payload and taking
+    draft state from the authoritative refetch."""
+
+    STALE_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+    def _run_main(self, payload_draft, refetched):
+        event = {
+            "pull_request": {
+                "number": 7,
+                "draft": payload_draft,
+                "head": {"sha": self.STALE_HEAD},
+            },
+            "repository": {"full_name": "Blockcast/frr"},
+        }
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False
+        ) as handle:
+            json.dump(event, handle)
+            event_path = handle.name
+        self.addCleanup(os.unlink, event_path)
+        env = {
+            "GITHUB_EVENT_PATH": event_path,
+            "GITHUB_REPOSITORY": "Blockcast/frr",
+            "GITHUB_TOKEN": "test-token",
+        }
+        statuses = []
+
+        def record_status(api, owner, repo, sha, token, state, description,
+                          target_url=None):
+            statuses.append((sha, state))
+
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "_request", return_value=refetched) as refetch, \
+                mock.patch.object(gate, "set_commit_status", side_effect=record_status), \
+                mock.patch.object(gate, "fetch_paginated", return_value=[]), \
+                mock.patch.object(gate, "enrich_reviews_with_edit_times"):
+            gate.main()
+        return refetch, statuses
+
+    def test_stale_draft_payload_still_gates_the_refetched_ready_head(self):
+        # Payload says draft (stale); the PR is actually ready at a new head.
+        # The run this event cancelled must be fully replaced: statuses go to
+        # the refetched head, never the payload's.
+        refetch, statuses = self._run_main(
+            payload_draft=True,
+            refetched={
+                "number": 7,
+                "state": "open",
+                "draft": False,
+                "head": {"sha": HEAD},
+                "user": {"login": HUMAN},
+                "labels": [],
+            },
+        )
+        self.assertTrue(statuses)
+        self.assertEqual({sha for sha, _ in statuses}, {HEAD})
+        # Only the PR *number* crossed over from the stale payload.
+        self.assertIn("/pulls/7", refetch.call_args[0][0])
+
+    def test_stale_ready_payload_does_not_gate_a_draft_pr(self):
+        # The inverse staleness: payload says ready, the PR has since gone
+        # back to draft. No status may be written against a draft head.
+        _, statuses = self._run_main(
+            payload_draft=False,
+            refetched={
+                "number": 7,
+                "state": "open",
+                "draft": True,
+                "head": {"sha": HEAD},
+                "user": {"login": HUMAN},
+                "labels": [],
+            },
+        )
+        self.assertEqual(statuses, [])
 
 
 if __name__ == "__main__":

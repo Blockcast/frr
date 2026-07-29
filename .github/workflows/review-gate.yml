@@ -78,13 +78,20 @@ jobs:
     # exists to close. Kept apart, a broken checker shows up as its own red
     # check while this job still reports what it can.
     name: Ally review gate
-    # issue_comment has no pull_request payload, so the draft check cannot be
-    # expressed here for that event; the script re-checks draft after it
-    # resolves the PR. Comments on plain issues are filtered out by requiring
-    # issue.pull_request.
+    # Only one payload fact is consulted here: whether an issue_comment sits
+    # on a PR at all (plain-issue comments have no PR to gate; comment events
+    # never cancel the group, so a stale one can only queue, never silence).
+    # Every other predicate -- draft state, labels, head -- belongs to the
+    # script, which refetches the PR before deciding. Round 7 removed the
+    # payload draft check that lived here: a delayed PR event whose stale
+    # snapshot still said `draft: true` first cancelled the in-flight
+    # ready-PR run (non-comment events cancel the shared group above), then
+    # skipped this job on that same stale snapshot -- leaving the current
+    # head with no status at all. Any event allowed to cancel the active run
+    # must be unconditionally willing to replace it.
     if: >-
-      (github.event_name != 'issue_comment' && github.event.pull_request.draft == false) ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)
+      github.event_name != 'issue_comment' ||
+      github.event.issue.pull_request != null
     runs-on: default
     steps:
       - name: Checkout
