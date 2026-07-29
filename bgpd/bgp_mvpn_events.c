@@ -69,8 +69,6 @@ DEFINE_MTYPE_STATIC(BGPD, MVPN_EVENT_LINE, "MVPN event wire line");
  * signal (see file header): the client's next connection restarts its read
  * at whatever seq is current, and the seq discontinuity is exactly what
  * tells it bytes were lost in between. */
-#define BGP_MVPN_EVENT_SINK_MAX_BACKLOG (8 * 1024 * 1024)
-
 struct bgp_mvpn_event_client {
 	struct bgp_mvpn_event_client *next;
 	int fd;
@@ -815,8 +813,7 @@ static bool bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
 		if (!target && !client->snapshot_ready && !client->snapshot_offered)
 			continue;
 
-		if (buffer_pending(client->wb) + linelen >
-		    BGP_MVPN_EVENT_SINK_MAX_BACKLOG) {
+		if (bgp_mvpn_event_backlog_exceeded(client->wb, linelen)) {
 			zlog_warn("MVPN events: client fd %d exceeded %u byte backlog, disconnecting (gap signal for reconnect)",
 				  client->fd, BGP_MVPN_EVENT_SINK_MAX_BACKLOG);
 			if (client == target)
@@ -844,6 +841,14 @@ static bool bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
 	XFREE(MTYPE_MVPN_EVENT_LINE, line);
 	json_object_free(jo);
 	return delivered;
+}
+
+bool bgp_mvpn_event_backlog_exceeded(const struct buffer *wb, size_t append_len)
+{
+	size_t pending = buffer_pending(wb);
+
+	return pending > BGP_MVPN_EVENT_SINK_MAX_BACKLOG ||
+	       append_len > BGP_MVPN_EVENT_SINK_MAX_BACKLOG - pending;
 }
 
 static void bgp_mvpn_event_broadcast(struct bgp_mvpn_event_sink *sink,

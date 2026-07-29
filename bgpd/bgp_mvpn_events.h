@@ -26,6 +26,7 @@
 
 #include "prefix.h"
 #include "ipaddr.h"
+#include "buffer.h"
 
 #include "bgpd/bgpd.h"
 
@@ -43,6 +44,12 @@ extern void bgp_mvpn_events_stop(struct bgp *bgp);
  * Passing NULL stops and clears any configured path. Returns CMD_SUCCESS or
  * CMD_WARNING_CONFIG_FAILED without disturbing the current listener. */
 extern int bgp_mvpn_events_set_socket(struct bgp *bgp, const char *path);
+
+/* A slow subscriber is disconnected once its live queued bytes would exceed
+ * this cap. The decision is based on the current buffer, never lifetime bytes. */
+#define BGP_MVPN_EVENT_SINK_MAX_BACKLOG (8 * 1024 * 1024)
+extern bool bgp_mvpn_event_backlog_exceeded(const struct buffer *wb,
+					     size_t append_len);
 
 /*
  * Called from bgp_mvpn_source_tree_join_set() exactly once per non-withdraw
