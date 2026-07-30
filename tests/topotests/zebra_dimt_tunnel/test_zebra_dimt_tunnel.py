@@ -88,6 +88,16 @@ def stop_tracer(tracer):
         tracer.wait(timeout=2)
 
 
+def gre_in_fou_supported(router):
+    probe = router.run(
+        "ip link del dimt-fou-probe 2>/dev/null || true; "
+        "ip link add dimt-fou-probe type gre local 192.0.2.1 remote 192.0.2.2 "
+        "encap fou encap-sport auto encap-dport 5555 2>/dev/null; "
+        "rc=$?; [ $rc -ne 0 ] || ip link del dimt-fou-probe; echo $rc"
+    )
+    return probe.strip() == "0"
+
+
 def test_acknowledged_gre_lifecycle_and_owner_reconnect():
     tgen = get_topogen()
     if tgen.routers_have_failure():
@@ -219,9 +229,9 @@ def test_delete_failure_retains_ownership_for_retry_and_reuse():
 
 def test_acknowledged_gre_in_fou_lifecycle():
     router = get_topogen().gears["r1"]
-    installed = request("add", 2, "fou")
-    if installed["result"] == 1:
+    if not gre_in_fou_supported(router):
         pytest.skip("test kernel does not support GRE-in-FOU")
+    installed = request("add", 2, "fou")
     assert installed["result"] == 0, installed
     link = router.run("ip -d link show dimt-00000002")
     assert "encap fou" in link and "encap-dport 5555" in link, link

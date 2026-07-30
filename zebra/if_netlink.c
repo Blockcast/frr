@@ -388,6 +388,42 @@ netlink_gre_set_msg_encoder(struct zebra_dplane_ctx *ctx, void *buf,
 	return NLMSG_ALIGN(req->n.nlmsg_len);
 }
 
+static bool netlink_dimt_if_matches(struct zebra_dplane_ctx *ctx,
+				    const struct zebra_dimt_tunnel_ctx *dimt)
+{
+	const struct zapi_dimt_tunnel *tunnel = &dimt->tunnel;
+	struct zebra_ns *zns = zebra_ns_lookup(dplane_ctx_get_ns_id(ctx));
+	struct interface *ifp;
+	const struct zebra_if *zif;
+	const struct zebra_l2info_gre *gre;
+	uint32_t key = 0;
+	uint16_t encap_type = TUNNEL_ENCAP_NONE;
+
+	if (!zns)
+		return false;
+	ifp = if_lookup_by_index_per_ns(zns, dimt->delete_ifindex);
+	if (!ifp || strcmp(ifp->name, dimt->ifname) != 0)
+		return false;
+	zif = ifp->info;
+	if (!zif || (IS_IPADDR_V4(&tunnel->outer_local)
+			     ? zif->zif_type != ZEBRA_IF_GRE
+			     : zif->zif_type != ZEBRA_IF_IP6GRE))
+		return false;
+	gre = &zif->l2info.gre;
+	if (!ipaddr_is_same(&gre->vtep_ip, &tunnel->outer_local) ||
+	    !ipaddr_is_same(&gre->vtep_ip_remote, &tunnel->outer_remote))
+		return false;
+	if (tunnel->options & ZAPI_DIMT_TUNNEL_KEY_PRESENT)
+		key = htonl(tunnel->key);
+	if (gre->ikey != key || gre->okey != key)
+		return false;
+	if (tunnel->encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU)
+		encap_type = TUNNEL_ENCAP_FOU;
+	return gre->encap_type == encap_type &&
+	       (encap_type != TUNNEL_ENCAP_FOU ||
+		gre->encap_dport == htons(tunnel->dport));
+}
+
 static ssize_t netlink_dimt_tunnel_msg_encoder(struct zebra_dplane_ctx *ctx,
 					       void *buf, size_t buflen)
 {
@@ -418,6 +454,8 @@ static ssize_t netlink_dimt_tunnel_msg_encoder(struct zebra_dplane_ctx *ctx,
 		} *addr = buf;
 
 		if (buflen < sizeof(*addr))
+			return 0;
+		if (!netlink_dimt_if_matches(ctx, dimt))
 			return 0;
 		memset(addr, 0, sizeof(*addr));
 		bytelen = IS_IPADDR_V4(&tunnel->inner_local) ? 4 : 16;

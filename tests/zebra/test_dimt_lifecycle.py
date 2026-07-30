@@ -53,9 +53,19 @@ class TestDimtLifecycleWiring(unittest.TestCase):
     def test_new_dataplane_api_version_and_vrf_scope_are_explicit(self):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
         dplane = (ROOT / "zebra" / "zebra_dplane.c").read_text()
+        l2 = (ROOT / "zebra" / "zebra_l2.h").read_text()
 
         self.assertIn("zvrf_id(zvrf) != VRF_DEFAULT", dimt)
         self.assertIn("MAKE_FRRVERSION(4, 1, 0)", dplane)
+        self.assertLess(l2.index("link_nsid"), l2.index("encap_type"))
+
+    def test_address_encoder_revalidates_dimt_link_identity(self):
+        encoder = (ROOT / "zebra" / "if_netlink.c").read_text()
+        address_branch = encoder.split(
+            "if (dimt->phase == ZEBRA_DIMT_TUNNEL_ADDRESS)", 1
+        )[1].split("RTM_NEWADDR", 1)[0]
+
+        self.assertIn("netlink_dimt_if_matches(ctx, dimt)", address_branch)
 
 
 if __name__ == "__main__":

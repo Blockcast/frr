@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <zebra.h>
 
+#define _LINUX_IN6_H
+#define _LINUX_IF_H
+#define _LINUX_IP_H
 #include <linux/if_tunnel.h>
 
 #include "lib/if.h"
