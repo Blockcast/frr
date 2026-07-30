@@ -37,6 +37,7 @@
 #include "zebra/zebra_evpn_mh.h"
 #include "zebra/zebra_trace.h"
 #include "zebra/zebra_l2.h"
+#include "zebra/zebra_dimt.h"
 
 DEFINE_MTYPE_STATIC(ZEBRA, ZINFO, "Zebra Interface Information");
 
@@ -2161,6 +2162,7 @@ static void zebra_if_dplane_ifp_handling(struct zebra_dplane_ctx *ctx)
 
 			/* Inform clients, install any configured addresses. */
 			if_add_update(ifp);
+			zebra_dimt_tunnel_if_update(ifp);
 
 			/*
 			 * Extract and save L2 interface information, take

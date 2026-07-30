@@ -117,13 +117,13 @@ static void zebra_dimt_tunnel_fail_install(struct zebra_dimt_tunnel *entry)
 		zebra_dimt_tunnel_forget(entry);
 }
 
-static int zebra_dimt_if_real(struct interface *ifp)
+void zebra_dimt_tunnel_if_update(struct interface *ifp)
 {
 	struct listnode *node;
 	struct zebra_dimt_tunnel *entry;
 
 	if (!zrouter.dimt_tunnels)
-		return 0;
+		return;
 	for (ALL_LIST_ELEMENTS_RO(zrouter.dimt_tunnels, node, entry)) {
 		if (entry->vrf_id != ifp->vrf->vrf_id ||
 		    strcmp(entry->ctx.ifname, ifp->name) != 0)
@@ -135,7 +135,6 @@ static int zebra_dimt_if_real(struct interface *ifp)
 			zebra_dimt_tunnel_fail_install(entry);
 		break;
 	}
-	return 0;
 }
 
 static int zebra_dimt_if_del(struct interface *ifp)
@@ -427,7 +426,6 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 void zebra_dimt_tunnel_init(void)
 {
 	hook_register_prio(if_del, 0, zebra_dimt_if_del);
-	hook_register_prio(if_real, 0, zebra_dimt_if_real);
 }
 
 void zebra_dimt_tunnel_cleanup(void)

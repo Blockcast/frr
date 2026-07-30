@@ -11,14 +11,14 @@ CWD = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(CWD, "../"))
 
 from lib import topotest
-from lib.topogen import Topogen, TopoRouter, get_topogen
+from lib.topogen import Topogen, get_topogen
 
 pytestmark = [pytest.mark.zebra]
 
 
 def build_topo(tgen):
     tgen.add_router("r1")
-    tgen.add_host("h1", "192.0.2.2/24")
+    tgen.add_host("h1", "192.0.2.2/24", "via 192.0.2.1")
     switch = tgen.add_switch("s1")
     switch.add_link(tgen.gears["r1"])
     switch.add_link(tgen.gears["h1"])
@@ -27,8 +27,8 @@ def build_topo(tgen):
 def setup_module(mod):
     tgen = Topogen(build_topo, mod.__name__)
     tgen.start_topology()
-    tgen.gears["r1"].load_config(
-        TopoRouter.RD_ZEBRA, os.path.join(CWD, "r1/zebra.conf")
+    tgen.gears["r1"].load_frr_config(
+        os.path.join(CWD, "r1/zebra.conf"), daemons=["zebra", "staticd"]
     )
     tgen.start_router()
 
@@ -50,6 +50,8 @@ def test_acknowledged_gre_lifecycle_and_owner_reconnect():
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
     router = tgen.gears["r1"]
+    underlay = router.vtysh_cmd("show ip route 192.0.2.2")
+    assert "r1-eth0" in underlay, underlay
 
     installed = request("add", 1)
     assert installed["result"] == 0, installed
@@ -72,22 +74,61 @@ def test_acknowledged_gre_lifecycle_and_owner_reconnect():
     assert result == "", result
 
 
+def test_create_failure_reports_fail_install_without_kernel_state():
+    router = get_topogen().gears["r1"]
+    router.run("ip link add dimt-00000004 type dummy")
+
+    failed = request("add", 4)
+    assert failed["result"] == 1, failed
+    link = router.run("ip -d link show dimt-00000004")
+    assert "dummy" in link and "gre remote" not in link, link
+
+    router.run("ip link del dimt-00000004")
+
+
+def test_outer_remote_via_dimt_is_rejected():
+    router = get_topogen().gears["r1"]
+    installed = request("add", 5)
+    assert installed["result"] == 0, installed
+
+    router.vtysh_cmd(
+        "configure terminal\nip route 192.0.2.2/32 dimt-00000005\nend"
+    )
+    _, route_installed = topotest.run_and_expect(
+        lambda: "dimt-00000005"
+        in router.vtysh_cmd("show ip route 192.0.2.2/32"),
+        True,
+        count=10,
+        wait=0.2,
+    )
+    assert route_installed, router.vtysh_cmd("show ip route 192.0.2.2/32")
+
+    rejected = request("add", 6)
+    assert rejected["result"] == 1, rejected
+    assert router.run("ip link show dimt-00000006 2>/dev/null") == ""
+
+    router.vtysh_cmd(
+        "configure terminal\nno ip route 192.0.2.2/32 dimt-00000005\nend"
+    )
+    assert request("del", 5)["result"] == 2
+
+
 def test_external_delete_does_not_reuse_stale_ifindex():
     router = get_topogen().gears["r1"]
 
     installed = request("add", 3)
     assert installed["result"] == 0, installed
     router.run("ip link del dimt-00000003")
-    router.run("ip link add dimt-delete-decoy type dummy")
+    router.run("ip link add dimt-decoy type dummy")
 
     removed = request("del", 3)
     assert removed["result"] == 2, removed
-    assert "dimt-delete-decoy" in router.run("ip link show dimt-delete-decoy")
+    assert "dimt-decoy" in router.run("ip link show dimt-decoy")
 
     reinstalled = request("add", 3)
     assert reinstalled["result"] == 0, reinstalled
     assert request("del", 3)["result"] == 2
-    router.run("ip link del dimt-delete-decoy")
+    router.run("ip link del dimt-decoy")
 
 
 def test_acknowledged_gre_in_fou_lifecycle():

@@ -6503,6 +6503,7 @@ static enum zebra_dplane_result dplane_dimt_tunnel_update(
 
 	ctx = dplane_ctx_alloc();
 	ctx->zd_op = op;
+	ctx->zd_status = ZEBRA_DPLANE_REQUEST_SUCCESS;
 	ctx->zd_vrf_id = vrf_id;
 	ctx->u.dimt_tunnel = *tunnel;
 	dplane_ctx_set_ifname(ctx, tunnel->ifname);
