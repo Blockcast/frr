@@ -92,6 +92,20 @@ def hold_dplane_worker(router, delay_usecs=6000000):
     already handed to the dataplane provably stays queued until the tracer
     detaches.
     """
+    return _hold_dplane_syscalls(router, "ppoll,poll", "delay_exit", delay_usecs)
+
+
+def hold_dplane_sendmsg(router, delay_usecs=6000000):
+    """Hold the dplane worker at sendmsg ENTRY.
+
+    At that point the netlink message is fully encoded (all identity checks
+    have run) but not yet delivered to the kernel -- the exact
+    encode-to-kernel window.
+    """
+    return _hold_dplane_syscalls(router, "sendmsg", "delay_enter", delay_usecs)
+
+
+def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs):
     if not router.run("command -v strace").strip():
         pytest.skip("strace is required to hold the dplane worker")
     worker = dplane_tid(router)
@@ -102,9 +116,9 @@ def hold_dplane_worker(router, delay_usecs=6000000):
             "strace",
             "-qq",
             "-e",
-            "trace=ppoll,poll",
+            "trace={}".format(syscalls),
             "-e",
-            "inject=ppoll,poll:delay_exit={}".format(delay_usecs),
+            "inject={}:{}={}".format(syscalls, inject_kind, delay_usecs),
             "-p",
             worker,
         ],
@@ -388,6 +402,131 @@ def test_uncertain_create_result_reconciles_surviving_link():
         retry = request("add", 8)
         assert retry["result"] == 0, retry
     assert request("del", 8)["result"] == 2
+
+
+def test_delete_encoded_before_replacement_binds_to_ifindex():
+    router = get_topogen().gears["r1"]
+    installed = request("add", 10)
+    assert installed["result"] == 0, installed
+
+    # Hold the worker at sendmsg ENTRY: the RTM_DELLINK is fully encoded
+    # (identity validated) but not yet delivered. Replacing the link in
+    # this window must not delete the same-name replacement -- the delete
+    # is bound to the old ifindex, which Linux does not reuse, so the
+    # kernel fails it with ENODEV instead.
+    tracer = hold_dplane_sendmsg(router)
+    client = os.path.join(CWD, "dimt_zapi_client.py")
+    try:
+        pending = router.popen(
+            ["python3", client, "del", "10", "--encap", "gre"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(0.5)
+        router.run(
+            "ip link del dimt-0000000a; ip link add dimt-0000000a type dummy"
+        )
+    finally:
+        stop_tracer(tracer)
+    stdout, stderr = pending.communicate(timeout=15)
+    assert pending.returncode == 0, stderr.decode()
+    result = json.loads(stdout.decode())["result"]
+    # REMOVE_FAIL (ENODEV on the stale index) that converges on retry, or
+    # REMOVED if the replacement raced ahead of the encoded request.
+    assert result in (2, 3), result
+    assert "dummy" in router.run("ip -d link show dimt-0000000a")
+    if result == 3:
+        assert request("del", 10)["result"] == 2
+    router.run("ip link del dimt-0000000a")
+
+
+def test_lost_delete_ack_reconciles_instead_of_resurrecting():
+    router = get_topogen().gears["r1"]
+    installed = request("add", 11)
+    assert installed["result"] == 0, installed
+
+    # The kernel applies the delete but its ack is lost. The entry must
+    # converge on reconciled interface state -- REMOVED now, or
+    # REMOVE_FAIL then REMOVED on retry -- and never report INSTALLED for
+    # a link that no longer exists.
+    tracer = inject_netlink_syscall_failure(router, "recvmsg", 1)
+    try:
+        removed = request("del", 11)
+    finally:
+        stop_tracer(tracer)
+    assert removed["result"] in (2, 3), removed
+    _, link = topotest.run_and_expect(
+        lambda: router.run("ip link show dimt-0000000b 2>/dev/null"),
+        "",
+        count=10,
+        wait=0.2,
+    )
+    assert link == "", link
+    if removed["result"] == 3:
+        assert request("del", 11)["result"] == 2
+
+    # An identical ADD must produce a real kernel link, never a phantom
+    # INSTALLED (the lost ack may still poison the next batch's
+    # correlation, so allow one explicit failure before the clean install).
+    readd = request("add", 11)
+    assert readd["result"] in (0, 1), readd
+    if readd["result"] == 1:
+        readd = request("add", 11)
+        assert readd["result"] == 0, readd
+    link = router.run("ip -d link show dimt-0000000b")
+    assert "gre remote 192.0.2.2 local 192.0.2.1" in link, link
+    assert request("del", 11)["result"] == 2
+
+
+def test_skipped_delete_result_survives_mixed_batch():
+    router = get_topogen().gears["r1"]
+    replaced = request("add", 12)
+    assert replaced["result"] == 0, replaced
+    normal = request("add", 13)
+    assert normal["result"] == 0, normal
+
+    # Queue the REAL delete first and the skipped one second: the
+    # no-message context then sits behind the only correlatable response,
+    # exactly where the end-of-responses drain used to flip its synthetic
+    # success into a failure.
+    tracer = hold_dplane_worker(router)
+    client = os.path.join(CWD, "dimt_zapi_client.py")
+    try:
+        pending13 = router.popen(
+            ["python3", client, "del", "13", "--encap", "gre"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(0.2)
+        pending12 = router.popen(
+            ["python3", client, "del", "12", "--encap", "gre"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(0.2)
+        router.run(
+            "ip link del dimt-0000000c; ip link add dimt-0000000c type dummy"
+        )
+        _, seen = topotest.run_and_expect(
+            lambda: zebra_ifindex(router, "dimt-0000000c")
+            not in (None, replaced["ifindex"]),
+            True,
+            count=15,
+            wait=0.2,
+        )
+        assert seen, "zebra did not process the replacement link"
+    finally:
+        stop_tracer(tracer)
+    out13, err13 = pending13.communicate(timeout=10)
+    out12, err12 = pending12.communicate(timeout=10)
+    assert pending13.returncode == 0, err13.decode()
+    assert pending12.returncode == 0, err12.decode()
+    assert json.loads(out13.decode())["result"] == 2, out13
+    # The skipped delete must report REMOVED even though it shared the
+    # batch with a real delete whose ack is the only response.
+    assert json.loads(out12.decode())["result"] == 2, out12
+    assert "dummy" in router.run("ip -d link show dimt-0000000c")
+    router.run("ip link del dimt-0000000c")
 
 
 def test_zebra_restart_adopts_surviving_tunnel():

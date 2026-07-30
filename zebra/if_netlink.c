@@ -417,6 +417,9 @@ static bool netlink_dimt_if_matches(struct zebra_dplane_ctx *ctx,
 		key = htonl(tunnel->key);
 	if (gre->ikey != key || gre->okey != key)
 		return false;
+	if ((tunnel->options & ZAPI_DIMT_TUNNEL_MTU_PRESENT) &&
+	    ifp->mtu != tunnel->mtu)
+		return false;
 	if (tunnel->encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU)
 		encap_type = TUNNEL_ENCAP_FOU;
 	return gre->encap_type == encap_type &&
@@ -494,13 +497,15 @@ static ssize_t netlink_dimt_tunnel_msg_encoder(struct zebra_dplane_ctx *ctx,
 		if (!netlink_dimt_if_matches(ctx, dimt))
 			return 0;
 		req->n.nlmsg_type = RTM_DELLINK;
-		/* Select the link by name, not by the captured ifindex: a
-		 * recycled ifindex must never delete an unrelated interface.
-		 * The kernel resolves IFLA_IFNAME only when ifi_index is 0. */
-		req->ifi.ifi_index = 0;
-		if (!nl_attr_put(&req->n, buflen, IFLA_IFNAME, dimt->ifname,
-				 strlen(dimt->ifname) + 1))
-			return 0;
+		/* Bind the delete to the validated ifindex, the one identity
+		 * that cannot be substituted after validation: Linux never
+		 * reuses an ifindex until 2^31 allocations wrap, whereas the
+		 * deterministic dimt-%08x NAME is trivially reusable -- a
+		 * name-selected delete would remove a same-name replacement
+		 * created between encoding and kernel processing. If this
+		 * link is replaced in that window, the kernel fails the
+		 * stale-index delete with ENODEV instead. */
+		req->ifi.ifi_index = dimt->delete_ifindex;
 		return NLMSG_ALIGN(req->n.nlmsg_len);
 	}
 

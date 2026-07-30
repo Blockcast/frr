@@ -74,20 +74,32 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         self.assertIn("netlink_dimt_if_matches(ctx, dimt)", delete_put)
         self.assertIn("ZEBRA_DPLANE_REQUEST_SUCCESS", delete_put)
 
-    def test_delete_encoder_revalidates_and_selects_by_name(self):
+    def test_delete_encoder_revalidates_and_binds_to_ifindex(self):
         encoder = (ROOT / "zebra" / "if_netlink.c").read_text()
         delete_branch = encoder.split(
             "dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL) {", 1
         )[1].split("RTM_NEWLINK", 1)[0]
 
-        # Identity is revalidated at encode time, and the RTM_DELLINK
-        # selects the link by name (ifi_index 0) so a recycled ifindex can
-        # never delete an unrelated interface.
+        # Identity is revalidated at encode time, and the RTM_DELLINK binds
+        # to the validated ifindex -- the identity Linux never reuses until
+        # wrap -- NOT the trivially reusable dimt-%08x name, so a same-name
+        # replacement created after encoding cannot be deleted.
         self.assertIn("netlink_dimt_if_matches(ctx, dimt)", delete_branch)
         self.assertIn("RTM_DELLINK", delete_branch)
-        self.assertIn("req->ifi.ifi_index = 0", delete_branch)
-        self.assertIn("IFLA_IFNAME", delete_branch)
-        self.assertNotIn("ifi_index = dimt->delete_ifindex", delete_branch)
+        self.assertIn("req->ifi.ifi_index = dimt->delete_ifindex", delete_branch)
+        self.assertNotIn("IFLA_IFNAME", delete_branch)
+
+    def test_worker_matcher_checks_full_identity_including_mtu(self):
+        encoder = (ROOT / "zebra" / "if_netlink.c").read_text()
+        matcher = encoder.split("static bool netlink_dimt_if_matches", 1)[1]
+        matcher = matcher.split("static ssize_t", 1)[0]
+
+        for check in (
+            "ZAPI_DIMT_TUNNEL_KEY_PRESENT",
+            "ZAPI_DIMT_TUNNEL_MTU_PRESENT",
+            "encap_dport",
+        ):
+            self.assertIn(check, matcher)
 
     def test_add_during_delete_rejects_instead_of_rebinding_owner(self):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
@@ -119,6 +131,37 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         if_update = dimt.split("void zebra_dimt_tunnel_if_update", 1)[1]
         self.assertIn(
             "ZEBRA_DIMT_CLEANUP", if_update.split("ZEBRA_DIMT_ADDING", 1)[0]
+        )
+
+    def test_uncertain_delete_reconciles_before_restoring_installed(self):
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+
+        # Both CREATE and DELETE distinguish lost verdicts from explicit
+        # kernel verdicts.
+        self.assertEqual(dimt.count("!ctx->result_authoritative"), 2)
+        # The uncertain-DELETE branch re-resolves the interface before
+        # deciding between REMOVE_FAIL and REMOVED, instead of restoring
+        # INSTALLED blindly.
+        uncertain_del = dimt.rsplit("!ctx->result_authoritative", 1)[1]
+        head = uncertain_del.split("ZAPI_DIMT_TUNNEL_REMOVED", 1)[0]
+        self.assertIn("zebra_dimt_tunnel_resolve_ifindex(entry)", head)
+        self.assertIn("ZAPI_DIMT_TUNNEL_REMOVE_FAIL", head)
+
+    def test_no_message_results_skip_ack_correlation(self):
+        batch = (ROOT / "zebra" / "kernel_netlink.c").read_text()
+        update_multi = batch.split("void kernel_update_multi", 1)[1]
+
+        # A synthetic FRR_NETLINK_SUCCESS (no message encoded) goes straight
+        # to the handled queue, never into the batch's ack correlation where
+        # the end-of-responses drain could overwrite its verdict.
+        self.assertIn(
+            "dplane_ctx_enqueue_tail(&handled_list, ctx)", update_multi
+        )
+        self.assertLess(
+            update_multi.index("res == FRR_NETLINK_SUCCESS"),
+            update_multi.index(
+                "dplane_ctx_enqueue_tail(&(batch.ctx_list), ctx)"
+            ),
         )
 
     def test_restart_adopts_exact_kernel_tunnel(self):

@@ -1599,6 +1599,18 @@ void kernel_update_multi(struct dplane_ctx_list_head *ctx_list)
 
 		res = nl_put_msg(&batch, ctx);
 
+		/* FRR_NETLINK_SUCCESS means the operation was handled without
+		 * encoding a netlink message (unsupported op, skipped route
+		 * type, or a DIMT delete whose target is already gone).
+		 * There is no response to correlate, so keep the context out
+		 * of the batch's ack bookkeeping: left in the list, the
+		 * end-of-responses drain or a read failure would overwrite
+		 * its synthetic verdict based on unrelated traffic. */
+		if (res == FRR_NETLINK_SUCCESS) {
+			dplane_ctx_enqueue_tail(&handled_list, ctx);
+			continue;
+		}
+
 		dplane_ctx_enqueue_tail(&(batch.ctx_list), ctx);
 		if (res == FRR_NETLINK_ERROR) {
 			dplane_ctx_set_status(ctx,

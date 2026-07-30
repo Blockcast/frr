@@ -547,6 +547,24 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 		zebra_dimt_tunnel_fail_install(entry);
 		return;
 	}
+	if (!add && !success && entry && !cleanup &&
+	    !ctx->result_authoritative) {
+		/* The delete's verdict was lost: the kernel may have removed
+		 * the link, and zebra_dimt_if_del() may already have cleared
+		 * the ifindex. Trust the reconciled interface state instead
+		 * of resurrecting INSTALLED blindly -- an identical ADD must
+		 * never report INSTALLED for a link that no longer exists. */
+		if (zebra_dimt_tunnel_resolve_ifindex(entry)) {
+			entry->state = ZEBRA_DIMT_INSTALLED;
+			zebra_dimt_notify(&entry->ctx, vrf_id, entry->ifindex,
+					  ZAPI_DIMT_TUNNEL_REMOVE_FAIL);
+			return;
+		}
+		zebra_dimt_notify(&entry->ctx, vrf_id, 0,
+				  ZAPI_DIMT_TUNNEL_REMOVED);
+		zebra_dimt_tunnel_forget(entry);
+		return;
+	}
 	if (!cleanup || entry->cleanup_notify_owner)
 		zebra_dimt_notify(
 			entry ? &entry->ctx : ctx, vrf_id, ifindex,
