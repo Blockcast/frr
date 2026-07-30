@@ -86,6 +86,17 @@ for entry in "${FLEET[@]}"; do
   repo="${entry%%:*}"
   runner="${entry#*:}"
   [ "$runner" != "$entry" ] || runner="default"
+  # The label is interpolated into sed replacements below and inside the
+  # subshell; restrict it to characters that are inert there AND valid in
+  # YAML scalars so a stray '/', '&', or '\' cannot corrupt the workflows.
+  case "$runner" in
+    ""|*[!A-Za-z0-9._-]*)
+      echo "=== $repo ===" >&2
+      echo "  invalid runner label: '$runner'" >&2
+      FAILED_REPOS+=("$repo")
+      continue
+      ;;
+  esac
   echo "=== $repo (runs-on: $runner) ==="
 
   if [ "$DRY_RUN" = "1" ]; then
@@ -106,6 +117,9 @@ for entry in "${FLEET[@]}"; do
     cd "$work"
     gh repo clone "$repo" repo -- --depth 1 >/dev/null 2>&1
     cd repo
+    # Recorded before the sync branch is created: the ancestry proof in
+    # the force-push guard needs to name the target default branch.
+    default_branch=$(git symbolic-ref --short HEAD)
     git checkout -B "$BRANCH" >/dev/null
 
     mkdir -p .github/scripts .github/workflows
@@ -170,15 +184,27 @@ tools/sync-review-gate.sh." >/dev/null
               ;;
           esac
           claimed_sha=${remote_subject#"$SYNC_SUBJECT_PREFIX"}
+          # The generated commit records only paths that DIFFER from the
+          # default branch, so a legitimate sync that changed one canonical
+          # file touches one path. Require a non-empty SUBSET of the gate
+          # paths; every tip blob is still verified in full below.
           if ! touched=$(git diff-tree --no-commit-id --name-only -r FETCH_HEAD 2>/dev/null) ||
-             [ -z "$touched" ] ||
-             [ "$(printf '%s\n' "$touched" | LC_ALL=C sort)" != \
-               "$(printf '%s\n' "${CANON_FILES[@]}" | LC_ALL=C sort)" ]; then
-            echo "  REFUSING force-push: remote $BRANCH tip touches paths beyond the gate files" >&2
-            echo "  (or its parent could not be read); rescue any human work, delete the" >&2
-            echo "  remote branch, re-run" >&2
+             [ -z "$touched" ]; then
+            echo "  REFUSING force-push: cannot enumerate remote $BRANCH tip's changes" >&2
+            echo "  (empty or merge commit, or unreadable parent); rescue any human work," >&2
+            echo "  delete the remote branch, re-run" >&2
             exit 2
           fi
+          while IFS= read -r p; do
+            case " ${CANON_FILES[*]} " in
+              *" $p "*) ;;
+              *)
+                echo "  REFUSING force-push: remote $BRANCH tip touches '$p' outside the" >&2
+                echo "  gate files; rescue any human work, delete the remote branch, re-run" >&2
+                exit 2
+                ;;
+            esac
+          done <<< "$touched"
           for f in "${CANON_FILES[@]}"; do
             if ! remote_blob=$(git rev-parse -q --verify "FETCH_HEAD:$f"); then
               echo "  REFUSING force-push: $f missing from remote $BRANCH tip" >&2
@@ -202,6 +228,23 @@ tools/sync-review-gate.sh." >/dev/null
               exit 2
             fi
           done
+          # Tip content alone says nothing about ANCESTRY: an
+          # automation-shaped tip stacked on branch-only human commits
+          # would still delete that history. Prove the tip's parent is on
+          # the default branch (ahead_by 0 in a compare against it), so
+          # the branch carries exactly the one generated commit.
+          if ! parent_sha=$(git rev-parse -q --verify FETCH_HEAD^ 2>/dev/null); then
+            echo "  REFUSING force-push: remote $BRANCH tip's parent is unreadable" >&2
+            exit 2
+          fi
+          ahead=$(gh api "repos/$repo/compare/${default_branch}...${parent_sha}" \
+                    --jq .ahead_by 2>/dev/null) || ahead=unknown
+          if [ "$ahead" != "0" ]; then
+            echo "  REFUSING force-push: remote $BRANCH carries history beyond the single" >&2
+            echo "  generated commit (parent is ${ahead} commit(s) off $default_branch);" >&2
+            echo "  rescue any human work, delete the remote branch, re-run" >&2
+            exit 2
+          fi
           git update-ref "refs/remotes/origin/$BRANCH" FETCH_HEAD
         fi
       fi
