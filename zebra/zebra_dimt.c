@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <zebra.h>
 
+#include <linux/if_tunnel.h>
+
 #include "lib/if.h"
 #include "lib/hook.h"
 #include "lib/linklist.h"
@@ -89,7 +91,7 @@ static bool zebra_dimt_if_matches(const struct zebra_dimt_tunnel *entry,
 		encap_type = TUNNEL_ENCAP_FOU;
 	return gre->encap_type == encap_type &&
 	       (encap_type != TUNNEL_ENCAP_FOU ||
-		gre->encap_dport == htons(tunnel->fou_dport));
+		gre->encap_dport == htons(tunnel->dport));
 }
 
 static bool zebra_dimt_tunnel_resolve_ifindex(struct zebra_dimt_tunnel *entry)
@@ -435,7 +437,11 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 	if (add && success && entry &&
 	    ctx->phase == ZEBRA_DIMT_TUNNEL_ADDRESS) {
 		ifindex = ctx->delete_ifindex;
-		entry->ifindex = ifindex;
+		if (entry->ifindex != ifindex ||
+		    !zebra_dimt_tunnel_resolve_ifindex(entry)) {
+			zebra_dimt_tunnel_fail_install(entry);
+			return;
+		}
 		entry->state = ZEBRA_DIMT_INSTALLED;
 	}
 	if (add && !success && entry &&

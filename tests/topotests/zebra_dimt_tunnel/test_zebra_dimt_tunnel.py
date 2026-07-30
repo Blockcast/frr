@@ -51,6 +51,13 @@ def inject_netlink_send_failure(router, when):
     if not router.run("command -v strace").strip():
         pytest.skip("strace is required for netlink failure injection")
     zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
+    dplane_tid = router.run(
+        f"for task in /proc/{zebra_pid}/task/*; do "
+        '[ "$(cat $task/comm)" = zebra_dplane ] && basename "$task"; '
+        "done"
+    ).strip()
+    if not dplane_tid:
+        pytest.skip("zebra_dplane worker is required for netlink failure injection")
     tracer = router.popen(
         [
             "strace",
@@ -60,7 +67,7 @@ def inject_netlink_send_failure(router, when):
             "-e",
             "inject=sendmsg:error=EIO:when={}".format(when),
             "-p",
-            zebra_pid,
+            dplane_tid,
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
