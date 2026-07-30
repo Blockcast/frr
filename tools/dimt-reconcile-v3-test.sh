@@ -75,6 +75,22 @@ check() { # <desc> <cmd...>
 	fi
 }
 
+write_upstream_rpf_json() { # <file> <S> <G> <Iif> <RPF-Nbr>
+	cat > "$1" <<EOF
+{
+  "$3": {
+    "$2": {
+      "source": "$2",
+      "group": "$3",
+      "rpfInterface": "$4",
+      "ribNexthop": "$5",
+      "rpfAddress": "$5"
+    }
+  }
+}
+EOF
+}
+
 # --- receiver mode ----------------------------------------------------
 
 cat > "$TESTDIR/show-ip-igmp-sources" <<'EOF'
@@ -198,11 +214,9 @@ br-lan           232.0.0.1       69.25.95.102    04:10   Y 00:00:17
 EOF
 echo "69.25.95.102 100.64.0.47" > "$TESTDIR/source-peers"
 
-# black-hole upstream: Iif is a non-dimt iface with no PIM neighbor
-cat > "$TESTDIR/show-ip-pim-upstream" <<'EOF'
- Iif         Source         Group            State  Uptime    JoinTimer
- tailscale0  69.25.95.102   232.0.0.1        J      02:05:46  00:00:15
-EOF
+# black-hole upstream: RPF interface is non-dimt with no selected PIM neighbor
+write_upstream_rpf_json "$TESTDIR/show-ip-pim-upstream-rpf-json" \
+	69.25.95.102 232.0.0.1 tailscale0 100.64.0.47
 cat > "$TESTDIR/show-ip-pim-neighbor" <<'EOF'
 Interface         Neighbor        Uptime    Holdtime  DR Pri
 EOF
@@ -216,24 +230,38 @@ check "usable: neighbor-less non-dimt upstream does NOT suppress build" \
 	grep -q "ip mroute 69.25.95.102/32 10.99.0.47" "$TESTDIR/vty.log"
 
 # dimt-* upstream (pim-light, hello-less: 0 neighbors) IS usable
-cat > "$TESTDIR/show-ip-pim-upstream" <<'EOF'
- Iif         Source         Group            State  Uptime    JoinTimer
- dimt-0-47   69.25.95.102   232.0.0.1        J      02:05:46  00:00:15
-EOF
+write_upstream_rpf_json "$TESTDIR/show-ip-pim-upstream-rpf-json" \
+	69.25.95.102 232.0.0.1 dimt-0-47 10.99.0.47
 rm -f "$STATE"/mroute-* "$STATE"/seen-*
 : > "$TESTDIR/vty.log"
-$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+check "usable: dimt-* reconcile succeeds before no-mroute assertion" \
+	$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
 	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
-	--v2 "$BIN/dimt-reconcile.sh" --once >/dev/null 2>&1
+	--v2 "$BIN/dimt-reconcile.sh" --once
 
 check "usable: dimt-* upstream suppresses build despite 0 neighbors" \
 	sh -c "! grep -q 'ip mroute' '$TESTDIR/vty.log'"
 
-# native upstream with a real PIM neighbor IS usable
-cat > "$TESTDIR/show-ip-pim-upstream" <<'EOF'
- Iif         Source         Group            State  Uptime    JoinTimer
- br-lan      69.25.95.102   232.0.0.1        J      02:05:46  00:00:15
+# native upstream with the selected RPF PIM neighbor IS usable
+write_upstream_rpf_json "$TESTDIR/show-ip-pim-upstream-rpf-json" \
+	69.25.95.102 232.0.0.1 br-lan 192.168.1.5
+cat > "$TESTDIR/show-ip-pim-neighbor" <<'EOF'
+Interface         Neighbor        Uptime    Holdtime  DR Pri
+br-lan            192.168.1.5     00:10:00  00:01:45  1
 EOF
+rm -f "$STATE"/mroute-* "$STATE"/seen-*
+: > "$TESTDIR/vty.log"
+check "usable: exact native-neighbor reconcile succeeds before no-mroute assertion" \
+	$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once
+
+check "usable: upstream via selected RPF PIM neighbor suppresses build" \
+	sh -c "! grep -q 'ip mroute' '$TESTDIR/vty.log'"
+
+# multi-access upstream with another neighbor, but not selected RPF, is not usable
+write_upstream_rpf_json "$TESTDIR/show-ip-pim-upstream-rpf-json" \
+	69.25.95.102 232.0.0.1 br-lan 192.168.1.9
 cat > "$TESTDIR/show-ip-pim-neighbor" <<'EOF'
 Interface         Neighbor        Uptime    Holdtime  DR Pri
 br-lan            192.168.1.5     00:10:00  00:01:45  1
@@ -244,15 +272,16 @@ $RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
 	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
 	--v2 "$BIN/dimt-reconcile.sh" --once >/dev/null 2>&1
 
-check "usable: upstream via iface with a PIM neighbor suppresses build" \
-	sh -c "! grep -q 'ip mroute' '$TESTDIR/vty.log'"
+check "usable: unrelated neighbor on RPF iface does NOT suppress build" \
+	grep -q "ip mroute 69.25.95.102/32 10.99.0.47" "$TESTDIR/vty.log"
 
 # restore the neutral upstream/neighbor fixtures for later blocks
 cat > "$TESTDIR/show-ip-pim-upstream" <<'EOF'
  Iif        Source        Group            State  Uptime    JoinTimer
  Unknown    *             239.255.255.250  NotJ   05:40:55  --:--:--
 EOF
-rm -f "$TESTDIR/show-ip-pim-neighbor" "$STATE"/mroute-* "$STATE"/seen-*
+rm -f "$TESTDIR/show-ip-pim-neighbor" "$TESTDIR/show-ip-pim-upstream-rpf" \
+	"$TESTDIR/show-ip-pim-upstream-rpf-json" "$STATE"/mroute-* "$STATE"/seen-*
 
 # --- receiver mode: v6 (MLDv2) -----------------------------------------
 
@@ -328,7 +357,83 @@ check "v6: /128 override withdrawn on leave (holddown 0)" \
 	grep -q "no ipv6 route fd69::193/128 fd99::88" "$TESTDIR/vty.log"
 check "v6: state cleaned" sh -c "! test -f '$STATE/mroute6-fd69::193'"
 
+# --- receiver mode: v6 upstream usability -----------------------------
+
+cat > "$TESTDIR/show-ip-igmp-sources" <<'EOF'
+Interface        Group           Source          Timer Fwd Uptime
+EOF
+cat > "$TESTDIR/show-ipv6-mld-joins" <<'EOF'
+Group                           Source                          State               LastSeen  NonTrkSeen     Created
+
+On interface br-lan:
+ff3e::1:1                       fd69::193                       JOIN                00:00:02           -    00:01:12
+EOF
+echo "fd69::193 100.64.0.47" > "$TESTDIR/source-peers"
+
+# v6 black-hole upstream: RPF interface is non-dimt with no selected PIM neighbor
+write_upstream_rpf_json "$TESTDIR/show-ipv6-pim-upstream-rpf-json" \
+	fd69::193 ff3e::1:1 tailscale0 fd7a:115c:a1e0::2f
+cat > "$TESTDIR/show-ipv6-pim-neighbor" <<'EOF'
+Interface         Neighbor              Uptime    Holdtime  DR Pri
+EOF
+rm -f "$STATE"/mroute-* "$STATE"/mroute6-* "$STATE"/seen-* "$STATE"/seen6-*
+: > "$TESTDIR/vty.log"
+$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once >/dev/null 2>&1
+
+check "v6 usable: neighbor-less non-dimt upstream does NOT suppress build" \
+	grep -q "ipv6 route fd69::193/128 fd99::47" "$TESTDIR/vty.log"
+
+# v6 dimt-* upstream (pim-light, hello-less: 0 neighbors) IS usable
+write_upstream_rpf_json "$TESTDIR/show-ipv6-pim-upstream-rpf-json" \
+	fd69::193 ff3e::1:1 dimt-0-47 fd99::47
+rm -f "$STATE"/mroute-* "$STATE"/mroute6-* "$STATE"/seen-* "$STATE"/seen6-*
+: > "$TESTDIR/vty.log"
+check "v6 usable: dimt-* reconcile succeeds before no-route assertion" \
+	$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once
+
+check "v6 usable: dimt-* upstream suppresses build despite 0 neighbors" \
+	sh -c "! grep -q 'ipv6 route' '$TESTDIR/vty.log'"
+
+# v6 native upstream with the selected RPF PIM neighbor IS usable
+write_upstream_rpf_json "$TESTDIR/show-ipv6-pim-upstream-rpf-json" \
+	fd69::193 ff3e::1:1 br-lan fe80::47
+cat > "$TESTDIR/show-ipv6-pim-neighbor" <<'EOF'
+Interface         Neighbor              Uptime    Holdtime  DR Pri
+br-lan            fe80::47              00:10:00  00:01:45  1
+EOF
+rm -f "$STATE"/mroute-* "$STATE"/mroute6-* "$STATE"/seen-* "$STATE"/seen6-*
+: > "$TESTDIR/vty.log"
+check "v6 usable: exact native-neighbor reconcile succeeds before no-route assertion" \
+	$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once
+
+check "v6 usable: upstream via selected RPF PIM neighbor suppresses build" \
+	sh -c "! grep -q 'ipv6 route' '$TESTDIR/vty.log'"
+
+# v6 multi-access upstream with another neighbor, but not selected RPF, is not usable
+write_upstream_rpf_json "$TESTDIR/show-ipv6-pim-upstream-rpf-json" \
+	fd69::193 ff3e::1:1 br-lan fe80::99
+cat > "$TESTDIR/show-ipv6-pim-neighbor" <<'EOF'
+Interface         Neighbor              Uptime    Holdtime  DR Pri
+br-lan            fe80::47              00:10:00  00:01:45  1
+EOF
+rm -f "$STATE"/mroute-* "$STATE"/mroute6-* "$STATE"/seen-* "$STATE"/seen6-*
+: > "$TESTDIR/vty.log"
+$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once >/dev/null 2>&1
+
+check "v6 usable: unrelated neighbor on RPF iface does NOT suppress build" \
+	grep -q "ipv6 route fd69::193/128 fd99::47" "$TESTDIR/vty.log"
+
 rm -f "$TESTDIR/show-ipv6-mld-joins" "$TESTDIR/show-bgp-ipv6-unicast-fd69::193-128" \
+	"$TESTDIR/show-ipv6-pim-neighbor" "$TESTDIR/show-ipv6-pim-upstream-rpf" \
+	"$TESTDIR/show-ipv6-pim-upstream-rpf-json" \
 	"$STATE"/mroute-* "$STATE"/mroute6-* "$STATE"/seen-* "$STATE"/seen6-*
 
 # --- source-pe mode ---------------------------------------------------
