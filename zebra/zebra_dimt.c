@@ -204,6 +204,15 @@ void zebra_dimt_tunnel_if_update(struct interface *ifp)
 		if (entry->vrf_id != ifp->vrf->vrf_id ||
 		    strcmp(entry->ctx.ifname, ifp->name) != 0)
 			continue;
+		if (entry->state == ZEBRA_DIMT_CLEANUP && !entry->ifindex &&
+		    zebra_dimt_if_matches(entry, ifp)) {
+			/* An uncertain create left this entry as a cleanup
+			 * tombstone and the link did survive in the kernel.
+			 * Adopt it and tear it down. */
+			entry->ifindex = ifp->ifindex;
+			zebra_dimt_tunnel_cleanup_link(entry);
+			break;
+		}
 		if (entry->state != ZEBRA_DIMT_ADDING)
 			break;
 		entry->ifindex = ifp->ifindex;
@@ -353,6 +362,18 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 						zebra_dimt_tunnel_forget(entry);
 					return;
 				}
+				if (entry->state == ZEBRA_DIMT_DELETING) {
+					/* A delete is in flight and its
+					 * completion belongs to the delete
+					 * requester. Reject the add instead
+					 * of rebinding ownership; the owner
+					 * retries once REMOVED arrives. */
+					zebra_dimt_notify(
+						&ctx, entry->vrf_id,
+						entry->ifindex,
+						ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+					return;
+				}
 				entry->ctx.owner_session = ctx.owner_session;
 				if (entry->state == ZEBRA_DIMT_INSTALLED) {
 					zebra_dimt_notify(
@@ -487,6 +508,28 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 			    ZEBRA_DPLANE_REQUEST_QUEUED)
 			return;
 		zebra_dimt_tunnel_fail_install(entry);
+		return;
+	}
+	if (add && !success && entry &&
+	    ctx->phase == ZEBRA_DIMT_TUNNEL_CREATE &&
+	    !ctx->result_authoritative) {
+		struct interface *ifp;
+
+		/* No kernel verdict arrived: the RTM_NEWLINK may have been
+		 * applied even though the request is reported as failed.
+		 * Report the failure but keep lifecycle ownership so a
+		 * surviving link is adopted and torn down instead of being
+		 * left unmanaged to collide with a later ADD. */
+		zebra_dimt_notify(&entry->ctx, vrf_id, 0,
+				  ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+		entry->state = ZEBRA_DIMT_CLEANUP;
+		ifp = if_lookup_by_name(ctx->ifname, vrf_id);
+		if (ifp && zebra_dimt_if_matches(entry, ifp))
+			entry->ifindex = ifp->ifindex;
+		/* Keep the entry even when nothing can be cleaned yet;
+		 * zebra_dimt_tunnel_if_update() reconciles a link that only
+		 * becomes visible later. */
+		zebra_dimt_tunnel_cleanup_link(entry);
 		return;
 	}
 	if (add && success && entry &&

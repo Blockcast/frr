@@ -488,8 +488,19 @@ static ssize_t netlink_dimt_tunnel_msg_encoder(struct zebra_dplane_ctx *ctx,
 	req->n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
 
 	if (dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL) {
+		/* Revalidate identity at encode time: the check in
+		 * netlink_put_dimt_tunnel_msg() may be stale by the time the
+		 * batch is (re)encoded. */
+		if (!netlink_dimt_if_matches(ctx, dimt))
+			return 0;
 		req->n.nlmsg_type = RTM_DELLINK;
-		req->ifi.ifi_index = dimt->delete_ifindex;
+		/* Select the link by name, not by the captured ifindex: a
+		 * recycled ifindex must never delete an unrelated interface.
+		 * The kernel resolves IFLA_IFNAME only when ifi_index is 0. */
+		req->ifi.ifi_index = 0;
+		if (!nl_attr_put(&req->n, buflen, IFLA_IFNAME, dimt->ifname,
+				 strlen(dimt->ifname) + 1))
+			return 0;
 		return NLMSG_ALIGN(req->n.nlmsg_len);
 	}
 

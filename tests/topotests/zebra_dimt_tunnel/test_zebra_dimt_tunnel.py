@@ -48,7 +48,7 @@ def request(action, tunnel_id, encap="gre"):
     return json.loads(output)
 
 
-def inject_netlink_send_failure(router, when):
+def inject_netlink_syscall_failure(router, syscall, when):
     if not router.run("command -v strace").strip():
         pytest.skip("strace is required for netlink failure injection")
     zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
@@ -64,9 +64,9 @@ def inject_netlink_send_failure(router, when):
             "strace",
             "-qq",
             "-e",
-            "trace=sendmsg",
+            "trace={}".format(syscall),
             "-e",
-            "inject=sendmsg:error=EIO:when={}".format(when),
+            "inject={}:error=EIO:when={}".format(syscall, when),
             "-p",
             dplane_tid,
         ],
@@ -74,6 +74,44 @@ def inject_netlink_send_failure(router, when):
         stderr=subprocess.PIPE,
     )
     time.sleep(0.2)
+    if tracer.poll() is not None:
+        _stdout, stderr = tracer.communicate()
+        pytest.skip("strace attach failed: {}".format(stderr.decode().strip()))
+    return tracer
+
+
+def inject_netlink_send_failure(router, when):
+    return inject_netlink_syscall_failure(router, "sendmsg", when)
+
+
+def hold_dplane_worker(router, delay_usecs=6000000):
+    """Hold only the dplane worker task at its event-loop wakeup.
+
+    ptrace stops just the traced task, so zebra's main thread keeps
+    processing ZAPI requests and netlink notifications while any context
+    already handed to the dataplane provably stays queued until the tracer
+    detaches.
+    """
+    if not router.run("command -v strace").strip():
+        pytest.skip("strace is required to hold the dplane worker")
+    worker = dplane_tid(router)
+    if not worker:
+        pytest.skip("zebra_dplane worker is required")
+    tracer = router.popen(
+        [
+            "strace",
+            "-qq",
+            "-e",
+            "trace=ppoll,poll",
+            "-e",
+            "inject=ppoll,poll:delay_exit={}".format(delay_usecs),
+            "-p",
+            worker,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    time.sleep(0.3)
     if tracer.poll() is not None:
         _stdout, stderr = tracer.communicate()
         pytest.skip("strace attach failed: {}".format(stderr.decode().strip()))
@@ -237,32 +275,119 @@ def test_delete_failure_retains_ownership_for_retry_and_reuse():
     assert request("del", 5)["result"] == 2
 
 
+def zebra_ifindex(router, name):
+    try:
+        data = json.loads(
+            router.vtysh_cmd("show interface {} json".format(name))
+        )
+    except ValueError:
+        return None
+    entry = data.get(name)
+    return entry.get("index") if entry else None
+
+
 def test_queued_delete_does_not_remove_reused_ifindex():
     router = get_topogen().gears["r1"]
     installed = request("add", 6)
     assert installed["result"] == 0, installed
 
-    worker = dplane_tid(router)
-    assert worker, "zebra_dplane worker is required"
-    router.run("kill -STOP {}".format(worker))
+    # Hold only the dplane worker task: the delete context is provably
+    # queued in the dataplane while zebra's main thread keeps processing
+    # the netlink notifications for the replacement link. Only then is the
+    # worker released to encode the delete against the updated tables.
+    tracer = hold_dplane_worker(router)
+    client = os.path.join(CWD, "dimt_zapi_client.py")
     try:
-        client = os.path.join(CWD, "dimt_zapi_client.py")
         pending = router.popen(
             ["python3", client, "del", "6", "--encap", "gre"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        time.sleep(0.2)
+        time.sleep(0.3)
         router.run(
             "ip link del dimt-00000006; ip link add dimt-00000006 type dummy"
         )
+        _, seen = topotest.run_and_expect(
+            lambda: zebra_ifindex(router, "dimt-00000006")
+            not in (None, installed["ifindex"]),
+            True,
+            count=15,
+            wait=0.2,
+        )
+        assert seen, "zebra did not process the replacement link"
     finally:
-        router.run("kill -CONT {} 2>/dev/null || true".format(worker))
-    stdout, stderr = pending.communicate(timeout=5)
+        stop_tracer(tracer)
+    stdout, stderr = pending.communicate(timeout=10)
     assert pending.returncode == 0, stderr.decode()
     assert json.loads(stdout.decode())["result"] == 2
     assert "dummy" in router.run("ip -d link show dimt-00000006")
     router.run("ip link del dimt-00000006")
+
+
+def test_add_during_inflight_delete_is_rejected():
+    router = get_topogen().gears["r1"]
+    installed = request("add", 9)
+    assert installed["result"] == 0, installed
+
+    tracer = hold_dplane_worker(router)
+    client = os.path.join(CWD, "dimt_zapi_client.py")
+    try:
+        pending = router.popen(
+            ["python3", client, "del", "9", "--encap", "gre"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(0.3)
+        # An identical ADD while the delete is in flight must be rejected
+        # instead of rebinding ownership: the delete completion belongs to
+        # the delete requester.
+        readd = request("add", 9)
+        assert readd["result"] == 1, readd
+    finally:
+        stop_tracer(tracer)
+    stdout, stderr = pending.communicate(timeout=10)
+    assert pending.returncode == 0, stderr.decode()
+    assert json.loads(stdout.decode())["result"] == 2
+    _, link = topotest.run_and_expect(
+        lambda: router.run("ip link show dimt-00000009 2>/dev/null"),
+        "",
+        count=10,
+        wait=0.2,
+    )
+    assert link == "", link
+
+    reinstalled = request("add", 9)
+    assert reinstalled["result"] == 0, reinstalled
+    assert request("del", 9)["result"] == 2
+
+
+def test_uncertain_create_result_reconciles_surviving_link():
+    router = get_topogen().gears["r1"]
+    # Fail the response read: the RTM_NEWLINK reaches the kernel but its
+    # ack is lost, so the reported failure is not an authoritative verdict.
+    tracer = inject_netlink_syscall_failure(router, "recvmsg", 1)
+    try:
+        failed = request("add", 8)
+    finally:
+        stop_tracer(tracer)
+    assert failed["result"] == 1, failed
+    # Zebra must adopt the surviving link and tear it down instead of
+    # leaving it unmanaged to collide with a later ADD.
+    _, link = topotest.run_and_expect(
+        lambda: router.run("ip link show dimt-00000008 2>/dev/null"),
+        "",
+        count=25,
+        wait=0.2,
+    )
+    assert link == "", link
+    # The retained lifecycle entry converges over the standard cleanup
+    # retry: at most one more explicit failure, then a clean install.
+    retry = request("add", 8)
+    assert retry["result"] in (0, 1), retry
+    if retry["result"] == 1:
+        retry = request("add", 8)
+        assert retry["result"] == 0, retry
+    assert request("del", 8)["result"] == 2
 
 
 def test_zebra_restart_adopts_surviving_tunnel():

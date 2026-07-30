@@ -3335,6 +3335,13 @@ dplane_ctx_get_dimt_tunnel(const struct zebra_dplane_ctx *ctx)
 	return &ctx->u.dimt_tunnel;
 }
 
+void dplane_ctx_dimt_tunnel_set_authoritative(struct zebra_dplane_ctx *ctx,
+					      bool authoritative)
+{
+	DPLANE_CTX_VALID(ctx);
+	ctx->u.dimt_tunnel.result_authoritative = authoritative;
+}
+
 /***********************************************************************
  *		PBR RULE ACCESSORS - start
  **********************************************************************/
@@ -6506,6 +6513,7 @@ static enum zebra_dplane_result dplane_dimt_tunnel_update(
 	ctx->zd_status = ZEBRA_DPLANE_REQUEST_SUCCESS;
 	ctx->zd_vrf_id = vrf_id;
 	ctx->u.dimt_tunnel = *tunnel;
+	ctx->u.dimt_tunnel.result_authoritative = false;
 	dplane_ctx_set_ifname(ctx, tunnel->ifname);
 	if (op == DPLANE_OP_DIMT_TUNNEL_DEL)
 		dplane_ctx_set_ifindex(ctx, tunnel->delete_ifindex);

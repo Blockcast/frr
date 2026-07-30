@@ -1705,6 +1705,15 @@ void kernel_update_multi(struct dplane_ctx_list_head *ctx_list)
 			flog_err(EC_ZEBRA_DPLANE_OP_UNHANDLED, "Unhandled dplane data for %s",
 				 dplane_op2str(dplane_ctx_get_op(ctx)));
 			res = ZEBRA_DPLANE_REQUEST_FAILURE;
+			/* The request was never handed to the kernel, so the
+			 * failure is an authoritative verdict for the DIMT
+			 * lifecycle. */
+			if (dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_ADD ||
+			    dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_DEL)
+				dplane_ctx_dimt_tunnel_set_authoritative(ctx,
+									 true);
 		}
 
 		dplane_ctx_set_status(ctx, res);

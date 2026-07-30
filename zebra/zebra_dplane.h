@@ -115,6 +115,12 @@ struct zebra_dimt_tunnel_ctx {
 	char ifname[IFNAMSIZ];
 	ifindex_t delete_ifindex;
 	uint8_t phase;
+	/* Set by the dataplane when the reported result is an explicit kernel
+	 * verdict (positive or negative ACK) or the request provably never
+	 * reached the kernel. Unset on failure means the outcome is
+	 * uncertain: the kernel may have applied the request even though it
+	 * is reported as failed. */
+	bool result_authoritative;
 };
 
 enum zebra_dimt_tunnel_phase {
@@ -436,6 +442,8 @@ const struct zebra_l2info_gre *
 dplane_ctx_get_ifp_gre_info(const struct zebra_dplane_ctx *ctx);
 const struct zebra_dimt_tunnel_ctx *
 dplane_ctx_get_dimt_tunnel(const struct zebra_dplane_ctx *ctx);
+void dplane_ctx_dimt_tunnel_set_authoritative(struct zebra_dplane_ctx *ctx,
+					      bool authoritative);
 void dplane_ctx_set_ifp_zltype(struct zebra_dplane_ctx *ctx,
 			       enum zebra_link_type zlt);
 enum zebra_link_type

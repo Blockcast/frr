@@ -74,6 +74,53 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         self.assertIn("netlink_dimt_if_matches(ctx, dimt)", delete_put)
         self.assertIn("ZEBRA_DPLANE_REQUEST_SUCCESS", delete_put)
 
+    def test_delete_encoder_revalidates_and_selects_by_name(self):
+        encoder = (ROOT / "zebra" / "if_netlink.c").read_text()
+        delete_branch = encoder.split(
+            "dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL) {", 1
+        )[1].split("RTM_NEWLINK", 1)[0]
+
+        # Identity is revalidated at encode time, and the RTM_DELLINK
+        # selects the link by name (ifi_index 0) so a recycled ifindex can
+        # never delete an unrelated interface.
+        self.assertIn("netlink_dimt_if_matches(ctx, dimt)", delete_branch)
+        self.assertIn("RTM_DELLINK", delete_branch)
+        self.assertIn("req->ifi.ifi_index = 0", delete_branch)
+        self.assertIn("IFLA_IFNAME", delete_branch)
+        self.assertNotIn("ifi_index = dimt->delete_ifindex", delete_branch)
+
+    def test_add_during_delete_rejects_instead_of_rebinding_owner(self):
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+        identical_add = dimt.split("if (add) {", 1)[1]
+
+        deleting_reject = identical_add.index(
+            "entry->state == ZEBRA_DIMT_DELETING"
+        )
+        rebind = identical_add.index(
+            "entry->ctx.owner_session = ctx.owner_session"
+        )
+        self.assertLess(deleting_reject, rebind)
+
+    def test_uncertain_create_result_keeps_ownership_for_reconcile(self):
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+        batch = (ROOT / "zebra" / "kernel_netlink.c").read_text()
+        dplane = (ROOT / "zebra" / "zebra_dplane.h").read_text()
+
+        self.assertIn("result_authoritative", dplane)
+        # Explicit kernel verdicts and provably-unsent requests are marked
+        # authoritative; everything else is an uncertain outcome.
+        self.assertIn("dplane_ctx_dimt_tunnel_set_authoritative", batch)
+        uncertain = dimt.split("!ctx->result_authoritative", 1)[1]
+        self.assertIn(
+            "ZEBRA_DIMT_CLEANUP", uncertain.split("return;", 1)[0]
+        )
+        # The interface-update hook adopts a link that survived an
+        # uncertain create and tears it down.
+        if_update = dimt.split("void zebra_dimt_tunnel_if_update", 1)[1]
+        self.assertIn(
+            "ZEBRA_DIMT_CLEANUP", if_update.split("ZEBRA_DIMT_ADDING", 1)[0]
+        )
+
     def test_restart_adopts_exact_kernel_tunnel(self):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
         request = dimt.split("void zebra_dimt_tunnel_request", 1)[1]

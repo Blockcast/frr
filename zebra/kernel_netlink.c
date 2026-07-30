@@ -1281,12 +1281,16 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 			if (dplane_ctx_get_op(ctx) ==
 				    DPLANE_OP_DIMT_TUNNEL_ADD ||
 			    dplane_ctx_get_op(ctx) ==
-				    DPLANE_OP_DIMT_TUNNEL_DEL)
+				    DPLANE_OP_DIMT_TUNNEL_DEL) {
+				/* The kernel delivered an explicit verdict
+				 * for this request. */
+				dplane_ctx_dimt_tunnel_set_authoritative(
+					ctx, true);
 				dplane_ctx_set_status(
 					ctx, err == 1
 						     ? ZEBRA_DPLANE_REQUEST_SUCCESS
 						     : ZEBRA_DPLANE_REQUEST_FAILURE);
-			else if (err == -1)
+			} else if (err == -1)
 				dplane_ctx_set_status(
 					ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
 
@@ -1382,9 +1386,20 @@ static void nl_batch_send(struct nl_batch *bth)
 		if (ctx == NULL)
 			break;
 
-		if (err)
+		if (err) {
 			dplane_ctx_set_status(ctx,
 					      ZEBRA_DPLANE_REQUEST_FAILURE);
+			/* Contexts still listed after a failure were never
+			 * handed to the kernel (a response-read failure
+			 * drains the list first), so this failure is an
+			 * authoritative verdict, not a lost ack. */
+			if (dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_ADD ||
+			    dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_DEL)
+				dplane_ctx_dimt_tunnel_set_authoritative(
+					ctx, true);
+		}
 
 		dplane_ctx_enqueue_tail(bth->ctx_out_q, ctx);
 	}
@@ -1585,9 +1600,18 @@ void kernel_update_multi(struct dplane_ctx_list_head *ctx_list)
 		res = nl_put_msg(&batch, ctx);
 
 		dplane_ctx_enqueue_tail(&(batch.ctx_list), ctx);
-		if (res == FRR_NETLINK_ERROR)
+		if (res == FRR_NETLINK_ERROR) {
 			dplane_ctx_set_status(ctx,
 					      ZEBRA_DPLANE_REQUEST_FAILURE);
+			/* The message was never handed to the kernel, so the
+			 * failure is an authoritative verdict. */
+			if (dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_ADD ||
+			    dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_DEL)
+				dplane_ctx_dimt_tunnel_set_authoritative(
+					ctx, true);
+		}
 
 		if (batch.curlen > batch.limit)
 			nl_batch_send(&batch);
