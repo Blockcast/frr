@@ -606,6 +606,15 @@ static int netlink_extract_gre_info(struct rtattr *link_data, struct zebra_l2inf
 		gre_info->ikey = *(uint32_t *)RTA_DATA(attr[IFLA_GRE_IKEY]);
 	if (attr[IFLA_GRE_OKEY])
 		gre_info->okey = *(uint32_t *)RTA_DATA(attr[IFLA_GRE_OKEY]);
+	if (attr[IFLA_GRE_ENCAP_TYPE])
+		gre_info->encap_type =
+			*(uint16_t *)RTA_DATA(attr[IFLA_GRE_ENCAP_TYPE]);
+	if (attr[IFLA_GRE_ENCAP_SPORT])
+		gre_info->encap_sport =
+			*(uint16_t *)RTA_DATA(attr[IFLA_GRE_ENCAP_SPORT]);
+	if (attr[IFLA_GRE_ENCAP_DPORT])
+		gre_info->encap_dport =
+			*(uint16_t *)RTA_DATA(attr[IFLA_GRE_ENCAP_DPORT]);
 	if (attr[IFLA_GRE_ENCAP_FLAGS])
 		gre_info->encap_flags = *(uint16_t *)RTA_DATA(attr[IFLA_GRE_ENCAP_FLAGS]);
 	return 0;

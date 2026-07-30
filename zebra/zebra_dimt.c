@@ -9,6 +9,7 @@
 #include "lib/stream.h"
 #include "lib/zclient.h"
 #include "zebra/rib.h"
+#include "zebra/interface.h"
 #include "zebra/zebra_dimt.h"
 #include "zebra/zebra_router.h"
 #include "zebra/zebra_vrf.h"
@@ -63,13 +64,48 @@ static bool zebra_dimt_owner_matches(const struct zebra_dimt_tunnel *entry,
 	       entry->ctx.owner_instance == ctx->owner_instance;
 }
 
+static bool zebra_dimt_if_matches(const struct zebra_dimt_tunnel *entry,
+				  const struct interface *ifp)
+{
+	const struct zapi_dimt_tunnel *tunnel = &entry->ctx.tunnel;
+	const struct zebra_if *zif = ifp->info;
+	const struct zebra_l2info_gre *gre;
+	uint32_t key = 0;
+	uint16_t encap_type = TUNNEL_ENCAP_NONE;
+
+	if (!zif || (IS_IPADDR_V4(&tunnel->outer_local)
+			     ? zif->zif_type != ZEBRA_IF_GRE
+			     : zif->zif_type != ZEBRA_IF_IP6GRE))
+		return false;
+	gre = &zif->l2info.gre;
+	if (!ipaddr_is_same(&gre->vtep_ip, &tunnel->outer_local) ||
+	    !ipaddr_is_same(&gre->vtep_ip_remote, &tunnel->outer_remote))
+		return false;
+	if (tunnel->options & ZAPI_DIMT_TUNNEL_KEY_PRESENT)
+		key = htonl(tunnel->key);
+	if (gre->ikey != key || gre->okey != key)
+		return false;
+	if (tunnel->encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU)
+		encap_type = TUNNEL_ENCAP_FOU;
+	return gre->encap_type == encap_type &&
+	       (encap_type != TUNNEL_ENCAP_FOU ||
+		gre->encap_dport == htons(tunnel->fou_dport));
+}
+
 static bool zebra_dimt_tunnel_resolve_ifindex(struct zebra_dimt_tunnel *entry)
 {
-	struct interface *ifp =
-		if_lookup_by_name(entry->ctx.ifname, entry->vrf_id);
+	struct interface *ifp;
 
-	entry->ifindex = ifp ? ifp->ifindex : 0;
-	return entry->ifindex != 0;
+	if (!entry->ifindex)
+		return false;
+	ifp = if_lookup_by_index(entry->ifindex, entry->vrf_id);
+	if (!ifp || strcmp(entry->ctx.ifname, ifp->name) != 0 ||
+	    !zebra_dimt_if_matches(entry, ifp)) {
+		entry->ifindex = 0;
+		return false;
+	}
+
+	return true;
 }
 
 static void zebra_dimt_tunnel_forget(struct zebra_dimt_tunnel *entry)
@@ -128,8 +164,10 @@ void zebra_dimt_tunnel_if_update(struct interface *ifp)
 		if (entry->vrf_id != ifp->vrf->vrf_id ||
 		    strcmp(entry->ctx.ifname, ifp->name) != 0)
 			continue;
+		if (entry->state != ZEBRA_DIMT_ADDING)
+			break;
 		entry->ifindex = ifp->ifindex;
-		if (entry->state == ZEBRA_DIMT_ADDING && entry->create_acked &&
+		if (entry->create_acked &&
 		    zebra_dimt_tunnel_address(entry) !=
 			    ZEBRA_DPLANE_REQUEST_QUEUED)
 			zebra_dimt_tunnel_fail_install(entry);
@@ -146,8 +184,10 @@ static int zebra_dimt_if_del(struct interface *ifp)
 		return 0;
 	for (ALL_LIST_ELEMENTS_RO(zrouter.dimt_tunnels, node, entry)) {
 		if (entry->vrf_id == ifp->vrf->vrf_id &&
-		    strcmp(entry->ctx.ifname, ifp->name) == 0) {
+		    entry->ifindex == ifp->ifindex) {
 			entry->ifindex = 0;
+			if (entry->state == ZEBRA_DIMT_INSTALLED)
+				entry->state = ZEBRA_DIMT_CLEANUP;
 			break;
 		}
 	}

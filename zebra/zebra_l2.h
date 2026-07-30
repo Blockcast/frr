@@ -74,6 +74,9 @@ struct zebra_l2info_gre {
 	struct ipaddr vtep_ip_remote; /* IFLA_GRE_REMOTE */
 	uint32_t ikey;
 	uint32_t okey;
+	uint16_t encap_type;	/* IFLA_GRE_ENCAP_TYPE */
+	uint16_t encap_sport;	/* IFLA_GRE_ENCAP_SPORT */
+	uint16_t encap_dport;	/* IFLA_GRE_ENCAP_DPORT */
 	uint16_t encap_flags;	/* IFLA_GRE_ENCAP_FLAGS */
 	ifindex_t ifindex_link; /* Interface index of interface
 				 * linked with GRE

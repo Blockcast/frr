@@ -3,7 +3,9 @@
 
 import json
 import os
+import subprocess
 import sys
+import time
 
 import pytest
 
@@ -43,6 +45,40 @@ def request(action, tunnel_id, encap="gre"):
         "python3 {} {} {} --encap {}".format(client, action, tunnel_id, encap)
     )
     return json.loads(output)
+
+
+def inject_netlink_send_failure(router, when):
+    if not router.run("command -v strace").strip():
+        pytest.skip("strace is required for netlink failure injection")
+    zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
+    tracer = router.popen(
+        [
+            "strace",
+            "-qq",
+            "-e",
+            "trace=sendmsg",
+            "-e",
+            "inject=sendmsg:error=EIO:when={}".format(when),
+            "-p",
+            zebra_pid,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    time.sleep(0.2)
+    if tracer.poll() is not None:
+        _stdout, stderr = tracer.communicate()
+        pytest.skip("strace attach failed: {}".format(stderr.decode().strip()))
+    return tracer
+
+
+def stop_tracer(tracer):
+    tracer.terminate()
+    try:
+        tracer.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        tracer.kill()
+        tracer.wait(timeout=2)
 
 
 def test_acknowledged_gre_lifecycle_and_owner_reconnect():
@@ -119,16 +155,59 @@ def test_external_delete_does_not_reuse_stale_ifindex():
     installed = request("add", 3)
     assert installed["result"] == 0, installed
     router.run("ip link del dimt-00000003")
-    router.run("ip link add dimt-decoy type dummy")
+    router.run("ip link add dimt-00000003 type dummy")
 
+    stale_retry = request("add", 3)
+    assert stale_retry["result"] == 1, stale_retry
+    assert "dimt-00000003" in router.run("ip link show dimt-00000003")
     removed = request("del", 3)
     assert removed["result"] == 2, removed
-    assert "dimt-decoy" in router.run("ip link show dimt-decoy")
+    assert "dimt-00000003" in router.run("ip link show dimt-00000003")
 
+    router.run("ip link del dimt-00000003")
     reinstalled = request("add", 3)
     assert reinstalled["result"] == 0, reinstalled
     assert request("del", 3)["result"] == 2
-    router.run("ip link del dimt-decoy")
+
+
+def test_address_failure_cleans_up_and_allows_tunnel_id_reuse():
+    router = get_topogen().gears["r1"]
+    tracer = inject_netlink_send_failure(router, 2)
+    try:
+        failed = request("add", 4)
+    finally:
+        stop_tracer(tracer)
+    assert failed["result"] == 1, failed
+    _, link = topotest.run_and_expect(
+        lambda: router.run("ip link show dimt-00000004 2>/dev/null"),
+        "",
+        count=10,
+        wait=0.2,
+    )
+    assert link == "", link
+
+    installed = request("add", 4)
+    assert installed["result"] == 0, installed
+    assert request("del", 4)["result"] == 2
+
+
+def test_delete_failure_retains_ownership_for_retry_and_reuse():
+    router = get_topogen().gears["r1"]
+    installed = request("add", 5)
+    assert installed["result"] == 0, installed
+
+    tracer = inject_netlink_send_failure(router, 1)
+    try:
+        failed = request("del", 5)
+    finally:
+        stop_tracer(tracer)
+    assert failed["result"] == 3, failed
+    assert "dimt-00000005" in router.run("ip link show dimt-00000005")
+
+    assert request("del", 5)["result"] == 2
+    reinstalled = request("add", 5)
+    assert reinstalled["result"] == 0, reinstalled
+    assert request("del", 5)["result"] == 2
 
 
 def test_acknowledged_gre_in_fou_lifecycle():
