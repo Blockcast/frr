@@ -207,14 +207,62 @@ receiver_wants() {
 }
 
 # True (0) when pim already has a usable upstream for (S,G).
-#   vtysh$ show ip pim upstream
-#   Iif        Source        Group      State ...
-#   dimt-0-47  69.25.95.102  232.0.0.1  J     ...
-upstream_usable() { # <S> <G>
-	vtysh -c 'show ip pim upstream' 2>/dev/null | awk -v s="$1" -v g="$2" '
-		$2 == s && $3 == g && $1 != "Unknown" { found = 1 }
+#   vtysh$ show ip pim upstream-rpf
+#   Source        Group      RpfIface   RibNextHop    RpfAddress
+#   69.25.95.102  232.0.0.1  dimt-0-47  10.99.0.47   10.99.0.47
+# Presence alone is NOT usable: the BGP UMH route gives every
+# advertised source an RPF interface, and when the BGP session rides a
+# pim-passive overlay (tailscale0) pimd holds a J upstream whose joins
+# are never sent -- a structural black hole that must not suppress the
+# tunnel build.  Usable means the Iif is a dimt-* tunnel (pim-light,
+# hello-less, so neighbor count is always 0 there) or the selected RPF
+# neighbor for S is present on the selected interface.
+pim_upstream_rpf() { # <show upstream-rpf command> <S> <G> -> "Iif RPF-Nbr"
+	rpf=$(vtysh -c "$1 json" 2>/dev/null | tr '{},' '\n\n\n' | awk -v s="$2" -v g="$3" '
+		function val(line) {
+			sub(/^[ \t]*"[^"]+"[ \t]*:[ \t]*"/, "", line)
+			sub(/"[ \t]*$/, "", line)
+			return line
+		}
+		/^[ \t]*"source"[ \t]*:/       { src = val($0); next }
+		/^[ \t]*"group"[ \t]*:/        { grp = val($0); next }
+		/^[ \t]*"rpfInterface"[ \t]*:/ { iif = val($0); next }
+		/^[ \t]*"rpfAddress"[ \t]*:/ {
+			nbr = val($0)
+			if (src == s && grp == g && iif != "" && iif != "Unknown" && iif != "<ifname?>" &&
+			    nbr != "" && nbr != "0.0.0.0" && nbr != "::") {
+				print iif, nbr
+				exit
+			}
+		}
+	')
+	[ -n "$rpf" ] && { echo "$rpf"; return 0; }
+
+	vtysh -c "$1" 2>/dev/null | awk -v s="$2" -v g="$3" '
+		$1 == s && $2 == g && $3 != "Unknown" && $3 != "<ifname?>" &&
+		$5 != "" && $5 != "0.0.0.0" && $5 != "::" { print $3, $5; exit }
+	'
+}
+
+pim_neighbor_exact() { # <show neighbor command> <Iif> <RPF-Nbr>
+	vtysh -c "$1" 2>/dev/null | awk -v i="$2" -v n="$3" '
+		$1 == i && $2 == n { found = 1 }
 		END { exit found ? 0 : 1 }
 	'
+}
+
+upstream_usable() { # <S> <G>
+	src="$1"
+	grp="$2"
+	rpf=$(pim_upstream_rpf 'show ip pim upstream-rpf' "$src" "$grp")
+	set -- $rpf
+	iif="${1:-}"
+	rpf_nbr="${2:-}"
+	[ -n "$iif" ] || return 1
+	case "$iif" in dimt-*) return 0 ;; esac
+	[ -n "$rpf_nbr" ] || return 1
+	[ "$rpf_nbr" = "$src" ] && return 0
+	pim_neighbor_exact 'show ip pim neighbor' "$iif" "$rpf_nbr"
 }
 
 # Resolve the source-side DIMT peer for source S.
@@ -324,10 +372,17 @@ receiver_wants6() {
 }
 
 upstream_usable6() { # <S6> <G6>
-	vtysh -c 'show ipv6 pim upstream' 2>/dev/null | awk -v s="$1" -v g="$2" '
-		$2 == s && $3 == g && $1 != "Unknown" { found = 1 }
-		END { exit found ? 0 : 1 }
-	'
+	src="$1"
+	grp="$2"
+	rpf=$(pim_upstream_rpf 'show ipv6 pim upstream-rpf' "$src" "$grp")
+	set -- $rpf
+	iif="${1:-}"
+	rpf_nbr="${2:-}"
+	[ -n "$iif" ] || return 1
+	case "$iif" in dimt-*) return 0 ;; esac
+	[ -n "$rpf_nbr" ] || return 1
+	[ "$rpf_nbr" = "$src" ] && return 0
+	pim_neighbor_exact 'show ipv6 pim neighbor' "$iif" "$rpf_nbr"
 }
 
 mroute_state() { echo "$STATE_DIR/mroute-$1"; }
