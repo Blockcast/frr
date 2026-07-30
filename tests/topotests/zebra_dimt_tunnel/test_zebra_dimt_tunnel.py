@@ -13,6 +13,7 @@ CWD = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(CWD, "../"))
 
 from lib import topotest
+from lib.common_config import kill_router_daemons, start_router_daemons
 from lib.topogen import Topogen, get_topogen
 
 pytestmark = [pytest.mark.zebra]
@@ -86,6 +87,15 @@ def stop_tracer(tracer):
     except subprocess.TimeoutExpired:
         tracer.kill()
         tracer.wait(timeout=2)
+
+
+def dplane_tid(router):
+    zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
+    return router.run(
+        f"for task in /proc/{zebra_pid}/task/*; do "
+        '[ "$(cat $task/comm)" = zebra_dplane ] && basename "$task"; '
+        "done"
+    ).strip()
 
 
 def gre_in_fou_supported(router):
@@ -225,6 +235,60 @@ def test_delete_failure_retains_ownership_for_retry_and_reuse():
     reinstalled = request("add", 5)
     assert reinstalled["result"] == 0, reinstalled
     assert request("del", 5)["result"] == 2
+
+
+def test_queued_delete_does_not_remove_reused_ifindex():
+    router = get_topogen().gears["r1"]
+    installed = request("add", 6)
+    assert installed["result"] == 0, installed
+
+    worker = dplane_tid(router)
+    assert worker, "zebra_dplane worker is required"
+    router.run("kill -STOP {}".format(worker))
+    try:
+        client = os.path.join(CWD, "dimt_zapi_client.py")
+        pending = router.popen(
+            ["python3", client, "del", "6", "--encap", "gre"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(0.2)
+        router.run(
+            "ip link del dimt-00000006; ip link add dimt-00000006 type dummy"
+        )
+    finally:
+        router.run("kill -CONT {} 2>/dev/null || true".format(worker))
+    stdout, stderr = pending.communicate(timeout=5)
+    assert pending.returncode == 0, stderr.decode()
+    assert json.loads(stdout.decode())["result"] == 2
+    assert "dummy" in router.run("ip -d link show dimt-00000006")
+    router.run("ip link del dimt-00000006")
+
+
+def test_zebra_restart_adopts_surviving_tunnel():
+    tgen = get_topogen()
+    router = tgen.gears["r1"]
+    installed = request("add", 7)
+    assert installed["result"] == 0, installed
+    before = router.run("ip -d link show dimt-00000007")
+
+    kill_router_daemons(tgen, "r1", ["zebra"])
+    assert "dimt-00000007" in router.run("ip link show dimt-00000007")
+    start_router_daemons(tgen, "r1", ["zebra"])
+
+    _, underlay_ready = topotest.run_and_expect(
+        lambda: "r1-eth0" in router.vtysh_cmd("show ip route 192.0.2.2"),
+        True,
+        count=10,
+        wait=0.2,
+    )
+    assert underlay_ready, router.vtysh_cmd("show ip route 192.0.2.2")
+
+    adopted = request("add", 7)
+    assert adopted["result"] == 0, adopted
+    assert adopted["ifindex"] == installed["ifindex"], (installed, adopted)
+    assert router.run("ip -d link show dimt-00000007") == before
+    assert request("del", 7)["result"] == 2
 
 
 def test_acknowledged_gre_in_fou_lifecycle():

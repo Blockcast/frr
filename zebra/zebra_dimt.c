@@ -90,11 +90,46 @@ static bool zebra_dimt_if_matches(const struct zebra_dimt_tunnel *entry,
 		key = htonl(tunnel->key);
 	if (gre->ikey != key || gre->okey != key)
 		return false;
+	if ((tunnel->options & ZAPI_DIMT_TUNNEL_MTU_PRESENT) &&
+	    ifp->mtu != tunnel->mtu)
+		return false;
 	if (tunnel->encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU)
 		encap_type = TUNNEL_ENCAP_FOU;
 	return gre->encap_type == encap_type &&
 	       (encap_type != TUNNEL_ENCAP_FOU ||
 		gre->encap_dport == htons(tunnel->dport));
+}
+
+static bool zebra_dimt_prefix_matches_ipaddr(const struct prefix *prefix,
+					     const struct ipaddr *addr)
+{
+	if (IS_IPADDR_V4(addr))
+		return prefix->family == AF_INET &&
+		       IPV4_ADDR_SAME(&prefix->u.prefix4, &addr->ipaddr_v4);
+	if (IS_IPADDR_V6(addr))
+		return prefix->family == AF_INET6 &&
+		       IPV6_ADDR_SAME(&prefix->u.prefix6, &addr->ipaddr_v6);
+	return false;
+}
+
+static bool zebra_dimt_if_address_matches(const struct zebra_dimt_tunnel *entry,
+					  const struct interface *ifp)
+{
+	const struct zapi_dimt_tunnel *tunnel = &entry->ctx.tunnel;
+	struct connected *connected;
+
+	frr_each (if_connected, ifp->connected, connected) {
+		if (!CHECK_FLAG(connected->conf, ZEBRA_IFC_QUEUED) ||
+		    !CONNECTED_PEER(connected) || !connected->address ||
+		    !connected->destination)
+			continue;
+		if (zebra_dimt_prefix_matches_ipaddr(connected->address,
+						       &tunnel->inner_local) &&
+		    zebra_dimt_prefix_matches_ipaddr(connected->destination,
+						       &tunnel->inner_peer))
+			return true;
+	}
+	return false;
 }
 
 static bool zebra_dimt_tunnel_resolve_ifindex(struct zebra_dimt_tunnel *entry)
@@ -284,6 +319,7 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 {
 	struct zebra_dimt_tunnel_ctx ctx = {};
 	struct zebra_dimt_tunnel *entry;
+	struct interface *ifp;
 	enum zebra_dplane_result result;
 	bool add = hdr->command == ZEBRA_DIMT_TUNNEL_ADD;
 
@@ -345,6 +381,22 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 		entry->vrf_id = zvrf_id(zvrf);
 		entry->state = ZEBRA_DIMT_ADDING;
 		listnode_add(zrouter.dimt_tunnels, entry);
+		ifp = if_lookup_by_name(ctx.ifname, entry->vrf_id);
+		if (ifp && zebra_dimt_if_matches(entry, ifp)) {
+			entry->ifindex = ifp->ifindex;
+			if (zebra_dimt_if_address_matches(entry, ifp)) {
+				entry->state = ZEBRA_DIMT_INSTALLED;
+				zebra_dimt_notify(&entry->ctx, entry->vrf_id,
+						  entry->ifindex,
+						  ZAPI_DIMT_TUNNEL_INSTALLED);
+				return;
+			}
+			if (zebra_dimt_tunnel_address(entry) ==
+			    ZEBRA_DPLANE_REQUEST_QUEUED)
+				return;
+			zebra_dimt_tunnel_fail_install(entry);
+			return;
+		}
 		result = dplane_dimt_tunnel_add(entry->vrf_id, &entry->ctx);
 		if (result != ZEBRA_DPLANE_REQUEST_QUEUED) {
 			zebra_dimt_notify(&ctx, entry->vrf_id, 0,

@@ -1028,8 +1028,16 @@ enum netlink_msg_status
 netlink_put_dimt_tunnel_msg(struct nl_batch *bth,
 			    struct zebra_dplane_ctx *ctx)
 {
+	const struct zebra_dimt_tunnel_ctx *dimt;
+
 	assert(dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_ADD ||
 	       dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL);
+	dimt = dplane_ctx_get_dimt_tunnel(ctx);
+	if (dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL &&
+	    !netlink_dimt_if_matches(ctx, dimt)) {
+		dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_SUCCESS);
+		return FRR_NETLINK_SUCCESS;
+	}
 	return netlink_batch_add_msg(bth, ctx,
 				     netlink_dimt_tunnel_msg_encoder, false);
 }

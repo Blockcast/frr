@@ -67,6 +67,20 @@ class TestDimtLifecycleWiring(unittest.TestCase):
 
         self.assertIn("netlink_dimt_if_matches(ctx, dimt)", address_branch)
 
+    def test_delete_worker_revalidates_dimt_link_identity(self):
+        encoder = (ROOT / "zebra" / "if_netlink.c").read_text()
+        delete_put = encoder.split("netlink_put_dimt_tunnel_msg", 1)[1]
+
+        self.assertIn("netlink_dimt_if_matches(ctx, dimt)", delete_put)
+        self.assertIn("ZEBRA_DPLANE_REQUEST_SUCCESS", delete_put)
+
+    def test_restart_adopts_exact_kernel_tunnel(self):
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+        request = dimt.split("void zebra_dimt_tunnel_request", 1)[1]
+
+        self.assertIn("zebra_dimt_if_matches(entry, ifp)", request)
+        self.assertIn("zebra_dimt_if_address_matches(entry, ifp)", request)
+
 
 if __name__ == "__main__":
     unittest.main()
