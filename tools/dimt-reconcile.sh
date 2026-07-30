@@ -17,9 +17,14 @@
 # so tunnels exist first and FRR state only selects among them.
 #
 # Addressing contract (no per-pair coordination):
+#   dev(X)    = dimt-<oct3>-<oct4> of X's overlay IPv4
 #   inner4(X) = 10.99.<oct3>.<oct4> of X's overlay IPv4
 #   inner6(X) = fd99::<oct3>:<oct4>  (decimal octets as literal groups,
 #               RFC 5952 canonical so exists-checks match `ip` output)
+# All three values share one derivation; changing any one requires changing
+# all three.  The peer-collision guard protects inner-address and UMH
+# uniqueness, not merely the netdev name.  Overlay addresses therefore come
+# from one Blockcast-allocated /16; do not hash dev(X) to admit a collision.
 # Both ends derive both inner addresses from the overlay pair alone.  The
 # PE's UMH extended community must advertise inner4(PE) or inner6(PE).
 # The tunnel is addressed `inner(self) peer inner(peer)/{32,128}`, which
