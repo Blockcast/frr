@@ -94,7 +94,15 @@ for entry in "${FLEET[@]}"; do
   fi
 
   work=$(mktemp -d)
-  if ! (
+  # Run the per-repo body as a PLAIN subshell, never as an `if !` condition:
+  # bash ignores errexit everywhere inside a condition context -- including
+  # a `set -e` issued within it -- so `if ! ( ... )` silently swallowed
+  # failed clones, commits, and pushes whenever a later command in the body
+  # succeeded, reporting a stale rollout as complete. Outer errexit is
+  # suspended only around the status capture.
+  set +e
+  (
+    set -euo pipefail
     cd "$work"
     gh repo clone "$repo" repo -- --depth 1 >/dev/null 2>&1
     cd repo
@@ -135,24 +143,65 @@ tools/sync-review-gate.sh." >/dev/null
       # without a fetched lease ref, --force-with-lease from a fresh clone
       # refuses and set -e killed the whole rollout on the first re-run
       # (2026-07-29). The depth-1 clone's refspec is single-branch, so the
-      # fetch lands only in FETCH_HEAD.
-      if git fetch origin "$BRANCH" >/dev/null 2>&1; then
+      # fetch lands only in FETCH_HEAD. depth=2 pulls the tip's parent as
+      # well, which the ownership verification below diffs against.
+      if git fetch --depth=2 origin "$BRANCH" >/dev/null 2>&1; then
         if [ "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$(git rev-parse "$BRANCH^{tree}")" ]; then
           echo "  sync branch already up to date on remote"
           need_push=0
         else
-          # Force-push guard: only overwrite commits THIS automation made.
-          # A human iterating on the sync branch must not lose work to a
-          # re-run; the subject prefix is the ownership marker.
+          # Force-push guard: only overwrite commits THIS automation
+          # provably made. The subject prefix alone is spoofable -- a human
+          # amending the generated commit with --no-edit keeps the subject
+          # while adding their own work -- so the remote tip must also
+          # MATCH reconstructed automation output for the canonical sha its
+          # subject records: it may touch only the four gate paths, and
+          # each path's blob must hash to exactly what this script would
+          # have generated. Anything else refuses; the operator rescues the
+          # human work and deletes the remote branch to re-enable syncing.
           remote_subject=$(git log -1 --format=%s FETCH_HEAD)
           case "$remote_subject" in
             "$SYNC_SUBJECT_PREFIX"*) ;;
             *)
               echo "  REFUSING force-push: remote $BRANCH tip is not automation-owned" >&2
               echo "  remote subject: $remote_subject" >&2
+              echo "  rescue the human work, delete the remote branch, re-run" >&2
               exit 2
               ;;
           esac
+          claimed_sha=${remote_subject#"$SYNC_SUBJECT_PREFIX"}
+          if ! touched=$(git diff-tree --no-commit-id --name-only -r FETCH_HEAD 2>/dev/null) ||
+             [ -z "$touched" ] ||
+             [ "$(printf '%s\n' "$touched" | LC_ALL=C sort)" != \
+               "$(printf '%s\n' "${CANON_FILES[@]}" | LC_ALL=C sort)" ]; then
+            echo "  REFUSING force-push: remote $BRANCH tip touches paths beyond the gate files" >&2
+            echo "  (or its parent could not be read); rescue any human work, delete the" >&2
+            echo "  remote branch, re-run" >&2
+            exit 2
+          fi
+          for f in "${CANON_FILES[@]}"; do
+            if ! remote_blob=$(git rev-parse -q --verify "FETCH_HEAD:$f"); then
+              echo "  REFUSING force-push: $f missing from remote $BRANCH tip" >&2
+              exit 2
+            fi
+            case "$f" in
+              .github/workflows/*)
+                expect_blob=$(git -C "$CANON_ROOT" show "${claimed_sha}:${f}" 2>/dev/null |
+                  sed "s/^    runs-on: default$/    runs-on: ${runner}/" |
+                  git hash-object --stdin) || expect_blob=unverifiable
+                ;;
+              *)
+                expect_blob=$(git -C "$CANON_ROOT" show "${claimed_sha}:${f}" 2>/dev/null |
+                  git hash-object --stdin) || expect_blob=unverifiable
+                ;;
+            esac
+            if [ "$remote_blob" != "$expect_blob" ]; then
+              echo "  REFUSING force-push: remote $f does not match automation output" >&2
+              echo "  for frr@${claimed_sha} (hand edit, unknown source sha, or a runner" >&2
+              echo "  label change); rescue any human work, delete the remote branch, re-run" >&2
+              exit 2
+            fi
+          done
           git update-ref "refs/remotes/origin/$BRANCH" FETCH_HEAD
         fi
       fi
@@ -184,11 +233,14 @@ Runner label for this repo: \`${runner}\`. Everything except that label is byte-
       echo "  ERROR: no open PR exists for $BRANCH and none could be created" >&2
       exit 2
     fi
-  ); then
-    FAILED_REPOS+=("$repo")
-    echo "  FAILED: $repo (continuing with the rest)" >&2
-  fi
+  )
+  repo_status=$?
+  set -e
   rm -rf "$work"
+  if [ "$repo_status" -ne 0 ]; then
+    FAILED_REPOS+=("$repo")
+    echo "  FAILED: $repo, exit $repo_status (continuing with the rest)" >&2
+  fi
 done
 
 if [ ${#FAILED_REPOS[@]} -gt 0 ]; then
