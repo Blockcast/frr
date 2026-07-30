@@ -252,13 +252,16 @@ pim_neighbor_exact() { # <show neighbor command> <Iif> <RPF-Nbr>
 }
 
 upstream_usable() { # <S> <G>
-	rpf=$(pim_upstream_rpf 'show ip pim upstream-rpf' "$1" "$2")
+	src="$1"
+	grp="$2"
+	rpf=$(pim_upstream_rpf 'show ip pim upstream-rpf' "$src" "$grp")
 	set -- $rpf
 	iif="${1:-}"
 	rpf_nbr="${2:-}"
 	[ -n "$iif" ] || return 1
 	case "$iif" in dimt-*) return 0 ;; esac
 	[ -n "$rpf_nbr" ] || return 1
+	[ "$rpf_nbr" = "$src" ] && return 0
 	pim_neighbor_exact 'show ip pim neighbor' "$iif" "$rpf_nbr"
 }
 
@@ -369,13 +372,16 @@ receiver_wants6() {
 }
 
 upstream_usable6() { # <S6> <G6>
-	rpf=$(pim_upstream_rpf 'show ipv6 pim upstream-rpf' "$1" "$2")
+	src="$1"
+	grp="$2"
+	rpf=$(pim_upstream_rpf 'show ipv6 pim upstream-rpf' "$src" "$grp")
 	set -- $rpf
 	iif="${1:-}"
 	rpf_nbr="${2:-}"
 	[ -n "$iif" ] || return 1
 	case "$iif" in dimt-*) return 0 ;; esac
 	[ -n "$rpf_nbr" ] || return 1
+	[ "$rpf_nbr" = "$src" ] && return 0
 	pim_neighbor_exact 'show ipv6 pim neighbor' "$iif" "$rpf_nbr"
 }
 

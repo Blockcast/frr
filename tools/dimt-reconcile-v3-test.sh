@@ -229,6 +229,22 @@ $RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
 check "usable: neighbor-less non-dimt upstream does NOT suppress build" \
 	grep -q "ip mroute 69.25.95.102/32 10.99.0.47" "$TESTDIR/vty.log"
 
+# directly connected source: the RPF address is the source host, not a PIM neighbor
+write_upstream_rpf_json "$TESTDIR/show-ip-pim-upstream-rpf-json" \
+	69.25.95.102 232.0.0.1 br-lan 69.25.95.102
+cat > "$TESTDIR/show-ip-pim-neighbor" <<'EOF'
+Interface         Neighbor        Uptime    Holdtime  DR Pri
+EOF
+rm -f "$STATE"/mroute-* "$STATE"/seen-*
+: > "$TESTDIR/vty.log"
+check "usable: connected-source reconcile succeeds before no-mroute assertion" \
+	$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once
+
+check "usable: directly connected source suppresses build without PIM neighbor" \
+	sh -c "! grep -q 'ip mroute' '$TESTDIR/vty.log'"
+
 # dimt-* upstream (pim-light, hello-less: 0 neighbors) IS usable
 write_upstream_rpf_json "$TESTDIR/show-ip-pim-upstream-rpf-json" \
 	69.25.95.102 232.0.0.1 dimt-0-47 10.99.0.47
@@ -384,6 +400,22 @@ $RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
 
 check "v6 usable: neighbor-less non-dimt upstream does NOT suppress build" \
 	grep -q "ipv6 route fd69::193/128 fd99::47" "$TESTDIR/vty.log"
+
+# directly connected v6 source: the RPF address is the source host, not a PIM neighbor
+write_upstream_rpf_json "$TESTDIR/show-ipv6-pim-upstream-rpf-json" \
+	fd69::193 ff3e::1:1 br-lan fd69::193
+cat > "$TESTDIR/show-ipv6-pim-neighbor" <<'EOF'
+Interface         Neighbor              Uptime    Holdtime  DR Pri
+EOF
+rm -f "$STATE"/mroute-* "$STATE"/mroute6-* "$STATE"/seen-* "$STATE"/seen6-*
+: > "$TESTDIR/vty.log"
+check "v6 usable: connected-source reconcile succeeds before no-route assertion" \
+	$RUN_SH "$V3" --mode receiver --self 100.64.0.40 \
+	--source-map "$TESTDIR/source-peers" --state-dir "$STATE" \
+	--v2 "$BIN/dimt-reconcile.sh" --once
+
+check "v6 usable: directly connected source suppresses build without PIM neighbor" \
+	sh -c "! grep -q 'ipv6 route' '$TESTDIR/vty.log'"
 
 # v6 dimt-* upstream (pim-light, hello-less: 0 neighbors) IS usable
 write_upstream_rpf_json "$TESTDIR/show-ipv6-pim-upstream-rpf-json" \
