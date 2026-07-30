@@ -63,6 +63,21 @@ static bool zebra_dimt_owner_matches(const struct zebra_dimt_tunnel *entry,
 	       entry->ctx.owner_instance == ctx->owner_instance;
 }
 
+static bool zebra_dimt_tunnel_resolve_ifindex(struct zebra_dimt_tunnel *entry)
+{
+	struct interface *ifp =
+		if_lookup_by_name(entry->ctx.ifname, entry->vrf_id);
+
+	entry->ifindex = ifp ? ifp->ifindex : 0;
+	return entry->ifindex != 0;
+}
+
+static void zebra_dimt_tunnel_forget(struct zebra_dimt_tunnel *entry)
+{
+	listnode_delete(zrouter.dimt_tunnels, entry);
+	zebra_dimt_tunnel_free(entry);
+}
+
 static enum zebra_dplane_result
 zebra_dimt_tunnel_address(struct zebra_dimt_tunnel *entry)
 {
@@ -79,6 +94,8 @@ zebra_dimt_tunnel_cleanup_link(struct zebra_dimt_tunnel *entry)
 
 	if (entry->cleanup_pending)
 		return ZEBRA_DPLANE_REQUEST_QUEUED;
+	if (!zebra_dimt_tunnel_resolve_ifindex(entry))
+		return ZEBRA_DPLANE_REQUEST_SUCCESS;
 	entry->ctx.phase = ZEBRA_DIMT_TUNNEL_DELETE;
 	entry->ctx.delete_ifindex = entry->ifindex;
 	entry->state = ZEBRA_DIMT_CLEANUP;
@@ -89,11 +106,15 @@ zebra_dimt_tunnel_cleanup_link(struct zebra_dimt_tunnel *entry)
 
 static void zebra_dimt_tunnel_fail_install(struct zebra_dimt_tunnel *entry)
 {
+	enum zebra_dplane_result result;
+
 	zebra_dimt_notify(&entry->ctx, entry->vrf_id, entry->ifindex,
 			  ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
 	/* Keep lifecycle ownership even if cleanup cannot be queued. A later
 	 * identical request retries cleanup instead of colliding with the link. */
-	zebra_dimt_tunnel_cleanup_link(entry);
+	result = zebra_dimt_tunnel_cleanup_link(entry);
+	if (result == ZEBRA_DPLANE_REQUEST_SUCCESS)
+		zebra_dimt_tunnel_forget(entry);
 }
 
 static int zebra_dimt_if_real(struct interface *ifp)
@@ -113,6 +134,23 @@ static int zebra_dimt_if_real(struct interface *ifp)
 			    ZEBRA_DPLANE_REQUEST_QUEUED)
 			zebra_dimt_tunnel_fail_install(entry);
 		break;
+	}
+	return 0;
+}
+
+static int zebra_dimt_if_del(struct interface *ifp)
+{
+	struct listnode *node;
+	struct zebra_dimt_tunnel *entry;
+
+	if (!zrouter.dimt_tunnels)
+		return 0;
+	for (ALL_LIST_ELEMENTS_RO(zrouter.dimt_tunnels, node, entry)) {
+		if (entry->vrf_id == ifp->vrf->vrf_id &&
+		    strcmp(entry->ctx.ifname, ifp->name) == 0) {
+			entry->ifindex = 0;
+			break;
+		}
 	}
 	return 0;
 }
@@ -209,7 +247,7 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 	ctx.owner_instance = client->instance;
 	ctx.owner_session = client->session_id;
 	if (zapi_dimt_tunnel_decode(msg, hdr->command, &ctx.tunnel) < 0 ||
-	    client->proto != ZEBRA_ROUTE_PIM) {
+	    client->proto != ZEBRA_ROUTE_PIM || zvrf_id(zvrf) != VRF_DEFAULT) {
 		zebra_dimt_notify(&ctx, zvrf_id(zvrf), 0,
 				  add ? ZAPI_DIMT_TUNNEL_FAIL_INSTALL
 				      : ZAPI_DIMT_TUNNEL_REMOVE_FAIL);
@@ -230,6 +268,9 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 						&ctx, entry->vrf_id,
 						entry->ifindex,
 						ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+					result = zebra_dimt_tunnel_cleanup_link(entry);
+					if (result == ZEBRA_DPLANE_REQUEST_SUCCESS)
+						zebra_dimt_tunnel_forget(entry);
 					return;
 				}
 				entry->ctx.owner_session = ctx.owner_session;
@@ -285,8 +326,12 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 		return;
 	if (entry->state == ZEBRA_DIMT_CLEANUP) {
 		entry->cleanup_notify_owner = true;
-		if (zebra_dimt_tunnel_cleanup_link(entry) !=
-		    ZEBRA_DPLANE_REQUEST_QUEUED)
+		result = zebra_dimt_tunnel_cleanup_link(entry);
+		if (result == ZEBRA_DPLANE_REQUEST_SUCCESS) {
+			zebra_dimt_notify(&entry->ctx, entry->vrf_id, 0,
+					  ZAPI_DIMT_TUNNEL_REMOVED);
+			zebra_dimt_tunnel_forget(entry);
+		} else if (result != ZEBRA_DPLANE_REQUEST_QUEUED)
 			zebra_dimt_notify(&entry->ctx, entry->vrf_id,
 					  entry->ifindex,
 					  ZAPI_DIMT_TUNNEL_REMOVE_FAIL);
@@ -299,11 +344,11 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 	}
 	entry->ctx.owner_proto = ctx.owner_proto;
 	entry->ctx.owner_instance = ctx.owner_instance;
-	if (!entry->ifindex) {
-		struct interface *ifp = if_lookup_by_name(entry->ctx.ifname,
-						      entry->vrf_id);
-		if (ifp)
-			entry->ifindex = ifp->ifindex;
+	if (!zebra_dimt_tunnel_resolve_ifindex(entry)) {
+		zebra_dimt_notify(&entry->ctx, entry->vrf_id, 0,
+				  ZAPI_DIMT_TUNNEL_REMOVED);
+		zebra_dimt_tunnel_forget(entry);
+		return;
 	}
 	entry->ctx.delete_ifindex = entry->ifindex;
 	entry->ctx.phase = ZEBRA_DIMT_TUNNEL_DELETE;
@@ -375,13 +420,13 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 	if (entry && ((add && !success &&
 		      ctx->phase == ZEBRA_DIMT_TUNNEL_CREATE) ||
 		     (!add && success))) {
-		listnode_delete(zrouter.dimt_tunnels, entry);
-		zebra_dimt_tunnel_free(entry);
+		zebra_dimt_tunnel_forget(entry);
 	}
 }
 
 void zebra_dimt_tunnel_init(void)
 {
+	hook_register_prio(if_del, 0, zebra_dimt_if_del);
 	hook_register_prio(if_real, 0, zebra_dimt_if_real);
 }
 

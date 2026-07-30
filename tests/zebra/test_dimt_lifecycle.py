@@ -42,6 +42,21 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         self.assertIn("zebra_dimt_if_lifecycle_owned", dimt)
         self.assertIn("ZAPI_DIMT_TUNNEL_FAIL_INSTALL", dimt)
 
+    def test_delete_revalidates_interface_and_cleanup_retries(self):
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+
+        self.assertIn("zebra_dimt_tunnel_resolve_ifindex(entry)", dimt)
+        self.assertIn("hook_register_prio(if_del, 0, zebra_dimt_if_del)", dimt)
+        cleanup_branch = dimt.split("if (entry->state == ZEBRA_DIMT_CLEANUP)", 1)[1]
+        self.assertIn("zebra_dimt_tunnel_cleanup_link(entry)", cleanup_branch)
+
+    def test_new_dataplane_api_version_and_vrf_scope_are_explicit(self):
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+        dplane = (ROOT / "zebra" / "zebra_dplane.c").read_text()
+
+        self.assertIn("zvrf_id(zvrf) != VRF_DEFAULT", dimt)
+        self.assertIn("MAKE_FRRVERSION(4, 1, 0)", dplane)
+
 
 if __name__ == "__main__":
     unittest.main()

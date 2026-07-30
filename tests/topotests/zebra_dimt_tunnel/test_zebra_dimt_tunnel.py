@@ -72,6 +72,24 @@ def test_acknowledged_gre_lifecycle_and_owner_reconnect():
     assert result == "", result
 
 
+def test_external_delete_does_not_reuse_stale_ifindex():
+    router = get_topogen().gears["r1"]
+
+    installed = request("add", 3)
+    assert installed["result"] == 0, installed
+    router.run("ip link del dimt-00000003")
+    router.run("ip link add dimt-delete-decoy type dummy")
+
+    removed = request("del", 3)
+    assert removed["result"] == 2, removed
+    assert "dimt-delete-decoy" in router.run("ip link show dimt-delete-decoy")
+
+    reinstalled = request("add", 3)
+    assert reinstalled["result"] == 0, reinstalled
+    assert request("del", 3)["result"] == 2
+    router.run("ip link del dimt-delete-decoy")
+
+
 def test_acknowledged_gre_in_fou_lifecycle():
     router = get_topogen().gears["r1"]
     installed = request("add", 2, "fou")
