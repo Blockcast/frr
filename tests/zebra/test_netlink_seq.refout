@@ -1,0 +1,10 @@
+nl_seq_lt(0x00000004, 0x00000005) = true: OK
+nl_seq_lt(0x00000005, 0x00000005) = false: OK
+nl_seq_lt(0x00000006, 0x00000005) = false: OK
+nl_seq_lt(0xffffffff, 0x00000000) = true: OK
+nl_seq_lt(0x00000000, 0xffffffff) = false: OK
+nl_seq_lt(0xfffffff0, 0x00000003) = true: OK
+nl_seq_lt(0x00000003, 0xfffffff0) = false: OK
+nl_seq_next(0x00000005) = 0x00000006: OK
+nl_seq_next(0xffffffff) = 0x00000000: OK
+nl_seq_lt(0x00000000, 0xffffffff) = false: OK

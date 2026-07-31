@@ -39,6 +39,7 @@
 #include "zebra/rule_netlink.h"
 #include "zebra/tc_netlink.h"
 #include "zebra/netconf_netlink.h"
+#include "zebra/netlink_seq.h"
 #include "zebra/zebra_errors.h"
 #include "zebra/ge_netlink.h"
 #include "zebra/zebra_trace.h"
@@ -1158,7 +1159,8 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 	struct nlmsghdr *h;
 	struct sockaddr_nl snl;
 	struct msghdr msg = {};
-	int status, seq;
+	int status;
+	uint32_t seq;
 	struct zebra_dplane_ctx *ctx;
 	bool ignore_msg;
 
@@ -1220,10 +1222,12 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 
 			/*
 			 * 'update' context objects take two consecutive
-			 * sequence numbers.
+			 * sequence numbers, contiguous modulo the 32-bit
+			 * space (nl_seq_next), including across the wrap.
 			 */
 			if (dplane_ctx_is_update(ctx) &&
-			    dplane_ctx_get_ns(ctx)->seq + 1 == seq) {
+			    nl_seq_next((uint32_t)dplane_ctx_get_ns(ctx)->seq) ==
+				    seq) {
 				/*
 				 * This is the situation where we get a response
 				 * to a message that should be ignored.
@@ -1238,9 +1242,14 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 			 * original read failed). Drop the response instead of
 			 * consuming current contexts: dequeueing here would
 			 * fail the head as unanswered and orphan its real
-			 * ack sitting right behind this message.
+			 * ack sitting right behind this message. Ordering is
+			 * serial-number arithmetic (nl_seq_lt): the counter
+			 * wraps, and a plain compare would read a delayed
+			 * pre-wrap response as newer than a post-wrap head
+			 * and drain the whole batch.
 			 */
-			if (dplane_ctx_get_ns(ctx)->seq > seq) {
+			if (nl_seq_lt(seq,
+				      (uint32_t)dplane_ctx_get_ns(ctx)->seq)) {
 				zlog_warn(
 					"%s:WARNING dropping stale response seq %u older than head ctx seq %u",
 					__func__, seq,
@@ -1253,7 +1262,7 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 			dplane_ctx_enqueue_tail(bth->ctx_out_q, ctx);
 
 			/* We have found corresponding context object. */
-			if (dplane_ctx_get_ns(ctx)->seq == seq)
+			if ((uint32_t)dplane_ctx_get_ns(ctx)->seq == seq)
 				break;
 		}
 

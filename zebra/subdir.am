@@ -145,6 +145,7 @@ nobase_pkginclude_HEADERS += \
 	zebra/kernel_socket.h \
 	zebra/label_manager.h \
 	zebra/netconf_netlink.h \
+	zebra/netlink_seq.h \
 	zebra/redistribute.h \
 	zebra/rib.h \
 	zebra/router-id.h \

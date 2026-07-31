@@ -185,6 +185,27 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         dequeue = walk.index("ctx = dplane_ctx_dequeue(&(bth->ctx_list))")
         self.assertLess(stale, dequeue)
 
+    def test_seq_ordering_is_wrap_aware(self):
+        # The sequence counter is 32-bit and wraps; ordering must be
+        # serial-number arithmetic. A plain relational compare reads a
+        # delayed pre-wrap response as newer than a post-wrap head and
+        # drains the batch (behavioral coverage: test_netlink_seq.c).
+        batch = (ROOT / "zebra" / "kernel_netlink.c").read_text()
+        walk = batch.split("static int nl_batch_read_resp", 1)[1].split(
+            "Find the corresponding context object", 1
+        )[1].split("if (ignore_msg)", 1)[0]
+        self.assertIn("nl_seq_lt(seq,", walk)
+        self.assertNotIn("->seq > seq", walk)
+        self.assertNotIn("->seq < seq", walk)
+
+        # Update partners span the wrap too: the successor is computed
+        # modulo the 32-bit space, never as a signed `seq + 1`.
+        self.assertIn("nl_seq_next((uint32_t)dplane_ctx_get_ns(ctx)->seq)",
+                      walk)
+
+        helpers = (ROOT / "zebra" / "netlink_seq.h").read_text()
+        self.assertIn("(int32_t)(a - b) < 0", helpers)
+
     def test_restart_adopts_exact_kernel_tunnel(self):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
         request = dimt.split("void zebra_dimt_tunnel_request", 1)[1]
