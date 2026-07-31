@@ -171,13 +171,22 @@ posts the status only; branch protection is a separate manual step per
 repo. Do not hand-edit -- change Blockcast/frr and re-run
 tools/sync-review-gate.sh." >/dev/null
 
-      # Fetch the remote sync branch first (if any) so re-runs are safe:
-      # without a fetched lease ref, --force-with-lease from a fresh clone
-      # refuses and set -e killed the whole rollout on the first re-run
-      # (2026-07-29). The depth-1 clone's refspec is single-branch, so the
-      # fetch lands only in FETCH_HEAD. depth=2 pulls the tip's parent as
-      # well, which the ownership verification below diffs against.
+      # Fetch the remote sync branch first (if any) so re-runs are safe.
+      # The depth-1 clone's refspec is single-branch, so the fetch lands
+      # only in FETCH_HEAD. depth=2 pulls the tip's parent as well, which
+      # the ownership verification below diffs against.
+      # An empty expected value means "remote ref must NOT exist" -- the
+      # correct first-rollout expectation when the fetch below finds no
+      # remote sync branch.
+      lease="$BRANCH:"
       if git fetch --depth=2 origin "$BRANCH" >/dev/null 2>&1; then
+        # A bare --force-with-lease maps the pushed ref through the fetch
+        # refspec; in this single-branch clone that mapping does not exist,
+        # so the lease degenerates to "remote ref must be ABSENT" and every
+        # legitimate re-sync is rejected with "stale info" (2026-07-31, all
+        # four re-run repos). Pin the lease to the exact tip the guard
+        # verified instead -- strictly safer than a tracking ref anyway.
+        lease="$BRANCH:$(git rev-parse FETCH_HEAD)"
         if [ "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$(git rev-parse "$BRANCH^{tree}")" ]; then
           echo "  sync branch already up to date on remote"
           need_push=0
@@ -275,11 +284,10 @@ tools/sync-review-gate.sh." >/dev/null
             echo "  rescue any human work, delete the remote branch, re-run" >&2
             exit 2
           fi
-          git update-ref "refs/remotes/origin/$BRANCH" FETCH_HEAD
         fi
       fi
       if [ "$need_push" = "1" ]; then
-        git push -u origin "$BRANCH" --force-with-lease >/dev/null 2>&1
+        git push -u origin "$BRANCH" --force-with-lease="$lease" >/dev/null 2>&1
       fi
     fi
 
