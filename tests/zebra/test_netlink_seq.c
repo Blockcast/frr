@@ -57,5 +57,16 @@ int main(int argc, char **argv)
 	check_next(UINT32_MAX, 0);
 	check_lt(nl_seq_next(UINT32_MAX), UINT32_MAX, false);
 
+	/*
+	 * The producer path (netlink_batch_add_msg) tags an update's
+	 * second message with the modular successor of a uint32_t
+	 * sequence. INT_MAX is the boundary where the previous signed
+	 * increment was undefined behavior; ordering must also hold
+	 * across the sign boundary, where a signed compare inverts.
+	 */
+	check_next(0x7fffffff, 0x80000000);
+	check_lt(0x7fffffff, 0x80000000, true);
+	check_lt(0x80000000, 0x7fffffff, false);
+
 	return 0;
 }

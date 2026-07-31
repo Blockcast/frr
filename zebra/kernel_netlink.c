@@ -1226,8 +1226,7 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 			 * space (nl_seq_next), including across the wrap.
 			 */
 			if (dplane_ctx_is_update(ctx) &&
-			    nl_seq_next((uint32_t)dplane_ctx_get_ns(ctx)->seq) ==
-				    seq) {
+			    nl_seq_next(dplane_ctx_get_ns(ctx)->seq) == seq) {
 				/*
 				 * This is the situation where we get a response
 				 * to a message that should be ignored.
@@ -1248,8 +1247,7 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 			 * pre-wrap response as newer than a post-wrap head
 			 * and drain the whole batch.
 			 */
-			if (nl_seq_lt(seq,
-				      (uint32_t)dplane_ctx_get_ns(ctx)->seq)) {
+			if (nl_seq_lt(seq, dplane_ctx_get_ns(ctx)->seq)) {
 				zlog_warn(
 					"%s:WARNING dropping stale response seq %u older than head ctx seq %u",
 					__func__, seq,
@@ -1262,7 +1260,7 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 			dplane_ctx_enqueue_tail(bth->ctx_out_q, ctx);
 
 			/* We have found corresponding context object. */
-			if ((uint32_t)dplane_ctx_get_ns(ctx)->seq == seq)
+			if (dplane_ctx_get_ns(ctx)->seq == seq)
 				break;
 		}
 
@@ -1432,7 +1430,7 @@ enum netlink_msg_status netlink_batch_add_msg(
 	ssize_t (*msg_encoder)(struct zebra_dplane_ctx *, void *, size_t),
 	bool ignore_res)
 {
-	int seq;
+	uint32_t seq;
 	ssize_t size;
 	struct nlmsghdr *msgh;
 	struct nlsock *nl = kernel_netlink_nlsock_lookup(dplane_ctx_get_ns_sock(ctx));
@@ -1467,8 +1465,12 @@ enum netlink_msg_status netlink_batch_add_msg(
 
 	seq = dplane_ctx_get_ns(ctx)->seq;
 
+	/* Update contexts answer to two consecutive sequence numbers; the
+	 * second is the modular successor, so an update whose first number
+	 * sits at the wrap still tags its message correctly (and no signed
+	 * increment can overflow). */
 	if (ignore_res)
-		seq++;
+		seq = nl_seq_next(seq);
 
 	msgh = (struct nlmsghdr *)bth->buf_head;
 	msgh->nlmsg_seq = seq;

@@ -41,7 +41,9 @@ struct zebra_dplane_info {
 
 #if defined(HAVE_NETLINK)
 	int sock;
-	int seq;
+	/* Snapshot of the nlsock sequence counter: unsigned end-to-end so
+	 * wrap stays defined modular arithmetic (zebra/netlink_seq.h). */
+	uint32_t seq;
 	bool is_cmd;
 #endif
 };

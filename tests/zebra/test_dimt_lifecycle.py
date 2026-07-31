@@ -200,8 +200,29 @@ class TestDimtLifecycleWiring(unittest.TestCase):
 
         # Update partners span the wrap too: the successor is computed
         # modulo the 32-bit space, never as a signed `seq + 1`.
-        self.assertIn("nl_seq_next((uint32_t)dplane_ctx_get_ns(ctx)->seq)",
-                      walk)
+        self.assertIn("nl_seq_next(dplane_ctx_get_ns(ctx)->seq)", walk)
+
+        # The PRODUCER must be modulo-safe as well: the batch encoder
+        # tags an update's second message with nl_seq_next on an
+        # unsigned local, and the sequence fields feeding it are
+        # unsigned end-to-end (a signed `seq++` is UB at INT_MAX).
+        producer = batch.split("enum netlink_msg_status netlink_batch_add_msg",
+                               1)[1].split("static enum netlink_msg_status", 1)[0]
+        self.assertIn("uint32_t seq;", producer)
+        self.assertIn("seq = nl_seq_next(seq)", producer)
+        self.assertNotIn("seq++", producer)
+
+        ns_h = (ROOT / "zebra" / "zebra_ns.h").read_text()
+        nlsock = ns_h.split("struct nlsock {", 1)[1].split("};", 1)[0]
+        self.assertIn("uint32_t seq;", nlsock)
+        self.assertNotIn("int seq;", nlsock)
+
+        dplane_h = (ROOT / "zebra" / "zebra_dplane.h").read_text()
+        info = dplane_h.split("struct zebra_dplane_info {", 1)[1].split(
+            "};", 1
+        )[0]
+        self.assertIn("uint32_t seq;", info)
+        self.assertNotIn("int seq;", info)
 
         helpers = (ROOT / "zebra" / "netlink_seq.h").read_text()
         self.assertIn("(int32_t)(a - b) < 0", helpers)
