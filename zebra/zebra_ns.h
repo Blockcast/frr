@@ -27,7 +27,10 @@ struct zebra_dplane_ctx;
 /* Socket interface to kernel */
 struct nlsock {
 	int sock;
-	int seq;
+	/* Free-running 32-bit sequence counter; ordering between values is
+	 * serial-number arithmetic (zebra/netlink_seq.h), and increments
+	 * wrap as defined unsigned arithmetic rather than signed UB. */
+	uint32_t seq;
 	struct sockaddr_nl snl;
 	char name[64];
 

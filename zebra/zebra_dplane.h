@@ -41,7 +41,9 @@ struct zebra_dplane_info {
 
 #if defined(HAVE_NETLINK)
 	int sock;
-	int seq;
+	/* Snapshot of the nlsock sequence counter: unsigned end-to-end so
+	 * wrap stays defined modular arithmetic (zebra/netlink_seq.h). */
+	uint32_t seq;
 	bool is_cmd;
 #endif
 };
@@ -105,6 +107,28 @@ enum zebra_dplane_startup_notifications {
 	ZEBRA_DPLANE_TUNNELS_READ,
 	ZEBRA_DPLANE_ADDRESSES_READ,
 	ZEBRA_DPLANE_FINISHED_READING,
+};
+
+struct zebra_dimt_tunnel_ctx {
+	struct zapi_dimt_tunnel tunnel;
+	uint8_t owner_proto;
+	uint16_t owner_instance;
+	uint32_t owner_session;
+	char ifname[IFNAMSIZ];
+	ifindex_t delete_ifindex;
+	uint8_t phase;
+	/* Set by the dataplane when the reported result is an explicit kernel
+	 * verdict (positive or negative ACK) or the request provably never
+	 * reached the kernel. Unset on failure means the outcome is
+	 * uncertain: the kernel may have applied the request even though it
+	 * is reported as failed. */
+	bool result_authoritative;
+};
+
+enum zebra_dimt_tunnel_phase {
+	ZEBRA_DIMT_TUNNEL_CREATE,
+	ZEBRA_DIMT_TUNNEL_ADDRESS,
+	ZEBRA_DIMT_TUNNEL_DELETE,
 };
 /*
  * API between the zebra dataplane system and the main zebra processing
@@ -226,6 +250,10 @@ enum dplane_op_e {
 	/* Traffic control qdisc read */
 	DPLANE_OP_TC_QDISC_READ,
 	DPLANE_OP_TC_QDISC_NOTIFY,
+
+	/* Append-only DIMT tunnel lifecycle operations. */
+	DPLANE_OP_DIMT_TUNNEL_ADD,
+	DPLANE_OP_DIMT_TUNNEL_DEL,
 };
 
 /* Operational status of Bridge Ports */
@@ -414,6 +442,10 @@ void dplane_ctx_set_ifp_gre_info(struct zebra_dplane_ctx *ctx,
 				 struct zebra_l2info_gre *greinfo);
 const struct zebra_l2info_gre *
 dplane_ctx_get_ifp_gre_info(const struct zebra_dplane_ctx *ctx);
+const struct zebra_dimt_tunnel_ctx *
+dplane_ctx_get_dimt_tunnel(const struct zebra_dplane_ctx *ctx);
+void dplane_ctx_dimt_tunnel_set_authoritative(struct zebra_dplane_ctx *ctx,
+					      bool authoritative);
 void dplane_ctx_set_ifp_zltype(struct zebra_dplane_ctx *ctx,
 			       enum zebra_link_type zlt);
 enum zebra_link_type
@@ -1140,6 +1172,10 @@ enum zebra_dplane_result dplane_neigh_table_update(const struct interface *ifp,
 enum zebra_dplane_result
 dplane_gre_set(struct interface *ifp, struct interface *ifp_link,
 	       unsigned int mtu, const struct zebra_l2info_gre *gre_info);
+enum zebra_dplane_result dplane_dimt_tunnel_add(
+	vrf_id_t vrf_id, const struct zebra_dimt_tunnel_ctx *tunnel);
+enum zebra_dplane_result dplane_dimt_tunnel_del(
+	vrf_id_t vrf_id, const struct zebra_dimt_tunnel_ctx *tunnel);
 
 /*
  * Enqueue an SRv6 encap source address set

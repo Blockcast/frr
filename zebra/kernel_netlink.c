@@ -39,6 +39,7 @@
 #include "zebra/rule_netlink.h"
 #include "zebra/tc_netlink.h"
 #include "zebra/netconf_netlink.h"
+#include "zebra/netlink_seq.h"
 #include "zebra/zebra_errors.h"
 #include "zebra/ge_netlink.h"
 #include "zebra/zebra_trace.h"
@@ -1158,7 +1159,8 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 	struct nlmsghdr *h;
 	struct sockaddr_nl snl;
 	struct msghdr msg = {};
-	int status, seq;
+	int status;
+	uint32_t seq;
 	struct zebra_dplane_ctx *ctx;
 	bool ignore_msg;
 
@@ -1182,7 +1184,11 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 		if (status == -1 || status == 0) {
 			while ((ctx = dplane_ctx_dequeue(&(bth->ctx_list))) !=
 			       NULL) {
-				if (status == -1)
+				if (status == -1 ||
+				    dplane_ctx_get_op(ctx) ==
+					    DPLANE_OP_DIMT_TUNNEL_ADD ||
+				    dplane_ctx_get_op(ctx) ==
+					    DPLANE_OP_DIMT_TUNNEL_DEL)
 					dplane_ctx_set_status(
 						ctx,
 						ZEBRA_DPLANE_REQUEST_FAILURE);
@@ -1216,15 +1222,37 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 
 			/*
 			 * 'update' context objects take two consecutive
-			 * sequence numbers.
+			 * sequence numbers, contiguous modulo the 32-bit
+			 * space (nl_seq_next), including across the wrap.
 			 */
 			if (dplane_ctx_is_update(ctx) &&
-			    dplane_ctx_get_ns(ctx)->seq + 1 == seq) {
+			    nl_seq_next(dplane_ctx_get_ns(ctx)->seq) == seq) {
 				/*
 				 * This is the situation where we get a response
 				 * to a message that should be ignored.
 				 */
 				ignore_msg = true;
+				break;
+			}
+
+			/*
+			 * A response OLDER than the current head is a stale
+			 * leftover from an earlier batch (e.g. an ack whose
+			 * original read failed). Drop the response instead of
+			 * consuming current contexts: dequeueing here would
+			 * fail the head as unanswered and orphan its real
+			 * ack sitting right behind this message. Ordering is
+			 * serial-number arithmetic (nl_seq_lt): the counter
+			 * wraps, and a plain compare would read a delayed
+			 * pre-wrap response as newer than a post-wrap head
+			 * and drain the whole batch.
+			 */
+			if (nl_seq_lt(seq, dplane_ctx_get_ns(ctx)->seq)) {
+				zlog_warn(
+					"%s:WARNING dropping stale response seq %u older than head ctx seq %u",
+					__func__, seq,
+					dplane_ctx_get_ns(ctx)->seq);
+				ctx = NULL;
 				break;
 			}
 
@@ -1234,12 +1262,6 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 			/* We have found corresponding context object. */
 			if (dplane_ctx_get_ns(ctx)->seq == seq)
 				break;
-
-			if (dplane_ctx_get_ns(ctx)->seq > seq)
-				zlog_warn(
-					"%s:WARNING Received %u is less than any context on the queue ctx->seq %u",
-					__func__, seq,
-					dplane_ctx_get_ns(ctx)->seq);
 		}
 
 		if (ignore_msg) {
@@ -1274,7 +1296,19 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 			int err = netlink_parse_error(nl, h, bth->zns->is_cmd,
 						      false);
 
-			if (err == -1)
+			if (dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_ADD ||
+			    dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_DEL) {
+				/* The kernel delivered an explicit verdict
+				 * for this request. */
+				dplane_ctx_dimt_tunnel_set_authoritative(
+					ctx, true);
+				dplane_ctx_set_status(
+					ctx, err == 1
+						     ? ZEBRA_DPLANE_REQUEST_SUCCESS
+						     : ZEBRA_DPLANE_REQUEST_FAILURE);
+			} else if (err == -1)
 				dplane_ctx_set_status(
 					ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
 
@@ -1283,6 +1317,11 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 					   __func__, h->nlmsg_seq);
 			continue;
 		}
+
+		if (dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_ADD ||
+		    dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL)
+			dplane_ctx_set_status(ctx,
+					      ZEBRA_DPLANE_REQUEST_FAILURE);
 
 		/*
 		 * If we get here then we did not receive neither the ack nor
@@ -1365,9 +1404,20 @@ static void nl_batch_send(struct nl_batch *bth)
 		if (ctx == NULL)
 			break;
 
-		if (err)
+		if (err) {
 			dplane_ctx_set_status(ctx,
 					      ZEBRA_DPLANE_REQUEST_FAILURE);
+			/* Contexts still listed after a failure were never
+			 * handed to the kernel (a response-read failure
+			 * drains the list first), so this failure is an
+			 * authoritative verdict, not a lost ack. */
+			if (dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_ADD ||
+			    dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_DEL)
+				dplane_ctx_dimt_tunnel_set_authoritative(
+					ctx, true);
+		}
 
 		dplane_ctx_enqueue_tail(bth->ctx_out_q, ctx);
 	}
@@ -1380,7 +1430,7 @@ enum netlink_msg_status netlink_batch_add_msg(
 	ssize_t (*msg_encoder)(struct zebra_dplane_ctx *, void *, size_t),
 	bool ignore_res)
 {
-	int seq;
+	uint32_t seq;
 	ssize_t size;
 	struct nlmsghdr *msgh;
 	struct nlsock *nl = kernel_netlink_nlsock_lookup(dplane_ctx_get_ns_sock(ctx));
@@ -1415,8 +1465,12 @@ enum netlink_msg_status netlink_batch_add_msg(
 
 	seq = dplane_ctx_get_ns(ctx)->seq;
 
+	/* Update contexts answer to two consecutive sequence numbers; the
+	 * second is the modular successor, so an update whose first number
+	 * sits at the wrap still tags its message correctly (and no signed
+	 * increment can overflow). */
 	if (ignore_res)
-		seq++;
+		seq = nl_seq_next(seq);
 
 	msgh = (struct nlmsghdr *)bth->buf_head;
 	msgh->nlmsg_seq = seq;
@@ -1502,6 +1556,9 @@ static enum netlink_msg_status nl_put_msg(struct nl_batch *bth,
 
 	case DPLANE_OP_GRE_SET:
 		return netlink_put_gre_set_msg(bth, ctx);
+	case DPLANE_OP_DIMT_TUNNEL_ADD:
+	case DPLANE_OP_DIMT_TUNNEL_DEL:
+		return netlink_put_dimt_tunnel_msg(bth, ctx);
 
 	case DPLANE_OP_INTF_ADDR_ADD:
 	case DPLANE_OP_INTF_ADDR_DEL:
@@ -1554,18 +1611,44 @@ void kernel_update_multi(struct dplane_ctx_list_head *ctx_list)
 		    && batch.zns->ns_id != dplane_ctx_get_ns(ctx)->ns_id)
 			nl_batch_send(&batch);
 
-		/*
-		 * Assume all messages will succeed and then mark only the ones
-		 * that failed.
-		 */
-		dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_SUCCESS);
+		/* DIMT requires a matching positive ACK; other operations retain
+		 * the historical optimistic-success behavior. */
+		dplane_ctx_set_status(
+			ctx, dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_ADD ||
+				     dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL
+			     ? ZEBRA_DPLANE_REQUEST_FAILURE
+			     : ZEBRA_DPLANE_REQUEST_SUCCESS);
 
 		res = nl_put_msg(&batch, ctx);
 
+		/* FRR_NETLINK_SUCCESS means the operation was handled without
+		 * encoding a netlink message (unsupported op, skipped route
+		 * type, or a DIMT delete whose target is already gone).
+		 * There is no response to correlate, so keep the context out
+		 * of the batch's ack bookkeeping: left in the list, the
+		 * end-of-responses drain or a read failure would overwrite
+		 * its synthetic verdict based on unrelated traffic. Flush
+		 * the pending batch first -- completing this context ahead
+		 * of earlier still-batched requests would reorder results. */
+		if (res == FRR_NETLINK_SUCCESS) {
+			nl_batch_send(&batch);
+			dplane_ctx_enqueue_tail(&handled_list, ctx);
+			continue;
+		}
+
 		dplane_ctx_enqueue_tail(&(batch.ctx_list), ctx);
-		if (res == FRR_NETLINK_ERROR)
+		if (res == FRR_NETLINK_ERROR) {
 			dplane_ctx_set_status(ctx,
 					      ZEBRA_DPLANE_REQUEST_FAILURE);
+			/* The message was never handed to the kernel, so the
+			 * failure is an authoritative verdict. */
+			if (dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_ADD ||
+			    dplane_ctx_get_op(ctx) ==
+				    DPLANE_OP_DIMT_TUNNEL_DEL)
+				dplane_ctx_dimt_tunnel_set_authoritative(
+					ctx, true);
+		}
 
 		if (batch.curlen > batch.limit)
 			nl_batch_send(&batch);

@@ -4280,6 +4280,103 @@ stream_failure:
 	return -1;
 }
 
+int zapi_dimt_tunnel_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
+			    const struct zapi_dimt_tunnel *tunnel)
+{
+	stream_reset(s);
+	zclient_create_header(s, cmd, vrf_id);
+	stream_putl(s, tunnel->tunnel_id);
+
+	if (cmd == ZEBRA_DIMT_TUNNEL_ADD) {
+		stream_put_ipaddr(s, &tunnel->inner_local);
+		stream_put_ipaddr(s, &tunnel->inner_peer);
+		stream_put_ipaddr(s, &tunnel->outer_local);
+		stream_put_ipaddr(s, &tunnel->outer_remote);
+		stream_putc(s, tunnel->encap);
+		stream_putw(s, tunnel->dport);
+		stream_putc(s, tunnel->options);
+		if (tunnel->options & ZAPI_DIMT_TUNNEL_KEY_PRESENT)
+			stream_putl(s, tunnel->key);
+		if (tunnel->options & ZAPI_DIMT_TUNNEL_MTU_PRESENT)
+			stream_putl(s, tunnel->mtu);
+	}
+
+	stream_putw_at(s, 0, stream_get_endp(s));
+	return 0;
+}
+
+int zapi_dimt_tunnel_decode(struct stream *s, int cmd,
+			    struct zapi_dimt_tunnel *tunnel)
+{
+	memset(tunnel, 0, sizeof(*tunnel));
+	STREAM_GETL(s, tunnel->tunnel_id);
+
+	if (cmd == ZEBRA_DIMT_TUNNEL_DEL)
+		return 0;
+	if (cmd != ZEBRA_DIMT_TUNNEL_ADD)
+		return -1;
+
+	STREAM_GET_IPADDR(s, &tunnel->inner_local);
+	STREAM_GET_IPADDR(s, &tunnel->inner_peer);
+	STREAM_GET_IPADDR(s, &tunnel->outer_local);
+	STREAM_GET_IPADDR(s, &tunnel->outer_remote);
+	STREAM_GETC(s, tunnel->encap);
+	STREAM_GETW(s, tunnel->dport);
+	STREAM_GETC(s, tunnel->options);
+	if (tunnel->options & ZAPI_DIMT_TUNNEL_KEY_PRESENT)
+		STREAM_GETL(s, tunnel->key);
+	if (tunnel->options & ZAPI_DIMT_TUNNEL_MTU_PRESENT)
+		STREAM_GETL(s, tunnel->mtu);
+
+	if (tunnel->options & ~(ZAPI_DIMT_TUNNEL_KEY_PRESENT |
+				ZAPI_DIMT_TUNNEL_MTU_PRESENT))
+		return -1;
+	if (tunnel->encap != ZAPI_DIMT_TUNNEL_ENCAP_GRE &&
+	    tunnel->encap != ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU)
+		return -1;
+	if (tunnel->inner_local.ipa_type == IPADDR_NONE ||
+	    tunnel->inner_local.ipa_type != tunnel->inner_peer.ipa_type ||
+	    tunnel->outer_local.ipa_type == IPADDR_NONE ||
+	    tunnel->outer_local.ipa_type != tunnel->outer_remote.ipa_type)
+		return -1;
+	if (tunnel->encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU &&
+	    tunnel->dport == 0)
+		return -1;
+
+	return 0;
+
+stream_failure:
+	return -1;
+}
+
+int zapi_dimt_tunnel_notify_encode(
+	struct stream *s, vrf_id_t vrf_id,
+	const struct zapi_dimt_tunnel_notify *notify)
+{
+	stream_reset(s);
+	zclient_create_header(s, ZEBRA_DIMT_TUNNEL_NOTIFY_OWNER, vrf_id);
+	stream_putl(s, notify->tunnel_id);
+	stream_putl(s, notify->ifindex);
+	stream_putc(s, notify->result);
+	stream_putw_at(s, 0, stream_get_endp(s));
+	return 0;
+}
+
+int zapi_dimt_tunnel_notify_decode(
+	struct stream *s, struct zapi_dimt_tunnel_notify *notify)
+{
+	memset(notify, 0, sizeof(*notify));
+	STREAM_GETL(s, notify->tunnel_id);
+	STREAM_GETL(s, notify->ifindex);
+	STREAM_GETC(s, notify->result);
+	if (notify->result > ZAPI_DIMT_TUNNEL_REMOVE_FAIL)
+		return -1;
+	return 0;
+
+stream_failure:
+	return -1;
+}
+
 enum zclient_send_status zebra_send_mpls_labels(struct zclient *zclient,
 						int cmd, struct zapi_labels *zl)
 {

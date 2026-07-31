@@ -79,6 +79,9 @@ struct zebra_l2info_gre {
 				 * linked with GRE
 				 */
 	ns_id_t link_nsid;
+	uint16_t encap_type;	/* IFLA_GRE_ENCAP_TYPE */
+	uint16_t encap_sport;	/* IFLA_GRE_ENCAP_SPORT */
+	uint16_t encap_dport;	/* IFLA_GRE_ENCAP_DPORT */
 };
 
 struct zebra_vxlan_vni {
