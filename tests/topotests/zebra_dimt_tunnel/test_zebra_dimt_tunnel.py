@@ -100,31 +100,42 @@ def hold_dplane_sendmsg(router, delay_usecs=6000000):
 
     At that point the netlink message is fully encoded (all identity checks
     have run) but not yet delivered to the kernel -- the exact
-    encode-to-kernel window.
+    encode-to-kernel window. Returns (tracer, trace_file); the trace file
+    records each sendmsg entry, so callers can positively synchronize on
+    the syscall having been entered instead of guessing with sleeps.
     """
-    return _hold_dplane_syscalls(router, "sendmsg", "delay_enter", delay_usecs)
+    trace_file = "/tmp/dimt-sendmsg-trace-{}.log".format(os.getpid())
+    router.run("rm -f {}".format(trace_file))
+    tracer = _hold_dplane_syscalls(
+        router, "sendmsg", "delay_enter", delay_usecs, trace_file
+    )
+    return tracer, trace_file
 
 
-def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs):
+def sendmsg_entered(router, trace_file):
+    return "sendmsg(" in router.run("cat {} 2>/dev/null".format(trace_file))
+
+
+def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
+                          trace_file=None):
     if not router.run("command -v strace").strip():
         pytest.skip("strace is required to hold the dplane worker")
     worker = dplane_tid(router)
     if not worker:
         pytest.skip("zebra_dplane worker is required")
-    tracer = router.popen(
-        [
-            "strace",
-            "-qq",
-            "-e",
-            "trace={}".format(syscalls),
-            "-e",
-            "inject={}:{}={}".format(syscalls, inject_kind, delay_usecs),
-            "-p",
-            worker,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    cmd = [
+        "strace",
+        "-qq",
+        "-e",
+        "trace={}".format(syscalls),
+        "-e",
+        "inject={}:{}={}".format(syscalls, inject_kind, delay_usecs),
+        "-p",
+        worker,
+    ]
+    if trace_file:
+        cmd[1:1] = ["-o", trace_file]
+    tracer = router.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     time.sleep(0.3)
     if tracer.poll() is not None:
         _stdout, stderr = tracer.communicate()
@@ -395,7 +406,9 @@ def test_uncertain_create_result_reconciles_surviving_link():
     )
     assert link == "", link
     # The retained lifecycle entry converges over the standard cleanup
-    # retry: at most one more explicit failure, then a clean install.
+    # retry. Stale-ack correlation poisoning is fixed (dropped by sequence
+    # comparison); the only remaining variance is reconcile timing -- the
+    # retry may land while the entry is still a cleanup tombstone.
     retry = request("add", 8)
     assert retry["result"] in (0, 1), retry
     if retry["result"] == 1:
@@ -409,12 +422,17 @@ def test_delete_encoded_before_replacement_binds_to_ifindex():
     installed = request("add", 10)
     assert installed["result"] == 0, installed
 
-    # Hold the worker at sendmsg ENTRY: the RTM_DELLINK is fully encoded
-    # (identity validated) but not yet delivered. Replacing the link in
-    # this window must not delete the same-name replacement -- the delete
-    # is bound to the old ifindex, which Linux does not reuse, so the
-    # kernel fails it with ENODEV instead.
-    tracer = hold_dplane_sendmsg(router)
+    # Hold the worker at sendmsg ENTRY and positively synchronize on the
+    # syscall having been entered: the RTM_DELLINK is then provably
+    # encoded (identity validated) but not yet delivered. Replacing the
+    # link in this window must not delete the auto-allocated same-name
+    # replacement -- the delete is bound to the old ifindex, which
+    # automatic allocation never reuses, so the kernel fails it with
+    # ENODEV instead. (An actor explicitly claiming the freed index needs
+    # CAP_NET_ADMIN plus a deliberate index claim and can delete any
+    # interface directly; rtnetlink has no compare-and-delete to defend
+    # against that.)
+    tracer, trace_file = hold_dplane_sendmsg(router)
     client = os.path.join(CWD, "dimt_zapi_client.py")
     try:
         pending = router.popen(
@@ -422,7 +440,10 @@ def test_delete_encoded_before_replacement_binds_to_ifindex():
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        time.sleep(0.5)
+        _, entered = topotest.run_and_expect(
+            lambda: sendmsg_entered(router, trace_file), True, count=20, wait=0.2
+        )
+        assert entered, "dplane worker never entered sendmsg for the delete"
         router.run(
             "ip link del dimt-0000000a; ip link add dimt-0000000a type dummy"
         )
@@ -430,13 +451,12 @@ def test_delete_encoded_before_replacement_binds_to_ifindex():
         stop_tracer(tracer)
     stdout, stderr = pending.communicate(timeout=15)
     assert pending.returncode == 0, stderr.decode()
-    result = json.loads(stdout.decode())["result"]
-    # REMOVE_FAIL (ENODEV on the stale index) that converges on retry, or
-    # REMOVED if the replacement raced ahead of the encoded request.
-    assert result in (2, 3), result
+    # The encode happened before the replacement (proven by the sendmsg
+    # sync), so the pre-encode skip path is unreachable: the delete must
+    # fail on the stale index and the replacement must survive.
+    assert json.loads(stdout.decode())["result"] == 3, stdout
     assert "dummy" in router.run("ip -d link show dimt-0000000a")
-    if result == 3:
-        assert request("del", 10)["result"] == 2
+    assert request("del", 10)["result"] == 2
     router.run("ip link del dimt-0000000a")
 
 
@@ -466,13 +486,11 @@ def test_lost_delete_ack_reconciles_instead_of_resurrecting():
         assert request("del", 11)["result"] == 2
 
     # An identical ADD must produce a real kernel link, never a phantom
-    # INSTALLED (the lost ack may still poison the next batch's
-    # correlation, so allow one explicit failure before the clean install).
+    # INSTALLED. The stale delete ack still sitting in the socket buffer
+    # must be discarded by sequence comparison -- not allowed to consume
+    # the ADD's context -- so the first post-reconciliation ADD succeeds.
     readd = request("add", 11)
-    assert readd["result"] in (0, 1), readd
-    if readd["result"] == 1:
-        readd = request("add", 11)
-        assert readd["result"] == 0, readd
+    assert readd["result"] == 0, readd
     link = router.run("ip -d link show dimt-0000000b")
     assert "gre remote 192.0.2.2 local 192.0.2.1" in link, link
     assert request("del", 11)["result"] == 2

@@ -497,14 +497,22 @@ static ssize_t netlink_dimt_tunnel_msg_encoder(struct zebra_dplane_ctx *ctx,
 		if (!netlink_dimt_if_matches(ctx, dimt))
 			return 0;
 		req->n.nlmsg_type = RTM_DELLINK;
-		/* Bind the delete to the validated ifindex, the one identity
-		 * that cannot be substituted after validation: Linux never
-		 * reuses an ifindex until 2^31 allocations wrap, whereas the
+		/* Bind the delete to the validated ifindex, the identity that
+		 * automatic allocation never substitutes: Linux does not
+		 * reuse an ifindex until 2^31 allocations wrap, whereas the
 		 * deterministic dimt-%08x NAME is trivially reusable -- a
 		 * name-selected delete would remove a same-name replacement
 		 * created between encoding and kernel processing. If this
 		 * link is replaced in that window, the kernel fails the
-		 * stale-index delete with ENODEV instead. */
+		 * stale-index delete with ENODEV instead.
+		 *
+		 * Deliberate substitution (`ip link add ... index N` claiming
+		 * the just-freed index inside this window) remains possible,
+		 * but requires CAP_NET_ADMIN plus an explicit claim of a
+		 * specific freed index; an actor with that power can delete
+		 * any interface directly, and rtnetlink offers no
+		 * compare-and-delete to defend further (even alt-name tokens
+		 * are world-readable and copyable). */
 		req->ifi.ifi_index = dimt->delete_ifindex;
 		return NLMSG_ALIGN(req->n.nlmsg_len);
 	}

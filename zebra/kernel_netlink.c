@@ -1232,18 +1232,29 @@ static int nl_batch_read_resp(struct nl_batch *bth, struct nlsock *nl)
 				break;
 			}
 
+			/*
+			 * A response OLDER than the current head is a stale
+			 * leftover from an earlier batch (e.g. an ack whose
+			 * original read failed). Drop the response instead of
+			 * consuming current contexts: dequeueing here would
+			 * fail the head as unanswered and orphan its real
+			 * ack sitting right behind this message.
+			 */
+			if (dplane_ctx_get_ns(ctx)->seq > seq) {
+				zlog_warn(
+					"%s:WARNING dropping stale response seq %u older than head ctx seq %u",
+					__func__, seq,
+					dplane_ctx_get_ns(ctx)->seq);
+				ctx = NULL;
+				break;
+			}
+
 			ctx = dplane_ctx_dequeue(&(bth->ctx_list));
 			dplane_ctx_enqueue_tail(bth->ctx_out_q, ctx);
 
 			/* We have found corresponding context object. */
 			if (dplane_ctx_get_ns(ctx)->seq == seq)
 				break;
-
-			if (dplane_ctx_get_ns(ctx)->seq > seq)
-				zlog_warn(
-					"%s:WARNING Received %u is less than any context on the queue ctx->seq %u",
-					__func__, seq,
-					dplane_ctx_get_ns(ctx)->seq);
 		}
 
 		if (ignore_msg) {
@@ -1605,8 +1616,11 @@ void kernel_update_multi(struct dplane_ctx_list_head *ctx_list)
 		 * There is no response to correlate, so keep the context out
 		 * of the batch's ack bookkeeping: left in the list, the
 		 * end-of-responses drain or a read failure would overwrite
-		 * its synthetic verdict based on unrelated traffic. */
+		 * its synthetic verdict based on unrelated traffic. Flush
+		 * the pending batch first -- completing this context ahead
+		 * of earlier still-batched requests would reorder results. */
 		if (res == FRR_NETLINK_SUCCESS) {
+			nl_batch_send(&batch);
 			dplane_ctx_enqueue_tail(&handled_list, ctx);
 			continue;
 		}

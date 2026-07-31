@@ -153,9 +153,18 @@ class TestDimtLifecycleWiring(unittest.TestCase):
 
         # A synthetic FRR_NETLINK_SUCCESS (no message encoded) goes straight
         # to the handled queue, never into the batch's ack correlation where
-        # the end-of-responses drain could overwrite its verdict.
+        # the end-of-responses drain could overwrite its verdict -- and the
+        # pending batch is flushed FIRST so it cannot overtake earlier
+        # requests' results.
         self.assertIn(
             "dplane_ctx_enqueue_tail(&handled_list, ctx)", update_multi
+        )
+        success_branch = update_multi.split("res == FRR_NETLINK_SUCCESS", 1)[1]
+        self.assertLess(
+            success_branch.index("nl_batch_send(&batch)"),
+            success_branch.index(
+                "dplane_ctx_enqueue_tail(&handled_list, ctx)"
+            ),
         )
         self.assertLess(
             update_multi.index("res == FRR_NETLINK_SUCCESS"),
@@ -163,6 +172,18 @@ class TestDimtLifecycleWiring(unittest.TestCase):
                 "dplane_ctx_enqueue_tail(&(batch.ctx_list), ctx)"
             ),
         )
+
+    def test_stale_responses_are_dropped_before_dequeue(self):
+        batch = (ROOT / "zebra" / "kernel_netlink.c").read_text()
+        read_resp = batch.split("static int nl_batch_read_resp", 1)[1]
+
+        # A response older than the current head is discarded WITHOUT
+        # dequeueing: consuming the head would fail it as unanswered and
+        # orphan its real ack right behind the stale message.
+        walk = read_resp.split("Find the corresponding context object", 1)[1]
+        stale = walk.index("dropping stale response")
+        dequeue = walk.index("ctx = dplane_ctx_dequeue(&(bth->ctx_list))")
+        self.assertLess(stale, dequeue)
 
     def test_restart_adopts_exact_kernel_tunnel(self):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
