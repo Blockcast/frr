@@ -122,6 +122,15 @@ for entry in "${FLEET[@]}"; do
     default_branch=$(git symbolic-ref --short HEAD)
     git checkout -B "$BRANCH" >/dev/null
 
+    # A committed symlink at any destination component would make the
+    # writes below follow it outside this checkout under the operator's
+    # credentials. Refuse rather than chase links.
+    for p in .github .github/scripts .github/workflows "${CANON_FILES[@]}"; do
+      if [ -L "$p" ]; then
+        echo "  REFUSING sync: '$p' is a symlink in $repo" >&2
+        exit 2
+      fi
+    done
     mkdir -p .github/scripts .github/workflows
     cp "$CANON_TMP/.github/scripts/require-ally-review.py" .github/scripts/
     cp "$CANON_TMP/.github/scripts/test_require_ally_review.py" .github/scripts/
@@ -131,6 +140,15 @@ for entry in "${FLEET[@]}"; do
       "$CANON_TMP/.github/workflows/review-gate.yml" > .github/workflows/review-gate.yml
     sed "s/^    runs-on: default$/    runs-on: ${runner}/" \
       "$CANON_TMP/.github/workflows/review-gate-selftest.yml" > .github/workflows/review-gate-selftest.yml
+    # Normalize modes to the canonical tree entries so the generated
+    # commit is byte- AND mode-deterministic (cp inherits checkout modes,
+    # redirection inherits the umask); the force-push guard verifies both.
+    for f in "${CANON_FILES[@]}"; do
+      case "$(git -C "$CANON_ROOT" ls-tree "$CANON_SHA" -- "$f" | awk '{print $1}')" in
+        100755) chmod 755 "$f" ;;
+        *) chmod 644 "$f" ;;
+      esac
+    done
 
     # Stage BEFORE the emptiness check: in a fresh clone every synced file
     # is untracked, and `git diff --quiet` ignores untracked files entirely
@@ -210,6 +228,18 @@ tools/sync-review-gate.sh." >/dev/null
               echo "  REFUSING force-push: $f missing from remote $BRANCH tip" >&2
               exit 2
             fi
+            # Tree-entry MODE is part of ownership: a mode-only human
+            # amendment (e.g. chmod +x) keeps every blob id identical.
+            remote_mode=$(git ls-tree FETCH_HEAD -- "$f" | awk '{print $1}')
+            expect_mode=$(git -C "$CANON_ROOT" ls-tree "${claimed_sha}" -- "$f" 2>/dev/null |
+              awk '{print $1}')
+            [ -n "$expect_mode" ] || expect_mode=unverifiable
+            if [ "$remote_mode" != "$expect_mode" ]; then
+              echo "  REFUSING force-push: remote $f mode ($remote_mode) differs from" >&2
+              echo "  automation output for frr@${claimed_sha} ($expect_mode); rescue any" >&2
+              echo "  human work, delete the remote branch, re-run" >&2
+              exit 2
+            fi
             case "$f" in
               .github/workflows/*)
                 expect_blob=$(git -C "$CANON_ROOT" show "${claimed_sha}:${f}" 2>/dev/null |
@@ -255,10 +285,16 @@ tools/sync-review-gate.sh." >/dev/null
 
     # The review artifact is an OPEN PR; finishing without one is a failure,
     # not a success with a hint. gh pr list only returns open PRs, so a
-    # closed/merged prior PR correctly falls through to create.
-    url=$(gh pr list --repo "$repo" --head "$BRANCH" --json url --jq '.[0].url // empty')
+    # closed/merged prior PR correctly falls through to create. The lookup
+    # is pinned to the intended artifact: base = the default branch and
+    # head repository = the target repo itself, so a fork PR reusing the
+    # branch name or a retargeted PR cannot satisfy the rollout.
+    url=$(gh pr list --repo "$repo" --head "$BRANCH" --base "$default_branch" \
+      --json url,headRepositoryOwner \
+      --jq ".[] | select(.headRepositoryOwner.login == \"${repo%%/*}\") | .url" |
+      head -n1)
     if [ -z "$url" ] && [ "$need_push" = "1" ] || { [ -z "$url" ] && git rev-parse -q --verify FETCH_HEAD >/dev/null 2>&1; }; then
-      url=$(gh pr create --repo "$repo" --head "$BRANCH" \
+      url=$(gh pr create --repo "$repo" --head "$BRANCH" --base "$default_branch" \
         --title "${SYNC_SUBJECT_PREFIX}${CANON_SHA:0:10}" \
         --body "Vendored sync of the canonical \`review/ally-complete\` gate from Blockcast/frr@${CANON_SHA} (see frr PR #31 for the eight review rounds behind it).
 
