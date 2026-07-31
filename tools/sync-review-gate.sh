@@ -287,11 +287,15 @@ tools/sync-review-gate.sh." >/dev/null
     # not a success with a hint. gh pr list only returns open PRs, so a
     # closed/merged prior PR correctly falls through to create. The lookup
     # is pinned to the intended artifact: base = the default branch and
-    # head repository = the target repo itself, so a fork PR reusing the
-    # branch name or a retargeted PR cannot satisfy the rollout.
+    # head repository = the target repo itself -- owner AND name, since
+    # GitHub permits same-org forks, so owner alone would accept a PR whose
+    # head lives in a sibling Blockcast repository reusing the branch name.
+    # Values enter the filter as jq --arg bindings, never by interpolation.
     url=$(gh pr list --repo "$repo" --head "$BRANCH" --base "$default_branch" \
-      --json url,headRepositoryOwner \
-      --jq ".[] | select(.headRepositoryOwner.login == \"${repo%%/*}\") | .url" |
+      --json url,headRepositoryOwner,headRepository |
+      jq -r --arg owner "${repo%%/*}" --arg name "${repo#*/}" \
+        '.[] | select(.headRepositoryOwner.login == $owner
+                      and .headRepository.name == $name) | .url' |
       head -n1)
     if [ -z "$url" ] && [ "$need_push" = "1" ] || { [ -z "$url" ] && git rev-parse -q --verify FETCH_HEAD >/dev/null 2>&1; }; then
       url=$(gh pr create --repo "$repo" --head "$BRANCH" --base "$default_branch" \
