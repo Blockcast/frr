@@ -65,14 +65,21 @@ ACTION_REQUIRED_COMMENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# "No action required" CONTAINS the affirmative phrase as a substring, so the
-# raw pattern above read Ally's all-clear as a changes-requested verdict --
-# the exact false-positive direction the keyword scan's own comment promises
-# to avoid. Negated forms are masked out first; only text that survives the
-# mask may count as affirmative, so "No action required for X. Action
-# required: fix Y." still fails on the second, un-negated phrase.
+# Negated forms CONTAIN the affirmative phrases as substrings, so the raw
+# pattern above read an all-clear ("No action required", "No changes
+# requested") as a changes-requested verdict -- the exact false-positive
+# direction the keyword scan's own comment promises to avoid. Negated forms
+# are masked out first; only text that survives the mask may count as
+# affirmative, so "No action required for X. Action required: fix Y." still
+# fails on the second, un-negated phrase. The mask must cover every phrase
+# family the affirmative pattern matches (action AND changes, with an
+# optional adjective/adverb slot: "no IMMEDIATE action required", "no
+# FURTHER changes requested") -- masking is safe in the fail-open direction,
+# since deletion only removes text and no affirmative phrase can be created
+# by removing a negated one.
 NO_ACTION_REQUIRED_PATTERN = re.compile(
-    r"\bno(?:\s+further)?\s+action\s+(?:is\s+|was\s+)?required\b",
+    r"\bno(?:\s+\w+)?\s+(?:action|changes?)\s+"
+    r"(?:is\s+|are\s+|was\s+|were\s+)?(?:required|requested|needed)\b",
     re.IGNORECASE,
 )
 
@@ -929,6 +936,12 @@ def enrich_reviews_with_edit_times(api_base_url, owner, repo, pull_number, token
 
 
 def main():
+    # Fresh coordinates per invocation: the module-level target otherwise
+    # carries a previous in-process caller's repo/token/head into this run
+    # (only matters for tests -- CI is one process per run -- but stale
+    # coordinates in a crash write would point the error status at the wrong
+    # head, so clear defensively rather than rely on caller hygiene).
+    _STATUS_TARGET.clear()
     event_path = os.environ.get("GITHUB_EVENT_PATH")
     if not event_path:
         raise RuntimeError("GITHUB_EVENT_PATH is required")
@@ -983,6 +996,7 @@ def main():
     # authoritative path gets its turn.
     payload_pr = event.get("pull_request") or {}
     payload_head = (payload_pr.get("head") or {}).get("sha")
+    early_claim_active = False
     if payload_head:
         _STATUS_TARGET["sha"] = payload_head
         if not payload_pr.get("draft") and (payload_pr.get("state") or "open") == "open":
@@ -997,12 +1011,40 @@ def main():
                     "Evaluating Ally review of head %s..." % short_sha(payload_head),
                     os.environ.get("STATUS_TARGET_URL"),
                 )
+                early_claim_active = True
             except Exception as error:  # noqa: BLE001 - the claim is best-effort
                 print(
                     "early pending claim on payload head %s failed (continuing): %s"
                     % (short_sha(payload_head), error),
                     file=sys.stderr,
                 )
+
+    # Resolves an early claim that turned out to target a PR the refetch says
+    # not to gate. The stale-HEAD case needs no cleanup (a pending on a
+    # superseded head gates nothing), but when the payload head IS the current
+    # head, a silent early return would strand the claim: on a merged/closed
+    # PR nothing ever re-evaluates, leaving a required context yellow forever
+    # on a commit that reached the base branch. Best-effort like the claim
+    # itself.
+    def resolve_early_claim(state, description):
+        if not early_claim_active:
+            return
+        try:
+            set_commit_status(
+                api_base_url,
+                owner,
+                repo,
+                payload_head,
+                token,
+                state,
+                description,
+                os.environ.get("STATUS_TARGET_URL"),
+            )
+        except Exception as error:  # noqa: BLE001 - cleanup is best-effort
+            print(
+                "resolving early claim on %s failed: %s" % (short_sha(payload_head), error),
+                file=sys.stderr,
+            )
 
     pull_request = _request(
         "%s/repos/%s/%s/pulls/%d" % (api_base_url.rstrip("/"), owner, repo, pull_number),
@@ -1014,12 +1056,24 @@ def main():
 
     if pull_request.get("state") and pull_request.get("state") != "open":
         # A delayed event can arrive after merge/close; there is no head left
-        # to gate and a status write would be noise on a settled PR.
+        # to gate. The early claim (if any) must not be left stranded: a
+        # settled PR gets no future evaluation, so a lingering `pending`
+        # would sit yellow forever. `success` is safe here -- the PR cannot
+        # merge again, so the context gates nothing.
         print("PR #%s is %s; nothing to gate." % (pull_number, pull_request["state"]))
+        resolve_early_claim(
+            "success", "PR is %s; nothing to gate." % pull_request["state"]
+        )
         return
 
     if pull_request.get("draft"):
+        # Keep the claim PENDING (fail-closed: a draft can return to ready at
+        # this same head, and a `success` here would pre-clear it), but say
+        # why -- the next ready_for_review event re-evaluates and overwrites.
         print("PR is a draft; nothing to gate.")
+        resolve_early_claim(
+            "pending", "PR is a draft; will re-evaluate when it becomes ready."
+        )
         return
 
     head_sha = (pull_request.get("head") or {}).get("sha")

@@ -887,7 +887,8 @@ class TestStalePayloadOrchestration(unittest.TestCase):
         # The inverse staleness: payload says ready, the PR has since gone
         # back to draft. The ready-claiming payload earns a best-effort early
         # pending on ITS OWN (stale) head -- harmless, a superseded head gates
-        # nothing -- but the draft PR's current head must get no status.
+        # nothing (the draft resolve keeps it pending with a note) -- but the
+        # draft PR's current head must get no status.
         _, statuses = self._run_main(
             payload_draft=False,
             refetched={
@@ -899,8 +900,52 @@ class TestStalePayloadOrchestration(unittest.TestCase):
                 "labels": [],
             },
         )
-        self.assertEqual(statuses, [(self.STALE_HEAD, "pending")])
+        self.assertEqual({sha for sha, _ in statuses}, {self.STALE_HEAD})
+        self.assertEqual({state for _, state in statuses}, {"pending"})
         self.assertNotIn(HEAD, {sha for sha, _ in statuses})
+
+    def test_settled_pr_resolves_the_early_claim(self):
+        # Round 2: a delayed event whose payload still said open earns the
+        # early claim, then the refetch says merged/closed AT THE SAME HEAD.
+        # A silent return would strand a required context yellow forever on a
+        # commit that reached the base branch -- nothing re-evaluates a
+        # settled PR. The claim must resolve to success (the PR cannot merge
+        # again, so the context gates nothing).
+        _, statuses = self._run_main(
+            payload_draft=False,
+            refetched={
+                "number": 7,
+                "state": "closed",
+                "draft": False,
+                "head": {"sha": self.STALE_HEAD},
+                "user": {"login": HUMAN},
+                "labels": [],
+            },
+        )
+        self.assertEqual(
+            statuses,
+            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "success")],
+        )
+
+    def test_draft_pr_same_head_keeps_the_claim_failclosed(self):
+        # Same-head draft: the PR can return to ready at this exact head, so
+        # resolving to success would pre-clear the gate (fail-open). The
+        # claim stays pending -- self-healing via the next ready_for_review.
+        _, statuses = self._run_main(
+            payload_draft=False,
+            refetched={
+                "number": 7,
+                "state": "open",
+                "draft": True,
+                "head": {"sha": self.STALE_HEAD},
+                "user": {"login": HUMAN},
+                "labels": [],
+            },
+        )
+        self.assertEqual(
+            statuses,
+            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "pending")],
+        )
 
 
 class TestNegatedActionRequired(unittest.TestCase):
@@ -925,6 +970,38 @@ class TestNegatedActionRequired(unittest.TestCase):
         )
         state, _ = decide(comments=[comment(body)])
         self.assertEqual(state, "success")
+
+    def test_no_changes_requested_is_not_a_failure(self):
+        # Review round 2: the mask covered only the "action required" phrase
+        # family; "No changes requested." hit the sibling `changes requested`
+        # alternation and produced the same false failure.
+        body = attest(
+            HEAD,
+            "No changes requested.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+
+    def test_adverb_does_not_defeat_the_mask(self):
+        body = attest(
+            HEAD,
+            "No immediate action required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+
+    def test_no_changes_needed_variant(self):
+        body = attest(
+            HEAD,
+            "No changes are needed.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+
+    def test_affirmative_changes_requested_still_fails(self):
+        body = attest(HEAD, "Changes requested: the overflow must be fixed first.")
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
 
     def test_no_action_required_review_is_not_a_failure(self):
         body = attest(
@@ -1094,19 +1171,33 @@ class TestWorkflowContracts(unittest.TestCase):
     def test_selftest_push_covers_both_fleet_default_branches(self):
         # frr's default branch is master; vendored repos default to main. A
         # master-only push trigger silently never runs the post-merge
-        # self-test on those repos.
+        # self-test on those repos. Anchored on the trigger-level `push:` key
+        # (2-space indent at line start), not a positional split -- the token
+        # can legitimately appear earlier in a comment or a new trigger, and
+        # a positional split would silently retarget this assertion.
         selftest_yml = self._read("review-gate-selftest.yml")
-        push_block = selftest_yml.split("push:", 1)[1]
+        trigger = re.search(r"(?m)^\s{2}push:\s*$", selftest_yml)
+        self.assertIsNotNone(trigger, "selftest must keep a push trigger")
+        push_block = selftest_yml[trigger.end():]
         branches = re.findall(r"(?m)^\s*-\s*([\w./-]+)\s*$", push_block.split("paths:", 1)[0])
         self.assertLessEqual({"master", "main"}, set(branches))
 
     def test_workflows_share_one_self_hosted_runner_label(self):
         # The vendoring overlay's single allowed diff is the runner label,
         # applied uniformly. Asserting consistency (not a hardcoded name)
-        # keeps this test itself byte-identical across the fleet.
+        # keeps this test itself byte-identical across the fleet. Each file
+        # must contribute at least one scalar match: an overlay rewriting one
+        # workflow to a list/expression form (`runs-on: [self-hosted, gpu]`)
+        # would otherwise contribute zero labels and the consistency check
+        # would pass on exactly the divergence it exists to catch.
         labels = set()
         for name in ("review-gate.yml", "review-gate-selftest.yml"):
-            labels.update(re.findall(r"(?m)^\s*runs-on:\s*(\S+)\s*$", self._read(name)))
+            matches = re.findall(r"(?m)^\s*runs-on:\s*(\S+)\s*$", self._read(name))
+            self.assertTrue(
+                matches,
+                "%s has no scalar runs-on -- overlay must keep the scalar form" % name,
+            )
+            labels.update(matches)
         self.assertEqual(len(labels), 1, "gate and selftest must run on the same label: %s" % labels)
         label = next(iter(labels))
         self.assertNotRegex(
