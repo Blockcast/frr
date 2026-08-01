@@ -13,6 +13,7 @@ Run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 import importlib.util
 import json
 import os
+import re
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -816,14 +817,15 @@ class TestApprovalAndRecency(unittest.TestCase):
 
 
 class TestStalePayloadOrchestration(unittest.TestCase):
-    """The workflow cancels the active run on any PR event, so main() must be
-    unconditionally willing to replace what it cancelled. Round 7: a delayed
-    event whose stale snapshot still said draft:true cancelled the in-flight
-    ready-PR run and then skipped the job on a workflow-level payload
-    predicate -- the current head was left with no status. The predicate is
-    gone; these fixtures prove the script layer makes that safe in BOTH stale
-    directions by reading only the PR number from the payload and taking
-    draft state from the authoritative refetch."""
+    """Runs serialize on a shared group and must be unconditionally willing to
+    evaluate current state, whatever stale snapshot woke them. Round 7: a
+    delayed event whose stale snapshot still said draft:true cancelled the
+    then-cancellable in-flight ready-PR run and skipped the job on a
+    workflow-level payload predicate -- the current head was left with no
+    status. The predicate is gone; these fixtures prove the script layer makes
+    that safe in BOTH stale directions by reading only the PR number (and a
+    best-effort early-claim head) from the payload and taking draft state from
+    the authoritative refetch."""
 
     STALE_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -883,7 +885,9 @@ class TestStalePayloadOrchestration(unittest.TestCase):
 
     def test_stale_ready_payload_does_not_gate_a_draft_pr(self):
         # The inverse staleness: payload says ready, the PR has since gone
-        # back to draft. No status may be written against a draft head.
+        # back to draft. The ready-claiming payload earns a best-effort early
+        # pending on ITS OWN (stale) head -- harmless, a superseded head gates
+        # nothing -- but the draft PR's current head must get no status.
         _, statuses = self._run_main(
             payload_draft=False,
             refetched={
@@ -895,7 +899,219 @@ class TestStalePayloadOrchestration(unittest.TestCase):
                 "labels": [],
             },
         )
-        self.assertEqual(statuses, [])
+        self.assertEqual(statuses, [(self.STALE_HEAD, "pending")])
+        self.assertNotIn(HEAD, {sha for sha, _ in statuses})
+
+
+class TestNegatedActionRequired(unittest.TestCase):
+    """"No action required" contains "action required" as a substring, so the
+    raw affirmative scan read Ally's all-clear as a changes-requested verdict.
+    Negated forms are masked before the scan; a separate un-negated
+    affirmative in the same body must still fail."""
+
+    def test_no_action_required_comment_is_not_a_failure(self):
+        body = attest(
+            HEAD,
+            "No action required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, description = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+        self.assertIn("clean comment", description)
+
+    def test_no_further_action_required_variant(self):
+        body = attest(
+            HEAD,
+            "No further action is required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+
+    def test_no_action_required_review_is_not_a_failure(self):
+        body = attest(
+            HEAD,
+            "No action required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, description = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("no blocking findings", description)
+
+    def test_affirmative_action_required_still_fails(self):
+        body = attest(HEAD, "Action required: fix the overflow before merge.")
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+    def test_negation_does_not_mask_a_separate_affirmative(self):
+        body = attest(
+            HEAD,
+            "No action required for the docs change. Action required: fix the gate.",
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+
+class TestCrashVisibility(unittest.TestCase):
+    """A run that dies must not exit silently. With no write, an earlier
+    same-head `success` remains the visible truth (fail-open), and a crash
+    before the refetch previously left no record at all. run() turns any
+    crash into an `error` status on the best-known head, and main() claims a
+    best-effort `pending` on the payload head BEFORE the fallible refetch."""
+
+    STALE_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+    def setUp(self):
+        gate._STATUS_TARGET.clear()
+        self.addCleanup(gate._STATUS_TARGET.clear)
+
+    def _run(self, payload_draft=False, request=None, paginated=None):
+        event = {
+            "pull_request": {
+                "number": 7,
+                "draft": payload_draft,
+                "head": {"sha": self.STALE_HEAD},
+            },
+            "repository": {"full_name": "Blockcast/frr"},
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+            event_path = handle.name
+        self.addCleanup(os.unlink, event_path)
+        env = {
+            "GITHUB_EVENT_PATH": event_path,
+            "GITHUB_REPOSITORY": "Blockcast/frr",
+            "GITHUB_TOKEN": "test-token",
+        }
+        calls = []
+
+        def record_status(api, owner, repo, sha, token, state, description,
+                          target_url=None):
+            calls.append(("status", sha, state))
+
+        def record_request(url, token, method="GET", payload=None):
+            calls.append(("request", url))
+            if isinstance(request, Exception):
+                raise request
+            return request
+
+        def record_paginated(api, path, token):
+            if isinstance(paginated, Exception):
+                raise paginated
+            return []
+
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "_request", side_effect=record_request), \
+                mock.patch.object(gate, "set_commit_status", side_effect=record_status), \
+                mock.patch.object(gate, "fetch_paginated", side_effect=record_paginated), \
+                mock.patch.object(gate, "enrich_reviews_with_edit_times"):
+            with self.assertRaises(SystemExit) as caught:
+                gate.run()
+        self.assertEqual(caught.exception.code, 1)
+        statuses = [(c[1], c[2]) for c in calls if c[0] == "status"]
+        return statuses, calls
+
+    def test_refetch_crash_posts_error_to_payload_head(self):
+        statuses, _ = self._run(request=RuntimeError("refetch boom"))
+        self.assertEqual(
+            statuses,
+            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "error")],
+        )
+
+    def test_crash_after_refetch_posts_error_to_current_head(self):
+        refetched = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+            "user": {"login": HUMAN},
+            "labels": [],
+        }
+        statuses, _ = self._run(request=refetched, paginated=RuntimeError("reviews boom"))
+        # Early claim on the payload head, authoritative claim on the real
+        # head, then the crash recorded against the real head -- never the
+        # stale one.
+        self.assertEqual(statuses[-1], (HEAD, "error"))
+        self.assertIn((HEAD, "pending"), statuses)
+
+    def test_early_claim_lands_before_the_refetch(self):
+        refetched = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+            "user": {"login": HUMAN},
+            "labels": [],
+        }
+        _, calls = self._run(request=refetched, paginated=RuntimeError("boom"))
+        kinds = [c[0] for c in calls]
+        self.assertEqual(kinds[0], "status", "the payload-head claim must precede the refetch")
+        self.assertEqual(kinds[1], "request")
+
+    def test_draft_payload_makes_no_early_claim_but_crash_stays_visible(self):
+        statuses, _ = self._run(payload_draft=True, request=RuntimeError("boom"))
+        self.assertEqual(statuses, [(self.STALE_HEAD, "error")])
+
+    def test_status_write_failure_does_not_mask_the_exit(self):
+        event = {
+            "pull_request": {"number": 7, "draft": False, "head": {"sha": self.STALE_HEAD}},
+            "repository": {"full_name": "Blockcast/frr"},
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+            event_path = handle.name
+        self.addCleanup(os.unlink, event_path)
+        env = {
+            "GITHUB_EVENT_PATH": event_path,
+            "GITHUB_REPOSITORY": "Blockcast/frr",
+            "GITHUB_TOKEN": "test-token",
+        }
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "_request", side_effect=RuntimeError("api down")), \
+                mock.patch.object(gate, "set_commit_status", side_effect=RuntimeError("statuses down")):
+            with self.assertRaises(SystemExit) as caught:
+                gate.run()
+        self.assertEqual(caught.exception.code, 1)
+
+
+class TestWorkflowContracts(unittest.TestCase):
+    """Regex checks over the two workflow files, pinning the properties the
+    vendoring overlay must preserve. Stdlib-only on purpose: the selftest
+    environment guarantees no third-party YAML parser."""
+
+    WORKFLOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows")
+
+    def _read(self, name):
+        with open(os.path.join(self.WORKFLOWS, name), encoding="utf8") as handle:
+            return handle.read()
+
+    def test_gate_workflow_never_cancels_in_flight_runs(self):
+        # Cancellation is not atomic: a cancelled run can land an in-flight
+        # final status POST after the superseding run wrote its verdict for
+        # the same SHA. Every run recomputes full state, so serialization
+        # loses nothing and closes that write race.
+        gate_yml = self._read("review-gate.yml")
+        self.assertRegex(gate_yml, r"(?m)^\s*cancel-in-progress:\s*false\s*$")
+        self.assertNotIn("cancel-in-progress: ${{", gate_yml)
+
+    def test_selftest_push_covers_both_fleet_default_branches(self):
+        # frr's default branch is master; vendored repos default to main. A
+        # master-only push trigger silently never runs the post-merge
+        # self-test on those repos.
+        selftest_yml = self._read("review-gate-selftest.yml")
+        push_block = selftest_yml.split("push:", 1)[1]
+        branches = re.findall(r"(?m)^\s*-\s*([\w./-]+)\s*$", push_block.split("paths:", 1)[0])
+        self.assertLessEqual({"master", "main"}, set(branches))
+
+    def test_workflows_share_one_self_hosted_runner_label(self):
+        # The vendoring overlay's single allowed diff is the runner label,
+        # applied uniformly. Asserting consistency (not a hardcoded name)
+        # keeps this test itself byte-identical across the fleet.
+        labels = set()
+        for name in ("review-gate.yml", "review-gate-selftest.yml"):
+            labels.update(re.findall(r"(?m)^\s*runs-on:\s*(\S+)\s*$", self._read(name)))
+        self.assertEqual(len(labels), 1, "gate and selftest must run on the same label: %s" % labels)
+        label = next(iter(labels))
+        self.assertNotRegex(
+            label, r"(?i)\b(?:ubuntu|macos|windows)-", "hosted runner labels are forbidden"
+        )
 
 
 if __name__ == "__main__":

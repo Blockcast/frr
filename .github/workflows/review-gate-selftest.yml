@@ -21,7 +21,11 @@ on:
       - '.github/workflows/review-gate-selftest.yml'
   push:
     branches:
+      # Both fleet default branches: frr uses master, but this file is
+      # vendored byte-identically into repos whose default is main, where a
+      # master-only trigger silently never runs the post-merge self-test.
       - master
+      - main
     paths:
       - '.github/scripts/require-ally-review.py'
       - '.github/scripts/test_require_ally_review.py'

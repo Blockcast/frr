@@ -39,6 +39,14 @@ TRUSTED_COLLABORATOR_PERMISSIONS = {"admin", "maintain", "write"}
 
 STATUS_CONTEXT = os.environ.get("STATUS_CONTEXT") or "review/ally-complete"
 
+# Best-known status-write coordinates, kept current by main() as each fact is
+# learned (token/repo first, payload head next, refetched head last). The
+# top-level handler in run() uses them to turn a crash into an `error` status
+# on the head instead of a silent non-zero exit: a run that dies before its
+# first write leaves an earlier same-head `success` standing as the visible
+# truth, which is the one direction a merge control must not fail.
+_STATUS_TARGET = {}
+
 # Sentinel (not a GitHub status state): a COMMENTED Ally review carrying no
 # blocking findings. Ally only ever COMMENTs -- never APPROVEs -- so this is
 # its "looks good". It is NOT an auto-pass: it stays overridable so the
@@ -56,6 +64,21 @@ ACTION_REQUIRED_COMMENT_PATTERN = re.compile(
     r"critical issues? \([1-9]\d*\)|important issues? \([1-9]\d*\))",
     re.IGNORECASE,
 )
+
+# "No action required" CONTAINS the affirmative phrase as a substring, so the
+# raw pattern above read Ally's all-clear as a changes-requested verdict --
+# the exact false-positive direction the keyword scan's own comment promises
+# to avoid. Negated forms are masked out first; only text that survives the
+# mask may count as affirmative, so "No action required for X. Action
+# required: fix Y." still fails on the second, un-negated phrase.
+NO_ACTION_REQUIRED_PATTERN = re.compile(
+    r"\bno(?:\s+further)?\s+action\s+(?:is\s+|was\s+)?required\b",
+    re.IGNORECASE,
+)
+
+
+def has_action_required_language(body):
+    return ACTION_REQUIRED_COMMENT_PATTERN.search(NO_ACTION_REQUIRED_PATTERN.sub(" ", body)) is not None
 
 # Explicit, machine-readable verdict markers. When any is present in an Ally
 # body we trust it over heuristics. Precedence: an explicit changes-requested
@@ -315,7 +338,7 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             # count > 0, is a real negative -- stays red, label or not.
             # Incidental security/"blocking" prose does NOT match.
             if verdict == "changes-requested" or (
-                verdict is None and ACTION_REQUIRED_COMMENT_PATTERN.search(body)
+                verdict is None and has_action_required_language(body)
             ):
                 signals.append(
                     {
@@ -528,7 +551,7 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
         # phrasing. A positive review that merely *mentions* security /
         # "blocking" / "unsafe" / "finding" never fails here.
         if verdict == "changes-requested" or (
-            verdict is None and ACTION_REQUIRED_COMMENT_PATTERN.search(body)
+            verdict is None and has_action_required_language(body)
         ):
             signals.append(
                 {
@@ -924,6 +947,7 @@ def main():
 
     owner, repo = full_name.split("/", 1)
     api_base_url = os.environ.get("GITHUB_API_URL") or "https://api.github.com"
+    _STATUS_TARGET.update({"api": api_base_url, "owner": owner, "repo": repo, "token": token})
 
     # Resolve the PR NUMBER from whatever payload the event carries, then
     # refetch the PR itself for EVERY event. The embedded pull_request object
@@ -946,6 +970,40 @@ def main():
         print("No pull_request payload found; nothing to gate.")
         return
 
+    # Claim the context on the PAYLOAD head before the authoritative refetch.
+    # The refetch itself can raise (network, rate limit), and a run that dies
+    # with no write leaves a previous same-head `success` standing -- the gate
+    # failing open on exactly the kind of error it should hold for. A stale
+    # payload head is harmless here for the same reason a stale-event run is:
+    # the authoritative post-refetch write targets the real head, and a
+    # pending on a superseded head gates nothing. Gated on the snapshot
+    # claiming an open, non-draft PR so settled PRs are not stamped
+    # (issue_comment payloads carry no head and are skipped), and best-effort
+    # so a failed early write cannot itself kill the run before the
+    # authoritative path gets its turn.
+    payload_pr = event.get("pull_request") or {}
+    payload_head = (payload_pr.get("head") or {}).get("sha")
+    if payload_head:
+        _STATUS_TARGET["sha"] = payload_head
+        if not payload_pr.get("draft") and (payload_pr.get("state") or "open") == "open":
+            try:
+                set_commit_status(
+                    api_base_url,
+                    owner,
+                    repo,
+                    payload_head,
+                    token,
+                    "pending",
+                    "Evaluating Ally review of head %s..." % short_sha(payload_head),
+                    os.environ.get("STATUS_TARGET_URL"),
+                )
+            except Exception as error:  # noqa: BLE001 - the claim is best-effort
+                print(
+                    "early pending claim on payload head %s failed (continuing): %s"
+                    % (short_sha(payload_head), error),
+                    file=sys.stderr,
+                )
+
     pull_request = _request(
         "%s/repos/%s/%s/pulls/%d" % (api_base_url.rstrip("/"), owner, repo, pull_number),
         token,
@@ -967,6 +1025,7 @@ def main():
     head_sha = (pull_request.get("head") or {}).get("sha")
     if not head_sha:
         raise RuntimeError("pull_request.head.sha is required")
+    _STATUS_TARGET["sha"] = head_sha
 
     pull_number = pull_request["number"]
     ally_logins = parse_list(os.environ.get("ALLY_REVIEWER_LOGINS"), DEFAULT_ALLY_LOGINS)
@@ -1073,9 +1132,37 @@ def main():
     print("%s: %s" % (STATUS_CONTEXT, description))
 
 
-if __name__ == "__main__":
+def run():
     try:
         main()
     except Exception as error:  # noqa: BLE001 - surface message, non-zero exit
         print(str(error), file=sys.stderr)
+        # A crash must stay VISIBLE on the head, not just in the workflow log:
+        # with no write, an earlier same-head `success` remains the status the
+        # merge control reads, and the failed run is indistinguishable from no
+        # run at all. Best-effort by construction -- the write needs whatever
+        # coordinates main() managed to learn before dying, and a failure to
+        # record the crash must not mask the original error's exit.
+        target = dict(_STATUS_TARGET)
+        if all(target.get(key) for key in ("api", "owner", "repo", "token", "sha")):
+            try:
+                set_commit_status(
+                    target["api"],
+                    target["owner"],
+                    target["repo"],
+                    target["sha"],
+                    target["token"],
+                    "error",
+                    "review-gate crashed before posting a verdict: %s" % error,
+                    os.environ.get("STATUS_TARGET_URL"),
+                )
+            except Exception as status_error:  # noqa: BLE001 - keep the original exit
+                print(
+                    "failed to record the crash as an error status: %s" % status_error,
+                    file=sys.stderr,
+                )
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    run()
