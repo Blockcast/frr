@@ -629,6 +629,13 @@ class TestDescriptionLength(unittest.TestCase):
                 trusted={HUMAN},
             ),
             decide(reviews=[review("COMMENTED", body=blocking)]),  # failure
+            decide(  # override refused: mask-ambiguous body
+                reviews=[review("COMMENTED", body=attest(
+                    HEAD, "No reviewer responded and action required: fix gate."))],
+                comments=[comment(override_body(HEAD), login=HUMAN)],
+                labels=[OVERRIDE],
+                trusted={HUMAN},
+            ),
             decide(reviews=[review("CHANGES_REQUESTED")]),  # changes requested
             decide(reviews=[review("APPROVED")]),  # approved
             decide(reviews=[review("APPROVED")], author="app/allyblockcast"),  # self demoted
@@ -1271,19 +1278,23 @@ if __name__ == "__main__":
 
 
 class TestIssueCommentCrashClaim(unittest.TestCase):
-    """Review round 5 CRITICAL 2: issue_comment payloads carry no
-    pull_request.head.sha, so a refetch crash previously skipped the `error`
-    write and left an earlier same-head `success` standing -- fail-open on
-    exactly the events (comment edit/delete) that can REMOVE the evidence
-    behind a green gate. main() now probes the head FIRST and claims it, so
-    the crash handler always has an addressable commit; a failed probe fails
-    the run visibly instead of returning silently."""
+    """Review round 5 CRITICAL 2 / round 7 CRITICAL 2: issue_comment payloads
+    carry no pull_request.head.sha, so a refetch crash previously skipped the
+    `error` write and left an earlier same-head `success` standing -- fail-open
+    on exactly the events (comment edit/delete) that can REMOVE the evidence
+    behind a green gate. main() now probes the head FIRST (with retries), falls
+    back to git transport when the REST plane is down, and claims whichever
+    source yields the SHA -- so the crash handler always has an addressable
+    commit. Only when BOTH transports fail does the run exit non-zero with no
+    write: with no addressable commit there is nothing any code path could
+    stamp, and posting the invalidating status itself requires the REST plane
+    -- the physically irreducible residual."""
 
     def setUp(self):
         gate._STATUS_TARGET.clear()
         self.addCleanup(gate._STATUS_TARGET.clear)
 
-    def _run(self, request_effects):
+    def _run(self, request_effects, git_fallback=None, expect_exit=True):
         event = {
             "issue": {"number": 7, "pull_request": {"url": "x"}},
             "repository": {"full_name": "Blockcast/frr"},
@@ -1314,11 +1325,17 @@ class TestIssueCommentCrashClaim(unittest.TestCase):
         with mock.patch.dict(os.environ, env), \
                 mock.patch.object(gate, "_request", side_effect=record_request), \
                 mock.patch.object(gate, "set_commit_status", side_effect=record_status), \
+                mock.patch.object(gate, "_sleep", lambda seconds: None), \
+                mock.patch.object(gate, "_git_pull_head_sha",
+                                  return_value=git_fallback), \
                 mock.patch.object(gate, "fetch_paginated", return_value=[]), \
                 mock.patch.object(gate, "enrich_reviews_with_edit_times"):
-            with self.assertRaises(SystemExit) as caught:
+            if expect_exit:
+                with self.assertRaises(SystemExit) as caught:
+                    gate.run()
+                self.assertEqual(caught.exception.code, 1)
+            else:
                 gate.run()
-        self.assertEqual(caught.exception.code, 1)
         return [(c[1], c[2]) for c in calls if c[0] == "status"]
 
     def test_refetch_crash_after_probe_posts_error_to_probed_head(self):
@@ -1331,9 +1348,57 @@ class TestIssueCommentCrashClaim(unittest.TestCase):
         statuses = self._run([probe, RuntimeError("refetch boom")])
         self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
 
-    def test_probe_failure_fails_the_run_instead_of_returning_silently(self):
-        statuses = self._run([None])
+    def test_probe_retry_recovers_from_a_transient_failure(self):
+        # One 5xx/rate-limit blip must no longer forfeit the head: attempt 2
+        # succeeds, the claim lands, and the later refetch crash escalates it.
+        probe = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+        }
+        statuses = self._run(
+            [RuntimeError("transient 502"), probe, RuntimeError("refetch boom")]
+        )
+        self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
+
+    def test_git_fallback_claims_the_head_when_rest_probe_is_down(self):
+        # Review round 7 CRITICAL 2: the head comes from an independent
+        # transport when every REST probe attempt fails, so the claim (and any
+        # later crash escalation) still reaches the exact head whose comment
+        # evidence changed -- stale green cannot survive a REST-plane blip.
+        statuses = self._run(
+            [
+                RuntimeError("rest down"),
+                RuntimeError("rest down"),
+                RuntimeError("rest down"),
+                RuntimeError("refetch boom"),
+            ],
+            git_fallback=HEAD,
+        )
+        self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
+
+    def test_both_transports_failing_fails_the_run(self):
+        # The irreducible residual: REST and git transport both unreachable
+        # means no addressable commit exists anywhere -- and the invalidating
+        # status write itself needs the REST plane. Non-zero exit is the only
+        # remaining signal.
+        statuses = self._run(
+            [RuntimeError("rest down")] * 3,
+            git_fallback=None,
+        )
         self.assertEqual(statuses, [])
+
+
+class TestGitHeadFallbackParsing(unittest.TestCase):
+    def test_parses_the_oid_column(self):
+        self.assertEqual(
+            gate._parse_ls_remote_head("%s\trefs/pull/7/head\n" % HEAD), HEAD
+        )
+
+    def test_rejects_non_oid_output(self):
+        for output in ("", "not-a-sha\trefs/pull/7/head\n", "fatal: auth failed\n"):
+            self.assertIsNone(gate._parse_ls_remote_head(output), repr(output))
 
 
 class TestAuthorizationInversion(unittest.TestCase):
@@ -1364,12 +1429,15 @@ class TestAuthorizationInversion(unittest.TestCase):
         self.assertEqual(state, "pending")
 
     def test_negated_request_changes_family_masks(self):
-        # Review round 5 Important: the "request changes" affirmative family
-        # was scanned but had no negated forms in the mask, so clean prose
-        # blocked. With CLEAN counts present these must authorize.
+        # Review round 5 Important + round 7 Important: the "request changes"
+        # affirmative family was scanned but had no negated forms in the mask,
+        # so clean prose blocked. Round 7 adds the semi-modal "need not" /
+        # "needn't" shapes. With CLEAN counts present these must authorize.
         for text in (
             "No need to request changes.",
             "We do not request changes.",
+            "We need not request changes.",
+            "We needn't request changes.",
         ):
             self.assertFalse(
                 gate.has_action_required_language(text), repr(text)
@@ -1380,3 +1448,119 @@ class TestAuthorizationInversion(unittest.TestCase):
             )
             state, _ = decide(reviews=[review("COMMENTED", body=body)])
             self.assertEqual(state, "pending", repr(text))
+
+    def test_affirmative_need_to_request_changes_still_fails(self):
+        # Adjacency control for the widened modal list: "need TO request
+        # changes" and "not ONLY request changes" are affirmative -- an
+        # intervening word breaks the negated-verb shape, so neither may mask.
+        for text in (
+            "We need to request changes here.",
+            "You must not only request changes but also fix the docs.",
+        ):
+            self.assertTrue(gate.has_action_required_language(text), repr(text))
+
+
+class TestPassBlockingContradiction(unittest.TestCase):
+    """Review round 7 CRITICAL 3: an explicit pass verdict must not suppress
+    surviving (un-negated) blocking prose in the same body. Contradiction
+    resolves red, exactly as contradictory issue counts do."""
+
+    CONTRADICTORY = (
+        "### Recommended Action\n\nMerge.\n\nAction required: fix the gate.\n"
+    )
+
+    def test_pass_plus_blocking_prose_fails_in_a_review(self):
+        body = attest(HEAD, self.CONTRADICTORY)
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "failure")
+
+    def test_pass_plus_blocking_prose_fails_in_a_comment(self):
+        body = attest(HEAD, self.CONTRADICTORY)
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+    def test_pass_plus_negated_prose_stays_clean(self):
+        # The mask still protects genuinely negated prose alongside a pass:
+        # only SURVIVING affirmative phrases contradict. Comment path clears
+        # outright; the review path lands the clean-commented pending.
+        body = attest(
+            HEAD, "### Recommended Action\n\nMerge.\n\nNo action required.\n"
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+
+
+class TestOverrideMaskAmbiguity(unittest.TestCase):
+    """Review round 7 CRITICAL 1: the negation mask can consume a REAL
+    blocking phrase behind an unlisted pivot ("No reviewer responded AND
+    action required"). Under the inversion that body authorizes nothing --
+    but the maintainer override then cleared the head, laundering the mask
+    error into green. Bodies whose only escape from a blocking verdict is
+    the mask (no pass verdict, no zero counts) are ambiguous, and the
+    override refuses them."""
+
+    AMBIGUOUS = "No reviewer responded and action required: fix gate."
+
+    def _with_override(self, reviews):
+        return decide(
+            reviews=reviews,
+            comments=[comment(override_body(HEAD), login=HUMAN)],
+            labels=[OVERRIDE],
+            trusted={HUMAN},
+        )
+
+    def test_override_refused_for_a_mask_ambiguous_review(self):
+        # Ally's exact round-7 probe: attested review whose blocking phrase
+        # the mask erased, plus the full trusted override combination.
+        body = attest(HEAD, self.AMBIGUOUS)
+        state, desc = self._with_override([review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("Override refused", desc)
+
+    def test_override_refused_for_a_mask_ambiguous_comment(self):
+        state, desc = decide(
+            comments=[
+                comment(attest(HEAD, self.AMBIGUOUS)),
+                comment(override_body(HEAD), login=HUMAN),
+            ],
+            labels=[OVERRIDE],
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("Override refused", desc)
+
+    def test_override_still_clears_a_zero_count_body_with_negated_prose(self):
+        # The normal clean-commented -> override flow must survive: zero
+        # counts are Ally's machine-readable summary and outrank prose
+        # scanning, so "No action required" alongside them is not ambiguous.
+        body = attest(
+            HEAD,
+            "### Critical Issues (0)\n\n### Important Issues (0)\n\n"
+            "No action required.\n",
+        )
+        state, _ = self._with_override([review("COMMENTED", body=body)])
+        self.assertEqual(state, "success")
+
+    def test_override_still_rescues_the_reviewer_never_ran_case(self):
+        state, _ = self._with_override([])
+        self.assertEqual(state, "success")
+
+    def test_mask_erased_blocking_unit_matrix(self):
+        cases = [
+            (self.AMBIGUOUS, True),
+            # Surviving blocking phrase: the failure paths own it.
+            ("Action required: fix the gate.", False),
+            # Machine-readable all-clears outrank prose scanning.
+            (
+                "No action required.\n### Critical Issues (0)\n"
+                "### Important Issues (0)\n",
+                False,
+            ),
+            ("ally-verdict: pass\nNo action required.", False),
+            # No affirmative vocabulary at all.
+            ("Looks good overall.", False),
+        ]
+        for text, expected in cases:
+            self.assertEqual(gate.mask_erased_blocking(text), expected, repr(text))

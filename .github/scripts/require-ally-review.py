@@ -18,7 +18,9 @@ Reads the workflow event from GITHUB_EVENT_PATH, needs GITHUB_TOKEN with
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -115,16 +117,20 @@ NO_ACTION_REQUIRED_PATTERN = re.compile(
 # The "request changes" affirmative family (scanned above) has its own
 # negated shapes the noun-phrase mask cannot reach: an infinitive after a
 # negated noun phrase ("no need to request changes") and direct verb
-# negation ("we do not request changes", "we won't request changes").
-# Same clause bounds as the main mask; same fail-closed footing -- under
-# the authorization inversion a mask error can only cause a false
+# negation ("we do not request changes", "we won't request changes",
+# "we need not request changes"). The modal list includes semi-modal
+# "need" ("need not" / "needn't") -- the same negated-verb shape as the
+# core modals. Adjacency keeps this safe: "not ONLY request changes"
+# (which affirms) has an intervening word and never matches. Same clause
+# bounds as the main mask; same fail-closed footing -- under the
+# authorization inversion a mask error can only cause a false
 # failure-or-pending, never a false green.
 NO_REQUEST_CHANGES_PATTERN = re.compile(
     r"(?:\bno(?:[ \t]+(?!(?:" + _NEGATION_SPAN_BREAKERS + r")\b)\w+)*"
     r"[ \t]+to[ \t]+request[ \t]+changes?\b"
-    r"|\b(?:do|does|did|would|will|shall|should|could|can|must|may|might)"
+    r"|\b(?:do|does|did|would|will|shall|should|could|can|must|may|might|need|dare)"
     r"[ \t]+not[ \t]+request[ \t]+changes?\b"
-    r"|\b(?:don't|doesn't|didn't|won't|wouldn't|shan't|shouldn't|couldn't|can't|cannot|mustn't)"
+    r"|\b(?:don't|doesn't|didn't|won't|wouldn't|shan't|shouldn't|couldn't|can't|cannot|mustn't|needn't)"
     r"[ \t]+request[ \t]+changes?\b)",
     re.IGNORECASE,
 )
@@ -134,6 +140,46 @@ def has_action_required_language(body):
     masked = NO_ACTION_REQUIRED_PATTERN.sub(" ", body)
     masked = NO_REQUEST_CHANGES_PATTERN.sub(" ", masked)
     return ACTION_REQUIRED_COMMENT_PATTERN.search(masked) is not None
+
+
+def mask_erased_blocking(body):
+    """True when the negation masks are the ONLY thing standing between this
+    body and a blocking verdict, and no machine-readable all-clear vouches for
+    it: the affirmative pattern matches the RAW text but not the masked text,
+    and the body carries neither an explicit pass verdict nor both zero-count
+    sections.
+
+    Why this exists (review round 7): the masks cannot fully parse English, so
+    a pivot outside the breaker list ("No reviewer responded AND action
+    required: fix gate") lets the mask consume a REAL blocking phrase. Under
+    the authorization inversion that error is fail-closed on its own -- the
+    body authorizes nothing and the gate stays pending -- but the maintainer
+    override could then clear the head, laundering the mask error into green.
+    Bodies in this state are therefore flagged as ambiguous and the override
+    refuses them.
+
+    The two exemptions are deliberate, not loopholes: an explicit pass verdict
+    or both zero-count sections is Ally's own machine-readable summary of the
+    review, which outranks prose scanning everywhere else in this gate (counts
+    > 0 already outrank a pass verdict via has_blocking_count). Without the
+    exemptions every genuine all-clear containing "No action required" prose
+    would become non-overridable, breaking the normal clean-commented ->
+    override flow.
+    """
+    if not ACTION_REQUIRED_COMMENT_PATTERN.search(body):
+        return False
+    if has_action_required_language(body):
+        # The blocking phrase SURVIVED the masks: the failure paths already
+        # handle it, and failure is never overridable.
+        return False
+    if explicit_verdict(body) == "pass":
+        return False
+    if (
+        extract_issue_count(body, "Critical Issues") == 0
+        and extract_issue_count(body, "Important Issues") == 0
+    ):
+        return False
+    return True
 
 # Explicit, machine-readable verdict markers. When any is present in an Ally
 # body we trust it over heuristics. Precedence: an explicit changes-requested
@@ -389,12 +435,15 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
 
         if state == "COMMENTED":
             verdict = explicit_verdict(body)
-            # An explicit changes-requested verdict, OR a machine-readable
-            # count > 0, is a real negative -- stays red, label or not.
-            # Incidental security/"blocking" prose does NOT match.
-            if verdict == "changes-requested" or (
-                verdict is None and has_action_required_language(body)
-            ):
+            # An explicit changes-requested verdict, OR surviving (un-negated)
+            # action-required prose, is a real negative -- stays red, label or
+            # not. The prose scan runs INDEPENDENTLY of the verdict (review
+            # round 7): a body pairing "Recommended Action: Merge." with
+            # "Action required: fix X." is contradictory, and contradiction
+            # resolves red, exactly as contradictory issue counts do in
+            # extract_issue_count. Incidental security/"blocking" prose still
+            # does NOT match.
+            if verdict == "changes-requested" or has_action_required_language(body):
                 signals.append(
                     {
                         "at": at,
@@ -616,13 +665,13 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
             continue
 
         verdict = explicit_verdict(body)
-        # FAILURE only on an actual changes-requested verdict: an explicit
-        # marker, a machine-readable count > 0, or the legacy action-required
-        # phrasing. A positive review that merely *mentions* security /
-        # "blocking" / "unsafe" / "finding" never fails here.
-        if verdict == "changes-requested" or (
-            verdict is None and has_action_required_language(body)
-        ):
+        # FAILURE on an actual changes-requested verdict OR surviving
+        # (un-negated) action-required prose -- checked INDEPENDENTLY of the
+        # verdict (review round 7): an explicit pass paired with "Action
+        # required: fix X." is contradictory prose, and contradiction resolves
+        # red. A positive review that merely *mentions* security / "blocking"
+        # / "unsafe" / "finding" never fails here.
+        if verdict == "changes-requested" or has_action_required_language(body):
             signals.append(
                 {
                     "at": at,
@@ -730,6 +779,40 @@ def override_attestation_logins(comments, head_sha):
     return logins
 
 
+def ambiguous_masked_bodies_for_head(reviews, comments, head_sha, ally_logins):
+    """Any head-relevant Ally body whose only escape from a blocking verdict
+    is the negation mask (see mask_erased_blocking). Head relevance mirrors
+    the BLOCKING binding rules -- commit_id or attestation for reviews, the
+    consolidated/issue-link shapes for comments -- because ambiguity is a
+    potential blocking signal, and blocking binds loosely by design.
+    """
+    ally = set(ally_logins)
+    for review in reviews or []:
+        login = (review.get("user") or {}).get("login")
+        if not isinstance(login, str) or login not in ally:
+            continue
+        if review.get("state") == "DISMISSED":
+            continue
+        body = str(review.get("body") or "")
+        if review.get("commit_id") != head_sha and not attests_head(body, head_sha):
+            continue
+        if mask_erased_blocking(body):
+            return True
+    for comment in comments or []:
+        login = (comment.get("user") or {}).get("login")
+        if not isinstance(login, str) or login not in ally:
+            continue
+        body = str(comment.get("body") or "")
+        if not (
+            is_consolidated_ally_comment_for_head(body, head_sha)
+            or is_issue_link_ally_comment_for_head(body, head_sha)
+        ):
+            continue
+        if mask_erased_blocking(body):
+            return True
+    return False
+
+
 def decide(
     reviews,
     comments,
@@ -799,6 +882,20 @@ def decide(
     has_override = has_label and has_head_attestation
 
     if has_override and (signal is None or signal["status"] != "failure"):
+        # The override rescues the reviewer-never-ran case and clears
+        # machine-readably-clean reviews. It must NOT launder a mask error
+        # (review round 7): a body whose blocking prose was consumed by the
+        # negation mask contributes no signal -- indistinguishable here from
+        # "no review" -- so without this check the override would clear a head
+        # Ally actually flagged. Refusal is fail-closed: the head stays
+        # pending until Ally re-reviews with a machine-readable verdict.
+        if ambiguous_masked_bodies_for_head(reviews, comments, head_sha, ally_logins):
+            return (
+                "pending",
+                "Override refused for head %s: an Ally body has unclassifiable "
+                "negated prose; request a machine-readable re-review."
+                % short_sha(head_sha),
+            )
         return (
             "success",
             "Ally review gate overridden for head %s (label '%s' + head-bound authorization)."
@@ -840,6 +937,81 @@ def _request(url, token, method="GET", payload=None):
     with urllib.request.urlopen(req) as response:
         body = response.read()
         return json.loads(body) if body else None
+
+
+# The issue_comment head probe is the single point where a transient API
+# failure used to leave a stale same-head `success` standing with no claim
+# and no error write (review round 7). Two hardening layers close most of
+# that window:
+#   1. Retries with backoff -- a rate-limit blip or one 5xx no longer
+#      forfeits the head.
+#   2. A git-transport fallback (`git ls-remote refs/pull/N/head`) -- an
+#      independent protocol path to the same immutable coordinate, so a
+#      REST-plane outage alone cannot hide the head. Once EITHER source
+#      yields the SHA it is claimed into _STATUS_TARGET, and any later
+#      crash posts `error` to it.
+# The residual window -- REST and git transport BOTH unreachable -- is
+# physically irreducible: with no addressable commit there is nothing any
+# code path could stamp, and posting the invalidating status itself
+# requires the REST plane. That case exits non-zero with no status write.
+_PROBE_ATTEMPTS = 3
+_sleep = time.sleep  # test seam
+
+
+def _probe_pull_request(url, token, attempts=_PROBE_ATTEMPTS):
+    """GET the PR with retries; returns the payload or None (never raises)."""
+    for attempt in range(attempts):
+        try:
+            payload = _request(url, token)
+        except Exception as error:  # noqa: BLE001 - each attempt is fallible
+            print(
+                "head probe attempt %d/%d failed: %s" % (attempt + 1, attempts, error),
+                file=sys.stderr,
+            )
+            payload = None
+        if payload:
+            return payload
+        if attempt + 1 < attempts:
+            _sleep(2 ** attempt)
+    return None
+
+
+def _parse_ls_remote_head(output):
+    """First 40-hex OID column of `git ls-remote` output, or None."""
+    for line in (output or "").splitlines():
+        oid = line.split("\t")[0].split(" ")[0].strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", oid):
+            return oid
+    return None
+
+
+def _git_pull_head_sha(owner, repo, pull_number, token):
+    """Resolve refs/pull/N/head over git smart-HTTP -- a transport
+    independent of the REST API plane. Returns the OID or None; never
+    raises and never echoes the tokened URL.
+    """
+    server = (os.environ.get("GITHUB_SERVER_URL") or "https://github.com").rstrip("/")
+    scheme, _, host = server.partition("://")
+    url = "%s://x-access-token:%s@%s/%s/%s.git" % (scheme, token, host, owner, repo)
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", url, "refs/pull/%d/head" % pull_number],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except Exception as error:  # noqa: BLE001 - fallback is best-effort
+        print("git head fallback failed: %s" % error, file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        print(
+            "git head fallback exited %d: %s"
+            % (result.returncode, (result.stderr or "").strip()[:200]),
+            file=sys.stderr,
+        )
+        return None
+    return _parse_ls_remote_head(result.stdout)
 
 
 def fetch_paginated(api_base_url, path, token):
@@ -1065,21 +1237,40 @@ def main():
         # crash would skip the `error` write and leave an earlier same-head
         # `success` standing -- fail-open on exactly the events that can
         # REMOVE the evidence behind a green gate (comment edits/deletes).
-        # Resolve the head with a minimal fetch BEFORE any fallible
+        # Resolve the head with a minimal retried fetch BEFORE any fallible
         # processing so this path gets the same fail-closed claim as
-        # pull_request payloads. If even this probe fails, the raised error
-        # fails the workflow run visibly -- there is no addressable commit
-        # to stamp, and a silent return would hide the outage.
-        probe = _request(
+        # pull_request payloads. When the REST probe stays down, the git
+        # smart-HTTP fallback supplies the same immutable coordinate over an
+        # independent transport; the run then continues so the claim below
+        # lands `pending` on the real head, and any later crash escalates it
+        # to `error`. Only when BOTH transports fail is there no addressable
+        # commit anywhere -- the raised error fails the workflow run visibly,
+        # the documented irreducible residual (see _probe_pull_request).
+        probe = _probe_pull_request(
             "%s/repos/%s/%s/pulls/%d" % (api_base_url.rstrip("/"), owner, repo, pull_number),
             token,
         )
-        if not probe:
-            raise RuntimeError(
-                "PR #%s head could not be resolved for the fail-closed claim" % pull_number
+        if probe:
+            payload_pr = probe
+            payload_head = (probe.get("head") or {}).get("sha")
+        else:
+            fallback_head = _git_pull_head_sha(owner, repo, pull_number, token)
+            if not fallback_head:
+                raise RuntimeError(
+                    "PR #%s head could not be resolved for the fail-closed claim "
+                    "(REST probe and git fallback both failed)" % pull_number
+                )
+            print(
+                "REST head probe failed; git fallback resolved head %s"
+                % short_sha(fallback_head)
             )
-        payload_pr = probe
-        payload_head = (probe.get("head") or {}).get("sha")
+            # Draft/state unknown without the REST payload; an empty snapshot
+            # falls through the claim gate below as open/non-draft, which is
+            # the fail-closed direction (a stray pending blocks, never clears,
+            # and resolve_early_claim cleans up if the refetch later says
+            # settled).
+            payload_pr = {}
+            payload_head = fallback_head
     early_claim_active = False
     if payload_head:
         _STATUS_TARGET["sha"] = payload_head
