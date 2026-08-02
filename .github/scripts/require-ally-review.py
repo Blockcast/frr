@@ -23,7 +23,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DEFAULT_ALLY_LOGINS = ["allyblockcast[bot]", "app/allyblockcast", "allyblockcast"]
+# Identities Ally's review pipeline actually posts as. The bare `allyblockcast`
+# User seat is deliberately absent -- it is an author credential, not a
+# reviewer; see DEFAULT_AUTHOR_ONLY_LOGINS.
+DEFAULT_ALLY_LOGINS = ["allyblockcast[bot]", "app/allyblockcast"]
+
+# Identities that act on PRs but are never reviewers. Dropping a login from
+# DEFAULT_ALLY_LOGINS alone is a regression, not a fix: the distinct-reviewer
+# test below admits any login merely for being absent from the Ally set, so a
+# bare removal would PROMOTE it to an ordinary reviewer needing no body
+# format at all. Both changes only make sense together (BLO-18926/BLO-18965).
+DEFAULT_AUTHOR_ONLY_LOGINS = ["allyblockcast"]
 TRUSTED_REVIEWER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 # author_association on a review is computed relative to the *requesting
@@ -344,18 +354,22 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
     return signals
 
 
-def distinct_reviewer_candidate_logins(reviews, head_sha, ally_logins, pr_author_login):
+def distinct_reviewer_candidate_logins(reviews, head_sha, ally_logins, pr_author_login, author_only_logins=None):
     """Structural-only pass (no trust check): every login that would qualify as
     a distinct reviewer for this head if it turns out to be trusted. Scopes the
     collaborator-permission lookups to the logins that matter.
     """
     ally = set(ally_logins)
+    author_only = set(author_only_logins or [])
     logins = set()
     for review in reviews:
         user = review.get("user") or {}
         login = user.get("login")
+        # An author-credential login is excluded first and unconditionally --
+        # see distinct_reviewer_signals_for_head for why ordering matters here.
         is_distinct = (
             isinstance(login, str)
+            and login not in author_only
             and login != pr_author_login
             and (login not in ally or user.get("type") == "User")
         )
@@ -378,8 +392,10 @@ def distinct_reviewer_signals_for_head(
     permission_trusted_logins,
     permission_resolved_logins=None,
     head_authorized_logins=None,
+    author_only_logins=None,
 ):
     ally = set(ally_logins)
+    author_only = set(author_only_logins or [])
     permission_resolved_logins = permission_resolved_logins or set()
     head_authorized_logins = head_authorized_logins or set()
     signals = []
@@ -390,7 +406,14 @@ def distinct_reviewer_signals_for_head(
         association = str(review.get("author_association") or "")
 
         # A reviewer counts as "distinct" from the PR author when its login
-        # differs AND it is a genuinely separate actor. Two cases qualify:
+        # differs AND it is a genuinely separate actor.
+        #
+        # An author-credential login is excluded FIRST and unconditionally.
+        # That ordering is the point: the clause below admits a login merely
+        # for being absent from the Ally set, so without this guard, demoting
+        # a seat out of that set would widen its trust rather than remove it.
+        #
+        # What remains qualifies in two cases:
         #   (a) a login outside the Ally set -- an ordinary trusted human; or
         #   (b) a real GitHub *User* seat inside the Ally set, e.g. the
         #       `allyblockcast` maintainer user, a distinct actor from the
@@ -399,6 +422,7 @@ def distinct_reviewer_signals_for_head(
         # type == "User"), so the App can never self-clear the gate.
         is_distinct = (
             isinstance(login, str)
+            and login not in author_only
             and login != pr_author_login
             and (login not in ally or user.get("type") == "User")
         )
@@ -610,7 +634,7 @@ def reduce_distinct_reviewer_signals(signals):
     return latest_signal(current_states)
 
 
-def override_attestation_logins(comments, head_sha):
+def override_attestation_logins(comments, head_sha, author_only_logins=None):
     """Logins that authorized an override of THIS exact head.
 
     The label alone is PR-scoped and survives `synchronize`, so on its own it
@@ -620,6 +644,7 @@ def override_attestation_logins(comments, head_sha):
     it was granted for. Full SHA only, for the same reason attestations require
     one: a 7-char prefix is 28 bits and grindable.
     """
+    author_only = set(author_only_logins or [])
     logins = set()
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha or ""):
         return logins
@@ -630,7 +655,9 @@ def override_attestation_logins(comments, head_sha):
     )
     for comment in comments or []:
         login = (comment.get("user") or {}).get("login")
-        if not isinstance(login, str):
+        if not isinstance(login, str) or login in author_only:
+            # An author credential cannot authorize an override any more than
+            # it can review.
             continue
         if pattern.search(str(comment.get("body") or "")):
             logins.add(login)
@@ -647,6 +674,7 @@ def decide(
     override_label,
     permission_trusted_logins=None,
     permission_resolved_logins=None,
+    author_only_logins=None,
 ):
     """Pure decision core: returns (state, description).
 
@@ -657,7 +685,13 @@ def decide(
     # trusted as implying resolved. Keeps the authoritative-lookup rule correct
     # even if a caller supplies only the trusted set.
     permission_resolved_logins = (permission_resolved_logins or set()) | permission_trusted_logins
-    is_self_review = isinstance(pr_author_login, str) and pr_author_login in set(ally_logins)
+    author_only_logins = author_only_logins or []
+    # An author-credential login authoring a PR is a self-review author too:
+    # it is the same actor as Ally, so its PRs must demand a distinct
+    # reviewer rather than being treated as ordinary third-party work needing
+    # only an Ally verdict.
+    self_review_author_logins = set(ally_logins) | set(author_only_logins)
+    is_self_review = isinstance(pr_author_login, str) and pr_author_login in self_review_author_logins
 
     ally_signals = review_signals_for_head(
         reviews, head_sha, ally_logins, is_self_review
@@ -671,7 +705,8 @@ def decide(
             pr_author_login,
             permission_trusted_logins,
             permission_resolved_logins,
-            head_authorized_logins=override_attestation_logins(comments, head_sha),
+            head_authorized_logins=override_attestation_logins(comments, head_sha, author_only_logins),
+            author_only_logins=author_only_logins,
         )
         if is_self_review
         else []
@@ -701,7 +736,7 @@ def decide(
     # one); a comment naming the full head SHA binds that authorization to a
     # specific revision, so pushing new code revokes it automatically.
     has_label = bool(override_label) and override_label in labels
-    override_logins = override_attestation_logins(comments, head_sha)
+    override_logins = override_attestation_logins(comments, head_sha, author_only_logins)
     has_head_attestation = bool(override_logins & set(permission_trusted_logins))
     has_override = has_label and has_head_attestation
 
@@ -969,9 +1004,21 @@ def main():
         raise RuntimeError("pull_request.head.sha is required")
 
     pull_number = pull_request["number"]
-    ally_logins = parse_list(os.environ.get("ALLY_REVIEWER_LOGINS"), DEFAULT_ALLY_LOGINS)
+    configured_ally_logins = parse_list(os.environ.get("ALLY_REVIEWER_LOGINS"), DEFAULT_ALLY_LOGINS)
+    # Author credentials, held out of every trust path. Configured separately
+    # from ALLY_REVIEWER_LOGINS because removing a login from that list demotes
+    # it to an ordinary distinct reviewer rather than demoting it at all --
+    # naming it here is what actually strips its reviewer standing.
+    author_only_logins = parse_list(os.environ.get("PR_AUTHOR_ONLY_LOGINS"), DEFAULT_AUTHOR_ONLY_LOGINS)
+    author_only_login_set = set(author_only_logins)
+    # Author-only membership WINS over Ally membership, globally and
+    # unconditionally, so a config where a login is stale-listed in BOTH
+    # variables cannot let its attested APPROVED through as Ally's own signal.
+    ally_logins = [login for login in configured_ally_logins if login not in author_only_login_set]
     pr_author_login = (pull_request.get("user") or {}).get("login")
-    is_self_review = isinstance(pr_author_login, str) and pr_author_login in set(ally_logins)
+    is_self_review = isinstance(pr_author_login, str) and pr_author_login in (
+        set(ally_logins) | author_only_login_set
+    )
 
     # Claim the context as `pending` BEFORE the fallible reads below. Everything
     # from here on can raise (network, rate limit, malformed payload), and a
@@ -1030,14 +1077,16 @@ def main():
     candidates = set()
     if is_self_review:
         candidates |= set(
-            distinct_reviewer_candidate_logins(reviews, head_sha, ally_logins, pr_author_login)
+            distinct_reviewer_candidate_logins(
+                reviews, head_sha, ally_logins, pr_author_login, author_only_logins
+            )
         )
         # Head-bound authorization comments can positively bind a distinct
         # approval even without the override label, so their authors need
         # permission resolution whenever the distinct-reviewer path is live.
-        candidates |= override_attestation_logins(comments, head_sha)
+        candidates |= override_attestation_logins(comments, head_sha, author_only_logins)
     if override_label and override_label in labels:
-        candidates |= override_attestation_logins(comments, head_sha)
+        candidates |= override_attestation_logins(comments, head_sha, author_only_logins)
     if candidates:
         (
             permission_trusted_logins,
@@ -1054,6 +1103,7 @@ def main():
         override_label=override_label,
         permission_trusted_logins=permission_trusted_logins,
         permission_resolved_logins=permission_resolved_logins,
+        author_only_logins=author_only_logins,
     )
 
     # Status descriptions fit GitHub's 140-char cap, so they name the override

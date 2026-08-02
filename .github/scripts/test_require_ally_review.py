@@ -26,7 +26,10 @@ _SPEC.loader.exec_module(gate)
 
 HEAD = "79eb5909f56c8e55a14339a1662adaeea4ac863f"
 OTHER = "5b91d5289c7cdb9c91016f101dc1581cbe7bd8a5"
-ALLY = ["allyblockcast[bot]", "app/allyblockcast", "allyblockcast"]
+# Matches what main() actually passes to decide(): ALLY_REVIEWER_LOGINS with
+# author-only logins already subtracted. The bare `allyblockcast` User seat
+# lives in gate.DEFAULT_AUTHOR_ONLY_LOGINS instead -- see TestAuthorOnlyLogins.
+ALLY = ["allyblockcast[bot]", "app/allyblockcast"]
 HUMAN = "kkroo"
 OVERRIDE = "review-gate-override"
 
@@ -70,7 +73,7 @@ def override_body(sha):
 
 
 def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=None,
-           resolved=None):
+           resolved=None, author_only=None):
     return gate.decide(
         reviews=list(reviews),
         comments=list(comments),
@@ -81,6 +84,7 @@ def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=
         override_label=OVERRIDE,
         permission_trusted_logins=trusted or set(),
         permission_resolved_logins=resolved or set(),
+        author_only_logins=gate.DEFAULT_AUTHOR_ONLY_LOGINS if author_only is None else author_only,
     )
 
 
@@ -272,6 +276,77 @@ class TestSelfReview(unittest.TestCase):
             author="app/allyblockcast",
         )
         self.assertEqual(state, "failure")
+
+
+class TestAuthorOnlyLogins(unittest.TestCase):
+    """BLO-18926/BLO-18965 -- the bare `allyblockcast` User seat is an author
+    credential, not a reviewer, and must never itself produce a success signal.
+    """
+
+    def test_user_seat_approval_does_not_clear_even_with_write(self):
+        # Write is granted here on purpose: this repo grants the seat only
+        # `read` today, so without the grant the assertion would hold for the
+        # wrong reason (the permission check, not the identity demotion).
+        state, _ = decide(
+            reviews=[
+                review("COMMENTED", login="allyblockcast[bot]"),
+                review(
+                    "APPROVED",
+                    login="allyblockcast",
+                    utype="User",
+                    assoc="MEMBER",
+                    at="2026-07-27T11:00:00Z",
+                ),
+            ],
+            author="app/allyblockcast",
+            trusted={"allyblockcast"},
+        )
+        self.assertEqual(state, "pending")
+
+    def test_user_seat_cannot_attest_its_own_override(self):
+        state, _ = decide(
+            reviews=[review("COMMENTED", login="allyblockcast[bot]")],
+            comments=[comment(override_body(HEAD), login="allyblockcast")],
+            labels=[OVERRIDE],
+            author="app/allyblockcast",
+            trusted={"allyblockcast"},
+        )
+        self.assertEqual(state, "pending")
+
+    def test_consolidated_review_from_the_bot_still_clears(self):
+        # The negative control: demoting the User seat must not also demote
+        # Ally's real verdict, posted by the App.
+        state, _ = decide(reviews=[review("APPROVED", login="app/allyblockcast", body=CLEAN)])
+        self.assertEqual(state, "success")
+
+    def test_would_regress_if_the_author_only_set_were_emptied(self):
+        # Pins WHY dropping the seat from ALLY_REVIEWER_LOGINS is not a fix on
+        # its own: with author_only emptied, the seat is merely absent from
+        # the Ally set, so the distinct-identity test admits it as an ordinary
+        # reviewer and the gate clears again.
+        state, _ = decide(
+            reviews=[
+                review("COMMENTED", login="allyblockcast[bot]"),
+                review(
+                    "APPROVED",
+                    login="allyblockcast",
+                    utype="User",
+                    assoc="MEMBER",
+                    at="2026-07-27T11:00:00Z",
+                ),
+            ],
+            author="app/allyblockcast",
+            trusted={"allyblockcast"},
+            author_only=[],
+        )
+        self.assertEqual(state, "success")
+
+    def test_pr_authored_by_the_user_seat_is_also_a_self_review(self):
+        state, _ = decide(
+            reviews=[review("COMMENTED", login="allyblockcast[bot]")],
+            author="allyblockcast",
+        )
+        self.assertEqual(state, "pending")
 
 
 class TestCommentSignals(unittest.TestCase):
