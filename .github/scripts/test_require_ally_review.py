@@ -1025,6 +1025,21 @@ class TestNegatedActionRequired(unittest.TestCase):
         state, _ = decide(comments=[comment(body)])
         self.assertEqual(state, "failure")
 
+    def test_mask_span_stops_at_pivots_and_verbs(self):
+        # Review round 5 CRITICAL: the unbounded modifier run accepted every
+        # word, so a same-line pivot let the mask consume a genuine verdict
+        # ("No reviewer has responded but action required:" masked to
+        # ": ..."), flipping the gate fail-open. Modifiers now exclude
+        # adversative/discourse pivots and auxiliary verbs -- both fixtures
+        # die at "has" before even reaching the conjunction.
+        for text in (
+            "No reviewer has responded but action required: fix the gate.",
+            "No reviewer requested this but changes requested: fix the gate.",
+        ):
+            body = attest(HEAD, text)
+            state, _ = decide(comments=[comment(body)])
+            self.assertEqual(state, "failure", repr(text))
+
     def test_mask_window_does_not_cross_line_boundaries(self):
         # Review round 4 CRITICAL: with "\s+" separators the mask crossed a
         # paragraph boundary -- a bare "No" ending one paragraph erased a

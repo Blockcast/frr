@@ -76,17 +76,37 @@ ACTION_REQUIRED_COMMENT_PATTERN = re.compile(
 # optional adjective/adverb slot: "no IMMEDIATE action required", "no
 # FURTHER changes requested", "no ADDITIONAL APPLICATION SOURCE CODE
 # changes requested" -- any number of modifier words, because the span is
-# clause-bounded rather than counted: separators admit only horizontal
-# whitespace and modifiers only word characters, so the mask can never
-# cross punctuation OR a line boundary. Both bounds are load-bearing for
-# fail-closed behavior: "\s+" would let a bare "No" on its own paragraph
-# swallow a real "Action required:" verdict on the next line (erasing a
-# blocking signal), and a standalone "No." must never swallow a separate
-# affirmative sentence. Within those bounds masking is safe, since
-# deletion only removes text and no affirmative phrase can be created by
-# removing a negated one.
+# a NEGATED NOUN PHRASE rather than a counted window. Three bounds keep it
+# one, and each is load-bearing for fail-closed behavior:
+#   1. Separators admit only horizontal whitespace: "\s+" would let a bare
+#      "No" on its own paragraph swallow a real "Action required:" verdict
+#      on the next line, erasing a blocking signal.
+#   2. Modifiers admit only word characters, so punctuation ends the span
+#      and a standalone "No." cannot swallow a separate affirmative
+#      sentence.
+#   3. Modifiers exclude the span-breaker words below: adversative and
+#      discourse pivots flip the polarity of what follows ("No reviewer
+#      responded BUT action required"), and auxiliary/copular verbs end
+#      any noun phrase ("no reviewer HAS responded ..."), so hitting one
+#      means the affirmative that follows is NOT under the negation.
+# A regex cannot fully parse English -- an exotic pivot outside the list
+# would still be consumed -- but the residual exposure is narrow because
+# the affirmative pattern requires its words ADJACENT: the mask only ever
+# erases a real verdict when a pivot immediately precedes it, and the
+# common pivots (and every auxiliary verb form) are listed. Errors from
+# over-listing fall in the safe direction: an unmasked negation can at
+# worst BLOCK a clean review, never pass a blocking one, because deletion
+# only removes text and no affirmative phrase can be created by removing
+# a negated one.
+_NEGATION_SPAN_BREAKERS = (
+    "but|yet|however|though|although|whereas|while|nevertheless|"
+    "nonetheless|instead|otherwise|rather|therefore|hence|thus|"
+    "consequently|accordingly|because|since|so|then|meanwhile|"
+    "is|are|was|were|be|been|being|has|have|had|do|does|did|not"
+)
 NO_ACTION_REQUIRED_PATTERN = re.compile(
-    r"\bno(?:[ \t]+\w+)*[ \t]+(?:action|changes?)[ \t]+"
+    r"\bno(?:[ \t]+(?!(?:" + _NEGATION_SPAN_BREAKERS + r")\b)\w+)*"
+    r"[ \t]+(?:action|changes?)[ \t]+"
     r"(?:is[ \t]+|are[ \t]+|was[ \t]+|were[ \t]+)?(?:required|requested|needed)\b",
     re.IGNORECASE,
 )
