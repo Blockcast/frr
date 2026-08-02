@@ -128,7 +128,7 @@ class TestCleanCommented(unittest.TestCase):
         state, desc = decide(reviews=[review("COMMENTED", body=CLEAN)])
         self.assertEqual(state, "pending")
         self.assertIn("no blocking findings", desc)
-        self.assertIn(OVERRIDE, desc)
+        self.assertIn("App-seat APPROVED", desc)
 
     def test_clean_commented_label_alone_does_not_clear(self):
         """The label is PR-scoped and survives `synchronize`. On its own it
@@ -138,17 +138,19 @@ class TestCleanCommented(unittest.TestCase):
             reviews=[review("COMMENTED", body=CONSOLIDATED)], labels=[OVERRIDE]
         )
         self.assertEqual(state, "pending")
-        self.assertIn("review-gate-override: <full head SHA>", desc)
+        self.assertIn("Waiting for Ally review", desc)
 
-    def test_clean_commented_clears_with_label_and_head_attestation(self):
+    def test_former_override_combination_no_longer_clears(self):
+        # Round 3 of the multicast vendoring review: the label+comment
+        # override was a User-authorized success path on a context whose
+        # sole positive authority is the App seat. It now clears nothing.
         state, desc = decide(
             reviews=[review("COMMENTED", body=CONSOLIDATED)],
             comments=[comment(override_body(HEAD), login=HUMAN)],
             labels=[OVERRIDE],
             trusted={HUMAN},
         )
-        self.assertEqual(state, "success")
-        self.assertIn("overridden", desc)
+        self.assertEqual(state, "pending")
 
 
 class TestBlockingFindings(unittest.TestCase):
@@ -202,7 +204,7 @@ class TestPositiveProseIsNotAVerdict(unittest.TestCase):
         body = CONSOLIDATED + "### Recommended Action\n\nMerge.\n"
         state, desc = decide(reviews=[review("COMMENTED", body=body)])
         self.assertEqual(state, "pending")
-        self.assertIn(OVERRIDE, desc)
+        self.assertIn("App-seat APPROVED", desc)
 
 
 class TestSelfReview(unittest.TestCase):
@@ -213,7 +215,7 @@ class TestSelfReview(unittest.TestCase):
             reviews=[review("APPROVED")], author="app/allyblockcast"
         )
         self.assertEqual(state, "pending")
-        self.assertIn("not authoritative", desc)
+        self.assertIn("independent author", desc)
 
     def test_self_review_blocking_findings_still_fail_closed(self):
         body = CONSOLIDATED + "### Critical Issues (1)\n"
@@ -238,8 +240,10 @@ class TestSelfReview(unittest.TestCase):
             author="app/allyblockcast",
             trusted={HUMAN},
         )
-        self.assertEqual(state, "success")
-        self.assertIn("distinct reviewer", desc)
+        # Round 3: App-authored PRs stay pending regardless of distinct
+        # approvals; reopen the head under an independent author.
+        self.assertEqual(state, "pending")
+        self.assertIn("independent author", desc)
 
     def test_distinct_approval_trusted_via_collaborator_permission(self):
         """Branch 8 — association is CONTRIBUTOR (the visibility-gated false
@@ -257,7 +261,9 @@ class TestSelfReview(unittest.TestCase):
             author="app/allyblockcast",
             trusted={HUMAN},
         )
-        self.assertEqual(state, "success")
+        # Round 3: pending — the permission lookup still resolves trust, but
+        # a distinct approval can no longer green this context.
+        self.assertEqual(state, "pending")
 
     def test_bot_ally_identity_cannot_be_its_own_distinct_reviewer(self):
         state, _ = decide(
@@ -458,7 +464,10 @@ class TestConflictingReviewers(unittest.TestCase):
             author="app/allyblockcast",
             trusted={"reviewer-a"},
         )
-        self.assertEqual(state, "success")
+        # The later approval withdraws reviewer-a's own objection, but a
+        # surviving distinct approval maps to NO signal (round 3): pending,
+        # never success.
+        self.assertEqual(state, "pending")
 
 
 class TestOverrideIsHeadBound(unittest.TestCase):
@@ -481,7 +490,7 @@ class TestOverrideIsHeadBound(unittest.TestCase):
     def test_label_without_attestation_names_the_required_comment(self):
         state, desc = decide(labels=[OVERRIDE], trusted={HUMAN})
         self.assertEqual(state, "pending")
-        self.assertIn("review-gate-override: <full head SHA>", desc)
+        self.assertIn("Waiting for Ally review", desc)
 
     def test_attestation_without_label_does_not_clear(self):
         state, _ = decide(
@@ -771,7 +780,10 @@ class TestDistinctReviewerHeadBinding(unittest.TestCase):
             author="app/allyblockcast",
             trusted={HUMAN},
         )
-        self.assertEqual(state, "success")
+        # Round 3: distinct approvals no longer produce success anywhere;
+        # binding now only governs whether an approval may withdraw the SAME
+        # reviewer's earlier change request.
+        self.assertEqual(state, "pending")
 
     def test_authorization_comment_binds_an_empty_body_approval(self):
         state, _ = decide(
@@ -780,7 +792,7 @@ class TestDistinctReviewerHeadBinding(unittest.TestCase):
             author="app/allyblockcast",
             trusted={HUMAN},
         )
-        self.assertEqual(state, "success")
+        self.assertEqual(state, "pending")
 
     def test_authorization_by_a_different_login_does_not_bind(self):
         # The approver must bind their own approval; a third party's
@@ -1356,17 +1368,18 @@ class TestUserSeatCannotProvidePositiveEvidence(unittest.TestCase):
         state, _ = decide(reviews=[review("APPROVED")])
         self.assertEqual(state, "success")
 
-    def test_user_seat_distinct_reviewer_role_is_unchanged(self):
-        # On an App-authored PR, the User seat with verified write permission
-        # still approves via the distinct-reviewer path -- a separate,
-        # permission-checked control, not Ally self-evidence.
+    def test_user_seat_distinct_approval_cannot_green_app_authored_pr(self):
+        # Inverted per round 3 of the multicast vendoring review: the
+        # merge-token User seat (or ANY trusted distinct approval) can no
+        # longer substitute for the App signal on an App-authored PR. Such
+        # heads stay pending until reopened under an independent author.
         state, _ = decide(
             reviews=[review("APPROVED", login="allyblockcast", utype="User",
                             at="2026-07-27T11:00:00Z")],
             author="app/allyblockcast",
             trusted={"allyblockcast"},
         )
-        self.assertEqual(state, "success")
+        self.assertEqual(state, "pending")
 
 
 if __name__ == "__main__":
@@ -1677,15 +1690,15 @@ class TestOverrideMaskAmbiguity(unittest.TestCase):
             trusted={HUMAN},
         )
 
-    def test_override_refused_for_a_mask_ambiguous_review(self):
-        # Ally's exact round-7 probe: attested review whose blocking phrase
-        # the mask erased, plus the full trusted override combination.
+    def test_mask_ambiguous_review_stays_pending_despite_override_combo(self):
+        # Ally's round-7 probe: attested review whose blocking phrase the
+        # mask erased, plus the full FORMER override combination. With the
+        # override removed (round 3), nothing can clear it.
         body = attest(HEAD, self.AMBIGUOUS)
-        state, desc = self._with_override([review("COMMENTED", body=body)])
+        state, _ = self._with_override([review("COMMENTED", body=body)])
         self.assertEqual(state, "pending")
-        self.assertIn("Override refused", desc)
 
-    def test_override_refused_for_a_mask_ambiguous_comment(self):
+    def test_mask_ambiguous_comment_stays_pending_despite_override_combo(self):
         state, desc = decide(
             comments=[
                 comment(attest(HEAD, self.AMBIGUOUS)),
@@ -1695,9 +1708,8 @@ class TestOverrideMaskAmbiguity(unittest.TestCase):
             trusted={HUMAN},
         )
         self.assertEqual(state, "pending")
-        self.assertIn("Override refused", desc)
 
-    def test_override_still_clears_a_zero_count_body_with_negated_prose(self):
+    def test_zero_count_body_with_negated_prose_holds_clean_commented(self):
         # The normal clean-commented -> override flow must survive: zero
         # counts are Ally's machine-readable summary and outrank prose
         # scanning, so "No action required" alongside them is not ambiguous.
@@ -1706,12 +1718,16 @@ class TestOverrideMaskAmbiguity(unittest.TestCase):
             "### Critical Issues (0)\n\n### Important Issues (0)\n\n"
             "No action required.\n",
         )
-        state, _ = self._with_override([review("COMMENTED", body=body)])
-        self.assertEqual(state, "success")
+        state, desc = self._with_override([review("COMMENTED", body=body)])
+        # Round 3: only an App-seat APPROVED review clears; the clean-
+        # commented state holds pending even with the former override.
+        self.assertEqual(state, "pending")
+        self.assertIn("App-seat APPROVED", desc)
 
-    def test_override_still_rescues_the_reviewer_never_ran_case(self):
-        state, _ = self._with_override([])
-        self.assertEqual(state, "success")
+    def test_reviewer_never_ran_stays_pending_despite_override_combo(self):
+        state, desc = self._with_override([])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
 
     def test_ambiguity_is_not_laundered_by_machine_readable_all_clears(self):
         # Review round 8 CRITICAL 1: adding `ally-verdict: pass` or both
@@ -1726,10 +1742,9 @@ class TestOverrideMaskAmbiguity(unittest.TestCase):
             self.assertEqual(state, "pending", repr(all_clear))
             state, _ = decide(reviews=[review("COMMENTED", body=body)])
             self.assertEqual(state, "pending", repr(all_clear))
-            # ...and the trusted override still refuses the same body.
-            state, desc = self._with_override([review("COMMENTED", body=body)])
+            # ...and the former override combination clears nothing either.
+            state, _ = self._with_override([review("COMMENTED", body=body)])
             self.assertEqual(state, "pending", repr(all_clear))
-            self.assertIn("Override refused", desc)
 
     def test_masked_blocking_ambiguity_unit_matrix(self):
         cases = [
