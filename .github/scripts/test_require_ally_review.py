@@ -998,6 +998,30 @@ class TestNegatedActionRequired(unittest.TestCase):
         state, _ = decide(comments=[comment(body)])
         self.assertEqual(state, "success")
 
+    def test_multi_modifier_negations_do_not_defeat_the_mask(self):
+        # Review round 3: the mask allowed exactly zero or one modifier word
+        # between "no" and the phrase family, so ordinary multi-modifier
+        # all-clear prose ("no ADDITIONAL CODE changes requested") left the
+        # affirmative substring behind and blocked a clean review.
+        for text in (
+            "No additional code changes requested.",
+            "No immediate further action required.",
+        ):
+            body = attest(
+                HEAD,
+                text + "\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+            )
+            state, _ = decide(comments=[comment(body)])
+            self.assertEqual(state, "success", text)
+
+    def test_mask_window_does_not_cross_punctuation(self):
+        # The widened modifier window must not let a standalone "No." swallow
+        # a separate affirmative sentence: the window admits only
+        # whitespace-separated word characters, so punctuation ends it.
+        body = attest(HEAD, "No. Changes requested: fix the overflow before merge.")
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
     def test_affirmative_changes_requested_still_fails(self):
         body = attest(HEAD, "Changes requested: the overflow must be fixed first.")
         state, _ = decide(comments=[comment(body)])

@@ -74,11 +74,15 @@ ACTION_REQUIRED_COMMENT_PATTERN = re.compile(
 # fails on the second, un-negated phrase. The mask must cover every phrase
 # family the affirmative pattern matches (action AND changes, with an
 # optional adjective/adverb slot: "no IMMEDIATE action required", "no
-# FURTHER changes requested") -- masking is safe in the fail-open direction,
-# since deletion only removes text and no affirmative phrase can be created
-# by removing a negated one.
+# FURTHER changes requested", "no ADDITIONAL CODE changes requested" -- up
+# to three modifier words, since ordinary prose stacks them and a
+# too-narrow window leaves the affirmative substring behind). The window
+# cannot cross punctuation ("\s+\w+" admits neither), so a standalone
+# "No." never swallows a separate affirmative sentence. Masking is safe in
+# the fail-open direction, since deletion only removes text and no
+# affirmative phrase can be created by removing a negated one.
 NO_ACTION_REQUIRED_PATTERN = re.compile(
-    r"\bno(?:\s+\w+)?\s+(?:action|changes?)\s+"
+    r"\bno(?:\s+\w+){0,3}\s+(?:action|changes?)\s+"
     r"(?:is\s+|are\s+|was\s+|were\s+)?(?:required|requested|needed)\b",
     re.IGNORECASE,
 )
