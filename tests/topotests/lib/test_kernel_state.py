@@ -101,17 +101,20 @@ def test_check_ip_mr_cache_rejects_unreadable_procfs_on_negative_assertion():
 
 
 def test_check_ip_mr_cache_rejects_malformed_matching_row_on_negative_assertion():
-    malformed = """Group Origin Iif Pkts Bytes Wrong Oifs
-010101EF 0100000A 1 12 840 0 invalid-oif
-"""
-
-    result = check_ip_mr_cache(
-        FakeRouter(cache=malformed),
-        "10.0.0.1",
-        "239.1.1.1",
-        7,
-        expected=False,
+    malformed_rows = (
+        "010101EF 0100000A 1 12 840 0 invalid-oif",
+        "010101EF 0100000A 1 12 840 0 2:not-a-number",
+        "010101EF 0100000A invalid-iif 12 840 0 2:1",
     )
 
-    assert "kernel MFC state unavailable" in result
-    assert "invalid /proc/net/ip_mr_cache OIF" in result
+    for row in malformed_rows:
+        result = check_ip_mr_cache(
+            FakeRouter(cache="Group Origin Iif Pkts Bytes Wrong Oifs\n{}\n".format(row)),
+            "10.0.0.1",
+            "239.1.1.1",
+            7,
+            expected=False,
+        )
+
+        assert "kernel MFC state unavailable" in result
+        assert "invalid /proc/net/ip_mr_cache" in result

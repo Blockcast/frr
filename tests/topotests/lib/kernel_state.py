@@ -32,7 +32,11 @@ def parse_ip_mr_cache(output):
         fields = line.split()
         if len(fields) < 6:
             raise ValueError("invalid /proc/net/ip_mr_cache row: {}".format(line))
-        if any(":" not in oif for oif in fields[6:]):
+        if not all(re.fullmatch(r"[0-9A-Fa-f]{8}", value) for value in fields[:2]):
+            raise ValueError("invalid /proc/net/ip_mr_cache address: {}".format(line))
+        if not all(value.isdigit() for value in fields[2:6]):
+            raise ValueError("invalid /proc/net/ip_mr_cache field: {}".format(line))
+        if not all(re.fullmatch(r"\d+:\d+", oif) for oif in fields[6:]):
             raise ValueError("invalid /proc/net/ip_mr_cache OIF: {}".format(line))
         oifs = {int(oif.split(":", 1)[0]) for oif in fields[6:]}
         entries.append(
