@@ -15,6 +15,7 @@ Reads the workflow event from GITHUB_EVENT_PATH, needs GITHUB_TOKEN with
 `statuses: write`.
 """
 
+import base64
 import json
 import os
 import re
@@ -106,8 +107,24 @@ _NEGATION_SPAN_BREAKERS = (
     "consequently|accordingly|because|since|so|then|meanwhile|"
     "is|are|was|were|be|been|being|has|have|had|do|does|did|not"
 )
+# Coordinators are deliberately NOT in the breaker list above: English
+# negation legitimately distributes across them ("no issues found or changes
+# requested" is an all-clear), so breaking on them would false-fail compound
+# negated prose. But a span that DID cross a coordinator is exactly where the
+# mask can consume a real verdict ("no reviewer responded AND action
+# required"). The STRICT variants below add the coordinators; the difference
+# between the two mask outcomes is the machine-detectable ambiguity signal
+# (see masked_blocking_ambiguity).
+_NEGATION_SPAN_COORDINATORS = "and|or|nor|plus"
+_STRICT_SPAN_BREAKERS = _NEGATION_SPAN_BREAKERS + "|" + _NEGATION_SPAN_COORDINATORS
 NO_ACTION_REQUIRED_PATTERN = re.compile(
     r"\bno(?:[ \t]+(?!(?:" + _NEGATION_SPAN_BREAKERS + r")\b)\w+)*"
+    r"[ \t]+(?:action|changes?)[ \t]+"
+    r"(?:is[ \t]+|are[ \t]+|was[ \t]+|were[ \t]+)?(?:required|requested|needed)\b",
+    re.IGNORECASE,
+)
+NO_ACTION_REQUIRED_STRICT_PATTERN = re.compile(
+    r"\bno(?:[ \t]+(?!(?:" + _STRICT_SPAN_BREAKERS + r")\b)\w+)*"
     r"[ \t]+(?:action|changes?)[ \t]+"
     r"(?:is[ \t]+|are[ \t]+|was[ \t]+|were[ \t]+)?(?:required|requested|needed)\b",
     re.IGNORECASE,
@@ -134,6 +151,15 @@ NO_REQUEST_CHANGES_PATTERN = re.compile(
     r"[ \t]+request[ \t]+changes?\b)",
     re.IGNORECASE,
 )
+NO_REQUEST_CHANGES_STRICT_PATTERN = re.compile(
+    r"(?:\bno(?:[ \t]+(?!(?:" + _STRICT_SPAN_BREAKERS + r")\b)\w+)*"
+    r"[ \t]+to[ \t]+request[ \t]+changes?\b"
+    r"|\b(?:do|does|did|would|will|shall|should|could|can|must|may|might|need|dare)"
+    r"[ \t]+not[ \t]+request[ \t]+changes?\b"
+    r"|\b(?:don't|doesn't|didn't|won't|wouldn't|shan't|shouldn't|couldn't|can't|cannot|mustn't|needn't)"
+    r"[ \t]+request[ \t]+changes?\b)",
+    re.IGNORECASE,
+)
 
 
 def has_action_required_language(body):
@@ -142,44 +168,37 @@ def has_action_required_language(body):
     return ACTION_REQUIRED_COMMENT_PATTERN.search(masked) is not None
 
 
-def mask_erased_blocking(body):
-    """True when the negation masks are the ONLY thing standing between this
-    body and a blocking verdict, and no machine-readable all-clear vouches for
-    it: the affirmative pattern matches the RAW text but not the masked text,
-    and the body carries neither an explicit pass verdict nor both zero-count
-    sections.
+def masked_blocking_ambiguity(body):
+    """True when ONLY a coordinator-crossing negation span stands between this
+    body and a blocking verdict -- the machine-detectable signature of the
+    mask consuming a real verdict (review rounds 7-8).
 
-    Why this exists (review round 7): the masks cannot fully parse English, so
-    a pivot outside the breaker list ("No reviewer responded AND action
-    required: fix gate") lets the mask consume a REAL blocking phrase. Under
-    the authorization inversion that error is fail-closed on its own -- the
-    body authorizes nothing and the gate stays pending -- but the maintainer
-    override could then clear the head, laundering the mask error into green.
-    Bodies in this state are therefore flagged as ambiguous and the override
-    refuses them.
-
-    The two exemptions are deliberate, not loopholes: an explicit pass verdict
-    or both zero-count sections is Ally's own machine-readable summary of the
-    review, which outranks prose scanning everywhere else in this gate (counts
-    > 0 already outrank a pass verdict via has_blocking_count). Without the
-    exemptions every genuine all-clear containing "No action required" prose
-    would become non-overridable, breaking the normal clean-commented ->
-    override flow.
+    Mechanics: the strict masks differ from the lenient ones in exactly one
+    way -- their spans additionally break on coordinators (and/or/nor/plus).
+    Strict spans are therefore a subset of lenient spans, so only three
+    outcomes exist:
+      - affirmative survives BOTH masks  -> real blocking; the failure paths
+        own it (has_action_required_language is true) and this returns False;
+      - affirmative survives NEITHER     -> a simple negated all-clear
+        ("No action required", "no further changes requested") -- not
+        ambiguous, may authorize;
+      - affirmative survives STRICT only -> the lenient span crossed a
+        coordinator. "No reviewer responded and action required: fix gate"
+        (a pivot reading -- blocking) is indistinguishable by regex from
+        "no issues found or changes requested" (a distributed negation --
+        clean). Ambiguity resolves fail-closed: the body may not authorize
+        green and may not be cleared by the override, no matter what pass
+        verdict or zero-count sections accompany it (review round 8: a
+        machine-readable all-clear must not launder a possibly-consumed
+        blocking verdict). Cost: a genuine distributed-negation all-clear
+        lands pending until re-worded -- a false HOLD, never a false green.
     """
-    if not ACTION_REQUIRED_COMMENT_PATTERN.search(body):
-        return False
     if has_action_required_language(body):
-        # The blocking phrase SURVIVED the masks: the failure paths already
-        # handle it, and failure is never overridable.
         return False
-    if explicit_verdict(body) == "pass":
-        return False
-    if (
-        extract_issue_count(body, "Critical Issues") == 0
-        and extract_issue_count(body, "Important Issues") == 0
-    ):
-        return False
-    return True
+    strict_masked = NO_ACTION_REQUIRED_STRICT_PATTERN.sub(" ", body)
+    strict_masked = NO_REQUEST_CHANGES_STRICT_PATTERN.sub(" ", strict_masked)
+    return ACTION_REQUIRED_COMMENT_PATTERN.search(strict_masked) is not None
+
 
 # Explicit, machine-readable verdict markers. When any is present in an Ally
 # body we trust it over heuristics. Precedence: an explicit changes-requested
@@ -457,6 +476,12 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
                 continue
             if not attested:
                 continue
+            # A coordinator-ambiguous body may not authorize green no matter
+            # what pass verdict or zero counts accompany it (review round 8):
+            # the mask may have consumed a real blocking phrase, and a
+            # machine-readable all-clear must not launder that away.
+            if masked_blocking_ambiguity(body):
+                continue
             # AUTHORIZATION INVERSION (review round 5): free prose never
             # authorizes green. A clean-commented review counts only with a
             # machine-readable all-clear -- an explicit pass verdict or
@@ -683,6 +708,11 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
             )
             continue
 
+        # A coordinator-ambiguous body may not authorize green regardless of
+        # verdict or counts (review round 8; see masked_blocking_ambiguity).
+        if masked_blocking_ambiguity(body):
+            continue
+
         # Positive only on an affirmative verdict: an explicit pass, or
         # validated zero blocking counts. Silence is not consent -- a
         # consolidated body with neither is ambiguous and stays pending.
@@ -781,7 +811,7 @@ def override_attestation_logins(comments, head_sha):
 
 def ambiguous_masked_bodies_for_head(reviews, comments, head_sha, ally_logins):
     """Any head-relevant Ally body whose only escape from a blocking verdict
-    is the negation mask (see mask_erased_blocking). Head relevance mirrors
+    is the negation mask (see masked_blocking_ambiguity). Head relevance mirrors
     the BLOCKING binding rules -- commit_id or attestation for reviews, the
     consolidated/issue-link shapes for comments -- because ambiguity is a
     potential blocking signal, and blocking binds loosely by design.
@@ -796,7 +826,7 @@ def ambiguous_masked_bodies_for_head(reviews, comments, head_sha, ally_logins):
         body = str(review.get("body") or "")
         if review.get("commit_id") != head_sha and not attests_head(body, head_sha):
             continue
-        if mask_erased_blocking(body):
+        if masked_blocking_ambiguity(body):
             return True
     for comment in comments or []:
         login = (comment.get("user") or {}).get("login")
@@ -808,7 +838,7 @@ def ambiguous_masked_bodies_for_head(reviews, comments, head_sha, ally_logins):
             or is_issue_link_ally_comment_for_head(body, head_sha)
         ):
             continue
-        if mask_erased_blocking(body):
+        if masked_blocking_ambiguity(body):
             return True
     return False
 
@@ -988,26 +1018,43 @@ def _parse_ls_remote_head(output):
 def _git_pull_head_sha(owner, repo, pull_number, token):
     """Resolve refs/pull/N/head over git smart-HTTP -- a transport
     independent of the REST API plane. Returns the OID or None; never
-    raises and never echoes the tokened URL.
+    raises.
+
+    The token travels via GIT_CONFIG_* environment variables, NEVER in
+    argv: on a shared self-hosted runner /proc/<pid>/cmdline is readable
+    by same-UID processes, and subprocess exceptions embed the full
+    command (review round 8). The URL itself stays credential-free, and
+    emitted error text is redacted as a second layer in case git echoes
+    configuration back.
     """
     server = (os.environ.get("GITHUB_SERVER_URL") or "https://github.com").rstrip("/")
-    scheme, _, host = server.partition("://")
-    url = "%s://x-access-token:%s@%s/%s/%s.git" % (scheme, token, host, owner, repo)
+    url = "%s/%s/%s.git" % (server, owner, repo)
+    basic = base64.b64encode(("x-access-token:%s" % token).encode()).decode()
+
+    def redact(text):
+        return (text or "").replace(token, "***").replace(basic, "***")
+
     try:
         result = subprocess.run(
             ["git", "ls-remote", url, "refs/pull/%d/head" % pull_number],
             capture_output=True,
             text=True,
             timeout=30,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            env={
+                **os.environ,
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.%s/.extraheader" % server,
+                "GIT_CONFIG_VALUE_0": "Authorization: Basic %s" % basic,
+            },
         )
     except Exception as error:  # noqa: BLE001 - fallback is best-effort
-        print("git head fallback failed: %s" % error, file=sys.stderr)
+        print("git head fallback failed: %s" % redact(str(error)), file=sys.stderr)
         return None
     if result.returncode != 0:
         print(
             "git head fallback exited %d: %s"
-            % (result.returncode, (result.stderr or "").strip()[:200]),
+            % (result.returncode, redact((result.stderr or "").strip())[:200]),
             file=sys.stderr,
         )
         return None
@@ -1096,18 +1143,37 @@ def clamp_description(description):
 
 
 def set_commit_status(api_base_url, owner, repo, sha, token, state, description, target_url):
+    """POST the status with bounded retries. Status writes are the gate's
+    entire output: a transient REST failure that drops one turns an
+    evaluated verdict into silence, and silence in front of an earlier
+    same-head `success` is fail-open (review round 8). Retries convert
+    blip-length outages into eventual writes; a sustained outage still
+    raises, which callers escalate (crash handler -> `error` status when
+    possible, non-zero exit -> the required workflow check-run backstop
+    otherwise).
+    """
     url = "%s/repos/%s/%s/statuses/%s" % (api_base_url.rstrip("/"), owner, repo, sha)
-    _request(
-        url,
-        token,
-        method="POST",
-        payload={
-            "context": STATUS_CONTEXT,
-            "description": clamp_description(description),
-            "state": state,
-            "target_url": target_url,
-        },
-    )
+    payload = {
+        "context": STATUS_CONTEXT,
+        "description": clamp_description(description),
+        "state": state,
+        "target_url": target_url,
+    }
+    last_error = None
+    for attempt in range(_PROBE_ATTEMPTS):
+        try:
+            _request(url, token, method="POST", payload=payload)
+            return
+        except Exception as error:  # noqa: BLE001 - each attempt is fallible
+            last_error = error
+            print(
+                "status write attempt %d/%d for %s failed: %s"
+                % (attempt + 1, _PROBE_ATTEMPTS, short_sha(sha), error),
+                file=sys.stderr,
+            )
+            if attempt + 1 < _PROBE_ATTEMPTS:
+                _sleep(2 ** attempt)
+    raise last_error
 
 
 def enrich_reviews_with_edit_times(api_base_url, owner, repo, pull_number, token, reviews):
@@ -1326,8 +1392,14 @@ def main():
         token,
     )
     if not pull_request:
-        print("PR #%s could not be fetched; nothing to gate." % pull_number)
-        return
+        # An empty refetch is indistinguishable from an outage. Returning
+        # zero here would leave whatever status history the head already has
+        # as the visible truth -- fail-open when that history is a stale
+        # `success` and the early claim happened to fail. Raise instead: the
+        # crash handler escalates to `error` on the claimed head when the
+        # REST plane allows, and the non-zero exit trips the required
+        # workflow check-run backstop when it does not.
+        raise RuntimeError("PR #%s could not be fetched; refusing to gate on absence" % pull_number)
 
     if pull_request.get("state") and pull_request.get("state") != "open":
         # A delayed event can arrive after merge/close; there is no head left

@@ -10,10 +10,13 @@ Stdlib only, no network -- decide() is a pure function.
 Run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -1236,6 +1239,19 @@ class TestWorkflowContracts(unittest.TestCase):
         self.assertRegex(gate_yml, r"(?m)^\s*cancel-in-progress:\s*false\s*$")
         self.assertNotIn("cancel-in-progress: ${{", gate_yml)
 
+    def test_gate_job_name_is_the_required_backstop_check(self):
+        # Branch protection requires the check-run named after the gate job
+        # ("Ally review gate") ALONGSIDE the review/ally-complete commit
+        # status (review round 8): a run that cannot reach the REST plane
+        # cannot write any status, but its non-zero exit still reports
+        # through the Actions plane and turns this check red on
+        # pull_request_target heads -- the fail-closed backstop for
+        # REST-outage runs. Renaming the job or adding continue-on-error
+        # silently detaches it from the protection rule.
+        gate_yml = self._read("review-gate.yml")
+        self.assertRegex(gate_yml, r"(?m)^\s*name:\s*Ally review gate\s*$")
+        self.assertNotIn("continue-on-error", gate_yml)
+
     def test_selftest_push_covers_both_fleet_default_branches(self):
         # frr's default branch is master; vendored repos default to main. A
         # master-only push trigger silently never runs the post-merge
@@ -1294,7 +1310,8 @@ class TestIssueCommentCrashClaim(unittest.TestCase):
         gate._STATUS_TARGET.clear()
         self.addCleanup(gate._STATUS_TARGET.clear)
 
-    def _run(self, request_effects, git_fallback=None, expect_exit=True):
+    def _run(self, request_effects, git_fallback=None, expect_exit=True,
+             status_error=None):
         event = {
             "issue": {"number": 7, "pull_request": {"url": "x"}},
             "repository": {"full_name": "Blockcast/frr"},
@@ -1314,6 +1331,8 @@ class TestIssueCommentCrashClaim(unittest.TestCase):
         def record_status(api, owner, repo, sha, token, state, description,
                           target_url=None):
             calls.append(("status", sha, state))
+            if status_error is not None:
+                raise status_error
 
         def record_request(url, token, method="GET", payload=None):
             calls.append(("request", url))
@@ -1389,6 +1408,20 @@ class TestIssueCommentCrashClaim(unittest.TestCase):
         )
         self.assertEqual(statuses, [])
 
+    def test_status_write_failure_after_git_fallback_still_exits_nonzero(self):
+        # Review round 8 CRITICAL 2: git resolves the head but the REST plane
+        # stays down, so the pending claim AND the crash-handler error write
+        # both fail. Nothing addressed to the head can land -- the run must
+        # exit non-zero so the required workflow check-run (the Actions-plane
+        # backstop that needs no REST write from us) turns red. Both writes
+        # must still have been ATTEMPTED against the exact fallback head.
+        statuses = self._run(
+            [RuntimeError("rest down")] * 4,
+            git_fallback=HEAD,
+            status_error=RuntimeError("statuses down"),
+        )
+        self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
+
 
 class TestGitHeadFallbackParsing(unittest.TestCase):
     def test_parses_the_oid_column(self):
@@ -1399,6 +1432,59 @@ class TestGitHeadFallbackParsing(unittest.TestCase):
     def test_rejects_non_oid_output(self):
         for output in ("", "not-a-sha\trefs/pull/7/head\n", "fatal: auth failed\n"):
             self.assertIsNone(gate._parse_ls_remote_head(output), repr(output))
+
+
+class TestGitFallbackTokenHygiene(unittest.TestCase):
+    """Review round 8 Important: /proc/<pid>/cmdline is readable by same-UID
+    processes on the shared self-hosted runner, and subprocess exceptions
+    embed argv -- so the token must never appear on the git command line. It
+    travels via GIT_CONFIG_* environment variables, and any emitted error
+    text is redacted as a second layer."""
+
+    TOKEN = "sekret-token-value"
+
+    def test_token_absent_from_argv_and_present_in_env_config(self):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["env"] = kwargs.get("env") or {}
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="%s\trefs/pull/7/head\n" % HEAD, stderr=""
+            )
+
+        with mock.patch.object(gate.subprocess, "run", side_effect=fake_run):
+            sha = gate._git_pull_head_sha("Blockcast", "frr", 7, self.TOKEN)
+        self.assertEqual(sha, HEAD)
+        joined = " ".join(captured["argv"])
+        self.assertNotIn(self.TOKEN, joined)
+        self.assertNotIn("x-access-token", joined)
+        header_values = [
+            value
+            for key, value in captured["env"].items()
+            if key.startswith("GIT_CONFIG_VALUE")
+        ]
+        expected = gate.base64.b64encode(
+            ("x-access-token:%s" % self.TOKEN).encode()
+        ).decode()
+        self.assertTrue(
+            any(expected in value for value in header_values),
+            "credential must travel via GIT_CONFIG_* env: %s" % header_values,
+        )
+
+    def test_error_text_is_redacted(self):
+        def fake_run(argv, **kwargs):
+            raise RuntimeError("boom %s boom" % self.TOKEN)
+
+        stderr = io.StringIO()
+        with mock.patch.object(gate.subprocess, "run", side_effect=fake_run), \
+                contextlib.redirect_stderr(stderr):
+            self.assertIsNone(
+                gate._git_pull_head_sha("Blockcast", "frr", 7, self.TOKEN)
+            )
+        output = stderr.getvalue()
+        self.assertIn("git head fallback failed", output)
+        self.assertNotIn(self.TOKEN, output)
 
 
 class TestAuthorizationInversion(unittest.TestCase):
@@ -1547,20 +1633,51 @@ class TestOverrideMaskAmbiguity(unittest.TestCase):
         state, _ = self._with_override([])
         self.assertEqual(state, "success")
 
-    def test_mask_erased_blocking_unit_matrix(self):
+    def test_ambiguity_is_not_laundered_by_machine_readable_all_clears(self):
+        # Review round 8 CRITICAL 1: adding `ally-verdict: pass` or both
+        # zero-count headings to a mask-erased blocking body must not make it
+        # authorize. Both combinations, both signal paths.
+        for all_clear in (
+            "\n\nally-verdict: pass\n",
+            "\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        ):
+            body = attest(HEAD, self.AMBIGUOUS + all_clear)
+            state, _ = decide(comments=[comment(body)])
+            self.assertEqual(state, "pending", repr(all_clear))
+            state, _ = decide(reviews=[review("COMMENTED", body=body)])
+            self.assertEqual(state, "pending", repr(all_clear))
+            # ...and the trusted override still refuses the same body.
+            state, desc = self._with_override([review("COMMENTED", body=body)])
+            self.assertEqual(state, "pending", repr(all_clear))
+            self.assertIn("Override refused", desc)
+
+    def test_masked_blocking_ambiguity_unit_matrix(self):
         cases = [
+            # Coordinator-crossing span: the pivot reading may be blocking.
             (self.AMBIGUOUS, True),
+            # All-clears do not launder ambiguity (round 8).
+            (self.AMBIGUOUS + "\nally-verdict: pass", True),
+            (
+                self.AMBIGUOUS
+                + "\n### Critical Issues (0)\n### Important Issues (0)\n",
+                True,
+            ),
+            # Distributed negation across a coordinator is regex-
+            # indistinguishable from the pivot reading: a false HOLD by
+            # design, never a false green.
+            ("No issues found or changes requested.", True),
             # Surviving blocking phrase: the failure paths own it.
             ("Action required: fix the gate.", False),
-            # Machine-readable all-clears outrank prose scanning.
-            (
-                "No action required.\n### Critical Issues (0)\n"
-                "### Important Issues (0)\n",
-                False,
-            ),
-            ("ally-verdict: pass\nNo action required.", False),
+            # Simple negated all-clears mask under BOTH variants.
+            ("No action required.", False),
+            ("No further changes requested.", False),
+            # Per-conjunct negation re-states "no", so strict spans never
+            # need to cross the coordinator.
+            ("No critical issues and no changes requested.", False),
             # No affirmative vocabulary at all.
             ("Looks good overall.", False),
         ]
         for text, expected in cases:
-            self.assertEqual(gate.mask_erased_blocking(text), expected, repr(text))
+            self.assertEqual(
+                gate.masked_blocking_ambiguity(text), expected, repr(text)
+            )
