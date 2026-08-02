@@ -36,12 +36,17 @@
 /* IPv6 (RFC 6515): RD(8) + OriginatingRouterIP(16) = 24 octets. */
 #define BGP_MVPN_TYPE1_V6_SPEC_LEN 24
 
-/* RFC 6514 Section 4.3: RD + C-S + C-G + originating-router address. */
+/* RFC 6514 Section 4.3: RD + C-S + C-G + originating-router address.
+ * These are the same-family endpoints; RFC 6515 also permits an IPv4
+ * originator in the IPv6 MVPN AF, whose Type-3 body is 46 octets. */
 #define BGP_MVPN_TYPE3_V4_SPEC_LEN 22
+#define BGP_MVPN_TYPE3_V6_V4_SPEC_LEN 46
 #define BGP_MVPN_TYPE3_V6_SPEC_LEN 58
 
-/* RFC 6514 Section 4.4: complete Type-3 NLRI route key + leaf originator. */
+/* RFC 6514 Section 4.4: complete Type-3 NLRI route key + leaf originator.
+ * The common IPv6-(S,G), IPv4-router-id shape is 52 octets. */
 #define BGP_MVPN_TYPE4_V4_SPEC_LEN 28
+#define BGP_MVPN_TYPE4_V6_V4_SPEC_LEN 52
 #define BGP_MVPN_TYPE4_V6_SPEC_LEN 76
 
 /*

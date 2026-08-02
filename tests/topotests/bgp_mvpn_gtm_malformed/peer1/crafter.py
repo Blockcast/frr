@@ -42,11 +42,7 @@ SAFI_MCAST_VPN = 5
 MVPN_TYPE3 = 3
 MVPN_TYPE4 = 4
 MVPN_TYPE5 = 5
-MVPN_TYPE3_SPEC_LEN = 22
-MVPN_TYPE4_SPEC_LEN = 28
-MVPN_TYPE5_SPEC_LEN = 18
-MVPN_TYPE3_V6_SPEC_LEN = 58
-MVPN_TYPE4_V6_SPEC_LEN = 76
+MVPN_TYPE1 = 1
 IPV4_BITLEN = 32
 IPV6_BITLEN = 128
 PMSI_FLAG_LEAF_INFO_REQUIRED = 1
@@ -71,8 +67,11 @@ RECOVER_SRC = "10.40.40.1"
 RECOVER_GRP = "232.40.40.1"   # valid SSM; trailing NLRI after a malformed one
 V6_SELECTIVE_SRC = "2001:db8:30::1"
 V6_SELECTIVE_GRP = "ff3e::30"
-V6_TYPE3_ORIGINATOR = "2001:db8:ffff::2"
-V6_TYPE4_LEAF = "2001:db8:ffff::3"
+V6_TYPE3_ORIGINATOR = "10.0.0.2"
+V6_TYPE4_LEAF = "10.0.0.3"
+V6_RECOVER_SRC = "2001:db8:40::1"
+V6_RECOVER_GRP = "ff3e::40"
+REFLECTED_TYPE1_ORIGINATOR = "10.0.0.1"
 
 
 def build_open(local_as, router_id):
@@ -104,14 +103,20 @@ def build_keepalive():
 
 def _type5_nlri(rd, src, grp):
     """MVPN Type-5 NLRI: RouteType, Length, RD(8), SrcLen, Src, GrpLen, Grp."""
-    return (
-        struct.pack("!BB", MVPN_TYPE5, MVPN_TYPE5_SPEC_LEN)
-        + rd
-        + struct.pack("!B", IPV4_BITLEN)
-        + socket.inet_aton(src)
-        + struct.pack("!B", IPV4_BITLEN)
-        + socket.inet_aton(grp)
+    bitlen = IPV6_BITLEN if ":" in src else IPV4_BITLEN
+    body = (
+        rd
+        + struct.pack("!B", bitlen)
+        + _packed_addr(src)
+        + struct.pack("!B", bitlen)
+        + _packed_addr(grp)
     )
+    return struct.pack("!BB", MVPN_TYPE5, len(body)) + body
+
+
+def _type1_nlri(rd, originator):
+    body = rd + _packed_addr(originator)
+    return struct.pack("!BB", MVPN_TYPE1, len(body)) + body
 
 
 def _packed_addr(address):
@@ -121,8 +126,6 @@ def _packed_addr(address):
 
 def _type3_nlri(rd, src, grp, originator, length=None):
     v6 = ":" in src
-    if length is None:
-        length = MVPN_TYPE3_V6_SPEC_LEN if v6 else MVPN_TYPE3_SPEC_LEN
     bitlen = IPV6_BITLEN if v6 else IPV4_BITLEN
     body = (
         rd
@@ -132,20 +135,15 @@ def _type3_nlri(rd, src, grp, originator, length=None):
         + _packed_addr(grp)
         + _packed_addr(originator)
     )
+    if length is None:
+        length = len(body)
     return struct.pack("!BB", MVPN_TYPE3, length) + body
 
 
 def _type4_nlri(rd, src, grp, originator, leaf, nested_length=None):
-    v6 = ":" in src
     route_key = _type3_nlri(rd, src, grp, originator, nested_length)
-    return (
-        struct.pack(
-            "!BB", MVPN_TYPE4,
-            MVPN_TYPE4_V6_SPEC_LEN if v6 else MVPN_TYPE4_SPEC_LEN,
-        )
-        + route_key
-        + _packed_addr(leaf)
-    )
+    body = route_key + _packed_addr(leaf)
+    return struct.pack("!BB", MVPN_TYPE4, len(body)) + body
 
 
 def build_mvpn_update(
@@ -289,15 +287,23 @@ def main():
             _type3_nlri(zero_rd, NO_PMSI_SRC, NO_PMSI_GRP, TYPE3_ORIGINATOR),
         )
     )
-    # G: dual-stack codec controls in AFI 2, including 16-byte originators.
+    # G: dual-stack codec controls in AFI 2 with IPv4 router-id originators.
     sock.sendall(
         build_mvpn_update(
             "2001:db8:1::2",
             _type3_nlri(
                 zero_rd, V6_SELECTIVE_SRC, V6_SELECTIVE_GRP,
                 V6_TYPE3_ORIGINATOR,
-            ),
+            ) + _type5_nlri(zero_rd, V6_RECOVER_SRC, V6_RECOVER_GRP),
             afi=AFI_IP6,
+            include_pmsi=True,
+        )
+    )
+    # G2: a reflected local Type-1 must not coexist with the self route.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type1_nlri(zero_rd, REFLECTED_TYPE1_ORIGINATOR),
             include_pmsi=True,
         )
     )
@@ -333,7 +339,7 @@ def main():
                 MALFORMED_GRP,
                 TYPE3_ORIGINATOR,
                 TYPE4_LEAF,
-                nested_length=MVPN_TYPE3_SPEC_LEN - 1,
+                nested_length=21,
             ),
         )
     )
@@ -351,7 +357,7 @@ def main():
                 MALFORMED_GRP,
                 TYPE3_ORIGINATOR,
                 TYPE4_LEAF,
-                nested_length=MVPN_TYPE3_SPEC_LEN - 1,
+                nested_length=21,
             )
             + _type5_nlri(zero_rd, RECOVER_SRC, RECOVER_GRP),
         )
