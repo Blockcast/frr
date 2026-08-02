@@ -27,25 +27,22 @@ def parse_ip_mr_cache(output):
 
     entries = []
     for line in lines[1:]:
+        if not line.strip():
+            continue
         fields = line.split()
         if len(fields) < 6:
-            continue
-        try:
-            oifs = {
-                int(oif.split(":", 1)[0])
-                for oif in fields[6:]
-                if ":" in oif
+            raise ValueError("invalid /proc/net/ip_mr_cache row: {}".format(line))
+        if any(":" not in oif for oif in fields[6:]):
+            raise ValueError("invalid /proc/net/ip_mr_cache OIF: {}".format(line))
+        oifs = {int(oif.split(":", 1)[0]) for oif in fields[6:]}
+        entries.append(
+            {
+                "group": _proc_ipv4(fields[0]),
+                "source": _proc_ipv4(fields[1]),
+                "iif": int(fields[2]),
+                "oifs": oifs,
             }
-            entries.append(
-                {
-                    "group": _proc_ipv4(fields[0]),
-                    "source": _proc_ipv4(fields[1]),
-                    "iif": int(fields[2]),
-                    "oifs": oifs,
-                }
-            )
-        except ValueError:
-            continue
+        )
     return entries
 
 
