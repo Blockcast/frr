@@ -666,10 +666,10 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
         body = str(comment.get("body") or "")
         if not isinstance(login, str) or login not in ally:
             continue
-        # Same App-seat rule as the review path (see review_signals_for_head):
-        # only `user.type == "Bot"` may contribute POSITIVE evidence; blocking
-        # evidence below stays identity-agnostic.
-        is_app_seat = user.get("type") == "Bot"
+        # No seat check here any more: since round 2 of this PR's review the
+        # comment path carries no positive branch, and its blocking evidence
+        # is deliberately identity-agnostic (any Ally-login seat may fail
+        # the gate, no seat may green it from a comment).
 
         is_consolidated = is_consolidated_ally_comment_for_head(body, head_sha)
         is_issue_link = is_issue_link_ally_comment_for_head(body, head_sha)
@@ -677,10 +677,10 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
             continue
 
         # Order on the LATER of created_at/updated_at. GitHub keeps created_at
-        # immutable across edits, so an older clean comment edited to add
-        # blocking findings would otherwise keep losing latest_signal() to a
-        # newer clean signal and leave the gate green on a review that now says
-        # the opposite.
+        # immutable across edits, so an older comment edited to add blocking
+        # findings would otherwise carry a stale timestamp and lose
+        # latest_signal() to an earlier formal approval, leaving the gate
+        # green on a body that now says the opposite.
         at = comment_signal_time(comment)
 
         # Self-review cannot approve its own PR, but machine-readable blocking
@@ -730,31 +730,16 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
 
         # A coordinator-ambiguous body may not authorize green regardless of
         # verdict or counts (review round 8; see masked_blocking_ambiguity).
-        if masked_blocking_ambiguity(body):
-            continue
-
-        # Positive only on an affirmative verdict from the App seat: an
-        # explicit pass, or validated zero blocking counts. Silence is not
-        # consent -- a consolidated body with neither is ambiguous and stays
-        # pending -- and a User-seat all-clear contributes nothing here.
-        if not is_app_seat:
-            continue
-        has_zero_counts = (
-            extract_issue_count(body, "Critical Issues") == 0
-            and extract_issue_count(body, "Important Issues") == 0
-        )
-        if verdict != "pass" and not has_zero_counts:
-            continue
-
-        signals.append(
-            {
-                "at": at,
-                "author": login,
-                "description": "Ally clean comment on head %s." % short_head,
-                "kind": "ally-comment",
-                "status": "success",
-            }
-        )
+        # Round 2 of this PR's review removed the comment path's positive
+        # branch entirely: a clean consolidated comment used to emit
+        # `success`, which let an issue comment green `review/ally-complete`
+        # with no formal review having happened, and let a later clean
+        # comment out-rank an earlier formal blocking signal through
+        # latest_signal(). Comments now contribute ONLY blocking evidence
+        # (the failure appends above); the sole producer of `success` on
+        # this context is the formal exact-head App-seat APPROVED branch in
+        # review_signals_for_head. A clean comment is therefore inert here
+        # -- it neither greens the gate nor withdraws a standing signal.
 
     return signals
 

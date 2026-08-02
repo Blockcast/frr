@@ -291,11 +291,16 @@ class TestSelfReview(unittest.TestCase):
 
 
 class TestCommentSignals(unittest.TestCase):
-    """Consolidated / issue-link comments count as signals for the head."""
+    """Consolidated / issue-link comments contribute BLOCKING signals only.
 
-    def test_consolidated_comment_with_zero_counts_is_clean(self):
-        state, _ = decide(comments=[comment(CLEAN)])
-        self.assertEqual(state, "success")
+    Round 2 of this PR's review removed the comment path's positive branch:
+    a clean consolidated comment used to return `success`, which let an
+    issue comment green the gate with no formal review having happened."""
+
+    def test_consolidated_clean_comment_is_inert(self):
+        state, desc = decide(comments=[comment(CLEAN)])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
 
     def test_consolidated_comment_without_a_verdict_stays_pending(self):
         """Silence is not consent: no pass verdict and no zero counts is
@@ -358,8 +363,12 @@ class TestFullShaAttestation(unittest.TestCase):
         self.assertIn("Waiting for Ally review", desc)
 
     def test_full_sha_comment_counts(self):
-        state, _ = decide(comments=[comment(CLEAN)])
-        self.assertEqual(state, "success")
+        # Positive comment evidence is inert since round 2 of this PR's
+        # review, so full-SHA attestation recognition is pinned through the
+        # blocking path: an unrecognized comment could not fail the gate.
+        body = attest(HEAD, "### Critical Issues (2)\n")
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
 
 
 class TestCommitIdIsNotProofOfCoverage(unittest.TestCase):
@@ -542,7 +551,11 @@ class TestEditedCommentOrdering(unittest.TestCase):
         )
         self.assertEqual(state, "failure")
 
-    def test_unedited_ordering_is_unchanged(self):
+    def test_later_clean_comment_cannot_clear_blocking_comment(self):
+        # Inverted in round 2 of this PR's review: a newer clean comment used
+        # to supersede an older blocking one via latest_signal(). Clean
+        # comments are inert now, so the blocking signal stands until a
+        # formal App-seat APPROVED review of this head supersedes it.
         blocking = CONSOLIDATED + "### Important Issues (1)\n"
         state, _ = decide(
             comments=[
@@ -550,7 +563,7 @@ class TestEditedCommentOrdering(unittest.TestCase):
                 comment(CLEAN, at="2026-07-27T12:00:00Z"),
             ]
         )
-        self.assertEqual(state, "success")
+        self.assertEqual(state, "failure")
 
     def test_missing_updated_at_falls_back_to_created_at(self):
         self.assertEqual(
@@ -599,25 +612,39 @@ class TestQualifiedMergeVerdicts(unittest.TestCase):
     Merge. A loose prefix match laundered 'Merge only after requested changes
     are addressed' into a clean signal that cleared the gate."""
 
-    def _comment_state(self, verdict_line):
+    def _review_state(self, verdict_line):
         body = attest(HEAD, "### Recommended Action\n\n%s\n" % verdict_line)
-        state, _ = decide(comments=[comment(body)])
-        return state
+        return decide(reviews=[review("COMMENTED", body=body)])
 
     def test_standalone_merge_is_a_pass(self):
-        self.assertEqual(self._comment_state("Merge."), "success")
+        # Round 2 of this PR's review made the comment path positive-inert,
+        # so the verdict matcher's discrimination shows on the review path:
+        # a standalone Merge lands the clean-commented pending, a qualified
+        # Merge contributes no clean signal at all.
+        state, desc = self._review_state("Merge.")
+        self.assertEqual(state, "pending")
+        self.assertIn("no blocking findings", desc)
 
     def test_merge_only_after_changes_is_not_a_pass(self):
-        self.assertEqual(
-            self._comment_state("Merge only after requested changes are addressed."),
-            "pending",
+        state, desc = self._review_state(
+            "Merge only after requested changes are addressed."
         )
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+
+    def test_merge_verdict_comment_is_inert(self):
+        body = attest(HEAD, "### Recommended Action\n\nMerge.\n")
+        state, desc = decide(comments=[comment(body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
 
     def test_merge_after_fixes_is_not_a_pass(self):
-        self.assertEqual(self._comment_state("Merge after fixes"), "pending")
+        state, _ = self._review_state("Merge after fixes")
+        self.assertEqual(state, "pending")
 
     def test_merge_must_be_blocked_is_not_a_pass(self):
-        self.assertEqual(self._comment_state("Merge must be blocked"), "pending")
+        state, _ = self._review_state("Merge must be blocked")
+        self.assertEqual(state, "pending")
 
 
 class TestDescriptionLength(unittest.TestCase):
@@ -703,9 +730,13 @@ class TestContradictoryCounts(unittest.TestCase):
         self.assertEqual(state, "failure")
 
     def test_duplicate_zero_headings_stay_clean(self):
+        # Via the review path since round 2 of this PR's review: the
+        # clean-commented description proves the duplicate zero headings
+        # were read as clean, which a positive-inert comment cannot show.
         body = CLEAN + "\n### Critical Issues (0)\n"
-        state, _ = decide(comments=[comment(body)])
-        self.assertEqual(state, "success")
+        state, desc = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("no blocking findings", desc)
 
 
 class TestSameTimestampTies(unittest.TestCase):
@@ -985,21 +1016,28 @@ class TestNegatedActionRequired(unittest.TestCase):
     affirmative in the same body must still fail."""
 
     def test_no_action_required_comment_is_not_a_failure(self):
+        # The mask's only job is preventing a false FAILURE from negated
+        # prose. On the (positive-inert) comment path that shows as pending
+        # rather than failure; on the review path the clean-commented
+        # description additionally proves the body was read as clean.
         body = attest(
             HEAD,
             "No action required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
         )
         state, description = decide(comments=[comment(body)])
-        self.assertEqual(state, "success")
-        self.assertIn("clean comment", description)
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", description)
+        state, description = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("no blocking findings", description)
 
     def test_no_further_action_required_variant(self):
         body = attest(
             HEAD,
             "No further action is required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
         )
-        state, _ = decide(comments=[comment(body)])
-        self.assertEqual(state, "success")
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
 
     def test_no_changes_requested_is_not_a_failure(self):
         # Review round 2: the mask covered only the "action required" phrase
@@ -1009,24 +1047,24 @@ class TestNegatedActionRequired(unittest.TestCase):
             HEAD,
             "No changes requested.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
         )
-        state, _ = decide(comments=[comment(body)])
-        self.assertEqual(state, "success")
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
 
     def test_adverb_does_not_defeat_the_mask(self):
         body = attest(
             HEAD,
             "No immediate action required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
         )
-        state, _ = decide(comments=[comment(body)])
-        self.assertEqual(state, "success")
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
 
     def test_no_changes_needed_variant(self):
         body = attest(
             HEAD,
             "No changes are needed.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
         )
-        state, _ = decide(comments=[comment(body)])
-        self.assertEqual(state, "success")
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
 
     def test_multi_modifier_negations_do_not_defeat_the_mask(self):
         # Review rounds 3-4: the mask first allowed exactly zero or one
@@ -1044,8 +1082,8 @@ class TestNegatedActionRequired(unittest.TestCase):
                 HEAD,
                 text + "\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
             )
-            state, _ = decide(comments=[comment(body)])
-            self.assertEqual(state, "success", text)
+            state, _ = decide(reviews=[review("COMMENTED", body=body)])
+            self.assertEqual(state, "pending", text)
 
     def test_mask_window_does_not_cross_punctuation(self):
         # The clause-bounded window must not let a standalone "No." swallow
@@ -1382,9 +1420,6 @@ class TestUserSeatCannotProvidePositiveEvidence(unittest.TestCase):
         self.assertEqual(state, "pending")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestIssueCommentCrashClaim(unittest.TestCase):
     """Review round 5 CRITICAL 2 / round 7 CRITICAL 2: issue_comment payloads
@@ -1660,15 +1695,18 @@ class TestPassBlockingContradiction(unittest.TestCase):
 
     def test_pass_plus_negated_prose_stays_clean(self):
         # The mask still protects genuinely negated prose alongside a pass:
-        # only SURVIVING affirmative phrases contradict. Comment path clears
-        # outright; the review path lands the clean-commented pending.
+        # only SURVIVING affirmative phrases contradict. The comment path is
+        # positive-inert (pending, not failure); the review path lands the
+        # clean-commented pending.
         body = attest(
             HEAD, "### Recommended Action\n\nMerge.\n\nNo action required.\n"
         )
-        state, _ = decide(comments=[comment(body)])
-        self.assertEqual(state, "success")
-        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        state, desc = decide(comments=[comment(body)])
         self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+        state, desc = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("no blocking findings", desc)
 
 
 class TestOverrideMaskAmbiguity(unittest.TestCase):
@@ -1776,3 +1814,68 @@ class TestOverrideMaskAmbiguity(unittest.TestCase):
             self.assertEqual(
                 gate.masked_blocking_ambiguity(text), expected, repr(text)
             )
+
+
+class TestSuccessExclusivity(unittest.TestCase):
+    """Round 2 of this PR's review: `success` has exactly ONE producer -- the
+    formal exact-head App-seat APPROVED review. Every other positive-looking
+    shape of Ally evidence lands pending, and positive comment evidence is
+    inert entirely. This is the machine-checkable form of the sole-authority
+    invariant this change claims."""
+
+    def test_only_a_formal_app_seat_approval_returns_success(self):
+        cases = [
+            ("formal-app-seat-approved",
+             dict(reviews=[review("APPROVED")]), "success"),
+            ("clean-commented-review",
+             dict(reviews=[review("COMMENTED", body=CLEAN)]), "pending"),
+            ("clean-consolidated-comment",
+             dict(comments=[comment(CLEAN)]), "pending"),
+            ("pass-verdict-comment",
+             dict(comments=[comment(
+                 attest(HEAD, "### Recommended Action\n\nMerge.\n"))]),
+             "pending"),
+            ("user-seat-approval",
+             dict(reviews=[review("APPROVED", login="allyblockcast",
+                                  utype="User")]), "pending"),
+            ("unattested-app-approval",
+             dict(reviews=[review("APPROVED", body=attest(OTHER))]), "pending"),
+            ("app-self-approval",
+             dict(reviews=[review("APPROVED")], author="app/allyblockcast"),
+             "pending"),
+            ("trusted-distinct-approval-on-app-authored-pr",
+             dict(reviews=[review("APPROVED", login=HUMAN, utype="User")],
+                  author="app/allyblockcast", trusted={HUMAN}), "pending"),
+        ]
+        for name, kwargs, expected in cases:
+            state, _ = decide(**kwargs)
+            self.assertEqual(state, expected, name)
+
+    def test_later_clean_comment_cannot_outrank_a_formal_blocking_review(self):
+        # The round-2 Critical's second half: latest_signal() must never let
+        # a clean comment supersede formal blocking evidence. Inert positive
+        # comments cannot -- the blocking review stays the newest signal.
+        state, _ = decide(
+            reviews=[review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z")],
+            comments=[comment(CLEAN, at="2026-07-27T12:00:00Z")],
+        )
+        self.assertEqual(state, "failure")
+
+    def test_later_clean_comment_does_not_withdraw_a_formal_approval(self):
+        state, _ = decide(
+            reviews=[review("APPROVED", at="2026-07-27T09:00:00Z")],
+            comments=[comment(CLEAN, at="2026-07-27T12:00:00Z")],
+        )
+        self.assertEqual(state, "success")
+
+    def test_later_blocking_comment_still_fails_over_a_formal_approval(self):
+        state, _ = decide(
+            reviews=[review("APPROVED", at="2026-07-27T09:00:00Z")],
+            comments=[comment(attest(HEAD, "### Critical Issues (1)\n"),
+                              at="2026-07-27T12:00:00Z")],
+        )
+        self.assertEqual(state, "failure")
+
+
+if __name__ == "__main__":
+    unittest.main()
