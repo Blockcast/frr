@@ -116,7 +116,9 @@ class TestCleanCommented(unittest.TestCase):
     """Branch 3 — Ally only ever COMMENTs, so a clean comment must NOT auto-pass."""
 
     def test_clean_commented_holds_pending_and_names_the_label(self):
-        state, desc = decide(reviews=[review("COMMENTED", body=CONSOLIDATED)])
+        # CLEAN (zero counts), not bare CONSOLIDATED prose: the inversion
+        # requires a machine-readable all-clear for the review to count.
+        state, desc = decide(reviews=[review("COMMENTED", body=CLEAN)])
         self.assertEqual(state, "pending")
         self.assertIn("no blocking findings", desc)
         self.assertIn(OVERRIDE, desc)
@@ -563,7 +565,7 @@ class TestEditedReviewOrdering(unittest.TestCase):
         state, _ = decide(
             reviews=[
                 review("COMMENTED", body=blocking, at="2026-07-27T09:00:00Z"),
-                review("COMMENTED", body=CONSOLIDATED, at="2026-07-27T12:00:00Z"),
+                review("COMMENTED", body=CLEAN, at="2026-07-27T12:00:00Z"),
             ]
         )
         self.assertEqual(state, "pending")  # newest is clean-commented
@@ -804,7 +806,9 @@ class TestApprovalAndRecency(unittest.TestCase):
         self.assertNotEqual(state, "failure")
 
     def test_latest_signal_wins(self):
-        clean = CONSOLIDATED
+        # Under the authorization inversion the newest review only counts as
+        # clean via machine-readable zero counts (CLEAN), not bare prose.
+        clean = CLEAN
         blocking = CONSOLIDATED + "### Important Issues (1)\n"
         state, _ = decide(
             reviews=[
@@ -1264,3 +1268,115 @@ class TestWorkflowContracts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIssueCommentCrashClaim(unittest.TestCase):
+    """Review round 5 CRITICAL 2: issue_comment payloads carry no
+    pull_request.head.sha, so a refetch crash previously skipped the `error`
+    write and left an earlier same-head `success` standing -- fail-open on
+    exactly the events (comment edit/delete) that can REMOVE the evidence
+    behind a green gate. main() now probes the head FIRST and claims it, so
+    the crash handler always has an addressable commit; a failed probe fails
+    the run visibly instead of returning silently."""
+
+    def setUp(self):
+        gate._STATUS_TARGET.clear()
+        self.addCleanup(gate._STATUS_TARGET.clear)
+
+    def _run(self, request_effects):
+        event = {
+            "issue": {"number": 7, "pull_request": {"url": "x"}},
+            "repository": {"full_name": "Blockcast/frr"},
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+            event_path = handle.name
+        self.addCleanup(os.unlink, event_path)
+        env = {
+            "GITHUB_EVENT_PATH": event_path,
+            "GITHUB_REPOSITORY": "Blockcast/frr",
+            "GITHUB_TOKEN": "test-token",
+        }
+        calls = []
+        effects = list(request_effects)
+
+        def record_status(api, owner, repo, sha, token, state, description,
+                          target_url=None):
+            calls.append(("status", sha, state))
+
+        def record_request(url, token, method="GET", payload=None):
+            calls.append(("request", url))
+            effect = effects.pop(0) if effects else None
+            if isinstance(effect, Exception):
+                raise effect
+            return effect
+
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "_request", side_effect=record_request), \
+                mock.patch.object(gate, "set_commit_status", side_effect=record_status), \
+                mock.patch.object(gate, "fetch_paginated", return_value=[]), \
+                mock.patch.object(gate, "enrich_reviews_with_edit_times"):
+            with self.assertRaises(SystemExit) as caught:
+                gate.run()
+        self.assertEqual(caught.exception.code, 1)
+        return [(c[1], c[2]) for c in calls if c[0] == "status"]
+
+    def test_refetch_crash_after_probe_posts_error_to_probed_head(self):
+        probe = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+        }
+        statuses = self._run([probe, RuntimeError("refetch boom")])
+        self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
+
+    def test_probe_failure_fails_the_run_instead_of_returning_silently(self):
+        statuses = self._run([None])
+        self.assertEqual(statuses, [])
+
+
+class TestAuthorizationInversion(unittest.TestCase):
+    """Review round 5 CRITICAL 1: prose must never authorize green. The
+    conjunction probes below defeat the negation mask by construction (an
+    unlisted pivot can always exist) -- under the inversion that mask error
+    can no longer authorize anything, because a review without an explicit
+    pass verdict or machine-readable zero counts contributes no clean
+    signal. NOT-success is the fail-closed contract here; the negation mask
+    only prevents false failures."""
+
+    def test_conjunction_probes_cannot_authorize_green(self):
+        for text in (
+            "No reviewer responded and action required: fix the gate.",
+            "No reviewer replied or changes requested: fix the gate.",
+        ):
+            body = attest(HEAD, text)
+            state, _ = decide(reviews=[review("COMMENTED", body=body)])
+            self.assertNotEqual(state, "success", repr(text))
+            state, _ = decide(comments=[comment(body)])
+            self.assertNotEqual(state, "success", repr(text))
+
+    def test_bare_prose_review_no_longer_authorizes(self):
+        # The pre-inversion behavior: an attested body whose only signal is
+        # the ABSENCE of blocking prose. Silence is not authorization.
+        body = attest(HEAD, "Looks good overall.")
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+
+    def test_negated_request_changes_family_masks(self):
+        # Review round 5 Important: the "request changes" affirmative family
+        # was scanned but had no negated forms in the mask, so clean prose
+        # blocked. With CLEAN counts present these must authorize.
+        for text in (
+            "No need to request changes.",
+            "We do not request changes.",
+        ):
+            self.assertFalse(
+                gate.has_action_required_language(text), repr(text)
+            )
+            body = attest(
+                HEAD,
+                text + "\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+            )
+            state, _ = decide(reviews=[review("COMMENTED", body=body)])
+            self.assertEqual(state, "pending", repr(text))

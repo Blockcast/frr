@@ -112,8 +112,28 @@ NO_ACTION_REQUIRED_PATTERN = re.compile(
 )
 
 
+# The "request changes" affirmative family (scanned above) has its own
+# negated shapes the noun-phrase mask cannot reach: an infinitive after a
+# negated noun phrase ("no need to request changes") and direct verb
+# negation ("we do not request changes", "we won't request changes").
+# Same clause bounds as the main mask; same fail-closed footing -- under
+# the authorization inversion a mask error can only cause a false
+# failure-or-pending, never a false green.
+NO_REQUEST_CHANGES_PATTERN = re.compile(
+    r"(?:\bno(?:[ \t]+(?!(?:" + _NEGATION_SPAN_BREAKERS + r")\b)\w+)*"
+    r"[ \t]+to[ \t]+request[ \t]+changes?\b"
+    r"|\b(?:do|does|did|would|will|shall|should|could|can|must|may|might)"
+    r"[ \t]+not[ \t]+request[ \t]+changes?\b"
+    r"|\b(?:don't|doesn't|didn't|won't|wouldn't|shan't|shouldn't|couldn't|can't|cannot|mustn't)"
+    r"[ \t]+request[ \t]+changes?\b)",
+    re.IGNORECASE,
+)
+
+
 def has_action_required_language(body):
-    return ACTION_REQUIRED_COMMENT_PATTERN.search(NO_ACTION_REQUIRED_PATTERN.sub(" ", body)) is not None
+    masked = NO_ACTION_REQUIRED_PATTERN.sub(" ", body)
+    masked = NO_REQUEST_CHANGES_PATTERN.sub(" ", masked)
+    return ACTION_REQUIRED_COMMENT_PATTERN.search(masked) is not None
 
 # Explicit, machine-readable verdict markers. When any is present in an Ally
 # body we trust it over heuristics. Precedence: an explicit changes-requested
@@ -387,6 +407,21 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
                 )
                 continue
             if not attested:
+                continue
+            # AUTHORIZATION INVERSION (review round 5): free prose never
+            # authorizes green. A clean-commented review counts only with a
+            # machine-readable all-clear -- an explicit pass verdict or
+            # BOTH zero-count sections. This removes the fail-open class
+            # where the negation mask over-consumed a real blocking phrase:
+            # a masked-away affirmative can now at worst leave the body
+            # unauthorized (pending), never authorize it. The masks' only
+            # remaining job is preventing false FAILURE from negated
+            # prose, so every mask error lands fail-closed.
+            has_zero_counts = (
+                extract_issue_count(body, "Critical Issues") == 0
+                and extract_issue_count(body, "Important Issues") == 0
+            )
+            if verdict != "pass" and not has_zero_counts:
                 continue
             signals.append(
                 {
@@ -1024,6 +1059,27 @@ def main():
     # authoritative path gets its turn.
     payload_pr = event.get("pull_request") or {}
     payload_head = (payload_pr.get("head") or {}).get("sha")
+    if not payload_head:
+        # issue_comment payloads carry no pull_request.head.sha, so without
+        # this probe the crash handler has no addressable commit: a refetch
+        # crash would skip the `error` write and leave an earlier same-head
+        # `success` standing -- fail-open on exactly the events that can
+        # REMOVE the evidence behind a green gate (comment edits/deletes).
+        # Resolve the head with a minimal fetch BEFORE any fallible
+        # processing so this path gets the same fail-closed claim as
+        # pull_request payloads. If even this probe fails, the raised error
+        # fails the workflow run visibly -- there is no addressable commit
+        # to stamp, and a silent return would hide the outage.
+        probe = _request(
+            "%s/repos/%s/%s/pulls/%d" % (api_base_url.rstrip("/"), owner, repo, pull_number),
+            token,
+        )
+        if not probe:
+            raise RuntimeError(
+                "PR #%s head could not be resolved for the fail-closed claim" % pull_number
+            )
+        payload_pr = probe
+        payload_head = (probe.get("head") or {}).get("sha")
     early_claim_active = False
     if payload_head:
         _STATUS_TARGET["sha"] = payload_head
