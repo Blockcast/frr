@@ -15,10 +15,13 @@ Reads the workflow event from GITHUB_EVENT_PATH, needs GITHUB_TOKEN with
 `statuses: write`.
 """
 
+import base64
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,6 +42,14 @@ TRUSTED_COLLABORATOR_PERMISSIONS = {"admin", "maintain", "write"}
 
 STATUS_CONTEXT = os.environ.get("STATUS_CONTEXT") or "review/ally-complete"
 
+# Best-known status-write coordinates, kept current by main() as each fact is
+# learned (token/repo first, payload head next, refetched head last). The
+# top-level handler in run() uses them to turn a crash into an `error` status
+# on the head instead of a silent non-zero exit: a run that dies before its
+# first write leaves an earlier same-head `success` standing as the visible
+# truth, which is the one direction a merge control must not fail.
+_STATUS_TARGET = {}
+
 # Sentinel (not a GitHub status state): a COMMENTED Ally review carrying no
 # blocking findings. Ally only ever COMMENTs -- never APPROVEs -- so this is
 # its "looks good". It is NOT an auto-pass: it stays overridable so the
@@ -56,6 +67,138 @@ ACTION_REQUIRED_COMMENT_PATTERN = re.compile(
     r"critical issues? \([1-9]\d*\)|important issues? \([1-9]\d*\))",
     re.IGNORECASE,
 )
+
+# Negated forms CONTAIN the affirmative phrases as substrings, so the raw
+# pattern above read an all-clear ("No action required", "No changes
+# requested") as a changes-requested verdict -- the exact false-positive
+# direction the keyword scan's own comment promises to avoid. Negated forms
+# are masked out first; only text that survives the mask may count as
+# affirmative, so "No action required for X. Action required: fix Y." still
+# fails on the second, un-negated phrase. The mask must cover every phrase
+# family the affirmative pattern matches (action AND changes, with an
+# optional adjective/adverb slot: "no IMMEDIATE action required", "no
+# FURTHER changes requested", "no ADDITIONAL APPLICATION SOURCE CODE
+# changes requested" -- any number of modifier words, because the span is
+# a NEGATED NOUN PHRASE rather than a counted window. Three bounds keep it
+# one, and each is load-bearing for fail-closed behavior:
+#   1. Separators admit only horizontal whitespace: "\s+" would let a bare
+#      "No" on its own paragraph swallow a real "Action required:" verdict
+#      on the next line, erasing a blocking signal.
+#   2. Modifiers admit only word characters, so punctuation ends the span
+#      and a standalone "No." cannot swallow a separate affirmative
+#      sentence.
+#   3. Modifiers exclude the span-breaker words below: adversative and
+#      discourse pivots flip the polarity of what follows ("No reviewer
+#      responded BUT action required"), and auxiliary/copular verbs end
+#      any noun phrase ("no reviewer HAS responded ..."), so hitting one
+#      means the affirmative that follows is NOT under the negation.
+# A regex cannot fully parse English -- an exotic pivot outside the list
+# would still be consumed -- but the residual exposure is narrow because
+# the affirmative pattern requires its words ADJACENT: the mask only ever
+# erases a real verdict when a pivot immediately precedes it, and the
+# common pivots (and every auxiliary verb form) are listed. Errors from
+# over-listing fall in the safe direction: an unmasked negation can at
+# worst BLOCK a clean review, never pass a blocking one, because deletion
+# only removes text and no affirmative phrase can be created by removing
+# a negated one.
+_NEGATION_SPAN_BREAKERS = (
+    "but|yet|however|though|although|whereas|while|nevertheless|"
+    "nonetheless|instead|otherwise|rather|therefore|hence|thus|"
+    "consequently|accordingly|because|since|so|then|meanwhile|"
+    "is|are|was|were|be|been|being|has|have|had|do|does|did|not"
+)
+# Coordinators are deliberately NOT in the breaker list above: English
+# negation legitimately distributes across them ("no issues found or changes
+# requested" is an all-clear), so breaking on them would false-fail compound
+# negated prose. But a span that DID cross a coordinator is exactly where the
+# mask can consume a real verdict ("no reviewer responded AND action
+# required"). The STRICT variants below add the coordinators; the difference
+# between the two mask outcomes is the machine-detectable ambiguity signal
+# (see masked_blocking_ambiguity).
+_NEGATION_SPAN_COORDINATORS = "and|or|nor|plus"
+_STRICT_SPAN_BREAKERS = _NEGATION_SPAN_BREAKERS + "|" + _NEGATION_SPAN_COORDINATORS
+NO_ACTION_REQUIRED_PATTERN = re.compile(
+    r"\bno(?:[ \t]+(?!(?:" + _NEGATION_SPAN_BREAKERS + r")\b)\w+)*"
+    r"[ \t]+(?:action|changes?)[ \t]+"
+    r"(?:is[ \t]+|are[ \t]+|was[ \t]+|were[ \t]+)?(?:required|requested|needed)\b",
+    re.IGNORECASE,
+)
+NO_ACTION_REQUIRED_STRICT_PATTERN = re.compile(
+    r"\bno(?:[ \t]+(?!(?:" + _STRICT_SPAN_BREAKERS + r")\b)\w+)*"
+    r"[ \t]+(?:action|changes?)[ \t]+"
+    r"(?:is[ \t]+|are[ \t]+|was[ \t]+|were[ \t]+)?(?:required|requested|needed)\b",
+    re.IGNORECASE,
+)
+
+
+# The "request changes" affirmative family (scanned above) has its own
+# negated shapes the noun-phrase mask cannot reach: an infinitive after a
+# negated noun phrase ("no need to request changes") and direct verb
+# negation ("we do not request changes", "we won't request changes",
+# "we need not request changes"). The modal list includes semi-modal
+# "need" ("need not" / "needn't") -- the same negated-verb shape as the
+# core modals. Adjacency keeps this safe: "not ONLY request changes"
+# (which affirms) has an intervening word and never matches. Same clause
+# bounds as the main mask; same fail-closed footing -- under the
+# authorization inversion a mask error can only cause a false
+# failure-or-pending, never a false green.
+NO_REQUEST_CHANGES_PATTERN = re.compile(
+    r"(?:\bno(?:[ \t]+(?!(?:" + _NEGATION_SPAN_BREAKERS + r")\b)\w+)*"
+    r"[ \t]+to[ \t]+request[ \t]+changes?\b"
+    r"|\b(?:do|does|did|would|will|shall|should|could|can|must|may|might|need|dare)"
+    r"[ \t]+not[ \t]+request[ \t]+changes?\b"
+    r"|\b(?:don't|doesn't|didn't|won't|wouldn't|shan't|shouldn't|couldn't|can't|cannot|mustn't|needn't)"
+    r"[ \t]+request[ \t]+changes?\b)",
+    re.IGNORECASE,
+)
+NO_REQUEST_CHANGES_STRICT_PATTERN = re.compile(
+    r"(?:\bno(?:[ \t]+(?!(?:" + _STRICT_SPAN_BREAKERS + r")\b)\w+)*"
+    r"[ \t]+to[ \t]+request[ \t]+changes?\b"
+    r"|\b(?:do|does|did|would|will|shall|should|could|can|must|may|might|need|dare)"
+    r"[ \t]+not[ \t]+request[ \t]+changes?\b"
+    r"|\b(?:don't|doesn't|didn't|won't|wouldn't|shan't|shouldn't|couldn't|can't|cannot|mustn't|needn't)"
+    r"[ \t]+request[ \t]+changes?\b)",
+    re.IGNORECASE,
+)
+
+
+def has_action_required_language(body):
+    masked = NO_ACTION_REQUIRED_PATTERN.sub(" ", body)
+    masked = NO_REQUEST_CHANGES_PATTERN.sub(" ", masked)
+    return ACTION_REQUIRED_COMMENT_PATTERN.search(masked) is not None
+
+
+def masked_blocking_ambiguity(body):
+    """True when ONLY a coordinator-crossing negation span stands between this
+    body and a blocking verdict -- the machine-detectable signature of the
+    mask consuming a real verdict (review rounds 7-8).
+
+    Mechanics: the strict masks differ from the lenient ones in exactly one
+    way -- their spans additionally break on coordinators (and/or/nor/plus).
+    Strict spans are therefore a subset of lenient spans, so only three
+    outcomes exist:
+      - affirmative survives BOTH masks  -> real blocking; the failure paths
+        own it (has_action_required_language is true) and this returns False;
+      - affirmative survives NEITHER     -> a simple negated all-clear
+        ("No action required", "no further changes requested") -- not
+        ambiguous, may authorize;
+      - affirmative survives STRICT only -> the lenient span crossed a
+        coordinator. "No reviewer responded and action required: fix gate"
+        (a pivot reading -- blocking) is indistinguishable by regex from
+        "no issues found or changes requested" (a distributed negation --
+        clean). Ambiguity resolves fail-closed: the body may not authorize
+        green and may not be cleared by the override, no matter what pass
+        verdict or zero-count sections accompany it (review round 8: a
+        machine-readable all-clear must not launder a possibly-consumed
+        blocking verdict). Cost: a genuine distributed-negation all-clear
+        lands pending until re-worded -- a false HOLD, never a false green.
+    """
+    if has_action_required_language(body):
+        return False
+    strict_masked = NO_ACTION_REQUIRED_STRICT_PATTERN.sub(" ", body)
+    strict_masked = NO_REQUEST_CHANGES_STRICT_PATTERN.sub(" ", strict_masked)
+    return ACTION_REQUIRED_COMMENT_PATTERN.search(strict_masked) is not None
+
 
 # Explicit, machine-readable verdict markers. When any is present in an Ally
 # body we trust it over heuristics. Precedence: an explicit changes-requested
@@ -311,12 +454,15 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
 
         if state == "COMMENTED":
             verdict = explicit_verdict(body)
-            # An explicit changes-requested verdict, OR a machine-readable
-            # count > 0, is a real negative -- stays red, label or not.
-            # Incidental security/"blocking" prose does NOT match.
-            if verdict == "changes-requested" or (
-                verdict is None and ACTION_REQUIRED_COMMENT_PATTERN.search(body)
-            ):
+            # An explicit changes-requested verdict, OR surviving (un-negated)
+            # action-required prose, is a real negative -- stays red, label or
+            # not. The prose scan runs INDEPENDENTLY of the verdict (review
+            # round 7): a body pairing "Recommended Action: Merge." with
+            # "Action required: fix X." is contradictory, and contradiction
+            # resolves red, exactly as contradictory issue counts do in
+            # extract_issue_count. Incidental security/"blocking" prose still
+            # does NOT match.
+            if verdict == "changes-requested" or has_action_required_language(body):
                 signals.append(
                     {
                         "at": at,
@@ -329,6 +475,27 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
                 )
                 continue
             if not attested:
+                continue
+            # A coordinator-ambiguous body may not authorize green no matter
+            # what pass verdict or zero counts accompany it (review round 8):
+            # the mask may have consumed a real blocking phrase, and a
+            # machine-readable all-clear must not launder that away.
+            if masked_blocking_ambiguity(body):
+                continue
+            # AUTHORIZATION INVERSION (review round 5): free prose never
+            # authorizes green. A clean-commented review counts only with a
+            # machine-readable all-clear -- an explicit pass verdict or
+            # BOTH zero-count sections. This removes the fail-open class
+            # where the negation mask over-consumed a real blocking phrase:
+            # a masked-away affirmative can now at worst leave the body
+            # unauthorized (pending), never authorize it. The masks' only
+            # remaining job is preventing false FAILURE from negated
+            # prose, so every mask error lands fail-closed.
+            has_zero_counts = (
+                extract_issue_count(body, "Critical Issues") == 0
+                and extract_issue_count(body, "Important Issues") == 0
+            )
+            if verdict != "pass" and not has_zero_counts:
                 continue
             signals.append(
                 {
@@ -523,13 +690,13 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
             continue
 
         verdict = explicit_verdict(body)
-        # FAILURE only on an actual changes-requested verdict: an explicit
-        # marker, a machine-readable count > 0, or the legacy action-required
-        # phrasing. A positive review that merely *mentions* security /
-        # "blocking" / "unsafe" / "finding" never fails here.
-        if verdict == "changes-requested" or (
-            verdict is None and ACTION_REQUIRED_COMMENT_PATTERN.search(body)
-        ):
+        # FAILURE on an actual changes-requested verdict OR surviving
+        # (un-negated) action-required prose -- checked INDEPENDENTLY of the
+        # verdict (review round 7): an explicit pass paired with "Action
+        # required: fix X." is contradictory prose, and contradiction resolves
+        # red. A positive review that merely *mentions* security / "blocking"
+        # / "unsafe" / "finding" never fails here.
+        if verdict == "changes-requested" or has_action_required_language(body):
             signals.append(
                 {
                     "at": at,
@@ -539,6 +706,11 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
                     "status": "failure",
                 }
             )
+            continue
+
+        # A coordinator-ambiguous body may not authorize green regardless of
+        # verdict or counts (review round 8; see masked_blocking_ambiguity).
+        if masked_blocking_ambiguity(body):
             continue
 
         # Positive only on an affirmative verdict: an explicit pass, or
@@ -637,6 +809,40 @@ def override_attestation_logins(comments, head_sha):
     return logins
 
 
+def ambiguous_masked_bodies_for_head(reviews, comments, head_sha, ally_logins):
+    """Any head-relevant Ally body whose only escape from a blocking verdict
+    is the negation mask (see masked_blocking_ambiguity). Head relevance mirrors
+    the BLOCKING binding rules -- commit_id or attestation for reviews, the
+    consolidated/issue-link shapes for comments -- because ambiguity is a
+    potential blocking signal, and blocking binds loosely by design.
+    """
+    ally = set(ally_logins)
+    for review in reviews or []:
+        login = (review.get("user") or {}).get("login")
+        if not isinstance(login, str) or login not in ally:
+            continue
+        if review.get("state") == "DISMISSED":
+            continue
+        body = str(review.get("body") or "")
+        if review.get("commit_id") != head_sha and not attests_head(body, head_sha):
+            continue
+        if masked_blocking_ambiguity(body):
+            return True
+    for comment in comments or []:
+        login = (comment.get("user") or {}).get("login")
+        if not isinstance(login, str) or login not in ally:
+            continue
+        body = str(comment.get("body") or "")
+        if not (
+            is_consolidated_ally_comment_for_head(body, head_sha)
+            or is_issue_link_ally_comment_for_head(body, head_sha)
+        ):
+            continue
+        if masked_blocking_ambiguity(body):
+            return True
+    return False
+
+
 def decide(
     reviews,
     comments,
@@ -706,6 +912,20 @@ def decide(
     has_override = has_label and has_head_attestation
 
     if has_override and (signal is None or signal["status"] != "failure"):
+        # The override rescues the reviewer-never-ran case and clears
+        # machine-readably-clean reviews. It must NOT launder a mask error
+        # (review round 7): a body whose blocking prose was consumed by the
+        # negation mask contributes no signal -- indistinguishable here from
+        # "no review" -- so without this check the override would clear a head
+        # Ally actually flagged. Refusal is fail-closed: the head stays
+        # pending until Ally re-reviews with a machine-readable verdict.
+        if ambiguous_masked_bodies_for_head(reviews, comments, head_sha, ally_logins):
+            return (
+                "pending",
+                "Override refused for head %s: an Ally body has unclassifiable "
+                "negated prose; request a machine-readable re-review."
+                % short_sha(head_sha),
+            )
         return (
             "success",
             "Ally review gate overridden for head %s (label '%s' + head-bound authorization)."
@@ -747,6 +967,98 @@ def _request(url, token, method="GET", payload=None):
     with urllib.request.urlopen(req) as response:
         body = response.read()
         return json.loads(body) if body else None
+
+
+# The issue_comment head probe is the single point where a transient API
+# failure used to leave a stale same-head `success` standing with no claim
+# and no error write (review round 7). Two hardening layers close most of
+# that window:
+#   1. Retries with backoff -- a rate-limit blip or one 5xx no longer
+#      forfeits the head.
+#   2. A git-transport fallback (`git ls-remote refs/pull/N/head`) -- an
+#      independent protocol path to the same immutable coordinate, so a
+#      REST-plane outage alone cannot hide the head. Once EITHER source
+#      yields the SHA it is claimed into _STATUS_TARGET, and any later
+#      crash posts `error` to it.
+# The residual window -- REST and git transport BOTH unreachable -- is
+# physically irreducible: with no addressable commit there is nothing any
+# code path could stamp, and posting the invalidating status itself
+# requires the REST plane. That case exits non-zero with no status write.
+_PROBE_ATTEMPTS = 3
+_sleep = time.sleep  # test seam
+
+
+def _probe_pull_request(url, token, attempts=_PROBE_ATTEMPTS):
+    """GET the PR with retries; returns the payload or None (never raises)."""
+    for attempt in range(attempts):
+        try:
+            payload = _request(url, token)
+        except Exception as error:  # noqa: BLE001 - each attempt is fallible
+            print(
+                "head probe attempt %d/%d failed: %s" % (attempt + 1, attempts, error),
+                file=sys.stderr,
+            )
+            payload = None
+        if payload:
+            return payload
+        if attempt + 1 < attempts:
+            _sleep(2 ** attempt)
+    return None
+
+
+def _parse_ls_remote_head(output):
+    """First 40-hex OID column of `git ls-remote` output, or None."""
+    for line in (output or "").splitlines():
+        oid = line.split("\t")[0].split(" ")[0].strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", oid):
+            return oid
+    return None
+
+
+def _git_pull_head_sha(owner, repo, pull_number, token):
+    """Resolve refs/pull/N/head over git smart-HTTP -- a transport
+    independent of the REST API plane. Returns the OID or None; never
+    raises.
+
+    The token travels via GIT_CONFIG_* environment variables, NEVER in
+    argv: on a shared self-hosted runner /proc/<pid>/cmdline is readable
+    by same-UID processes, and subprocess exceptions embed the full
+    command (review round 8). The URL itself stays credential-free, and
+    emitted error text is redacted as a second layer in case git echoes
+    configuration back.
+    """
+    server = (os.environ.get("GITHUB_SERVER_URL") or "https://github.com").rstrip("/")
+    url = "%s/%s/%s.git" % (server, owner, repo)
+    basic = base64.b64encode(("x-access-token:%s" % token).encode()).decode()
+
+    def redact(text):
+        return (text or "").replace(token, "***").replace(basic, "***")
+
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", url, "refs/pull/%d/head" % pull_number],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={
+                **os.environ,
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.%s/.extraheader" % server,
+                "GIT_CONFIG_VALUE_0": "Authorization: Basic %s" % basic,
+            },
+        )
+    except Exception as error:  # noqa: BLE001 - fallback is best-effort
+        print("git head fallback failed: %s" % redact(str(error)), file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        print(
+            "git head fallback exited %d: %s"
+            % (result.returncode, redact((result.stderr or "").strip())[:200]),
+            file=sys.stderr,
+        )
+        return None
+    return _parse_ls_remote_head(result.stdout)
 
 
 def fetch_paginated(api_base_url, path, token):
@@ -831,18 +1143,37 @@ def clamp_description(description):
 
 
 def set_commit_status(api_base_url, owner, repo, sha, token, state, description, target_url):
+    """POST the status with bounded retries. Status writes are the gate's
+    entire output: a transient REST failure that drops one turns an
+    evaluated verdict into silence, and silence in front of an earlier
+    same-head `success` is fail-open (review round 8). Retries convert
+    blip-length outages into eventual writes; a sustained outage still
+    raises, which callers escalate (crash handler -> `error` status when
+    possible, non-zero exit -> the required workflow check-run backstop
+    otherwise).
+    """
     url = "%s/repos/%s/%s/statuses/%s" % (api_base_url.rstrip("/"), owner, repo, sha)
-    _request(
-        url,
-        token,
-        method="POST",
-        payload={
-            "context": STATUS_CONTEXT,
-            "description": clamp_description(description),
-            "state": state,
-            "target_url": target_url,
-        },
-    )
+    payload = {
+        "context": STATUS_CONTEXT,
+        "description": clamp_description(description),
+        "state": state,
+        "target_url": target_url,
+    }
+    last_error = None
+    for attempt in range(_PROBE_ATTEMPTS):
+        try:
+            _request(url, token, method="POST", payload=payload)
+            return
+        except Exception as error:  # noqa: BLE001 - each attempt is fallible
+            last_error = error
+            print(
+                "status write attempt %d/%d for %s failed: %s"
+                % (attempt + 1, _PROBE_ATTEMPTS, short_sha(sha), error),
+                file=sys.stderr,
+            )
+            if attempt + 1 < _PROBE_ATTEMPTS:
+                _sleep(2 ** attempt)
+    raise last_error
 
 
 def enrich_reviews_with_edit_times(api_base_url, owner, repo, pull_number, token, reviews):
@@ -906,6 +1237,12 @@ def enrich_reviews_with_edit_times(api_base_url, owner, repo, pull_number, token
 
 
 def main():
+    # Fresh coordinates per invocation: the module-level target otherwise
+    # carries a previous in-process caller's repo/token/head into this run
+    # (only matters for tests -- CI is one process per run -- but stale
+    # coordinates in a crash write would point the error status at the wrong
+    # head, so clear defensively rather than rely on caller hygiene).
+    _STATUS_TARGET.clear()
     event_path = os.environ.get("GITHUB_EVENT_PATH")
     if not event_path:
         raise RuntimeError("GITHUB_EVENT_PATH is required")
@@ -924,6 +1261,7 @@ def main():
 
     owner, repo = full_name.split("/", 1)
     api_base_url = os.environ.get("GITHUB_API_URL") or "https://api.github.com"
+    _STATUS_TARGET.update({"api": api_base_url, "owner": owner, "repo": repo, "token": token})
 
     # Resolve the PR NUMBER from whatever payload the event carries, then
     # refetch the PR itself for EVERY event. The embedded pull_request object
@@ -946,27 +1284,149 @@ def main():
         print("No pull_request payload found; nothing to gate.")
         return
 
+    # Claim the context on the PAYLOAD head before the authoritative refetch.
+    # The refetch itself can raise (network, rate limit), and a run that dies
+    # with no write leaves a previous same-head `success` standing -- the gate
+    # failing open on exactly the kind of error it should hold for. A stale
+    # payload head is harmless here for the same reason a stale-event run is:
+    # the authoritative post-refetch write targets the real head, and a
+    # pending on a superseded head gates nothing. Gated on the snapshot
+    # claiming an open, non-draft PR so settled PRs are not stamped
+    # (issue_comment payloads carry no head and are skipped), and best-effort
+    # so a failed early write cannot itself kill the run before the
+    # authoritative path gets its turn.
+    payload_pr = event.get("pull_request") or {}
+    payload_head = (payload_pr.get("head") or {}).get("sha")
+    if not payload_head:
+        # issue_comment payloads carry no pull_request.head.sha, so without
+        # this probe the crash handler has no addressable commit: a refetch
+        # crash would skip the `error` write and leave an earlier same-head
+        # `success` standing -- fail-open on exactly the events that can
+        # REMOVE the evidence behind a green gate (comment edits/deletes).
+        # Resolve the head with a minimal retried fetch BEFORE any fallible
+        # processing so this path gets the same fail-closed claim as
+        # pull_request payloads. When the REST probe stays down, the git
+        # smart-HTTP fallback supplies the same immutable coordinate over an
+        # independent transport; the run then continues so the claim below
+        # lands `pending` on the real head, and any later crash escalates it
+        # to `error`. Only when BOTH transports fail is there no addressable
+        # commit anywhere -- the raised error fails the workflow run visibly,
+        # the documented irreducible residual (see _probe_pull_request).
+        probe = _probe_pull_request(
+            "%s/repos/%s/%s/pulls/%d" % (api_base_url.rstrip("/"), owner, repo, pull_number),
+            token,
+        )
+        if probe:
+            payload_pr = probe
+            payload_head = (probe.get("head") or {}).get("sha")
+        else:
+            fallback_head = _git_pull_head_sha(owner, repo, pull_number, token)
+            if not fallback_head:
+                raise RuntimeError(
+                    "PR #%s head could not be resolved for the fail-closed claim "
+                    "(REST probe and git fallback both failed)" % pull_number
+                )
+            print(
+                "REST head probe failed; git fallback resolved head %s"
+                % short_sha(fallback_head)
+            )
+            # Draft/state unknown without the REST payload; an empty snapshot
+            # falls through the claim gate below as open/non-draft, which is
+            # the fail-closed direction (a stray pending blocks, never clears,
+            # and resolve_early_claim cleans up if the refetch later says
+            # settled).
+            payload_pr = {}
+            payload_head = fallback_head
+    early_claim_active = False
+    if payload_head:
+        _STATUS_TARGET["sha"] = payload_head
+        if not payload_pr.get("draft") and (payload_pr.get("state") or "open") == "open":
+            try:
+                set_commit_status(
+                    api_base_url,
+                    owner,
+                    repo,
+                    payload_head,
+                    token,
+                    "pending",
+                    "Evaluating Ally review of head %s..." % short_sha(payload_head),
+                    os.environ.get("STATUS_TARGET_URL"),
+                )
+                early_claim_active = True
+            except Exception as error:  # noqa: BLE001 - the claim is best-effort
+                print(
+                    "early pending claim on payload head %s failed (continuing): %s"
+                    % (short_sha(payload_head), error),
+                    file=sys.stderr,
+                )
+
+    # Resolves an early claim that turned out to target a PR the refetch says
+    # not to gate. The stale-HEAD case needs no cleanup (a pending on a
+    # superseded head gates nothing), but when the payload head IS the current
+    # head, a silent early return would strand the claim: on a merged/closed
+    # PR nothing ever re-evaluates, leaving a required context yellow forever
+    # on a commit that reached the base branch. Best-effort like the claim
+    # itself.
+    def resolve_early_claim(state, description):
+        if not early_claim_active:
+            return
+        try:
+            set_commit_status(
+                api_base_url,
+                owner,
+                repo,
+                payload_head,
+                token,
+                state,
+                description,
+                os.environ.get("STATUS_TARGET_URL"),
+            )
+        except Exception as error:  # noqa: BLE001 - cleanup is best-effort
+            print(
+                "resolving early claim on %s failed: %s" % (short_sha(payload_head), error),
+                file=sys.stderr,
+            )
+
     pull_request = _request(
         "%s/repos/%s/%s/pulls/%d" % (api_base_url.rstrip("/"), owner, repo, pull_number),
         token,
     )
     if not pull_request:
-        print("PR #%s could not be fetched; nothing to gate." % pull_number)
-        return
+        # An empty refetch is indistinguishable from an outage. Returning
+        # zero here would leave whatever status history the head already has
+        # as the visible truth -- fail-open when that history is a stale
+        # `success` and the early claim happened to fail. Raise instead: the
+        # crash handler escalates to `error` on the claimed head when the
+        # REST plane allows, and the non-zero exit trips the required
+        # workflow check-run backstop when it does not.
+        raise RuntimeError("PR #%s could not be fetched; refusing to gate on absence" % pull_number)
 
     if pull_request.get("state") and pull_request.get("state") != "open":
         # A delayed event can arrive after merge/close; there is no head left
-        # to gate and a status write would be noise on a settled PR.
+        # to gate. The early claim (if any) must not be left stranded: a
+        # settled PR gets no future evaluation, so a lingering `pending`
+        # would sit yellow forever. `success` is safe here -- the PR cannot
+        # merge again, so the context gates nothing.
         print("PR #%s is %s; nothing to gate." % (pull_number, pull_request["state"]))
+        resolve_early_claim(
+            "success", "PR is %s; nothing to gate." % pull_request["state"]
+        )
         return
 
     if pull_request.get("draft"):
+        # Keep the claim PENDING (fail-closed: a draft can return to ready at
+        # this same head, and a `success` here would pre-clear it), but say
+        # why -- the next ready_for_review event re-evaluates and overwrites.
         print("PR is a draft; nothing to gate.")
+        resolve_early_claim(
+            "pending", "PR is a draft; will re-evaluate when it becomes ready."
+        )
         return
 
     head_sha = (pull_request.get("head") or {}).get("sha")
     if not head_sha:
         raise RuntimeError("pull_request.head.sha is required")
+    _STATUS_TARGET["sha"] = head_sha
 
     pull_number = pull_request["number"]
     ally_logins = parse_list(os.environ.get("ALLY_REVIEWER_LOGINS"), DEFAULT_ALLY_LOGINS)
@@ -1073,9 +1533,37 @@ def main():
     print("%s: %s" % (STATUS_CONTEXT, description))
 
 
-if __name__ == "__main__":
+def run():
     try:
         main()
     except Exception as error:  # noqa: BLE001 - surface message, non-zero exit
         print(str(error), file=sys.stderr)
+        # A crash must stay VISIBLE on the head, not just in the workflow log:
+        # with no write, an earlier same-head `success` remains the status the
+        # merge control reads, and the failed run is indistinguishable from no
+        # run at all. Best-effort by construction -- the write needs whatever
+        # coordinates main() managed to learn before dying, and a failure to
+        # record the crash must not mask the original error's exit.
+        target = dict(_STATUS_TARGET)
+        if all(target.get(key) for key in ("api", "owner", "repo", "token", "sha")):
+            try:
+                set_commit_status(
+                    target["api"],
+                    target["owner"],
+                    target["repo"],
+                    target["sha"],
+                    target["token"],
+                    "error",
+                    "review-gate crashed before posting a verdict: %s" % error,
+                    os.environ.get("STATUS_TARGET_URL"),
+                )
+            except Exception as status_error:  # noqa: BLE001 - keep the original exit
+                print(
+                    "failed to record the crash as an error status: %s" % status_error,
+                    file=sys.stderr,
+                )
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    run()

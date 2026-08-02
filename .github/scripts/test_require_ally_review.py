@@ -10,9 +10,13 @@ Stdlib only, no network -- decide() is a pure function.
 Run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
+import re
+import subprocess
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -115,7 +119,9 @@ class TestCleanCommented(unittest.TestCase):
     """Branch 3 — Ally only ever COMMENTs, so a clean comment must NOT auto-pass."""
 
     def test_clean_commented_holds_pending_and_names_the_label(self):
-        state, desc = decide(reviews=[review("COMMENTED", body=CONSOLIDATED)])
+        # CLEAN (zero counts), not bare CONSOLIDATED prose: the inversion
+        # requires a machine-readable all-clear for the review to count.
+        state, desc = decide(reviews=[review("COMMENTED", body=CLEAN)])
         self.assertEqual(state, "pending")
         self.assertIn("no blocking findings", desc)
         self.assertIn(OVERRIDE, desc)
@@ -562,7 +568,7 @@ class TestEditedReviewOrdering(unittest.TestCase):
         state, _ = decide(
             reviews=[
                 review("COMMENTED", body=blocking, at="2026-07-27T09:00:00Z"),
-                review("COMMENTED", body=CONSOLIDATED, at="2026-07-27T12:00:00Z"),
+                review("COMMENTED", body=CLEAN, at="2026-07-27T12:00:00Z"),
             ]
         )
         self.assertEqual(state, "pending")  # newest is clean-commented
@@ -626,6 +632,13 @@ class TestDescriptionLength(unittest.TestCase):
                 trusted={HUMAN},
             ),
             decide(reviews=[review("COMMENTED", body=blocking)]),  # failure
+            decide(  # override refused: mask-ambiguous body
+                reviews=[review("COMMENTED", body=attest(
+                    HEAD, "No reviewer responded and action required: fix gate."))],
+                comments=[comment(override_body(HEAD), login=HUMAN)],
+                labels=[OVERRIDE],
+                trusted={HUMAN},
+            ),
             decide(reviews=[review("CHANGES_REQUESTED")]),  # changes requested
             decide(reviews=[review("APPROVED")]),  # approved
             decide(reviews=[review("APPROVED")], author="app/allyblockcast"),  # self demoted
@@ -803,7 +816,9 @@ class TestApprovalAndRecency(unittest.TestCase):
         self.assertNotEqual(state, "failure")
 
     def test_latest_signal_wins(self):
-        clean = CONSOLIDATED
+        # Under the authorization inversion the newest review only counts as
+        # clean via machine-readable zero counts (CLEAN), not bare prose.
+        clean = CLEAN
         blocking = CONSOLIDATED + "### Important Issues (1)\n"
         state, _ = decide(
             reviews=[
@@ -816,14 +831,15 @@ class TestApprovalAndRecency(unittest.TestCase):
 
 
 class TestStalePayloadOrchestration(unittest.TestCase):
-    """The workflow cancels the active run on any PR event, so main() must be
-    unconditionally willing to replace what it cancelled. Round 7: a delayed
-    event whose stale snapshot still said draft:true cancelled the in-flight
-    ready-PR run and then skipped the job on a workflow-level payload
-    predicate -- the current head was left with no status. The predicate is
-    gone; these fixtures prove the script layer makes that safe in BOTH stale
-    directions by reading only the PR number from the payload and taking
-    draft state from the authoritative refetch."""
+    """Runs serialize on a shared group and must be unconditionally willing to
+    evaluate current state, whatever stale snapshot woke them. Round 7: a
+    delayed event whose stale snapshot still said draft:true cancelled the
+    then-cancellable in-flight ready-PR run and skipped the job on a
+    workflow-level payload predicate -- the current head was left with no
+    status. The predicate is gone; these fixtures prove the script layer makes
+    that safe in BOTH stale directions by reading only the PR number (and a
+    best-effort early-claim head) from the payload and taking draft state from
+    the authoritative refetch."""
 
     STALE_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -883,7 +899,10 @@ class TestStalePayloadOrchestration(unittest.TestCase):
 
     def test_stale_ready_payload_does_not_gate_a_draft_pr(self):
         # The inverse staleness: payload says ready, the PR has since gone
-        # back to draft. No status may be written against a draft head.
+        # back to draft. The ready-claiming payload earns a best-effort early
+        # pending on ITS OWN (stale) head -- harmless, a superseded head gates
+        # nothing (the draft resolve keeps it pending with a note) -- but the
+        # draft PR's current head must get no status.
         _, statuses = self._run_main(
             payload_draft=False,
             refetched={
@@ -895,8 +914,770 @@ class TestStalePayloadOrchestration(unittest.TestCase):
                 "labels": [],
             },
         )
-        self.assertEqual(statuses, [])
+        self.assertEqual({sha for sha, _ in statuses}, {self.STALE_HEAD})
+        self.assertEqual({state for _, state in statuses}, {"pending"})
+        self.assertNotIn(HEAD, {sha for sha, _ in statuses})
+
+    def test_settled_pr_resolves_the_early_claim(self):
+        # Round 2: a delayed event whose payload still said open earns the
+        # early claim, then the refetch says merged/closed AT THE SAME HEAD.
+        # A silent return would strand a required context yellow forever on a
+        # commit that reached the base branch -- nothing re-evaluates a
+        # settled PR. The claim must resolve to success (the PR cannot merge
+        # again, so the context gates nothing).
+        _, statuses = self._run_main(
+            payload_draft=False,
+            refetched={
+                "number": 7,
+                "state": "closed",
+                "draft": False,
+                "head": {"sha": self.STALE_HEAD},
+                "user": {"login": HUMAN},
+                "labels": [],
+            },
+        )
+        self.assertEqual(
+            statuses,
+            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "success")],
+        )
+
+    def test_draft_pr_same_head_keeps_the_claim_failclosed(self):
+        # Same-head draft: the PR can return to ready at this exact head, so
+        # resolving to success would pre-clear the gate (fail-open). The
+        # claim stays pending -- self-healing via the next ready_for_review.
+        _, statuses = self._run_main(
+            payload_draft=False,
+            refetched={
+                "number": 7,
+                "state": "open",
+                "draft": True,
+                "head": {"sha": self.STALE_HEAD},
+                "user": {"login": HUMAN},
+                "labels": [],
+            },
+        )
+        self.assertEqual(
+            statuses,
+            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "pending")],
+        )
+
+
+class TestNegatedActionRequired(unittest.TestCase):
+    """"No action required" contains "action required" as a substring, so the
+    raw affirmative scan read Ally's all-clear as a changes-requested verdict.
+    Negated forms are masked before the scan; a separate un-negated
+    affirmative in the same body must still fail."""
+
+    def test_no_action_required_comment_is_not_a_failure(self):
+        body = attest(
+            HEAD,
+            "No action required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, description = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+        self.assertIn("clean comment", description)
+
+    def test_no_further_action_required_variant(self):
+        body = attest(
+            HEAD,
+            "No further action is required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+
+    def test_no_changes_requested_is_not_a_failure(self):
+        # Review round 2: the mask covered only the "action required" phrase
+        # family; "No changes requested." hit the sibling `changes requested`
+        # alternation and produced the same false failure.
+        body = attest(
+            HEAD,
+            "No changes requested.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+
+    def test_adverb_does_not_defeat_the_mask(self):
+        body = attest(
+            HEAD,
+            "No immediate action required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+
+    def test_no_changes_needed_variant(self):
+        body = attest(
+            HEAD,
+            "No changes are needed.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+
+    def test_multi_modifier_negations_do_not_defeat_the_mask(self):
+        # Review rounds 3-4: the mask first allowed exactly zero or one
+        # modifier word, then an arbitrary cap of three -- each left some
+        # ordinary multi-modifier all-clear prose ("no ADDITIONAL
+        # APPLICATION SOURCE CODE changes requested") with the affirmative
+        # substring behind, blocking a clean review. The span is now
+        # clause-bounded instead of counted.
+        for text in (
+            "No additional code changes requested.",
+            "No immediate further action required.",
+            "No additional application source code changes requested.",
+        ):
+            body = attest(
+                HEAD,
+                text + "\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+            )
+            state, _ = decide(comments=[comment(body)])
+            self.assertEqual(state, "success", text)
+
+    def test_mask_window_does_not_cross_punctuation(self):
+        # The clause-bounded window must not let a standalone "No." swallow
+        # a separate affirmative sentence: modifiers admit only word
+        # characters, so punctuation ends the span.
+        body = attest(HEAD, "No. Changes requested: fix the overflow before merge.")
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+    def test_mask_span_stops_at_pivots_and_verbs(self):
+        # Review round 5 CRITICAL: the unbounded modifier run accepted every
+        # word, so a same-line pivot let the mask consume a genuine verdict
+        # ("No reviewer has responded but action required:" masked to
+        # ": ..."), flipping the gate fail-open. Modifiers now exclude
+        # adversative/discourse pivots and auxiliary verbs -- both fixtures
+        # die at "has" before even reaching the conjunction.
+        for text in (
+            "No reviewer has responded but action required: fix the gate.",
+            "No reviewer requested this but changes requested: fix the gate.",
+        ):
+            body = attest(HEAD, text)
+            state, _ = decide(comments=[comment(body)])
+            self.assertEqual(state, "failure", repr(text))
+
+    def test_mask_window_does_not_cross_line_boundaries(self):
+        # Review round 4 CRITICAL: with "\s+" separators the mask crossed a
+        # paragraph boundary -- a bare "No" ending one paragraph erased a
+        # real blocking verdict opening the next ("No\n\nAction required:"
+        # became ": ..."), flipping the gate fail-open. Separators admit
+        # only horizontal whitespace, so a line boundary ends the span and
+        # the blocking verdict survives the mask.
+        for text in (
+            "No\n\nAction required: fix the gate.",
+            "No\n\nChanges requested: fix the gate.",
+        ):
+            body = attest(HEAD, text)
+            state, _ = decide(comments=[comment(body)])
+            self.assertEqual(state, "failure", repr(text))
+
+    def test_affirmative_changes_requested_still_fails(self):
+        body = attest(HEAD, "Changes requested: the overflow must be fixed first.")
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+    def test_no_action_required_review_is_not_a_failure(self):
+        body = attest(
+            HEAD,
+            "No action required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, description = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("no blocking findings", description)
+
+    def test_affirmative_action_required_still_fails(self):
+        body = attest(HEAD, "Action required: fix the overflow before merge.")
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+    def test_negation_does_not_mask_a_separate_affirmative(self):
+        body = attest(
+            HEAD,
+            "No action required for the docs change. Action required: fix the gate.",
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+
+class TestCrashVisibility(unittest.TestCase):
+    """A run that dies must not exit silently. With no write, an earlier
+    same-head `success` remains the visible truth (fail-open), and a crash
+    before the refetch previously left no record at all. run() turns any
+    crash into an `error` status on the best-known head, and main() claims a
+    best-effort `pending` on the payload head BEFORE the fallible refetch."""
+
+    STALE_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+    def setUp(self):
+        gate._STATUS_TARGET.clear()
+        self.addCleanup(gate._STATUS_TARGET.clear)
+
+    def _run(self, payload_draft=False, request=None, paginated=None):
+        event = {
+            "pull_request": {
+                "number": 7,
+                "draft": payload_draft,
+                "head": {"sha": self.STALE_HEAD},
+            },
+            "repository": {"full_name": "Blockcast/frr"},
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+            event_path = handle.name
+        self.addCleanup(os.unlink, event_path)
+        env = {
+            "GITHUB_EVENT_PATH": event_path,
+            "GITHUB_REPOSITORY": "Blockcast/frr",
+            "GITHUB_TOKEN": "test-token",
+        }
+        calls = []
+
+        def record_status(api, owner, repo, sha, token, state, description,
+                          target_url=None):
+            calls.append(("status", sha, state))
+
+        def record_request(url, token, method="GET", payload=None):
+            calls.append(("request", url))
+            if isinstance(request, Exception):
+                raise request
+            return request
+
+        def record_paginated(api, path, token):
+            if isinstance(paginated, Exception):
+                raise paginated
+            return []
+
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "_request", side_effect=record_request), \
+                mock.patch.object(gate, "set_commit_status", side_effect=record_status), \
+                mock.patch.object(gate, "fetch_paginated", side_effect=record_paginated), \
+                mock.patch.object(gate, "enrich_reviews_with_edit_times"):
+            with self.assertRaises(SystemExit) as caught:
+                gate.run()
+        self.assertEqual(caught.exception.code, 1)
+        statuses = [(c[1], c[2]) for c in calls if c[0] == "status"]
+        return statuses, calls
+
+    def test_refetch_crash_posts_error_to_payload_head(self):
+        statuses, _ = self._run(request=RuntimeError("refetch boom"))
+        self.assertEqual(
+            statuses,
+            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "error")],
+        )
+
+    def test_crash_after_refetch_posts_error_to_current_head(self):
+        refetched = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+            "user": {"login": HUMAN},
+            "labels": [],
+        }
+        statuses, _ = self._run(request=refetched, paginated=RuntimeError("reviews boom"))
+        # Early claim on the payload head, authoritative claim on the real
+        # head, then the crash recorded against the real head -- never the
+        # stale one.
+        self.assertEqual(statuses[-1], (HEAD, "error"))
+        self.assertIn((HEAD, "pending"), statuses)
+
+    def test_early_claim_lands_before_the_refetch(self):
+        refetched = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+            "user": {"login": HUMAN},
+            "labels": [],
+        }
+        _, calls = self._run(request=refetched, paginated=RuntimeError("boom"))
+        kinds = [c[0] for c in calls]
+        self.assertEqual(kinds[0], "status", "the payload-head claim must precede the refetch")
+        self.assertEqual(kinds[1], "request")
+
+    def test_draft_payload_makes_no_early_claim_but_crash_stays_visible(self):
+        statuses, _ = self._run(payload_draft=True, request=RuntimeError("boom"))
+        self.assertEqual(statuses, [(self.STALE_HEAD, "error")])
+
+    def test_status_write_failure_does_not_mask_the_exit(self):
+        event = {
+            "pull_request": {"number": 7, "draft": False, "head": {"sha": self.STALE_HEAD}},
+            "repository": {"full_name": "Blockcast/frr"},
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+            event_path = handle.name
+        self.addCleanup(os.unlink, event_path)
+        env = {
+            "GITHUB_EVENT_PATH": event_path,
+            "GITHUB_REPOSITORY": "Blockcast/frr",
+            "GITHUB_TOKEN": "test-token",
+        }
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "_request", side_effect=RuntimeError("api down")), \
+                mock.patch.object(gate, "set_commit_status", side_effect=RuntimeError("statuses down")):
+            with self.assertRaises(SystemExit) as caught:
+                gate.run()
+        self.assertEqual(caught.exception.code, 1)
+
+
+class TestWorkflowContracts(unittest.TestCase):
+    """Regex checks over the two workflow files, pinning the properties the
+    vendoring overlay must preserve. Stdlib-only on purpose: the selftest
+    environment guarantees no third-party YAML parser."""
+
+    WORKFLOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows")
+
+    def _read(self, name):
+        with open(os.path.join(self.WORKFLOWS, name), encoding="utf8") as handle:
+            return handle.read()
+
+    def test_gate_workflow_never_cancels_in_flight_runs(self):
+        # Cancellation is not atomic: a cancelled run can land an in-flight
+        # final status POST after the superseding run wrote its verdict for
+        # the same SHA. Every run recomputes full state, so serialization
+        # loses nothing and closes that write race.
+        gate_yml = self._read("review-gate.yml")
+        self.assertRegex(gate_yml, r"(?m)^\s*cancel-in-progress:\s*false\s*$")
+        self.assertNotIn("cancel-in-progress: ${{", gate_yml)
+
+    def test_gate_job_name_is_the_required_backstop_check(self):
+        # Branch protection requires the check-run named after the gate job
+        # ("Ally review gate") ALONGSIDE the review/ally-complete commit
+        # status (review round 8): a run that cannot reach the REST plane
+        # cannot write any status, but its non-zero exit still reports
+        # through the Actions plane and turns this check red on
+        # pull_request_target heads -- the fail-closed backstop for
+        # REST-outage runs. Renaming the job or adding continue-on-error
+        # silently detaches it from the protection rule.
+        gate_yml = self._read("review-gate.yml")
+        self.assertRegex(gate_yml, r"(?m)^\s*name:\s*Ally review gate\s*$")
+        self.assertNotIn("continue-on-error", gate_yml)
+
+    def test_selftest_push_covers_both_fleet_default_branches(self):
+        # frr's default branch is master; vendored repos default to main. A
+        # master-only push trigger silently never runs the post-merge
+        # self-test on those repos. Anchored on the trigger-level `push:` key
+        # (2-space indent at line start), not a positional split -- the token
+        # can legitimately appear earlier in a comment or a new trigger, and
+        # a positional split would silently retarget this assertion.
+        selftest_yml = self._read("review-gate-selftest.yml")
+        trigger = re.search(r"(?m)^\s{2}push:\s*$", selftest_yml)
+        self.assertIsNotNone(trigger, "selftest must keep a push trigger")
+        push_block = selftest_yml[trigger.end():]
+        branches = re.findall(r"(?m)^\s*-\s*([\w./-]+)\s*$", push_block.split("paths:", 1)[0])
+        self.assertLessEqual({"master", "main"}, set(branches))
+
+    def test_workflows_share_one_self_hosted_runner_label(self):
+        # The vendoring overlay's single allowed diff is the runner label,
+        # applied uniformly. Asserting consistency (not a hardcoded name)
+        # keeps this test itself byte-identical across the fleet. Each file
+        # must contribute at least one scalar match: an overlay rewriting one
+        # workflow to a list/expression form (`runs-on: [self-hosted, gpu]`)
+        # would otherwise contribute zero labels and the consistency check
+        # would pass on exactly the divergence it exists to catch.
+        labels = set()
+        for name in ("review-gate.yml", "review-gate-selftest.yml"):
+            matches = re.findall(r"(?m)^\s*runs-on:\s*(\S+)\s*$", self._read(name))
+            self.assertTrue(
+                matches,
+                "%s has no scalar runs-on -- overlay must keep the scalar form" % name,
+            )
+            labels.update(matches)
+        self.assertEqual(len(labels), 1, "gate and selftest must run on the same label: %s" % labels)
+        label = next(iter(labels))
+        self.assertNotRegex(
+            label, r"(?i)\b(?:ubuntu|macos|windows)-", "hosted runner labels are forbidden"
+        )
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIssueCommentCrashClaim(unittest.TestCase):
+    """Review round 5 CRITICAL 2 / round 7 CRITICAL 2: issue_comment payloads
+    carry no pull_request.head.sha, so a refetch crash previously skipped the
+    `error` write and left an earlier same-head `success` standing -- fail-open
+    on exactly the events (comment edit/delete) that can REMOVE the evidence
+    behind a green gate. main() now probes the head FIRST (with retries), falls
+    back to git transport when the REST plane is down, and claims whichever
+    source yields the SHA -- so the crash handler always has an addressable
+    commit. Only when BOTH transports fail does the run exit non-zero with no
+    write: with no addressable commit there is nothing any code path could
+    stamp, and posting the invalidating status itself requires the REST plane
+    -- the physically irreducible residual."""
+
+    def setUp(self):
+        gate._STATUS_TARGET.clear()
+        self.addCleanup(gate._STATUS_TARGET.clear)
+
+    def _run(self, request_effects, git_fallback=None, expect_exit=True,
+             status_error=None):
+        event = {
+            "issue": {"number": 7, "pull_request": {"url": "x"}},
+            "repository": {"full_name": "Blockcast/frr"},
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+            event_path = handle.name
+        self.addCleanup(os.unlink, event_path)
+        env = {
+            "GITHUB_EVENT_PATH": event_path,
+            "GITHUB_REPOSITORY": "Blockcast/frr",
+            "GITHUB_TOKEN": "test-token",
+        }
+        calls = []
+        effects = list(request_effects)
+
+        def record_status(api, owner, repo, sha, token, state, description,
+                          target_url=None):
+            calls.append(("status", sha, state))
+            if status_error is not None:
+                raise status_error
+
+        def record_request(url, token, method="GET", payload=None):
+            calls.append(("request", url))
+            effect = effects.pop(0) if effects else None
+            if isinstance(effect, Exception):
+                raise effect
+            return effect
+
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "_request", side_effect=record_request), \
+                mock.patch.object(gate, "set_commit_status", side_effect=record_status), \
+                mock.patch.object(gate, "_sleep", lambda seconds: None), \
+                mock.patch.object(gate, "_git_pull_head_sha",
+                                  return_value=git_fallback), \
+                mock.patch.object(gate, "fetch_paginated", return_value=[]), \
+                mock.patch.object(gate, "enrich_reviews_with_edit_times"):
+            if expect_exit:
+                with self.assertRaises(SystemExit) as caught:
+                    gate.run()
+                self.assertEqual(caught.exception.code, 1)
+            else:
+                gate.run()
+        return [(c[1], c[2]) for c in calls if c[0] == "status"]
+
+    def test_refetch_crash_after_probe_posts_error_to_probed_head(self):
+        probe = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+        }
+        statuses = self._run([probe, RuntimeError("refetch boom")])
+        self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
+
+    def test_probe_retry_recovers_from_a_transient_failure(self):
+        # One 5xx/rate-limit blip must no longer forfeit the head: attempt 2
+        # succeeds, the claim lands, and the later refetch crash escalates it.
+        probe = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+        }
+        statuses = self._run(
+            [RuntimeError("transient 502"), probe, RuntimeError("refetch boom")]
+        )
+        self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
+
+    def test_git_fallback_claims_the_head_when_rest_probe_is_down(self):
+        # Review round 7 CRITICAL 2: the head comes from an independent
+        # transport when every REST probe attempt fails, so the claim (and any
+        # later crash escalation) still reaches the exact head whose comment
+        # evidence changed -- stale green cannot survive a REST-plane blip.
+        statuses = self._run(
+            [
+                RuntimeError("rest down"),
+                RuntimeError("rest down"),
+                RuntimeError("rest down"),
+                RuntimeError("refetch boom"),
+            ],
+            git_fallback=HEAD,
+        )
+        self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
+
+    def test_both_transports_failing_fails_the_run(self):
+        # The irreducible residual: REST and git transport both unreachable
+        # means no addressable commit exists anywhere -- and the invalidating
+        # status write itself needs the REST plane. Non-zero exit is the only
+        # remaining signal.
+        statuses = self._run(
+            [RuntimeError("rest down")] * 3,
+            git_fallback=None,
+        )
+        self.assertEqual(statuses, [])
+
+    def test_status_write_failure_after_git_fallback_still_exits_nonzero(self):
+        # Review round 8 CRITICAL 2: git resolves the head but the REST plane
+        # stays down, so the pending claim AND the crash-handler error write
+        # both fail. Nothing addressed to the head can land -- the run must
+        # exit non-zero so the required workflow check-run (the Actions-plane
+        # backstop that needs no REST write from us) turns red. Both writes
+        # must still have been ATTEMPTED against the exact fallback head.
+        statuses = self._run(
+            [RuntimeError("rest down")] * 4,
+            git_fallback=HEAD,
+            status_error=RuntimeError("statuses down"),
+        )
+        self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
+
+
+class TestGitHeadFallbackParsing(unittest.TestCase):
+    def test_parses_the_oid_column(self):
+        self.assertEqual(
+            gate._parse_ls_remote_head("%s\trefs/pull/7/head\n" % HEAD), HEAD
+        )
+
+    def test_rejects_non_oid_output(self):
+        for output in ("", "not-a-sha\trefs/pull/7/head\n", "fatal: auth failed\n"):
+            self.assertIsNone(gate._parse_ls_remote_head(output), repr(output))
+
+
+class TestGitFallbackTokenHygiene(unittest.TestCase):
+    """Review round 8 Important: /proc/<pid>/cmdline is readable by same-UID
+    processes on the shared self-hosted runner, and subprocess exceptions
+    embed argv -- so the token must never appear on the git command line. It
+    travels via GIT_CONFIG_* environment variables, and any emitted error
+    text is redacted as a second layer."""
+
+    TOKEN = "sekret-token-value"
+
+    def test_token_absent_from_argv_and_present_in_env_config(self):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["env"] = kwargs.get("env") or {}
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="%s\trefs/pull/7/head\n" % HEAD, stderr=""
+            )
+
+        with mock.patch.object(gate.subprocess, "run", side_effect=fake_run):
+            sha = gate._git_pull_head_sha("Blockcast", "frr", 7, self.TOKEN)
+        self.assertEqual(sha, HEAD)
+        joined = " ".join(captured["argv"])
+        self.assertNotIn(self.TOKEN, joined)
+        self.assertNotIn("x-access-token", joined)
+        header_values = [
+            value
+            for key, value in captured["env"].items()
+            if key.startswith("GIT_CONFIG_VALUE")
+        ]
+        expected = gate.base64.b64encode(
+            ("x-access-token:%s" % self.TOKEN).encode()
+        ).decode()
+        self.assertTrue(
+            any(expected in value for value in header_values),
+            "credential must travel via GIT_CONFIG_* env: %s" % header_values,
+        )
+
+    def test_error_text_is_redacted(self):
+        def fake_run(argv, **kwargs):
+            raise RuntimeError("boom %s boom" % self.TOKEN)
+
+        stderr = io.StringIO()
+        with mock.patch.object(gate.subprocess, "run", side_effect=fake_run), \
+                contextlib.redirect_stderr(stderr):
+            self.assertIsNone(
+                gate._git_pull_head_sha("Blockcast", "frr", 7, self.TOKEN)
+            )
+        output = stderr.getvalue()
+        self.assertIn("git head fallback failed", output)
+        self.assertNotIn(self.TOKEN, output)
+
+
+class TestAuthorizationInversion(unittest.TestCase):
+    """Review round 5 CRITICAL 1: prose must never authorize green. The
+    conjunction probes below defeat the negation mask by construction (an
+    unlisted pivot can always exist) -- under the inversion that mask error
+    can no longer authorize anything, because a review without an explicit
+    pass verdict or machine-readable zero counts contributes no clean
+    signal. NOT-success is the fail-closed contract here; the negation mask
+    only prevents false failures."""
+
+    def test_conjunction_probes_cannot_authorize_green(self):
+        for text in (
+            "No reviewer responded and action required: fix the gate.",
+            "No reviewer replied or changes requested: fix the gate.",
+        ):
+            body = attest(HEAD, text)
+            state, _ = decide(reviews=[review("COMMENTED", body=body)])
+            self.assertNotEqual(state, "success", repr(text))
+            state, _ = decide(comments=[comment(body)])
+            self.assertNotEqual(state, "success", repr(text))
+
+    def test_bare_prose_review_no_longer_authorizes(self):
+        # The pre-inversion behavior: an attested body whose only signal is
+        # the ABSENCE of blocking prose. Silence is not authorization.
+        body = attest(HEAD, "Looks good overall.")
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+
+    def test_negated_request_changes_family_masks(self):
+        # Review round 5 Important + round 7 Important: the "request changes"
+        # affirmative family was scanned but had no negated forms in the mask,
+        # so clean prose blocked. Round 7 adds the semi-modal "need not" /
+        # "needn't" shapes. With CLEAN counts present these must authorize.
+        for text in (
+            "No need to request changes.",
+            "We do not request changes.",
+            "We need not request changes.",
+            "We needn't request changes.",
+        ):
+            self.assertFalse(
+                gate.has_action_required_language(text), repr(text)
+            )
+            body = attest(
+                HEAD,
+                text + "\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+            )
+            state, _ = decide(reviews=[review("COMMENTED", body=body)])
+            self.assertEqual(state, "pending", repr(text))
+
+    def test_affirmative_need_to_request_changes_still_fails(self):
+        # Adjacency control for the widened modal list: "need TO request
+        # changes" and "not ONLY request changes" are affirmative -- an
+        # intervening word breaks the negated-verb shape, so neither may mask.
+        for text in (
+            "We need to request changes here.",
+            "You must not only request changes but also fix the docs.",
+        ):
+            self.assertTrue(gate.has_action_required_language(text), repr(text))
+
+
+class TestPassBlockingContradiction(unittest.TestCase):
+    """Review round 7 CRITICAL 3: an explicit pass verdict must not suppress
+    surviving (un-negated) blocking prose in the same body. Contradiction
+    resolves red, exactly as contradictory issue counts do."""
+
+    CONTRADICTORY = (
+        "### Recommended Action\n\nMerge.\n\nAction required: fix the gate.\n"
+    )
+
+    def test_pass_plus_blocking_prose_fails_in_a_review(self):
+        body = attest(HEAD, self.CONTRADICTORY)
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "failure")
+
+    def test_pass_plus_blocking_prose_fails_in_a_comment(self):
+        body = attest(HEAD, self.CONTRADICTORY)
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+    def test_pass_plus_negated_prose_stays_clean(self):
+        # The mask still protects genuinely negated prose alongside a pass:
+        # only SURVIVING affirmative phrases contradict. Comment path clears
+        # outright; the review path lands the clean-commented pending.
+        body = attest(
+            HEAD, "### Recommended Action\n\nMerge.\n\nNo action required.\n"
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "success")
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+
+
+class TestOverrideMaskAmbiguity(unittest.TestCase):
+    """Review round 7 CRITICAL 1: the negation mask can consume a REAL
+    blocking phrase behind an unlisted pivot ("No reviewer responded AND
+    action required"). Under the inversion that body authorizes nothing --
+    but the maintainer override then cleared the head, laundering the mask
+    error into green. Bodies whose only escape from a blocking verdict is
+    the mask (no pass verdict, no zero counts) are ambiguous, and the
+    override refuses them."""
+
+    AMBIGUOUS = "No reviewer responded and action required: fix gate."
+
+    def _with_override(self, reviews):
+        return decide(
+            reviews=reviews,
+            comments=[comment(override_body(HEAD), login=HUMAN)],
+            labels=[OVERRIDE],
+            trusted={HUMAN},
+        )
+
+    def test_override_refused_for_a_mask_ambiguous_review(self):
+        # Ally's exact round-7 probe: attested review whose blocking phrase
+        # the mask erased, plus the full trusted override combination.
+        body = attest(HEAD, self.AMBIGUOUS)
+        state, desc = self._with_override([review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("Override refused", desc)
+
+    def test_override_refused_for_a_mask_ambiguous_comment(self):
+        state, desc = decide(
+            comments=[
+                comment(attest(HEAD, self.AMBIGUOUS)),
+                comment(override_body(HEAD), login=HUMAN),
+            ],
+            labels=[OVERRIDE],
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("Override refused", desc)
+
+    def test_override_still_clears_a_zero_count_body_with_negated_prose(self):
+        # The normal clean-commented -> override flow must survive: zero
+        # counts are Ally's machine-readable summary and outrank prose
+        # scanning, so "No action required" alongside them is not ambiguous.
+        body = attest(
+            HEAD,
+            "### Critical Issues (0)\n\n### Important Issues (0)\n\n"
+            "No action required.\n",
+        )
+        state, _ = self._with_override([review("COMMENTED", body=body)])
+        self.assertEqual(state, "success")
+
+    def test_override_still_rescues_the_reviewer_never_ran_case(self):
+        state, _ = self._with_override([])
+        self.assertEqual(state, "success")
+
+    def test_ambiguity_is_not_laundered_by_machine_readable_all_clears(self):
+        # Review round 8 CRITICAL 1: adding `ally-verdict: pass` or both
+        # zero-count headings to a mask-erased blocking body must not make it
+        # authorize. Both combinations, both signal paths.
+        for all_clear in (
+            "\n\nally-verdict: pass\n",
+            "\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        ):
+            body = attest(HEAD, self.AMBIGUOUS + all_clear)
+            state, _ = decide(comments=[comment(body)])
+            self.assertEqual(state, "pending", repr(all_clear))
+            state, _ = decide(reviews=[review("COMMENTED", body=body)])
+            self.assertEqual(state, "pending", repr(all_clear))
+            # ...and the trusted override still refuses the same body.
+            state, desc = self._with_override([review("COMMENTED", body=body)])
+            self.assertEqual(state, "pending", repr(all_clear))
+            self.assertIn("Override refused", desc)
+
+    def test_masked_blocking_ambiguity_unit_matrix(self):
+        cases = [
+            # Coordinator-crossing span: the pivot reading may be blocking.
+            (self.AMBIGUOUS, True),
+            # All-clears do not launder ambiguity (round 8).
+            (self.AMBIGUOUS + "\nally-verdict: pass", True),
+            (
+                self.AMBIGUOUS
+                + "\n### Critical Issues (0)\n### Important Issues (0)\n",
+                True,
+            ),
+            # Distributed negation across a coordinator is regex-
+            # indistinguishable from the pivot reading: a false HOLD by
+            # design, never a false green.
+            ("No issues found or changes requested.", True),
+            # Surviving blocking phrase: the failure paths own it.
+            ("Action required: fix the gate.", False),
+            # Simple negated all-clears mask under BOTH variants.
+            ("No action required.", False),
+            ("No further changes requested.", False),
+            # Per-conjunct negation re-states "no", so strict spans never
+            # need to cross the coordinator.
+            ("No critical issues and no changes requested.", False),
+            # No affirmative vocabulary at all.
+            ("Looks good overall.", False),
+        ]
+        for text, expected in cases:
+            self.assertEqual(
+                gate.masked_blocking_ambiguity(text), expected, repr(text)
+            )

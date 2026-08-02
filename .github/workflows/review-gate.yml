@@ -42,23 +42,27 @@ permissions:
   pull-requests: read
   statuses: write
 
-# One shared group per PR, but only non-comment events cancel the in-flight
-# run. Third design for this block; each prior failure is this one's spec:
+# One shared group per PR; nothing cancels, everything queues. Fourth design
+# for this block; each prior failure is this one's spec:
 #   v1: shared group, always cancel -- ANY commenter could cancel a run about
 #       to post a failure.
 #   v2: per-run groups for comments -- uncancellable but CONCURRENT: a run
 #       holding stale evidence could write success AFTER a deletion-triggered
 #       run wrote pending, leaving green backed by deleted evidence.
-# Serialize instead: comment-triggered runs queue behind the active run and
-# never cancel it, so evaluation order matches event order and the last
-# writer always evaluated the newest evidence. GitHub keeps only the newest
-# queued run per group; collapsed intermediates are fine because every run
-# recomputes from full current state. Push/review events still cancel: a new
-# head or review legitimately supersedes the in-flight evaluation, and the
-# superseding run itself posts the verdict.
+#   v3: cancel only for non-comment events -- but cancellation is not atomic:
+#       a cancelled run can still land an already-in-flight final status POST
+#       after the superseding run wrote its verdict for the same SHA, leaving
+#       the head green on evidence the newer run had already rejected.
+#       Cancellation never bought correctness here -- every run recomputes
+#       from full current state -- it only bought that write race.
+# Serialize instead: every run queues behind the active one, so evaluation
+# order matches event order and the last writer always evaluated the newest
+# evidence. GitHub keeps only the newest queued run per group; collapsed
+# intermediates are fine because every run recomputes from full current
+# state.
 concurrency:
   group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'issue_comment' }}
+  cancel-in-progress: false
 
 jobs:
   ally-complete:
@@ -79,16 +83,16 @@ jobs:
     # check while this job still reports what it can.
     name: Ally review gate
     # Only one payload fact is consulted here: whether an issue_comment sits
-    # on a PR at all (plain-issue comments have no PR to gate; comment events
-    # never cancel the group, so a stale one can only queue, never silence).
+    # on a PR at all (plain-issue comments have no PR to gate; nothing ever
+    # cancels the group, so a stale event can only queue, never silence).
     # Every other predicate -- draft state, labels, head -- belongs to the
     # script, which refetches the PR before deciding. Round 7 removed the
     # payload draft check that lived here: a delayed PR event whose stale
     # snapshot still said `draft: true` first cancelled the in-flight
-    # ready-PR run (non-comment events cancel the shared group above), then
-    # skipped this job on that same stale snapshot -- leaving the current
-    # head with no status at all. Any event allowed to cancel the active run
-    # must be unconditionally willing to replace it.
+    # ready-PR run (non-comment events then cancelled the shared group
+    # above), then skipped this job on that same stale snapshot -- leaving
+    # the current head with no status at all. Any event that competes for the
+    # group must be unconditionally willing to evaluate the current state.
     if: >-
       github.event_name != 'issue_comment' ||
       github.event.issue.pull_request != null
