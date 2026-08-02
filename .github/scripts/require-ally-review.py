@@ -378,11 +378,24 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
     signals = []
 
     for review in reviews:
-        login = (review.get("user") or {}).get("login")
+        user = review.get("user") or {}
+        login = user.get("login")
         if not isinstance(login, str) or login not in ally:
             continue
         if review.get("state") == "DISMISSED":
             continue
+        # POSITIVE Ally evidence must come from the App seat (REST
+        # `user.type == "Bot"`), never the shared `allyblockcast` User seat
+        # (review round 2 of the multicast vendoring): the org ruleset
+        # already counts that User as the singleton Ally-team approval, so
+        # accepting it here would let ONE User review satisfy BOTH controls
+        # while the required App review is absent. Blocking evidence stays
+        # identity-agnostic below -- dropping a User-seat CHANGES_REQUESTED
+        # or blocking count would be fail-open. The User seat still
+        # participates as a DISTINCT REVIEWER on App-authored PRs via the
+        # permission-checked distinct_reviewer path, which is a separate
+        # control.
+        is_app_seat = user.get("type") == "Bot"
 
         body = str(review.get("body") or "")
         # Attestation gates CLEARING the gate, never BLOCKING it.
@@ -425,7 +438,7 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             continue
 
         if state == "APPROVED":
-            if not attested:
+            if not attested or not is_app_seat:
                 continue
             signals.append(
                 {
@@ -474,7 +487,7 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
                     }
                 )
                 continue
-            if not attested:
+            if not attested or not is_app_seat:
                 continue
             # A coordinator-ambiguous body may not authorize green no matter
             # what pass verdict or zero counts accompany it (review round 8):
@@ -646,10 +659,15 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
     signals = []
 
     for comment in comments:
-        login = (comment.get("user") or {}).get("login")
+        user = comment.get("user") or {}
+        login = user.get("login")
         body = str(comment.get("body") or "")
         if not isinstance(login, str) or login not in ally:
             continue
+        # Same App-seat rule as the review path (see review_signals_for_head):
+        # only `user.type == "Bot"` may contribute POSITIVE evidence; blocking
+        # evidence below stays identity-agnostic.
+        is_app_seat = user.get("type") == "Bot"
 
         is_consolidated = is_consolidated_ally_comment_for_head(body, head_sha)
         is_issue_link = is_issue_link_ally_comment_for_head(body, head_sha)
@@ -713,9 +731,12 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
         if masked_blocking_ambiguity(body):
             continue
 
-        # Positive only on an affirmative verdict: an explicit pass, or
-        # validated zero blocking counts. Silence is not consent -- a
-        # consolidated body with neither is ambiguous and stays pending.
+        # Positive only on an affirmative verdict from the App seat: an
+        # explicit pass, or validated zero blocking counts. Silence is not
+        # consent -- a consolidated body with neither is ambiguous and stays
+        # pending -- and a User-seat all-clear contributes nothing here.
+        if not is_app_seat:
+            continue
         has_zero_counts = (
             extract_issue_count(body, "Critical Issues") == 0
             and extract_issue_count(body, "Important Issues") == 0

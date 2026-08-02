@@ -61,8 +61,12 @@ def review(state, commit=HEAD, body=None, login="allyblockcast[bot]", at="2026-0
     return row
 
 
-def comment(body, login="allyblockcast[bot]", at="2026-07-27T10:00:00Z", updated=None):
-    row = {"body": body, "user": {"login": login}, "created_at": at}
+def comment(body, login="allyblockcast[bot]", at="2026-07-27T10:00:00Z", updated=None,
+            utype="Bot"):
+    """Defaults to the App seat (type Bot): positive Ally evidence requires
+    it, and most fixtures exercise the authoritative path. Pass utype="User"
+    to model the shared `allyblockcast` User seat."""
+    row = {"body": body, "user": {"login": login, "type": utype}, "created_at": at}
     if updated is not None:
         row["updated_at"] = updated
     return row
@@ -1287,6 +1291,82 @@ class TestWorkflowContracts(unittest.TestCase):
         self.assertNotRegex(
             label, r"(?i)\b(?:ubuntu|macos|windows)-", "hosted runner labels are forbidden"
         )
+
+
+class TestUserSeatCannotProvidePositiveEvidence(unittest.TestCase):
+    """Multicast-vendoring review round 2 CRITICAL: the org ruleset counts the
+    shared `allyblockcast` User as the singleton Ally-team approval, so if the
+    gate also accepted that User's reviews as positive Ally evidence, ONE User
+    review would satisfy BOTH controls while the required App review is
+    absent. Positive evidence therefore requires `user.type == "Bot"` (the
+    App seat); blocking evidence stays identity-agnostic (dropping a User-seat
+    CHANGES_REQUESTED would be fail-open); and the User seat keeps its
+    separate, permission-checked DISTINCT-REVIEWER role on App-authored PRs.
+    """
+
+    def _user_review(self, state, body=None, **kw):
+        return review(state, body=body, login="allyblockcast", utype="User", **kw)
+
+    def test_user_seat_attested_approval_alone_stays_pending(self):
+        state, desc = decide(reviews=[self._user_review("APPROVED", body=attest(HEAD))])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+
+    def test_user_seat_zero_count_commented_review_stays_pending(self):
+        state, desc = decide(reviews=[self._user_review("COMMENTED", body=CLEAN)])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+
+    def test_user_seat_clean_consolidated_comment_stays_pending(self):
+        state, _ = decide(comments=[comment(CLEAN, login="allyblockcast", utype="User")])
+        self.assertEqual(state, "pending")
+
+    def test_user_seat_pass_verdict_comment_stays_pending(self):
+        body = attest(HEAD, "### Recommended Action\n\nMerge.\n")
+        state, _ = decide(comments=[comment(body, login="allyblockcast", utype="User")])
+        self.assertEqual(state, "pending")
+
+    def test_user_seat_changes_requested_still_fails(self):
+        state, _ = decide(reviews=[self._user_review("CHANGES_REQUESTED")])
+        self.assertEqual(state, "failure")
+
+    def test_user_seat_blocking_count_still_fails(self):
+        blocking = attest(HEAD, "### Critical Issues (2)\n")
+        state, _ = decide(reviews=[self._user_review("COMMENTED", body=blocking)])
+        self.assertEqual(state, "failure")
+        state, _ = decide(
+            comments=[comment(blocking, login="allyblockcast", utype="User")]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_user_seat_positive_does_not_shadow_bot_blocking(self):
+        # A newer User-seat all-clear contributes NO signal, so it cannot
+        # out-recency an older App-seat blocking review.
+        blocking = attest(HEAD, "### Important Issues (1)\n")
+        state, _ = decide(
+            reviews=[
+                review("COMMENTED", body=blocking, at="2026-07-27T09:00:00Z"),
+                self._user_review("APPROVED", body=attest(HEAD),
+                                  at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_app_seat_approval_still_succeeds(self):
+        state, _ = decide(reviews=[review("APPROVED")])
+        self.assertEqual(state, "success")
+
+    def test_user_seat_distinct_reviewer_role_is_unchanged(self):
+        # On an App-authored PR, the User seat with verified write permission
+        # still approves via the distinct-reviewer path -- a separate,
+        # permission-checked control, not Ally self-evidence.
+        state, _ = decide(
+            reviews=[review("APPROVED", login="allyblockcast", utype="User",
+                            at="2026-07-27T11:00:00Z")],
+            author="app/allyblockcast",
+            trusted={"allyblockcast"},
+        )
+        self.assertEqual(state, "success")
 
 
 if __name__ == "__main__":
