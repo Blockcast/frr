@@ -71,6 +71,10 @@ V6_TYPE3_ORIGINATOR = "10.0.0.2"
 V6_TYPE4_LEAF = "10.0.0.3"
 V6_RECOVER_SRC = "2001:db8:40::1"
 V6_RECOVER_GRP = "ff3e::40"
+V6_TYPE4_RECOVER_SRC = "2001:db8:40::2"
+V6_TYPE4_RECOVER_GRP = "ff3e::41"
+V6_TRUNC_RECOVER_SRC = "2001:db8:40::3"
+V6_TRUNC_RECOVER_GRP = "ff3e::42"
 REFLECTED_TYPE1_ORIGINATOR = "10.0.0.1"
 
 
@@ -138,6 +142,12 @@ def _type3_nlri(rd, src, grp, originator, length=None):
     if length is None:
         length = len(body)
     return struct.pack("!BB", MVPN_TYPE3, length) + body
+
+
+def _type3_source_only_nlri(rd, src):
+    """Type-3 whose declared body ends immediately after its C-source."""
+    body = rd + struct.pack("!B", IPV6_BITLEN) + _packed_addr(src)
+    return struct.pack("!BB", MVPN_TYPE3, len(body)) + body
 
 
 def _type4_nlri(rd, src, grp, originator, leaf, nested_length=None):
@@ -313,8 +323,21 @@ def main():
             _type4_nlri(
                 zero_rd, V6_SELECTIVE_SRC, V6_SELECTIVE_GRP,
                 V6_TYPE3_ORIGINATOR, V6_TYPE4_LEAF,
+            ) + _type5_nlri(
+                zero_rd, V6_TYPE4_RECOVER_SRC, V6_TYPE4_RECOVER_GRP,
             ),
             afi=AFI_IP6,
+        )
+    )
+    # G3: the declared Type-3 body ends after C-S. Its missing C-G length must
+    # not consume the following Type-5 route-type byte.
+    sock.sendall(
+        build_mvpn_update(
+            "2001:db8:1::2",
+            _type3_source_only_nlri(zero_rd, V6_SELECTIVE_SRC)
+            + _type5_nlri(zero_rd, V6_TRUNC_RECOVER_SRC, V6_TRUNC_RECOVER_GRP),
+            afi=AFI_IP6,
+            include_pmsi=True,
         )
     )
     sock.sendall(

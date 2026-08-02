@@ -497,7 +497,7 @@ static int bgp_mvpn_parse_sg_body(struct peer *peer, struct stream *data, uint8_
 		STREAM_GETL(data, *source_as);
 
 	STREAM_GETC(data, src_len);
-	if (stream_get_getp(data) + prefix_blen(src_len) > body_end)
+	if (stream_get_getp(data) + PSIZE(src_len) > body_end)
 		goto bad_length;
 	switch (bgp_mvpn_read_caddr(data, src, src_len)) {
 	case MVPN_CADDR_OK:
@@ -510,8 +510,10 @@ static int bgp_mvpn_parse_sg_body(struct peer *peer, struct stream *data, uint8_
 		return BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
 	}
 
+	if (stream_get_getp(data) >= body_end)
+		goto bad_length;
 	STREAM_GETC(data, grp_len);
-	if (stream_get_getp(data) + prefix_blen(grp_len) > body_end)
+	if (stream_get_getp(data) + PSIZE(grp_len) > body_end)
 		goto bad_length;
 	switch (bgp_mvpn_read_caddr(data, grp, grp_len)) {
 	case MVPN_CADDR_OK:
@@ -677,13 +679,19 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 
 		case BGP_MVPN_ROUTE_TYPE_S_PMSI_AD: {
 			bool originator_v6;
+			size_t nlri_end = stream_get_getp(data) + length;
 
 			ret = bgp_mvpn_parse_sg_body(peer, data, route_type, length, rd, &src,
 						     &grp, &source_as, &originator_v6);
 			if (ret == -1)
 				goto stream_failure;
-			if (ret != BGP_NLRI_PARSE_OK)
-				goto done;
+			if (ret != BGP_NLRI_PARSE_OK) {
+				/* The outer length was checked above, so discard only this
+				 * malformed NLRI and preserve the following route boundary. */
+				stream_set_getp(data, nlri_end);
+				ret = BGP_NLRI_PARSE_OK;
+				continue;
+			}
 			ret = bgp_mvpn_read_originator(data, &originator, originator_v6);
 			if (ret != BGP_NLRI_PARSE_OK)
 				goto stream_failure;

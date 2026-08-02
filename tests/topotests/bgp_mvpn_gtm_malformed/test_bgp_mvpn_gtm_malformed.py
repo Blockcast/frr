@@ -65,6 +65,8 @@ V6_SELECTIVE_SG = ("2001:db8:30::1", "ff3e::30")
 V6_TYPE3_ORIGINATOR = "10.0.0.2"
 V6_TYPE4_LEAF = "10.0.0.3"
 V6_RECOVER_SG = ("2001:db8:40::1", "ff3e::40")
+V6_TYPE4_RECOVER_SG = ("2001:db8:40::2", "ff3e::41")
+V6_TRUNC_RECOVER_SG = ("2001:db8:40::3", "ff3e::42")
 SELECTIVE_LABEL = 0x12345
 
 
@@ -264,7 +266,13 @@ def test_valid_ipv6_type3_and_type4_accepted():
         if not type3.get("pmsiTunnel", {}).get("leafInfoRequired"):
             return "IPv6 Type-3 PMSI L-bit was not preserved: {}".format(type3)
         if not _has_type5(routes, V6_RECOVER_SG):
-            return "trailing IPv6 Type-5 was desynchronized: {}".format(routes)
+            return "Type-5 following IPv6 Type-3 was desynchronized: {}".format(routes)
+        if not _has_type5(routes, V6_TYPE4_RECOVER_SG):
+            return "Type-5 following IPv6 Type-4 was desynchronized: {}".format(routes)
+        if not _has_type5(routes, V6_TRUNC_RECOVER_SG):
+            return "Type-3 consumed the following Type-5 route-type byte: {}".format(
+                routes
+            )
         return None
 
     _, result = topotest.run_and_expect(_present, None, count=60, wait=1)
