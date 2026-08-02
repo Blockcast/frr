@@ -705,6 +705,7 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			bool originator_v6;
 			bool leaf_v6;
 			uint8_t leaf_length;
+			size_t nlri_end = stream_get_getp(data) + length;
 
 			if (length < 2) {
 				flog_err(EC_BGP_UPDATE_RCV,
@@ -724,7 +725,7 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 				/* The outer Type-4 length is valid, so its boundary is
 				 * trustworthy even though the embedded route key is not.
 				 * Discard this NLRI without resetting the BGP session. */
-				stream_forward_getp(data, length - 2);
+				stream_set_getp(data, nlri_end);
 				continue;
 			}
 
@@ -732,16 +733,20 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 						     &grp, &source_as, &originator_v6);
 			if (ret == -1)
 				goto stream_failure;
-			if (ret != BGP_NLRI_PARSE_OK)
-				goto done;
+			if (ret != BGP_NLRI_PARSE_OK) {
+				stream_set_getp(data, nlri_end);
+				ret = BGP_NLRI_PARSE_OK;
+				continue;
+			}
 			leaf_length = length - 2 - key_length;
 			if (leaf_length != IPV4_MAX_BYTELEN &&
 			    leaf_length != IPV6_MAX_BYTELEN) {
 				flog_err(EC_BGP_UPDATE_RCV,
 					 "%s [Error] MVPN Type-4 bad leaf originator length %u",
 					 peer->host, leaf_length);
-				ret = BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
-				goto done;
+				stream_set_getp(data, nlri_end);
+				ret = BGP_NLRI_PARSE_OK;
+				continue;
 			}
 			leaf_v6 = leaf_length == IPV6_MAX_BYTELEN;
 			if (bgp_mvpn_read_originator(data, &originator, originator_v6) !=

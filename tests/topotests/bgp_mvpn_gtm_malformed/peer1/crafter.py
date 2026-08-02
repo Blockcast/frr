@@ -75,6 +75,8 @@ V6_TYPE4_RECOVER_SRC = "2001:db8:40::2"
 V6_TYPE4_RECOVER_GRP = "ff3e::41"
 V6_TRUNC_RECOVER_SRC = "2001:db8:40::3"
 V6_TRUNC_RECOVER_GRP = "ff3e::42"
+V6_NESTED_RECOVER_SRC = "2001:db8:40::4"
+V6_NESTED_RECOVER_GRP = "ff3e::43"
 REFLECTED_TYPE1_ORIGINATOR = "10.0.0.1"
 
 
@@ -152,6 +154,20 @@ def _type3_source_only_nlri(rd, src):
 
 def _type4_nlri(rd, src, grp, originator, leaf, nested_length=None):
     route_key = _type3_nlri(rd, src, grp, originator, nested_length)
+    body = route_key + _packed_addr(leaf)
+    return struct.pack("!BB", MVPN_TYPE4, len(body)) + body
+
+
+def _type4_bad_nested_body_nlri(rd, src, leaf):
+    """Type-4 with an allowed 46-byte key whose C-G cannot fit its body."""
+    key_body = (
+        rd
+        + struct.pack("!B", IPV6_BITLEN)
+        + _packed_addr(src)
+        + struct.pack("!B", 255)
+        + b"\x00" * 20
+    )
+    route_key = struct.pack("!BB", MVPN_TYPE3, len(key_body)) + key_body
     body = route_key + _packed_addr(leaf)
     return struct.pack("!BB", MVPN_TYPE4, len(body)) + body
 
@@ -383,6 +399,20 @@ def main():
                 nested_length=21,
             )
             + _type5_nlri(zero_rd, RECOVER_SRC, RECOVER_GRP),
+        )
+    )
+    # E3: the nested key length is allowed, but its C-G framing is malformed.
+    # The trustworthy outer Type-4 boundary must preserve the trailing Type-5.
+    sock.sendall(
+        build_mvpn_update(
+            "2001:db8:1::2",
+            _type4_bad_nested_body_nlri(
+                zero_rd, V6_SELECTIVE_SRC, V6_TYPE4_LEAF,
+            )
+            + _type5_nlri(
+                zero_rd, V6_NESTED_RECOVER_SRC, V6_NESTED_RECOVER_GRP,
+            ),
+            afi=AFI_IP6,
         )
     )
     # F: empty MP_UNREACH -- must not crash the receiver.

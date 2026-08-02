@@ -67,6 +67,7 @@ V6_TYPE4_LEAF = "10.0.0.3"
 V6_RECOVER_SG = ("2001:db8:40::1", "ff3e::40")
 V6_TYPE4_RECOVER_SG = ("2001:db8:40::2", "ff3e::41")
 V6_TRUNC_RECOVER_SG = ("2001:db8:40::3", "ff3e::42")
+V6_NESTED_RECOVER_SG = ("2001:db8:40::4", "ff3e::43")
 SELECTIVE_LABEL = 0x12345
 
 
@@ -271,6 +272,10 @@ def test_valid_ipv6_type3_and_type4_accepted():
             return "Type-5 following IPv6 Type-4 was desynchronized: {}".format(routes)
         if not _has_type5(routes, V6_TRUNC_RECOVER_SG):
             return "Type-3 consumed the following Type-5 route-type byte: {}".format(
+                routes
+            )
+        if not _has_type5(routes, V6_NESTED_RECOVER_SG):
+            return "malformed Type-4 nested body consumed trailing Type-5: {}".format(
                 routes
             )
         return None
