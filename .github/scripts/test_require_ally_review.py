@@ -999,13 +999,16 @@ class TestNegatedActionRequired(unittest.TestCase):
         self.assertEqual(state, "success")
 
     def test_multi_modifier_negations_do_not_defeat_the_mask(self):
-        # Review round 3: the mask allowed exactly zero or one modifier word
-        # between "no" and the phrase family, so ordinary multi-modifier
-        # all-clear prose ("no ADDITIONAL CODE changes requested") left the
-        # affirmative substring behind and blocked a clean review.
+        # Review rounds 3-4: the mask first allowed exactly zero or one
+        # modifier word, then an arbitrary cap of three -- each left some
+        # ordinary multi-modifier all-clear prose ("no ADDITIONAL
+        # APPLICATION SOURCE CODE changes requested") with the affirmative
+        # substring behind, blocking a clean review. The span is now
+        # clause-bounded instead of counted.
         for text in (
             "No additional code changes requested.",
             "No immediate further action required.",
+            "No additional application source code changes requested.",
         ):
             body = attest(
                 HEAD,
@@ -1015,12 +1018,27 @@ class TestNegatedActionRequired(unittest.TestCase):
             self.assertEqual(state, "success", text)
 
     def test_mask_window_does_not_cross_punctuation(self):
-        # The widened modifier window must not let a standalone "No." swallow
-        # a separate affirmative sentence: the window admits only
-        # whitespace-separated word characters, so punctuation ends it.
+        # The clause-bounded window must not let a standalone "No." swallow
+        # a separate affirmative sentence: modifiers admit only word
+        # characters, so punctuation ends the span.
         body = attest(HEAD, "No. Changes requested: fix the overflow before merge.")
         state, _ = decide(comments=[comment(body)])
         self.assertEqual(state, "failure")
+
+    def test_mask_window_does_not_cross_line_boundaries(self):
+        # Review round 4 CRITICAL: with "\s+" separators the mask crossed a
+        # paragraph boundary -- a bare "No" ending one paragraph erased a
+        # real blocking verdict opening the next ("No\n\nAction required:"
+        # became ": ..."), flipping the gate fail-open. Separators admit
+        # only horizontal whitespace, so a line boundary ends the span and
+        # the blocking verdict survives the mask.
+        for text in (
+            "No\n\nAction required: fix the gate.",
+            "No\n\nChanges requested: fix the gate.",
+        ):
+            body = attest(HEAD, text)
+            state, _ = decide(comments=[comment(body)])
+            self.assertEqual(state, "failure", repr(text))
 
     def test_affirmative_changes_requested_still_fails(self):
         body = attest(HEAD, "Changes requested: the overflow must be fixed first.")
