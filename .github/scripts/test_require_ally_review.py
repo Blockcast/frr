@@ -1358,9 +1358,13 @@ class TestUserSeatCannotProvidePositiveEvidence(unittest.TestCase):
         return review(state, body=body, login="allyblockcast", utype="User", **kw)
 
     def test_user_seat_attested_approval_alone_stays_pending(self):
+        # Round 4: the exact-head-attested User-seat approval now emits the
+        # clean-commented placeholder (so it can withdraw its own earlier
+        # objection under per-login reduction), but it still cannot green --
+        # the gate pends awaiting the formal App-seat approval.
         state, desc = decide(reviews=[self._user_review("APPROVED", body=attest(HEAD))])
         self.assertEqual(state, "pending")
-        self.assertIn("Waiting for Ally review", desc)
+        self.assertIn("awaiting an App-seat APPROVED", desc)
 
     def test_user_seat_zero_count_commented_review_stays_pending(self):
         state, desc = decide(reviews=[self._user_review("COMMENTED", body=CLEAN)])
@@ -1873,6 +1877,453 @@ class TestSuccessExclusivity(unittest.TestCase):
             reviews=[review("APPROVED", at="2026-07-27T09:00:00Z")],
             comments=[comment(attest(HEAD, "### Critical Issues (1)\n"),
                               at="2026-07-27T12:00:00Z")],
+        )
+        self.assertEqual(state, "failure")
+
+
+class TestApprovedBodyContradiction(unittest.TestCase):
+    """Round 4 CRITICAL 1: blocking body evidence is classified before the
+    state branches, so an exact-head App APPROVED whose body still carries
+    machine-readable blocking findings (or surviving action-required prose)
+    is a contradiction and resolves red -- it must never green the gate."""
+
+    def test_approved_with_nonzero_counts_fails(self):
+        body = attest(HEAD, "### Critical Issues (1)\n")
+        state, desc = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "failure")
+        self.assertIn("blocking findings", desc)
+
+    def test_approved_with_action_required_prose_fails(self):
+        body = attest(HEAD, "Action required: fix the decode bounds.\n")
+        state, _ = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "failure")
+
+    def test_approved_with_changes_requested_verdict_fails(self):
+        body = attest(
+            HEAD, "### Recommended Action\n\nRequest changes before merge.\n"
+        )
+        state, _ = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "failure")
+
+    def test_approved_with_negated_prose_still_greens(self):
+        # The negation mask keeps protecting genuine all-clear prose in an
+        # approval body -- only SURVIVING affirmatives contradict.
+        body = attest(
+            HEAD,
+            "No action required.\n\n### Critical Issues (0)\n\n"
+            "### Important Issues (0)\n",
+        )
+        state, _ = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "success")
+
+    def test_approved_with_masked_ambiguous_body_stays_pending(self):
+        # Round-8 invariant extended to the APPROVED branch: a body whose
+        # only escape from a blocking phrase is the lenient mask may not
+        # authorize green even with the formal state. Fail-closed = pending.
+        body = attest(
+            HEAD, "No reviewer responded and action required: fix the gate.\n"
+        )
+        state, _ = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "pending")
+
+    def test_self_review_with_blocking_counts_fails(self):
+        # Body-level blocking evidence now fails closed BEFORE the
+        # self-review demotion, matching the comment path's rule.
+        body = attest(HEAD, "### Important Issues (2)\n")
+        state, _ = decide(
+            reviews=[review("APPROVED", body=body)], author="app/allyblockcast"
+        )
+        self.assertEqual(state, "failure")
+
+
+class TestPerLoginSeatReduction(unittest.TestCase):
+    """Round 4 CRITICAL 2: Ally's App and User seats are distinct actors.
+    A later App approval must not erase a User-seat CHANGES_REQUESTED the
+    User identity never withdrew; only the same identity supersedes its own
+    objection."""
+
+    def _user_review(self, state, body=None, **kw):
+        return review(state, body=body, login="allyblockcast", utype="User", **kw)
+
+    def test_app_approval_does_not_erase_user_seat_changes_requested(self):
+        state, desc = decide(
+            reviews=[
+                self._user_review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+        self.assertIn("requested changes", desc)
+
+    def test_user_seat_withdraws_its_own_objection_via_attested_approval(self):
+        state, _ = decide(
+            reviews=[
+                self._user_review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z"),
+                self._user_review(
+                    "APPROVED", body=attest(HEAD), at="2026-07-27T10:00:00Z"
+                ),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_unattested_user_approval_does_not_withdraw(self):
+        # An approval that neither matches the head nor attests it binds
+        # nothing in either direction; the User objection stands.
+        state, _ = decide(
+            reviews=[
+                self._user_review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z"),
+                self._user_review(
+                    "APPROVED",
+                    body=attest(OTHER),
+                    commit=OTHER,
+                    at="2026-07-27T10:00:00Z",
+                ),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_user_withdrawal_newest_does_not_unseat_app_approval(self):
+        # Selection is by status priority after per-login reduction: with no
+        # outstanding blocker, the App seat's standing approval greens even
+        # when a User-seat placeholder is globally newest.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+                self._user_review(
+                    "APPROVED", body=attest(HEAD), at="2026-07-27T13:00:00Z"
+                ),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_apps_own_newer_clean_review_still_supersedes_its_approval(self):
+        # Same-login supersession is preserved: the App seat's newest signal
+        # is its current state, so its own later clean COMMENTED review
+        # returns the gate to pending-awaiting-approval.
+        state, desc = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+                review("COMMENTED", body=CLEAN, at="2026-07-27T13:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("awaiting an App-seat APPROVED", desc)
+
+
+class TestSeatAwareReduction(unittest.TestCase):
+    """Round 2 of the #47 review: reduction keys are (login, seat), and
+    ambiguous approvals fail closed against prior state in both directions.
+    """
+
+    AMBIGUOUS = "No reviewer responded and action required: fix the gate.\n"
+
+    def test_normalized_app_login_does_not_merge_seats(self):
+        # GitHub REST may normalize the App login to the same string as the
+        # shared User login. The seats are still distinct actors: a
+        # normalized App approval must not erase the User seat's objection.
+        state, desc = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="Bot",
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+        self.assertIn("requested changes", desc)
+
+    def test_same_seat_same_login_still_supersedes(self):
+        # The seat-aware key must not break same-actor withdrawal: the same
+        # (login, seat) pair's newer approval supersedes its own objection.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="Bot",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="Bot",
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_apps_own_ambiguous_approval_supersedes_its_success(self):
+        # An ambiguous approval is the seat's newest formal verdict: the
+        # earlier clean success is no longer current, and the gate pends.
+        state, desc = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T10:00:00Z"),
+                review("APPROVED", body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("ambiguous", desc)
+
+    def test_ambiguous_user_approval_does_not_withdraw_blocker(self):
+        # Fail closed in the other direction: an ambiguous User-seat
+        # approval must not act as that seat's withdrawal, so the objection
+        # survives a standing App approval.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T10:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_unambiguous_user_approval_still_withdraws_after_ambiguous(self):
+        # The seat's own UNAMBIGUOUS approval remains the withdrawal path
+        # even after an ambiguous attempt.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T10:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T11:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_reduction_is_input_order_independent_across_sources(self):
+        # Round 3 of the #47 review: decide() concatenates all reviews
+        # before all comments, so the User seat's ambiguous approval (10:00)
+        # used to install first and that seat's OLDER blocking comment
+        # (09:00) was discarded as stale -- erasing the blocker by input
+        # order. The per-actor fold now sorts chronologically first: the
+        # blocker installs, the ambiguous approval cannot withdraw it, and
+        # the separate App approval must not green the head.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T10:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ],
+            comments=[
+                comment(attest(HEAD, "### Critical Issues (1)\n"),
+                        login="allyblockcast", utype="User",
+                        at="2026-07-27T09:00:00Z"),
+            ],
+        )
+        self.assertEqual(state, "failure")
+
+    def test_same_second_clean_and_ambiguous_approvals_resolve_ambiguous(self):
+        # Round 3 of the #47 review: at an equal timestamp ambiguity
+        # outranks a non-blocking success, in either input order, so a
+        # clean and an ambiguous App approval in the same second land
+        # pending rather than letting list order pick success.
+        clean = review("APPROVED", at="2026-07-27T12:00:00Z")
+        ambiguous = review("APPROVED", body=attest(HEAD, self.AMBIGUOUS),
+                           at="2026-07-27T12:00:00Z")
+        for ordering in ([clean, ambiguous], [ambiguous, clean]):
+            state, desc = decide(reviews=list(ordering))
+            self.assertEqual(state, "pending")
+            self.assertIn("ambiguous", desc)
+
+    def test_same_second_failure_still_outranks_ambiguity(self):
+        # Tie precedence is failure > ambiguity > non-blocking.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T12:00:00Z"),
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_same_second_success_and_clean_review_resolve_pending(self):
+        # Round 4 of the #47 review: success and clean-commented both ranked
+        # 0, so REST list order decided a same-second approval-vs-clean-
+        # review tie. The full precedence (failure > ambiguity >
+        # clean/pending > success) now resolves an equal-second
+        # contradiction away from green in either input order.
+        approved = review("APPROVED", at="2026-07-27T12:00:00Z")
+        clean = review("COMMENTED", body=CLEAN, at="2026-07-27T12:00:00Z")
+        for ordering in ([approved, clean], [clean, approved]):
+            state, desc = decide(reviews=list(ordering))
+            self.assertEqual(state, "pending")
+            self.assertIn("awaiting an App-seat APPROVED", desc)
+
+    def test_app_login_aliases_group_as_one_actor(self):
+        # Round 5 of the #47 review: REST may expose the same App seat as
+        # `allyblockcast[bot]` in one row and normalized `allyblockcast` in
+        # another. Splitting them left an older clean approval standing as a
+        # separate current success beside the App's newer ambiguous verdict.
+        # Both alias directions must reduce to one actor: the ambiguous
+        # approval is that actor's newest signal, and the gate pends.
+        for old_login, new_login in (
+            ("allyblockcast[bot]", "allyblockcast"),
+            ("allyblockcast", "allyblockcast[bot]"),
+        ):
+            state, desc = decide(
+                reviews=[
+                    review("APPROVED", login=old_login,
+                           at="2026-07-27T10:00:00Z"),
+                    review("APPROVED", login=new_login,
+                           body=attest(HEAD, self.AMBIGUOUS),
+                           at="2026-07-27T12:00:00Z"),
+                ]
+            )
+            self.assertEqual(state, "pending", (old_login, new_login))
+            self.assertIn("ambiguous", desc)
+
+    def test_alias_canonicalization_keeps_seats_apart(self):
+        # The round-2 property survives round 5: a normalized App approval
+        # and a User-seat objection under the SAME login string stay
+        # distinct actors (the seat component of the key separates them).
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast[bot]", utype="Bot",
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_same_second_clean_and_ambiguous_bucket_cannot_clear_blocker(self):
+        # Round 6 of the #47 review: folding individual signals let the
+        # clean approval withdraw the 09:00 blocker one step before the
+        # same-second ambiguous approval was processed, and a separate App
+        # approval then greened. Each timestamp bucket now collapses to its
+        # highest fail-closed precedence first: the 10:00 bucket is
+        # ambiguous, ambiguity cannot withdraw the blocker, and the head
+        # stays failure -- in either bucket input order.
+        blocker = review("CHANGES_REQUESTED", login="allyblockcast",
+                         utype="User", at="2026-07-27T09:00:00Z")
+        clean = review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T10:00:00Z")
+        ambiguous = review("APPROVED", login="allyblockcast", utype="User",
+                           body=attest(HEAD, self.AMBIGUOUS),
+                           at="2026-07-27T10:00:00Z")
+        app = review("APPROVED", at="2026-07-27T12:00:00Z")
+        for ordering in ([blocker, clean, ambiguous, app],
+                         [blocker, ambiguous, clean, app]):
+            state, _ = decide(reviews=list(ordering))
+            self.assertEqual(state, "failure")
+
+    def test_newer_ambiguous_commented_review_supersedes_approval(self):
+        # Round 6 of the #47 review: an attested App-seat ambiguous
+        # COMMENTED review was discarded, so an older App approval stayed
+        # green. It is now the seat's current non-success signal: the gate
+        # returns to pending.
+        state, desc = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T09:00:00Z"),
+                review("COMMENTED", body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("ambiguous", desc)
+
+    def test_ambiguous_commented_review_still_cannot_withdraw_blocker(self):
+        # The emitted ambiguous review obeys the same reduction rule as
+        # ambiguous approvals: it never withdraws its own seat's blocker.
+        # Both signals are App-seat here -- a User-seat ambiguous COMMENTED
+        # emits nothing at all (the branch is App-gated before ambiguity).
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z"),
+                review("COMMENTED", body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_edited_old_approval_cannot_withdraw_newer_objection(self):
+        # Round 7 of the #47 review: withdrawal authority binds to
+        # submitted_at. The edit-aware clock let an old User approval,
+        # body-edited AFTER the same identity's newer CHANGES_REQUESTED,
+        # become the actor's newest clean placeholder -- withdrawing an
+        # objection no new formal review ever withdrew, and letting a
+        # separate App approval green the head.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T12:00:00Z"),
+                review("APPROVED", at="2026-07-27T14:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_edited_old_app_approval_cannot_outrank_newer_clean_review(self):
+        # The same submitted_at rule for the success signal: editing an old
+        # App approval's body must not rank it past the seat's newer clean
+        # COMMENTED look, which holds the gate pending awaiting a NEW formal
+        # approval.
+        state, desc = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("COMMENTED", body=CLEAN, at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("awaiting an App-seat APPROVED", desc)
+
+    def test_review_edited_to_add_blocking_still_ranks_newest(self):
+        # The fail-closed half of the round-7 rule is unchanged: blocking
+        # evidence keeps the edit-aware clock, so an old clean review edited
+        # to ADD findings outranks the seat's newer approval.
+        state, _ = decide(
+            reviews=[
+                review("COMMENTED",
+                       body=attest(HEAD, "### Critical Issues (1)\n"),
+                       at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_edited_old_objection_cannot_resurrect_past_withdrawal(self):
+        # Round 8 of the #47 review: the CHANGES_REQUESTED state signal
+        # binds to submitted_at too. Editing an old objection's plain body
+        # (no blocking counts or prose) must not re-time the STATE past the
+        # same seat's newer formal approval -- the 12:00 approval remains
+        # the User seat's current verdict and the App approval greens.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T12:00:00Z"),
+                review("APPROVED", at="2026-07-27T14:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_objection_edited_to_add_blocking_counts_stays_red(self):
+        # The symmetric fail-closed pin: when the edit ADDS machine-readable
+        # blocking evidence, the edit-aware body-evidence branch (not the
+        # state branch) emits the failure at edit time, outranking the
+        # seat's 12:00 withdrawal.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, "### Critical Issues (1)\n"),
+                       at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T12:00:00Z"),
+                review("APPROVED", at="2026-07-27T14:00:00Z"),
+            ]
         )
         self.assertEqual(state, "failure")
 
