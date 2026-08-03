@@ -2242,6 +2242,55 @@ class TestSeatAwareReduction(unittest.TestCase):
         )
         self.assertEqual(state, "failure")
 
+    def test_edited_old_approval_cannot_withdraw_newer_objection(self):
+        # Round 7 of the #47 review: withdrawal authority binds to
+        # submitted_at. The edit-aware clock let an old User approval,
+        # body-edited AFTER the same identity's newer CHANGES_REQUESTED,
+        # become the actor's newest clean placeholder -- withdrawing an
+        # objection no new formal review ever withdrew, and letting a
+        # separate App approval green the head.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T12:00:00Z"),
+                review("APPROVED", at="2026-07-27T14:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_edited_old_app_approval_cannot_outrank_newer_clean_review(self):
+        # The same submitted_at rule for the success signal: editing an old
+        # App approval's body must not rank it past the seat's newer clean
+        # COMMENTED look, which holds the gate pending awaiting a NEW formal
+        # approval.
+        state, desc = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("COMMENTED", body=CLEAN, at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("awaiting an App-seat APPROVED", desc)
+
+    def test_review_edited_to_add_blocking_still_ranks_newest(self):
+        # The fail-closed half of the round-7 rule is unchanged: blocking
+        # evidence keeps the edit-aware clock, so an old clean review edited
+        # to ADD findings outranks the seat's newer approval.
+        state, _ = decide(
+            reviews=[
+                review("COMMENTED",
+                       body=attest(HEAD, "### Critical Issues (1)\n"),
+                       at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
 
 if __name__ == "__main__":
     unittest.main()

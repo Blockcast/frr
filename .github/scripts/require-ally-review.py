@@ -429,6 +429,19 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             continue
 
         at = review_signal_time(review)
+        # Round 7 of the #47 review: STATE-WITHDRAWAL AUTHORITY orders by
+        # submission time. review_signal_time() ranks a review at the later
+        # of submitted_at/last_edited_at so a body edited to ADD blocking
+        # findings ranks newest (fail closed) -- but that same edit-aware
+        # clock let an OLD approval, body-edited after a newer
+        # CHANGES_REQUESTED from the same identity, become the actor's
+        # newest clean placeholder and withdraw an objection that was never
+        # formally withdrawn. Positive and withdrawal signals (success,
+        # clean-commented, the User-seat withdrawal placeholder, the
+        # self-review placeholder) therefore bind to submitted_at; only
+        # fail-closed body-derived evidence (blocking findings, coordinator
+        # ambiguity) keeps the edit-aware time.
+        submitted = str(review.get("submitted_at") or "")
         state = review.get("state")
 
         # Blocking body evidence is classified BEFORE the state branches
@@ -465,7 +478,7 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
         # neither hard-pass (APPROVED) nor hard-fail (CHANGES_REQUESTED); its
         # body-level blocking evidence has already failed closed above.
         if is_self_review:
-            signals.append(self_review_signal(at, login, head_sha, seat))
+            signals.append(self_review_signal(submitted, login, head_sha, seat))
             continue
 
         if state == "APPROVED":
@@ -506,7 +519,7 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
                 # it can never become the green.
                 signals.append(
                     {
-                        "at": at,
+                        "at": submitted,
                         "author": login,
                         "seat": seat,
                         "description": "Ally User-seat approval of head %s "
@@ -518,7 +531,7 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
                 continue
             signals.append(
                 {
-                    "at": at,
+                    "at": submitted,
                     "author": login,
                     "seat": seat,
                     "description": "Ally approved head %s." % short_sha(head_sha),
@@ -585,7 +598,7 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
                 continue
             signals.append(
                 {
-                    "at": at,
+                    "at": submitted,
                     "author": login,
                     "seat": seat,
                     "description": "Ally reviewed head %s with no blocking findings."
@@ -785,7 +798,14 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
             continue
 
         if is_self_review:
-            signals.append(self_review_signal(at, login, head_sha, seat))
+            # Binds to created_at (the submission analog): an edited old
+            # comment must not re-time this pending placeholder past the
+            # actor's newer blocking evidence (round 7 of the #47 review).
+            signals.append(
+                self_review_signal(
+                    str(comment.get("created_at") or ""), login, head_sha, seat
+                )
+            )
             continue
 
         verdict = explicit_verdict(body)
