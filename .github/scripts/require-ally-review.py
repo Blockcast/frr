@@ -822,6 +822,27 @@ def latest_signal(signals):
     return sorted(signals, key=order)[-1]
 
 
+def canonical_actor_login(login, seat):
+    """One grouping key per identity across REST login spellings (round 5 of
+    the #47 review): the same GitHub App may surface as `x[bot]`, `app/x`,
+    or a normalized bare `x` in different rows, and splitting those left a
+    stale clean approval standing as a separate current `success` beside
+    the App's newer ambiguous verdict under the other spelling. Only the
+    App seat is normalized -- the shared User seat keeps its raw login, so
+    the seat separation from round 2 (normalized App vs User with the same
+    login string) is untouched: the seat component of the key still
+    distinguishes them.
+    """
+    if seat != "app":
+        return login
+    name = login
+    if name.startswith("app/"):
+        name = name[len("app/"):]
+    if name.endswith("[bot]"):
+        name = name[: -len("[bot]")]
+    return name
+
+
 def current_signals_per_login(signals):
     """Each actor's CURRENT signal, independent of input order.
 
@@ -870,7 +891,9 @@ def current_signals_per_login(signals):
 
     grouped = {}
     for signal in signals:
-        grouped.setdefault((signal["author"], signal.get("seat", "")), []).append(signal)
+        seat = signal.get("seat", "")
+        actor = (canonical_actor_login(signal["author"], seat), seat)
+        grouped.setdefault(actor, []).append(signal)
 
     current_states = []
     for group in grouped.values():

@@ -2155,6 +2155,43 @@ class TestSeatAwareReduction(unittest.TestCase):
             self.assertEqual(state, "pending")
             self.assertIn("awaiting an App-seat APPROVED", desc)
 
+    def test_app_login_aliases_group_as_one_actor(self):
+        # Round 5 of the #47 review: REST may expose the same App seat as
+        # `allyblockcast[bot]` in one row and normalized `allyblockcast` in
+        # another. Splitting them left an older clean approval standing as a
+        # separate current success beside the App's newer ambiguous verdict.
+        # Both alias directions must reduce to one actor: the ambiguous
+        # approval is that actor's newest signal, and the gate pends.
+        for old_login, new_login in (
+            ("allyblockcast[bot]", "allyblockcast"),
+            ("allyblockcast", "allyblockcast[bot]"),
+        ):
+            state, desc = decide(
+                reviews=[
+                    review("APPROVED", login=old_login,
+                           at="2026-07-27T10:00:00Z"),
+                    review("APPROVED", login=new_login,
+                           body=attest(HEAD, self.AMBIGUOUS),
+                           at="2026-07-27T12:00:00Z"),
+                ]
+            )
+            self.assertEqual(state, "pending", (old_login, new_login))
+            self.assertIn("ambiguous", desc)
+
+    def test_alias_canonicalization_keeps_seats_apart(self):
+        # The round-2 property survives round 5: a normalized App approval
+        # and a User-seat objection under the SAME login string stay
+        # distinct actors (the seat component of the key separates them).
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast[bot]", utype="Bot",
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
 
 if __name__ == "__main__":
     unittest.main()
