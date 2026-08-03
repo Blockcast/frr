@@ -854,12 +854,19 @@ def current_signals_per_login(signals):
 
     def tie_rank(signal):
         # Higher rank folds LAST at an equal timestamp, so it wins the tie
-        # unless a fold rule (ambiguity-vs-failure) says otherwise.
+        # unless a fold rule (ambiguity-vs-failure) says otherwise. Every
+        # same-second pairing is deterministic (round 4 of the #47 review):
+        # failure > ambiguity > clean/pending > success. Ranking success
+        # LOWEST means an equal-second contradiction always resolves away
+        # from green -- a clean COMMENTED beside a same-second approval
+        # withdraws it to pending, never the reverse by REST list order.
         if signal["status"] == "failure":
-            return 2
+            return 3
         if signal["status"] == AMBIGUOUS_APPROVAL_STATUS:
-            return 1
-        return 0
+            return 2
+        if signal["status"] == "success":
+            return 0
+        return 1
 
     grouped = {}
     for signal in signals:

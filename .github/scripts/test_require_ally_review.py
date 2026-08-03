@@ -2142,6 +2142,19 @@ class TestSeatAwareReduction(unittest.TestCase):
         )
         self.assertEqual(state, "failure")
 
+    def test_same_second_success_and_clean_review_resolve_pending(self):
+        # Round 4 of the #47 review: success and clean-commented both ranked
+        # 0, so REST list order decided a same-second approval-vs-clean-
+        # review tie. The full precedence (failure > ambiguity >
+        # clean/pending > success) now resolves an equal-second
+        # contradiction away from green in either input order.
+        approved = review("APPROVED", at="2026-07-27T12:00:00Z")
+        clean = review("COMMENTED", body=CLEAN, at="2026-07-27T12:00:00Z")
+        for ordering in ([approved, clean], [clean, approved]):
+            state, desc = decide(reviews=list(ordering))
+            self.assertEqual(state, "pending")
+            self.assertIn("awaiting an App-seat APPROVED", desc)
+
 
 if __name__ == "__main__":
     unittest.main()
