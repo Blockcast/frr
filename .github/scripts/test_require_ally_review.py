@@ -1358,9 +1358,13 @@ class TestUserSeatCannotProvidePositiveEvidence(unittest.TestCase):
         return review(state, body=body, login="allyblockcast", utype="User", **kw)
 
     def test_user_seat_attested_approval_alone_stays_pending(self):
+        # Round 4: the exact-head-attested User-seat approval now emits the
+        # clean-commented placeholder (so it can withdraw its own earlier
+        # objection under per-login reduction), but it still cannot green --
+        # the gate pends awaiting the formal App-seat approval.
         state, desc = decide(reviews=[self._user_review("APPROVED", body=attest(HEAD))])
         self.assertEqual(state, "pending")
-        self.assertIn("Waiting for Ally review", desc)
+        self.assertIn("awaiting an App-seat APPROVED", desc)
 
     def test_user_seat_zero_count_commented_review_stays_pending(self):
         state, desc = decide(reviews=[self._user_review("COMMENTED", body=CLEAN)])
@@ -1875,6 +1879,137 @@ class TestSuccessExclusivity(unittest.TestCase):
                               at="2026-07-27T12:00:00Z")],
         )
         self.assertEqual(state, "failure")
+
+
+class TestApprovedBodyContradiction(unittest.TestCase):
+    """Round 4 CRITICAL 1: blocking body evidence is classified before the
+    state branches, so an exact-head App APPROVED whose body still carries
+    machine-readable blocking findings (or surviving action-required prose)
+    is a contradiction and resolves red -- it must never green the gate."""
+
+    def test_approved_with_nonzero_counts_fails(self):
+        body = attest(HEAD, "### Critical Issues (1)\n")
+        state, desc = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "failure")
+        self.assertIn("blocking findings", desc)
+
+    def test_approved_with_action_required_prose_fails(self):
+        body = attest(HEAD, "Action required: fix the decode bounds.\n")
+        state, _ = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "failure")
+
+    def test_approved_with_changes_requested_verdict_fails(self):
+        body = attest(
+            HEAD, "### Recommended Action\n\nRequest changes before merge.\n"
+        )
+        state, _ = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "failure")
+
+    def test_approved_with_negated_prose_still_greens(self):
+        # The negation mask keeps protecting genuine all-clear prose in an
+        # approval body -- only SURVIVING affirmatives contradict.
+        body = attest(
+            HEAD,
+            "No action required.\n\n### Critical Issues (0)\n\n"
+            "### Important Issues (0)\n",
+        )
+        state, _ = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "success")
+
+    def test_approved_with_masked_ambiguous_body_stays_pending(self):
+        # Round-8 invariant extended to the APPROVED branch: a body whose
+        # only escape from a blocking phrase is the lenient mask may not
+        # authorize green even with the formal state. Fail-closed = pending.
+        body = attest(
+            HEAD, "No reviewer responded and action required: fix the gate.\n"
+        )
+        state, _ = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "pending")
+
+    def test_self_review_with_blocking_counts_fails(self):
+        # Body-level blocking evidence now fails closed BEFORE the
+        # self-review demotion, matching the comment path's rule.
+        body = attest(HEAD, "### Important Issues (2)\n")
+        state, _ = decide(
+            reviews=[review("APPROVED", body=body)], author="app/allyblockcast"
+        )
+        self.assertEqual(state, "failure")
+
+
+class TestPerLoginSeatReduction(unittest.TestCase):
+    """Round 4 CRITICAL 2: Ally's App and User seats are distinct actors.
+    A later App approval must not erase a User-seat CHANGES_REQUESTED the
+    User identity never withdrew; only the same identity supersedes its own
+    objection."""
+
+    def _user_review(self, state, body=None, **kw):
+        return review(state, body=body, login="allyblockcast", utype="User", **kw)
+
+    def test_app_approval_does_not_erase_user_seat_changes_requested(self):
+        state, desc = decide(
+            reviews=[
+                self._user_review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+        self.assertIn("requested changes", desc)
+
+    def test_user_seat_withdraws_its_own_objection_via_attested_approval(self):
+        state, _ = decide(
+            reviews=[
+                self._user_review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z"),
+                self._user_review(
+                    "APPROVED", body=attest(HEAD), at="2026-07-27T10:00:00Z"
+                ),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_unattested_user_approval_does_not_withdraw(self):
+        # An approval that neither matches the head nor attests it binds
+        # nothing in either direction; the User objection stands.
+        state, _ = decide(
+            reviews=[
+                self._user_review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z"),
+                self._user_review(
+                    "APPROVED",
+                    body=attest(OTHER),
+                    commit=OTHER,
+                    at="2026-07-27T10:00:00Z",
+                ),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_user_withdrawal_newest_does_not_unseat_app_approval(self):
+        # Selection is by status priority after per-login reduction: with no
+        # outstanding blocker, the App seat's standing approval greens even
+        # when a User-seat placeholder is globally newest.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+                self._user_review(
+                    "APPROVED", body=attest(HEAD), at="2026-07-27T13:00:00Z"
+                ),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_apps_own_newer_clean_review_still_supersedes_its_approval(self):
+        # Same-login supersession is preserved: the App seat's newest signal
+        # is its current state, so its own later clean COMMENTED review
+        # returns the gate to pending-awaiting-approval.
+        state, desc = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+                review("COMMENTED", body=CLEAN, at="2026-07-27T13:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("awaiting an App-seat APPROVED", desc)
 
 
 if __name__ == "__main__":

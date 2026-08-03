@@ -418,9 +418,23 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
         at = review_signal_time(review)
         state = review.get("state")
 
-        # Self-review cannot approve its own PR, but its machine-readable
-        # blocking findings must still fail closed and stay un-overridable.
-        if state == "COMMENTED" and has_blocking_count(body):
+        # Blocking body evidence is classified BEFORE the state branches
+        # (round 4 of the multicast vendoring review): the APPROVED branch
+        # used to return success without reading the body, so an exact-head
+        # App approval whose body still carried `Critical Issues (1)` -- or
+        # surviving (un-negated) action-required prose, or an explicit
+        # changes-requested verdict -- greened the gate. Contradiction
+        # resolves red for EVERY state, including a self-review, matching
+        # the comment path's rule that machine-readable blocking findings
+        # fail closed and stay un-overridable. The prose scan runs
+        # independently of the verdict (review round 7); incidental
+        # security/"blocking" mentions still do NOT match.
+        verdict = explicit_verdict(body)
+        if (
+            has_blocking_count(body)
+            or verdict == "changes-requested"
+            or has_action_required_language(body)
+        ):
             signals.append(
                 {
                     "at": at,
@@ -433,14 +447,42 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             )
             continue
 
-        # Demote before reading the verdict so a bot review of its own PR can
-        # neither hard-pass (APPROVED) nor hard-fail (CHANGES_REQUESTED).
+        # Demote before reading the state so a bot review of its own PR can
+        # neither hard-pass (APPROVED) nor hard-fail (CHANGES_REQUESTED); its
+        # body-level blocking evidence has already failed closed above.
         if is_self_review:
             signals.append(self_review_signal(at, login, head_sha))
             continue
 
         if state == "APPROVED":
             if not attested or not is_app_seat:
+                # Round 4: an exact-head-attested User-seat approval carries
+                # no positive authority, but it IS that identity's newest
+                # formal verdict. Emit the clean-commented placeholder so the
+                # per-login reduction in decide() lets the User seat withdraw
+                # ITS OWN earlier objection -- mirroring GitHub's rule that a
+                # reviewer's new approval supersedes their prior
+                # CHANGES_REQUESTED. decide() maps this status to pending, so
+                # it can never become the green. Unattested approvals bind
+                # nothing, in either direction.
+                if attested and not is_app_seat:
+                    signals.append(
+                        {
+                            "at": at,
+                            "author": login,
+                            "description": "Ally User-seat approval of head %s "
+                            "(no positive authority)." % short_sha(head_sha),
+                            "kind": "user-seat-approval",
+                            "status": CLEAN_COMMENTED_STATUS,
+                        }
+                    )
+                continue
+            # A coordinator-ambiguous body may not authorize green even with
+            # a formal APPROVED state (the round-8 invariant, extended to
+            # this branch in round 4): the lenient mask may have consumed a
+            # real blocking phrase, and the formal state must not launder
+            # that away. Fail-closed lands pending, never success.
+            if masked_blocking_ambiguity(body):
                 continue
             signals.append(
                 {
@@ -468,27 +510,6 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             continue
 
         if state == "COMMENTED":
-            verdict = explicit_verdict(body)
-            # An explicit changes-requested verdict, OR surviving (un-negated)
-            # action-required prose, is a real negative -- stays red, label or
-            # not. The prose scan runs INDEPENDENTLY of the verdict (review
-            # round 7): a body pairing "Recommended Action: Merge." with
-            # "Action required: fix X." is contradictory, and contradiction
-            # resolves red, exactly as contradictory issue counts do in
-            # extract_issue_count. Incidental security/"blocking" prose still
-            # does NOT match.
-            if verdict == "changes-requested" or has_action_required_language(body):
-                signals.append(
-                    {
-                        "at": at,
-                        "author": login,
-                        "description": "Ally review flagged blocking findings on head %s."
-                        % short_sha(head_sha),
-                        "kind": "formal-review",
-                        "status": "failure",
-                    }
-                )
-                continue
             if not attested or not is_app_seat:
                 continue
             # A coordinator-ambiguous body may not authorize green no matter
@@ -758,15 +779,14 @@ def latest_signal(signals):
     return sorted(signals, key=order)[-1]
 
 
-def reduce_distinct_reviewer_signals(signals):
-    """Reduce to each reviewer's CURRENT state, then fail if any reviewer is
-    currently requesting changes.
-
-    Taking the single globally-latest signal is wrong with more than one
-    reviewer: reviewer B approving after reviewer A requested changes would
-    erase A's still-active objection and clear the gate. GitHub itself treats
-    an outstanding CHANGES_REQUESTED as blocking regardless of who reviewed
-    later, and so does this.
+def current_signals_per_login(signals):
+    """Each login's CURRENT signal: newest by effective time; a same-second
+    tie between opposite states from one login resolves to the blocking one
+    (fail closed) rather than letting API list order pick. Shared by the
+    distinct-reviewer reduction and (round 4 of the multicast vendoring
+    review) by decide()'s reduction of Ally's own dual-seat signals -- the
+    App seat and the shared User seat are distinct actors, so only the same
+    identity may supersede its own objection.
     """
     latest_by_author = {}
     for signal in signals:
@@ -783,7 +803,20 @@ def reduce_distinct_reviewer_signals(signals):
         if newer or tie_blocking:
             latest_by_author[signal["author"]] = signal
 
-    current_states = list(latest_by_author.values())
+    return list(latest_by_author.values())
+
+
+def reduce_distinct_reviewer_signals(signals):
+    """Reduce to each reviewer's CURRENT state, then fail if any reviewer is
+    currently requesting changes.
+
+    Taking the single globally-latest signal is wrong with more than one
+    reviewer: reviewer B approving after reviewer A requested changes would
+    erase A's still-active objection and clear the gate. GitHub itself treats
+    an outstanding CHANGES_REQUESTED as blocking regardless of who reviewed
+    later, and so does this.
+    """
+    current_states = current_signals_per_login(signals)
     blocking = [s for s in current_states if s["status"] == "failure"]
     if blocking:
         return latest_signal(blocking)
@@ -857,6 +890,25 @@ def decide(
         else []
     )
 
+    # Round 4 of the multicast vendoring review: Ally's own signals reduce
+    # PER LOGIN, exactly like distinct reviewers, because the App seat and
+    # the shared User seat are distinct actors -- a later App approval must
+    # not erase a User-seat CHANGES_REQUESTED that its own identity never
+    # withdrew. After the reduction, selection is fail-closed by status:
+    # any outstanding blocker wins; otherwise a standing App-seat approval
+    # (only the formal App APPROVED branch can produce `success`, and only
+    # that login's own newer signal can supersede it); otherwise the newest
+    # clean/pending placeholder.
+    ally_current = current_signals_per_login(ally_signals)
+    ally_blocking = [s for s in ally_current if s["status"] == "failure"]
+    ally_successes = [s for s in ally_current if s["status"] == "success"]
+    if ally_blocking:
+        signal = latest_signal(ally_blocking)
+    elif ally_successes:
+        signal = latest_signal(ally_successes)
+    else:
+        signal = latest_signal(ally_current)
+
     # Distinct-reviewer evidence contributes ONLY blocking signals (round 3
     # of the multicast vendoring review): this context's sole positive
     # authority is the Ally App seat, and an App-authored PR cannot receive
@@ -865,10 +917,8 @@ def decide(
     # closed (dropping it would be fail-open), and inside the per-reviewer
     # reduction a reviewer's later approval still withdraws THEIR OWN earlier
     # change request -- but a surviving approval maps to no signal, never
-    # success. Ally's own blocking findings outrank everything.
-    ally_has_failure = any(entry["status"] == "failure" for entry in ally_signals)
-    signal = latest_signal(ally_signals)
-    if is_self_review and distinct_signals and not ally_has_failure:
+    # success. Ally's own OUTSTANDING blocking findings outrank everything.
+    if is_self_review and distinct_signals and not ally_blocking:
         reduced = reduce_distinct_reviewer_signals(distinct_signals)
         if reduced is not None and reduced["status"] == "failure":
             signal = reduced
