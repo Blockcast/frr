@@ -823,13 +823,15 @@ def latest_signal(signals):
 
 
 def current_signals_per_login(signals):
-    """Each actor's CURRENT signal: newest by effective time; a same-second
-    tie between opposite states from one actor resolves to the blocking one
-    (fail closed) rather than letting API list order pick. Shared by the
-    distinct-reviewer reduction and (round 4 of the multicast vendoring
-    review) by decide()'s reduction of Ally's own dual-seat signals -- the
-    App seat and the shared User seat are distinct actors, so only the same
-    identity may supersede its own objection.
+    """Each actor's CURRENT signal, independent of input order.
+
+    Round 3 of the #47 review: the previous incremental fold depended on the
+    order signals arrived -- decide() concatenates all reviews before all
+    comments, so a seat's ambiguous approval could be installed first and
+    that same seat's OLDER blocking comment then discarded as stale, erasing
+    a blocker the ambiguity rule was supposed to preserve. Each (login,
+    seat) group is now sorted before folding, so caller concatenation order
+    cannot change the result.
 
     The key is (login, seat), not login alone (round 2 of the #47 review):
     GitHub REST may normalize the App login to the same string as the shared
@@ -837,37 +839,48 @@ def current_signals_per_login(signals):
     letting a normalized App approval erase the User seat's outstanding
     objection.
 
-    An AMBIGUOUS_APPROVAL_STATUS signal never displaces a standing blocker:
-    it supersedes the same seat's non-blocking state (so a later ambiguous
-    approval unseats an earlier clean success), but a seat whose current
-    state is failure keeps that failure until an UNAMBIGUOUS same-seat
-    verdict supersedes it.
+    Ordering inside one actor is chronological with a fail-closed tie rank:
+    on an equal timestamp, failure outranks ambiguity, and ambiguity
+    outranks any non-blocking state (a clean approval and an ambiguous
+    approval in the same second resolve to ambiguous -- pending, not
+    success). Across timestamps the chronologically newest signal wins,
+    EXCEPT that an AMBIGUOUS_APPROVAL_STATUS signal never displaces a
+    standing failure: the blocker stays current until an UNAMBIGUOUS
+    same-seat verdict supersedes it. Shared by the distinct-reviewer
+    reduction and by decide()'s reduction of Ally's own dual-seat signals --
+    the App seat and the shared User seat are distinct actors, so only the
+    same identity may supersede its own objection.
     """
-    latest_by_actor = {}
-    for signal in signals:
-        actor = (signal["author"], signal.get("seat", ""))
-        current = latest_by_actor.get(actor)
-        newer = current is None or str(signal["at"]) > str(current["at"])
-        if (
-            newer
-            and current is not None
-            and current["status"] == "failure"
-            and signal["status"] == AMBIGUOUS_APPROVAL_STATUS
-        ):
-            # An ambiguous approval cannot withdraw this seat's blocker.
-            continue
-        # Same-second tie between opposite states from one actor: fail
-        # closed rather than let list order pick.
-        tie_blocking = (
-            current is not None
-            and str(signal["at"]) == str(current["at"])
-            and signal["status"] == "failure"
-            and current["status"] != "failure"
-        )
-        if newer or tie_blocking:
-            latest_by_actor[actor] = signal
 
-    return list(latest_by_actor.values())
+    def tie_rank(signal):
+        # Higher rank folds LAST at an equal timestamp, so it wins the tie
+        # unless a fold rule (ambiguity-vs-failure) says otherwise.
+        if signal["status"] == "failure":
+            return 2
+        if signal["status"] == AMBIGUOUS_APPROVAL_STATUS:
+            return 1
+        return 0
+
+    grouped = {}
+    for signal in signals:
+        grouped.setdefault((signal["author"], signal.get("seat", "")), []).append(signal)
+
+    current_states = []
+    for group in grouped.values():
+        current = None
+        for signal in sorted(group, key=lambda s: (str(s["at"]), tie_rank(s))):
+            if (
+                current is not None
+                and current["status"] == "failure"
+                and signal["status"] == AMBIGUOUS_APPROVAL_STATUS
+            ):
+                # An ambiguous approval cannot withdraw this seat's blocker.
+                continue
+            current = signal
+        if current is not None:
+            current_states.append(current)
+
+    return current_states
 
 
 def reduce_distinct_reviewer_signals(signals):

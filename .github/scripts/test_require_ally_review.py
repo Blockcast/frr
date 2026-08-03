@@ -2093,6 +2093,55 @@ class TestSeatAwareReduction(unittest.TestCase):
         )
         self.assertEqual(state, "success")
 
+    def test_reduction_is_input_order_independent_across_sources(self):
+        # Round 3 of the #47 review: decide() concatenates all reviews
+        # before all comments, so the User seat's ambiguous approval (10:00)
+        # used to install first and that seat's OLDER blocking comment
+        # (09:00) was discarded as stale -- erasing the blocker by input
+        # order. The per-actor fold now sorts chronologically first: the
+        # blocker installs, the ambiguous approval cannot withdraw it, and
+        # the separate App approval must not green the head.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T10:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ],
+            comments=[
+                comment(attest(HEAD, "### Critical Issues (1)\n"),
+                        login="allyblockcast", utype="User",
+                        at="2026-07-27T09:00:00Z"),
+            ],
+        )
+        self.assertEqual(state, "failure")
+
+    def test_same_second_clean_and_ambiguous_approvals_resolve_ambiguous(self):
+        # Round 3 of the #47 review: at an equal timestamp ambiguity
+        # outranks a non-blocking success, in either input order, so a
+        # clean and an ambiguous App approval in the same second land
+        # pending rather than letting list order pick success.
+        clean = review("APPROVED", at="2026-07-27T12:00:00Z")
+        ambiguous = review("APPROVED", body=attest(HEAD, self.AMBIGUOUS),
+                           at="2026-07-27T12:00:00Z")
+        for ordering in ([clean, ambiguous], [ambiguous, clean]):
+            state, desc = decide(reviews=list(ordering))
+            self.assertEqual(state, "pending")
+            self.assertIn("ambiguous", desc)
+
+    def test_same_second_failure_still_outranks_ambiguity(self):
+        # Tie precedence is failure > ambiguity > non-blocking.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T12:00:00Z"),
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
 
 if __name__ == "__main__":
     unittest.main()
