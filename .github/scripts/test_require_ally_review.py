@@ -2291,6 +2291,42 @@ class TestSeatAwareReduction(unittest.TestCase):
         )
         self.assertEqual(state, "failure")
 
+    def test_edited_old_objection_cannot_resurrect_past_withdrawal(self):
+        # Round 8 of the #47 review: the CHANGES_REQUESTED state signal
+        # binds to submitted_at too. Editing an old objection's plain body
+        # (no blocking counts or prose) must not re-time the STATE past the
+        # same seat's newer formal approval -- the 12:00 approval remains
+        # the User seat's current verdict and the App approval greens.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T12:00:00Z"),
+                review("APPROVED", at="2026-07-27T14:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_objection_edited_to_add_blocking_counts_stays_red(self):
+        # The symmetric fail-closed pin: when the edit ADDS machine-readable
+        # blocking evidence, the edit-aware body-evidence branch (not the
+        # state branch) emits the failure at edit time, outranking the
+        # seat's 12:00 withdrawal.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, "### Critical Issues (1)\n"),
+                       at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T12:00:00Z"),
+                review("APPROVED", at="2026-07-27T14:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
 
 if __name__ == "__main__":
     unittest.main()

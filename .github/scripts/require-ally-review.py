@@ -542,11 +542,17 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             continue
 
         # The canonical distinct-reviewer negative verdict. Stays red
-        # regardless of body prose or the override label.
+        # regardless of body prose or the override label. Round 8 of the
+        # #47 review: this STATE signal binds to submitted_at like every
+        # other formal-state signal -- editing an old objection's body must
+        # not re-time it past the same seat's newer formal approval and
+        # resurrect a formally withdrawn objection. An edit that ADDS
+        # machine-readable blocking evidence still fails closed through the
+        # edit-aware body-evidence branch above.
         if state == "CHANGES_REQUESTED":
             signals.append(
                 {
-                    "at": at,
+                    "at": submitted,
                     "author": login,
                     "seat": seat,
                     "description": "Ally requested changes on head %s." % short_sha(head_sha),
