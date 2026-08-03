@@ -14,6 +14,7 @@ sys.path.append(os.path.join(CWD, "../"))
 
 from lib import topotest
 from lib.common_config import kill_router_daemons, start_router_daemons
+from lib.kernel_state import check_gre_link
 from lib.topogen import Topogen, get_topogen
 
 pytestmark = [pytest.mark.zebra]
@@ -182,8 +183,14 @@ def test_acknowledged_gre_lifecycle_and_owner_reconnect():
     installed = request("add", 1)
     assert installed["result"] == 0, installed
     assert installed["ifindex"] > 0, installed
-    link = router.run("ip -d link show dimt-00000001")
-    assert "gre remote 192.0.2.2 local 192.0.2.1" in link, link
+    kernel_error = check_gre_link(
+        router,
+        "dimt-00000001",
+        local="192.0.2.1",
+        remote="192.0.2.2",
+        mtu=1476,
+    )
+    assert kernel_error is None, kernel_error
     address = router.run("ip -o address show dev dimt-00000001")
     assert "10.200.0.1 peer 10.200.0.2/32" in address, address
 

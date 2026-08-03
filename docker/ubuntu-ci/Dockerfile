@@ -233,7 +233,7 @@ RUN cd ~/frr && \
     make -j $(nproc) && \
     sudo make install
 
-RUN cd ~/frr && make check || true
+RUN cd ~/frr && make check
 
 COPY docker/ubuntu-ci/docker-start /usr/sbin/docker-start
 CMD ["/usr/sbin/docker-start"]
