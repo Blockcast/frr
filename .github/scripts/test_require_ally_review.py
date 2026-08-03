@@ -2192,6 +2192,56 @@ class TestSeatAwareReduction(unittest.TestCase):
         )
         self.assertEqual(state, "failure")
 
+    def test_same_second_clean_and_ambiguous_bucket_cannot_clear_blocker(self):
+        # Round 6 of the #47 review: folding individual signals let the
+        # clean approval withdraw the 09:00 blocker one step before the
+        # same-second ambiguous approval was processed, and a separate App
+        # approval then greened. Each timestamp bucket now collapses to its
+        # highest fail-closed precedence first: the 10:00 bucket is
+        # ambiguous, ambiguity cannot withdraw the blocker, and the head
+        # stays failure -- in either bucket input order.
+        blocker = review("CHANGES_REQUESTED", login="allyblockcast",
+                         utype="User", at="2026-07-27T09:00:00Z")
+        clean = review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T10:00:00Z")
+        ambiguous = review("APPROVED", login="allyblockcast", utype="User",
+                           body=attest(HEAD, self.AMBIGUOUS),
+                           at="2026-07-27T10:00:00Z")
+        app = review("APPROVED", at="2026-07-27T12:00:00Z")
+        for ordering in ([blocker, clean, ambiguous, app],
+                         [blocker, ambiguous, clean, app]):
+            state, _ = decide(reviews=list(ordering))
+            self.assertEqual(state, "failure")
+
+    def test_newer_ambiguous_commented_review_supersedes_approval(self):
+        # Round 6 of the #47 review: an attested App-seat ambiguous
+        # COMMENTED review was discarded, so an older App approval stayed
+        # green. It is now the seat's current non-success signal: the gate
+        # returns to pending.
+        state, desc = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T09:00:00Z"),
+                review("COMMENTED", body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("ambiguous", desc)
+
+    def test_ambiguous_commented_review_still_cannot_withdraw_blocker(self):
+        # The emitted ambiguous review obeys the same reduction rule as
+        # ambiguous approvals: it never withdraws its own seat's blocker.
+        # Both signals are App-seat here -- a User-seat ambiguous COMMENTED
+        # emits nothing at all (the branch is App-gated before ambiguity).
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z"),
+                review("COMMENTED", body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
 
 if __name__ == "__main__":
     unittest.main()

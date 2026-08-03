@@ -549,8 +549,24 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             # A coordinator-ambiguous body may not authorize green no matter
             # what pass verdict or zero counts accompany it (review round 8):
             # the mask may have consumed a real blocking phrase, and a
-            # machine-readable all-clear must not launder that away.
+            # machine-readable all-clear must not launder that away. Round 6
+            # of the #47 review: the ambiguous review is EMITTED rather than
+            # discarded -- it is this App seat's newest formal look at the
+            # head, so it supersedes the seat's older approval to pending
+            # (while still never withdrawing a blocker, per the reduction).
             if masked_blocking_ambiguity(body):
+                signals.append(
+                    {
+                        "at": at,
+                        "author": login,
+                        "seat": seat,
+                        "description": "Ally review of head %s is "
+                        "coordinator-ambiguous; it neither authorizes nor "
+                        "withdraws." % short_sha(head_sha),
+                        "kind": "ambiguous-commented-review",
+                        "status": AMBIGUOUS_APPROVAL_STATUS,
+                    }
+                )
                 continue
             # AUTHORIZATION INVERSION (review round 5): free prose never
             # authorizes green. A clean-commented review counts only with a
@@ -897,16 +913,27 @@ def current_signals_per_login(signals):
 
     current_states = []
     for group in grouped.values():
+        # Round 6 of the #47 review: reduce each TIMESTAMP BUCKET to its
+        # highest fail-closed precedence before applying it to prior state.
+        # Folding individual signals let a clean approval withdraw a
+        # standing blocker one step before the same-second ambiguous
+        # approval was processed -- the bucket's contradictory verdicts must
+        # collapse first (ambiguity beats the clean withdrawal), and an
+        # ambiguous bucket still cannot withdraw the seat's earlier blocker.
+        buckets = {}
+        for signal in group:
+            buckets.setdefault(str(signal["at"]), []).append(signal)
         current = None
-        for signal in sorted(group, key=lambda s: (str(s["at"]), tie_rank(s))):
+        for at in sorted(buckets):
+            representative = max(buckets[at], key=tie_rank)
             if (
                 current is not None
                 and current["status"] == "failure"
-                and signal["status"] == AMBIGUOUS_APPROVAL_STATUS
+                and representative["status"] == AMBIGUOUS_APPROVAL_STATUS
             ):
-                # An ambiguous approval cannot withdraw this seat's blocker.
+                # An ambiguous verdict cannot withdraw this seat's blocker.
                 continue
-            current = signal
+            current = representative
         if current is not None:
             current_states.append(current)
 
