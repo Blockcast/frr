@@ -51,10 +51,11 @@ STATUS_CONTEXT = os.environ.get("STATUS_CONTEXT") or "review/ally-complete"
 _STATUS_TARGET = {}
 
 # Sentinel (not a GitHub status state): a COMMENTED Ally review carrying no
-# blocking findings. Ally only ever COMMENTs -- never APPROVEs -- so this is
-# its "looks good". It is NOT an auto-pass: it stays overridable so the
-# review-gate-override label can clear it, but without the label the gate
-# posts `pending` (and so still blocks merge).
+# blocking findings. Ally historically only COMMENTed -- never APPROVEd --
+# so this is its "looks good". It is NOT a pass: since round 3 of the
+# multicast vendoring review the ONLY green for this context is an exact-head
+# App-seat APPROVED review, so a clean COMMENTED body holds `pending` until
+# the App seat approves.
 CLEAN_COMMENTED_STATUS = "clean-commented"
 
 # A loose keyword scan over prose is unsafe: a *positive* review that merely
@@ -337,18 +338,19 @@ def is_issue_link_ally_comment_for_head(body, head_sha):
 
 def self_review_signal(at, author, head_sha):
     """A clean self-review (the PR was authored by an Ally identity, and Ally
-    is reviewing its own PR) is not authoritative: Ally's own prose says
-    "formal review/approval must come from a human or a distinct reviewer
-    identity". Demoted to a non-authoritative "pending"; machine-readable
-    blocking findings are classified before reaching here and still fail
-    closed.
+    is reviewing its own PR) is not authoritative, and since round 3 of the
+    multicast vendoring review no substitute exists: the only identity that
+    may authorize this context is the App seat, which cannot approve its own
+    PR. App-authored heads stay pending until reopened under an independent
+    author. Machine-readable blocking findings are classified before reaching
+    here and still fail closed.
     """
     return {
         "at": str(at or ""),
         "author": author,
         "description": (
-            "Ally self-review on head %s is not authoritative; "
-            "needs a human or distinct reviewer." % short_sha(head_sha)
+            "Ally-authored PR: head %s cannot be App-self-approved; "
+            "reopen it under an independent author." % short_sha(head_sha)
         ),
         "kind": "self-review",
         "status": "pending",
@@ -664,10 +666,10 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
         body = str(comment.get("body") or "")
         if not isinstance(login, str) or login not in ally:
             continue
-        # Same App-seat rule as the review path (see review_signals_for_head):
-        # only `user.type == "Bot"` may contribute POSITIVE evidence; blocking
-        # evidence below stays identity-agnostic.
-        is_app_seat = user.get("type") == "Bot"
+        # No seat check here any more: since round 2 of this PR's review the
+        # comment path carries no positive branch, and its blocking evidence
+        # is deliberately identity-agnostic (any Ally-login seat may fail
+        # the gate, no seat may green it from a comment).
 
         is_consolidated = is_consolidated_ally_comment_for_head(body, head_sha)
         is_issue_link = is_issue_link_ally_comment_for_head(body, head_sha)
@@ -675,10 +677,10 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
             continue
 
         # Order on the LATER of created_at/updated_at. GitHub keeps created_at
-        # immutable across edits, so an older clean comment edited to add
-        # blocking findings would otherwise keep losing latest_signal() to a
-        # newer clean signal and leave the gate green on a review that now says
-        # the opposite.
+        # immutable across edits, so an older comment edited to add blocking
+        # findings would otherwise carry a stale timestamp and lose
+        # latest_signal() to an earlier formal approval, leaving the gate
+        # green on a body that now says the opposite.
         at = comment_signal_time(comment)
 
         # Self-review cannot approve its own PR, but machine-readable blocking
@@ -728,31 +730,16 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
 
         # A coordinator-ambiguous body may not authorize green regardless of
         # verdict or counts (review round 8; see masked_blocking_ambiguity).
-        if masked_blocking_ambiguity(body):
-            continue
-
-        # Positive only on an affirmative verdict from the App seat: an
-        # explicit pass, or validated zero blocking counts. Silence is not
-        # consent -- a consolidated body with neither is ambiguous and stays
-        # pending -- and a User-seat all-clear contributes nothing here.
-        if not is_app_seat:
-            continue
-        has_zero_counts = (
-            extract_issue_count(body, "Critical Issues") == 0
-            and extract_issue_count(body, "Important Issues") == 0
-        )
-        if verdict != "pass" and not has_zero_counts:
-            continue
-
-        signals.append(
-            {
-                "at": at,
-                "author": login,
-                "description": "Ally clean comment on head %s." % short_head,
-                "kind": "ally-comment",
-                "status": "success",
-            }
-        )
+        # Round 2 of this PR's review removed the comment path's positive
+        # branch entirely: a clean consolidated comment used to emit
+        # `success`, which let an issue comment green `review/ally-complete`
+        # with no formal review having happened, and let a later clean
+        # comment out-rank an earlier formal blocking signal through
+        # latest_signal(). Comments now contribute ONLY blocking evidence
+        # (the failure appends above); the sole producer of `success` on
+        # this context is the formal exact-head App-seat APPROVED branch in
+        # review_signals_for_head. A clean comment is therefore inert here
+        # -- it neither greens the gate nor withdraws a standing signal.
 
     return signals
 
@@ -830,40 +817,6 @@ def override_attestation_logins(comments, head_sha):
     return logins
 
 
-def ambiguous_masked_bodies_for_head(reviews, comments, head_sha, ally_logins):
-    """Any head-relevant Ally body whose only escape from a blocking verdict
-    is the negation mask (see masked_blocking_ambiguity). Head relevance mirrors
-    the BLOCKING binding rules -- commit_id or attestation for reviews, the
-    consolidated/issue-link shapes for comments -- because ambiguity is a
-    potential blocking signal, and blocking binds loosely by design.
-    """
-    ally = set(ally_logins)
-    for review in reviews or []:
-        login = (review.get("user") or {}).get("login")
-        if not isinstance(login, str) or login not in ally:
-            continue
-        if review.get("state") == "DISMISSED":
-            continue
-        body = str(review.get("body") or "")
-        if review.get("commit_id") != head_sha and not attests_head(body, head_sha):
-            continue
-        if masked_blocking_ambiguity(body):
-            return True
-    for comment in comments or []:
-        login = (comment.get("user") or {}).get("login")
-        if not isinstance(login, str) or login not in ally:
-            continue
-        body = str(comment.get("body") or "")
-        if not (
-            is_consolidated_ally_comment_for_head(body, head_sha)
-            or is_issue_link_ally_comment_for_head(body, head_sha)
-        ):
-            continue
-        if masked_blocking_ambiguity(body):
-            return True
-    return False
-
-
 def decide(
     reviews,
     comments,
@@ -904,74 +857,40 @@ def decide(
         else []
     )
 
-    # A trusted distinct-reviewer approval only supersedes Ally's own signal
-    # when Ally's signal for this head is the non-authoritative self-review
-    # demotion (or absent) -- never when Ally already flagged blocking findings
-    # on this exact head.
+    # Distinct-reviewer evidence contributes ONLY blocking signals (round 3
+    # of the multicast vendoring review): this context's sole positive
+    # authority is the Ally App seat, and an App-authored PR cannot receive
+    # App approval -- it stays pending until reopened under an independent
+    # author. A trusted distinct reviewer's CHANGES_REQUESTED still fails
+    # closed (dropping it would be fail-open), and inside the per-reviewer
+    # reduction a reviewer's later approval still withdraws THEIR OWN earlier
+    # change request -- but a surviving approval maps to no signal, never
+    # success. Ally's own blocking findings outrank everything.
     ally_has_failure = any(entry["status"] == "failure" for entry in ally_signals)
+    signal = latest_signal(ally_signals)
     if is_self_review and distinct_signals and not ally_has_failure:
-        # Per-reviewer reduction: one reviewer's later approval must not erase
-        # another's outstanding change request.
-        signal = reduce_distinct_reviewer_signals(distinct_signals)
-    else:
-        signal = latest_signal(ally_signals)
+        reduced = reduce_distinct_reviewer_signals(distinct_signals)
+        if reduced is not None and reduced["status"] == "failure":
+            signal = reduced
 
-    # Escape hatch: Ally does not reliably auto-review, so a "Waiting for Ally
-    # review" pending can deadlock a PR forever. A maintainer can override --
-    # but the override NEVER bypasses a review that flagged issues: a `failure`
-    # on the current head stays red regardless. It only rescues the
-    # reviewer-never-ran case.
-    #
-    # Two independent conditions, because the label alone is PR-scoped and
-    # survives `synchronize`: it would silently clear every later unreviewed
-    # head. The label carries the authorization (only maintainers can apply
-    # one); a comment naming the full head SHA binds that authorization to a
-    # specific revision, so pushing new code revokes it automatically.
-    has_label = bool(override_label) and override_label in labels
-    override_logins = override_attestation_logins(comments, head_sha)
-    has_head_attestation = bool(override_logins & set(permission_trusted_logins))
-    has_override = has_label and has_head_attestation
-
-    if has_override and (signal is None or signal["status"] != "failure"):
-        # The override rescues the reviewer-never-ran case and clears
-        # machine-readably-clean reviews. It must NOT launder a mask error
-        # (review round 7): a body whose blocking prose was consumed by the
-        # negation mask contributes no signal -- indistinguishable here from
-        # "no review" -- so without this check the override would clear a head
-        # Ally actually flagged. Refusal is fail-closed: the head stays
-        # pending until Ally re-reviews with a machine-readable verdict.
-        if ambiguous_masked_bodies_for_head(reviews, comments, head_sha, ally_logins):
-            return (
-                "pending",
-                "Override refused for head %s: an Ally body has unclassifiable "
-                "negated prose; request a machine-readable re-review."
-                % short_sha(head_sha),
-            )
-        return (
-            "success",
-            "Ally review gate overridden for head %s (label '%s' + head-bound authorization)."
-            % (short_sha(head_sha), override_label),
-        )
+    # There is deliberately NO maintainer override on this context (round 3
+    # of the multicast vendoring review): a head-bound label+comment override
+    # was a second path where a permission-trusted User could green a context
+    # whose sole positive authority is the App seat. Deadlock relief for a
+    # reviewer that never ran is an administrative action outside this
+    # context (branch-protection admin bypass), not a state this script will
+    # ever report as success.
 
     if signal is None:
-        if has_label and not has_head_attestation:
-            return (
-                "pending",
-                "Waiting for Ally review of head %s; label '%s' needs a "
-                "'review-gate-override: <full head SHA>' comment."
-                % (short_sha(head_sha), override_label),
-            )
         return "pending", "Waiting for Ally review of head %s." % short_sha(head_sha)
 
-    # A clean COMMENTED review (override didn't fire) is not a GitHub status
-    # state. Not blocked by findings, but not an auto-pass either: stay
-    # `pending` and tell the maintainer exactly what to do.
+    # A clean COMMENTED review is not a GitHub status state, and no label can
+    # clear it any more: hold pending until the App seat APPROVES this head.
     if signal["status"] == CLEAN_COMMENTED_STATUS:
         return (
             "pending",
-            "Ally reviewed head %s, no blocking findings; apply '%s' and comment "
-            "'review-gate-override: <full head SHA>'."
-            % (short_sha(head_sha), override_label),
+            "Ally reviewed head %s, no blocking findings; awaiting an "
+            "App-seat APPROVED review." % short_sha(head_sha),
         )
 
     return signal["status"], signal["description"]
@@ -1539,7 +1458,6 @@ def main():
 
     # Status descriptions fit GitHub's 140-char cap, so they name the override
     # command generically. The copy-pasteable form lives here in the log.
-    print("Head-bound override command: review-gate-override: %s" % head_sha)
 
     set_commit_status(
         api_base_url,
