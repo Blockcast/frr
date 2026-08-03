@@ -57,6 +57,12 @@ _STATUS_TARGET = {}
 # App-seat APPROVED review, so a clean COMMENTED body holds `pending` until
 # the App seat approves.
 CLEAN_COMMENTED_STATUS = "clean-commented"
+# Round 2 of the #47 review: an APPROVED whose body is coordinator-
+# ambiguous is that seat's newest formal verdict but authorizes nothing
+# and withdraws nothing -- it supersedes the seat's own earlier success
+# while current_signals_per_login refuses to let it displace a standing
+# blocker. decide() maps it to pending.
+AMBIGUOUS_APPROVAL_STATUS = "ambiguous-approval"
 
 # A loose keyword scan over prose is unsafe: a *positive* review that merely
 # discusses security ("blocks a real security gap", "unsafe RBAC", "finding")
@@ -336,7 +342,7 @@ def is_issue_link_ally_comment_for_head(body, head_sha):
     )
 
 
-def self_review_signal(at, author, head_sha):
+def self_review_signal(at, author, head_sha, seat):
     """A clean self-review (the PR was authored by an Ally identity, and Ally
     is reviewing its own PR) is not authoritative, and since round 3 of the
     multicast vendoring review no substitute exists: the only identity that
@@ -348,6 +354,7 @@ def self_review_signal(at, author, head_sha):
     return {
         "at": str(at or ""),
         "author": author,
+        "seat": seat,
         "description": (
             "Ally-authored PR: head %s cannot be App-self-approved; "
             "reopen it under an independent author." % short_sha(head_sha)
@@ -398,6 +405,12 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
         # permission-checked distinct_reviewer path, which is a separate
         # control.
         is_app_seat = user.get("type") == "Bot"
+        # Round 2 of the #47 review: signals carry the SEAT alongside the
+        # login. GitHub REST may normalize the App login to the same string
+        # as the shared User login, and a login-only reduction key would then
+        # merge two distinct actors -- letting a normalized App approval
+        # erase the User seat's outstanding objection.
+        seat = "app" if is_app_seat else "user"
 
         body = str(review.get("body") or "")
         # Attestation gates CLEARING the gate, never BLOCKING it.
@@ -439,6 +452,7 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "Ally review flagged blocking findings on head %s."
                     % short_sha(head_sha),
                     "kind": "formal-review",
@@ -451,43 +465,62 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
         # neither hard-pass (APPROVED) nor hard-fail (CHANGES_REQUESTED); its
         # body-level blocking evidence has already failed closed above.
         if is_self_review:
-            signals.append(self_review_signal(at, login, head_sha))
+            signals.append(self_review_signal(at, login, head_sha, seat))
             continue
 
         if state == "APPROVED":
-            if not attested or not is_app_seat:
+            if not attested:
+                # Unattested approvals bind nothing, in either direction.
+                continue
+            # The ambiguity check runs BEFORE either approval branch (round
+            # 2 of the #47 review): the lenient mask may have consumed a
+            # real blocking phrase, so an ambiguous approval may neither
+            # authorize green nor stand as this seat's clean verdict. It is
+            # emitted as the seat's current NON-success signal: it
+            # supersedes the same seat's earlier success (the newest look is
+            # no longer a clean approval), while current_signals_per_login
+            # refuses to let it displace a standing blocker -- fail closed
+            # in both directions. decide() maps it to pending.
+            if masked_blocking_ambiguity(body):
+                signals.append(
+                    {
+                        "at": at,
+                        "author": login,
+                        "seat": seat,
+                        "description": "Ally approval of head %s is "
+                        "coordinator-ambiguous; it neither authorizes nor "
+                        "withdraws." % short_sha(head_sha),
+                        "kind": "ambiguous-approval",
+                        "status": AMBIGUOUS_APPROVAL_STATUS,
+                    }
+                )
+                continue
+            if not is_app_seat:
                 # Round 4: an exact-head-attested User-seat approval carries
                 # no positive authority, but it IS that identity's newest
                 # formal verdict. Emit the clean-commented placeholder so the
-                # per-login reduction in decide() lets the User seat withdraw
+                # per-seat reduction in decide() lets the User seat withdraw
                 # ITS OWN earlier objection -- mirroring GitHub's rule that a
                 # reviewer's new approval supersedes their prior
                 # CHANGES_REQUESTED. decide() maps this status to pending, so
-                # it can never become the green. Unattested approvals bind
-                # nothing, in either direction.
-                if attested and not is_app_seat:
-                    signals.append(
-                        {
-                            "at": at,
-                            "author": login,
-                            "description": "Ally User-seat approval of head %s "
-                            "(no positive authority)." % short_sha(head_sha),
-                            "kind": "user-seat-approval",
-                            "status": CLEAN_COMMENTED_STATUS,
-                        }
-                    )
-                continue
-            # A coordinator-ambiguous body may not authorize green even with
-            # a formal APPROVED state (the round-8 invariant, extended to
-            # this branch in round 4): the lenient mask may have consumed a
-            # real blocking phrase, and the formal state must not launder
-            # that away. Fail-closed lands pending, never success.
-            if masked_blocking_ambiguity(body):
+                # it can never become the green.
+                signals.append(
+                    {
+                        "at": at,
+                        "author": login,
+                        "seat": seat,
+                        "description": "Ally User-seat approval of head %s "
+                        "(no positive authority)." % short_sha(head_sha),
+                        "kind": "user-seat-approval",
+                        "status": CLEAN_COMMENTED_STATUS,
+                    }
+                )
                 continue
             signals.append(
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "Ally approved head %s." % short_sha(head_sha),
                     "kind": "formal-review",
                     "status": "success",
@@ -502,6 +535,7 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "Ally requested changes on head %s." % short_sha(head_sha),
                     "kind": "formal-review",
                     "status": "failure",
@@ -537,6 +571,7 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "Ally reviewed head %s with no blocking findings."
                     % short_sha(head_sha),
                     "kind": "clean-commented-review",
@@ -636,6 +671,7 @@ def distinct_reviewer_signals_for_head(
         # commit_id; a drifting commit_id may add red, never green.
         positively_bound = attested or login in head_authorized_logins
 
+        seat = "app" if user.get("type") == "Bot" else "user"
         at = str(review.get("submitted_at") or "")
         if review.get("state") == "APPROVED":
             if not positively_bound:
@@ -644,6 +680,7 @@ def distinct_reviewer_signals_for_head(
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "%s approved head %s as a distinct reviewer."
                     % (login, short_sha(head_sha)),
                     "kind": "distinct-reviewer-approval",
@@ -655,6 +692,7 @@ def distinct_reviewer_signals_for_head(
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "%s requested changes on head %s."
                     % (login, short_sha(head_sha)),
                     "kind": "distinct-reviewer-changes-requested",
@@ -687,10 +725,13 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
         body = str(comment.get("body") or "")
         if not isinstance(login, str) or login not in ally:
             continue
-        # No seat check here any more: since round 2 of this PR's review the
-        # comment path carries no positive branch, and its blocking evidence
-        # is deliberately identity-agnostic (any Ally-login seat may fail
-        # the gate, no seat may green it from a comment).
+        # No positive seat gating here: since #45 the comment path carries
+        # no positive branch, and its blocking evidence is deliberately
+        # identity-agnostic (any Ally-login seat may fail the gate, no seat
+        # may green it from a comment). The seat still labels the signal so
+        # per-seat reduction in decide() keys distinct actors correctly even
+        # when REST normalizes both seats to the same login string.
+        seat = "app" if user.get("type") == "Bot" else "user"
 
         is_consolidated = is_consolidated_ally_comment_for_head(body, head_sha)
         is_issue_link = is_issue_link_ally_comment_for_head(body, head_sha)
@@ -711,6 +752,7 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "Ally comment requested action on head %s." % short_head,
                     "kind": "consolidated-comment",
                     "status": "failure",
@@ -727,7 +769,7 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
             continue
 
         if is_self_review:
-            signals.append(self_review_signal(at, login, head_sha))
+            signals.append(self_review_signal(at, login, head_sha, seat))
             continue
 
         verdict = explicit_verdict(body)
@@ -742,6 +784,7 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "Ally comment requested action on head %s." % short_head,
                     "kind": "consolidated-comment",
                     "status": "failure",
@@ -780,19 +823,40 @@ def latest_signal(signals):
 
 
 def current_signals_per_login(signals):
-    """Each login's CURRENT signal: newest by effective time; a same-second
-    tie between opposite states from one login resolves to the blocking one
+    """Each actor's CURRENT signal: newest by effective time; a same-second
+    tie between opposite states from one actor resolves to the blocking one
     (fail closed) rather than letting API list order pick. Shared by the
     distinct-reviewer reduction and (round 4 of the multicast vendoring
     review) by decide()'s reduction of Ally's own dual-seat signals -- the
     App seat and the shared User seat are distinct actors, so only the same
     identity may supersede its own objection.
+
+    The key is (login, seat), not login alone (round 2 of the #47 review):
+    GitHub REST may normalize the App login to the same string as the shared
+    User login, and a login-only key would merge two distinct actors --
+    letting a normalized App approval erase the User seat's outstanding
+    objection.
+
+    An AMBIGUOUS_APPROVAL_STATUS signal never displaces a standing blocker:
+    it supersedes the same seat's non-blocking state (so a later ambiguous
+    approval unseats an earlier clean success), but a seat whose current
+    state is failure keeps that failure until an UNAMBIGUOUS same-seat
+    verdict supersedes it.
     """
-    latest_by_author = {}
+    latest_by_actor = {}
     for signal in signals:
-        current = latest_by_author.get(signal["author"])
+        actor = (signal["author"], signal.get("seat", ""))
+        current = latest_by_actor.get(actor)
         newer = current is None or str(signal["at"]) > str(current["at"])
-        # Same-second tie between opposite states from one reviewer: fail
+        if (
+            newer
+            and current is not None
+            and current["status"] == "failure"
+            and signal["status"] == AMBIGUOUS_APPROVAL_STATUS
+        ):
+            # An ambiguous approval cannot withdraw this seat's blocker.
+            continue
+        # Same-second tie between opposite states from one actor: fail
         # closed rather than let list order pick.
         tie_blocking = (
             current is not None
@@ -801,9 +865,9 @@ def current_signals_per_login(signals):
             and current["status"] != "failure"
         )
         if newer or tie_blocking:
-            latest_by_author[signal["author"]] = signal
+            latest_by_actor[actor] = signal
 
-    return list(latest_by_author.values())
+    return list(latest_by_actor.values())
 
 
 def reduce_distinct_reviewer_signals(signals):
@@ -933,6 +997,13 @@ def decide(
 
     if signal is None:
         return "pending", "Waiting for Ally review of head %s." % short_sha(head_sha)
+
+    if signal["status"] == AMBIGUOUS_APPROVAL_STATUS:
+        return (
+            "pending",
+            "Ally approval of head %s is ambiguous; awaiting an unambiguous "
+            "App-seat APPROVED review." % short_sha(head_sha),
+        )
 
     # A clean COMMENTED review is not a GitHub status state, and no label can
     # clear it any more: hold pending until the App seat APPROVES this head.

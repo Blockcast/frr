@@ -2012,5 +2012,87 @@ class TestPerLoginSeatReduction(unittest.TestCase):
         self.assertIn("awaiting an App-seat APPROVED", desc)
 
 
+class TestSeatAwareReduction(unittest.TestCase):
+    """Round 2 of the #47 review: reduction keys are (login, seat), and
+    ambiguous approvals fail closed against prior state in both directions.
+    """
+
+    AMBIGUOUS = "No reviewer responded and action required: fix the gate.\n"
+
+    def test_normalized_app_login_does_not_merge_seats(self):
+        # GitHub REST may normalize the App login to the same string as the
+        # shared User login. The seats are still distinct actors: a
+        # normalized App approval must not erase the User seat's objection.
+        state, desc = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="Bot",
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+        self.assertIn("requested changes", desc)
+
+    def test_same_seat_same_login_still_supersedes(self):
+        # The seat-aware key must not break same-actor withdrawal: the same
+        # (login, seat) pair's newer approval supersedes its own objection.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="Bot",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="Bot",
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_apps_own_ambiguous_approval_supersedes_its_success(self):
+        # An ambiguous approval is the seat's newest formal verdict: the
+        # earlier clean success is no longer current, and the gate pends.
+        state, desc = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T10:00:00Z"),
+                review("APPROVED", body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("ambiguous", desc)
+
+    def test_ambiguous_user_approval_does_not_withdraw_blocker(self):
+        # Fail closed in the other direction: an ambiguous User-seat
+        # approval must not act as that seat's withdrawal, so the objection
+        # survives a standing App approval.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T10:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_unambiguous_user_approval_still_withdraws_after_ambiguous(self):
+        # The seat's own UNAMBIGUOUS approval remains the withdrawal path
+        # even after an ambiguous attempt.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T10:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T11:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+
 if __name__ == "__main__":
     unittest.main()
