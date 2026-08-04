@@ -289,6 +289,42 @@ check "a: reachable peer produces no warning" \
 	err_lacks "does not answer"
 [ "$rc" -ne 0 ] && printf '%s\n' "$err"
 
+# --- (a2) managed underlay endpoints preserve overlay identity ----------
+new_state a2
+cat > "$TESTDIR/underlay-endpoints" <<'EOF'
+100.64.0.40 192.0.2.1
+100.64.0.47 192.0.2.2
+EOF
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47 \
+	--peers-file "$TESTDIR/no-such-file" \
+	--endpoints-file "$TESTDIR/underlay-endpoints" 2>&1)
+rc=$?
+check "a2: managed-underlay reconcile exits 0" [ "$rc" -eq 0 ]
+check "a2: GRE uses managed underlay endpoints" log_has \
+	"^ip link add dimt-0-47 type gre local 192.0.2.1 remote 192.0.2.2 "
+check "a2: PMTU lookup follows the managed endpoint" log_has \
+	"^ip route get 192.0.2.2$"
+check "a2: device and inner4 remain overlay-derived" log_has \
+	"^ip addr add 10.99.0.40 peer 10.99.0.47/32 dev dimt-0-47$"
+check "a2: inner6 remains overlay-derived" log_has \
+	"^ip -6 addr add fd99::40 peer fd99::47/128 dev dimt-0-47$"
+
+# Missing mappings fail before endpoint-drift deletion or any other mutation.
+new_state a3
+echo "100.64.0.40 192.0.2.1" > "$TESTDIR/underlay-incomplete"
+echo "dimt-0-47 100.64.0.40 100.64.0.47 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47 \
+	--peers-file "$TESTDIR/no-such-file" \
+	--endpoints-file "$TESTDIR/underlay-incomplete" 2>&1)
+rc=$?
+check "a3: incomplete endpoint map exits nonzero" [ "$rc" -ne 0 ]
+check "a3: missing peer mapping is explicit" err_has \
+	"no managed underlay endpoint for overlay 100.64.0.47"
+check "a3: incomplete map cannot delete the live tunnel" \
+	log_lacks "^ip link del dimt-0-47$"
+check "a3: incomplete map fails before FOU or GRE probes" \
+	log_lacks "^ip fou add"
+
 # --- (b) missing peers file refuses ----------------------------------
 new_state b
 echo "dimt-9-9 100.64.0.40 100.64.9.9" >> "$FAKEIP_DIR/links"
