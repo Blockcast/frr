@@ -301,7 +301,11 @@ jobs:
           docker rm -f "${UNIT_TEST_CONTAINER}" || true
 
   Test:
-    runs-on: default
+    # BLO-21606: moved off arc-default — this ~43min Docker-heavy lane is the
+    # same long/CPU-heavy shape BLO-19140 moved off arc-default for NOP after
+    # mid-job runner loss under pool oversubscription. arc-e2e shares
+    # arc-default's pod template (Docker/NET_ADMIN/KVM) but is capacity-capped.
+    runs-on: arc-e2e
     needs: Build
     name: ${{ matrix.cfg.name }}
     # Topotest runs can be long; still cap runtime for stuck jobs.
