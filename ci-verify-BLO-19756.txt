@@ -1,0 +1,9 @@
+CI verification branch for BLO-19756.
+
+This branch exists only to obtain green `Ubuntu 22.04 amd64 Test` and
+`Ubuntu 24.04 amd64 Test` evidence for the DIMT harness change merged to
+master as 391029a8390052e73587ded3866e45f2af26887f (PR #42).
+
+It is master + this file, nothing else. No file the build, unit tests, or
+topotests read is modified. See:
+https://paperclip.blockcast.net/BLO/issues/BLO-19756
