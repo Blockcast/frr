@@ -97,6 +97,43 @@ def test_pim_join_prune():
     ), "invalid interface join-prune interval"
 
 
+def test_pim_rpf_cache_refresh_delay():
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    router = tgen.gears["r1"]
+    output = router.vtysh_cmd("show ip pim rpf json", isjson=True)
+    assert (
+        topotest.json_cmp(output, {"rpfCacheRefreshDelayMsecs": 50}) is None
+    ), "invalid default RPF cache refresh delay"
+
+    router.vtysh_cmd(
+        """
+    configure terminal
+    router pim
+     rpf-cache-refresh-delay 7
+    """
+    )
+    output = router.vtysh_cmd("show ip pim rpf json", isjson=True)
+    assert (
+        topotest.json_cmp(output, {"rpfCacheRefreshDelayMsecs": 7}) is None
+    ), "RPF cache refresh delay was not applied"
+    assert " rpf-cache-refresh-delay 7" in router.vtysh_cmd("show running-config")
+
+    router.vtysh_cmd(
+        """
+    configure terminal
+    router pim
+     no rpf-cache-refresh-delay
+    """
+    )
+    output = router.vtysh_cmd("show ip pim rpf json", isjson=True)
+    assert (
+        topotest.json_cmp(output, {"rpfCacheRefreshDelayMsecs": 50}) is None
+    ), "RPF cache refresh delay did not reset to its default"
+
+
 def test_pim_assert_interval():
     tgen = get_topogen()
     if tgen.routers_have_failure():
@@ -187,6 +224,43 @@ def test_pim6_join_prune():
     assert (
         topotest.json_cmp(output, {"r1-eth0": {"joinPruneInterval": 134}}) is None
     ), "invalid interface join-prune interval"
+
+
+def test_pim6_rpf_cache_refresh_delay():
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    router = tgen.gears["r1"]
+    output = router.vtysh_cmd("show ipv6 pim rpf json", isjson=True)
+    assert (
+        topotest.json_cmp(output, {"rpfCacheRefreshDelayMsecs": 50}) is None
+    ), "invalid default RPF cache refresh delay"
+
+    router.vtysh_cmd(
+        """
+    configure terminal
+    router pim6
+     rpf-cache-refresh-delay 9
+    """
+    )
+    output = router.vtysh_cmd("show ipv6 pim rpf json", isjson=True)
+    assert (
+        topotest.json_cmp(output, {"rpfCacheRefreshDelayMsecs": 9}) is None
+    ), "RPF cache refresh delay was not applied"
+    assert " rpf-cache-refresh-delay 9" in router.vtysh_cmd("show running-config")
+
+    router.vtysh_cmd(
+        """
+    configure terminal
+    router pim6
+     no rpf-cache-refresh-delay
+    """
+    )
+    output = router.vtysh_cmd("show ipv6 pim rpf json", isjson=True)
+    assert (
+        topotest.json_cmp(output, {"rpfCacheRefreshDelayMsecs": 50}) is None
+    ), "RPF cache refresh delay did not reset to its default"
 
 
 def test_pim6_assert_interval():

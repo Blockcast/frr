@@ -144,6 +144,7 @@ extern uint8_t qpim_ecmp_enable;
 extern uint8_t qpim_ecmp_rebalance_enable;
 
 #define PIM_DEFAULT_PACKET_PROCESS 3
+#define PIM_DEFAULT_RPF_CACHE_REFRESH_DELAY_MSEC 50
 
 #define PIM_JP_HOLDTIME (router->t_periodic * 7 / 2)
 

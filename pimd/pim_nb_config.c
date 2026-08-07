@@ -641,6 +641,26 @@ int pim_address_family_join_prune_interval_modify(
 }
 
 /*
+ * XPath: /frr-pim:pim/address-family/rpf-cache-refresh-delay
+ */
+int pim_address_family_rpf_cache_refresh_delay_modify(
+	struct nb_cb_modify_args *args)
+{
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		router->rpf_cache_refresh_delay_msec =
+			yang_dnode_get_uint16(args->dnode, NULL);
+		break;
+	}
+
+	return NB_OK;
+}
+
+/*
  * XPath: /frr-pim:pim/address-family/register-suppress-time
  */
 int pim_address_family_register_suppress_time_modify(

@@ -51,6 +51,12 @@ const struct frr_yang_module_info frr_pim_info = {
 			}
 		},
 		{
+			.xpath = "/frr-pim:pim/address-family/rpf-cache-refresh-delay",
+			.cbs = {
+				.modify = pim_address_family_rpf_cache_refresh_delay_modify,
+			}
+		},
+		{
 			.xpath = "/frr-routing:routing/control-plane-protocols/control-plane-protocol/frr-pim:pim/address-family/keep-alive-timer",
 			.cbs = {
 				.modify = routing_control_plane_protocols_control_plane_protocol_pim_address_family_keep_alive_timer_modify,

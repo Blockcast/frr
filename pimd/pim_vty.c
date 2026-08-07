@@ -228,6 +228,12 @@ int pim_global_config_write_worker(struct pim_instance *pim, struct vty *vty)
 				router->t_periodic);
 			++writes;
 		}
+		if (router->rpf_cache_refresh_delay_msec
+		    != PIM_DEFAULT_RPF_CACHE_REFRESH_DELAY_MSEC) {
+			vty_out(vty, " rpf-cache-refresh-delay %ld\n",
+				router->rpf_cache_refresh_delay_msec);
+			++writes;
+		}
 
 		if (router->packet_process != PIM_DEFAULT_PACKET_PROCESS) {
 			vty_out(vty, " packets %d\n", router->packet_process);

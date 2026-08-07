@@ -152,6 +152,25 @@ DEFPY_YANG (no_pim6_joinprune_time,
 	return pim_process_no_join_prune_cmd(vty);
 }
 
+DEFPY_YANG(pim6_rpf_cache_refresh_delay,
+	   pim6_rpf_cache_refresh_delay_cmd,
+	   "rpf-cache-refresh-delay (0-65535)$delay",
+	   "RPF cache refresh delay\n"
+	   "Milliseconds\n")
+{
+	return pim_process_rpf_cache_refresh_delay_cmd(vty, delay_str);
+}
+
+DEFPY_YANG(no_pim6_rpf_cache_refresh_delay,
+	   no_pim6_rpf_cache_refresh_delay_cmd,
+	   "no rpf-cache-refresh-delay [(0-65535)]",
+	   NO_STR
+	   "RPF cache refresh delay\n"
+	   IGNORED_IN_NO_STR)
+{
+	return pim_process_no_rpf_cache_refresh_delay_cmd(vty);
+}
+
 DEFPY_ATTR(no_ipv6_pim_joinprune_time,
            no_ipv6_pim_joinprune_time_cmd,
            "no ipv6 pim join-prune-interval [(1-65535)]",
@@ -3179,6 +3198,8 @@ void pim_cmd_init(void)
 
 	install_element(PIM6_NODE, &pim6_joinprune_time_cmd);
 	install_element(PIM6_NODE, &no_pim6_joinprune_time_cmd);
+	install_element(PIM6_NODE, &pim6_rpf_cache_refresh_delay_cmd);
+	install_element(PIM6_NODE, &no_pim6_rpf_cache_refresh_delay_cmd);
 	install_element(PIM6_NODE, &pim6_spt_switchover_infinity_cmd);
 	install_element(PIM6_NODE, &pim6_spt_switchover_infinity_plist_cmd);
 	install_element(PIM6_NODE, &no_pim6_spt_switchover_infinity_cmd);

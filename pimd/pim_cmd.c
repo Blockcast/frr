@@ -3686,6 +3686,24 @@ DEFPY_YANG (no_pim_joinprune_time,
 	return pim_process_no_join_prune_cmd(vty);
 }
 
+DEFPY_YANG(pim_rpf_cache_refresh_delay, pim_rpf_cache_refresh_delay_cmd,
+	   "rpf-cache-refresh-delay (0-65535)$delay",
+	   "RPF cache refresh delay\n"
+	   "Milliseconds\n")
+{
+	return pim_process_rpf_cache_refresh_delay_cmd(vty, delay_str);
+}
+
+DEFPY_YANG(no_pim_rpf_cache_refresh_delay,
+	   no_pim_rpf_cache_refresh_delay_cmd,
+	   "no rpf-cache-refresh-delay [(0-65535)]",
+	   NO_STR
+	   "RPF cache refresh delay\n"
+	   IGNORED_IN_NO_STR)
+{
+	return pim_process_no_rpf_cache_refresh_delay_cmd(vty);
+}
+
 DEFPY_ATTR(no_ip_pim_joinprune_time,
 			  no_ip_pim_joinprune_time_cmd,
 			  "no ip pim join-prune-interval [(1-65535)]",
@@ -9407,6 +9425,8 @@ void pim_cmd_init(void)
 	install_element(PIM_NODE, &pim_register_accept_list_cmd);
 	install_element(PIM_NODE, &pim_joinprune_time_cmd);
 	install_element(PIM_NODE, &no_pim_joinprune_time_cmd);
+	install_element(PIM_NODE, &pim_rpf_cache_refresh_delay_cmd);
+	install_element(PIM_NODE, &no_pim_rpf_cache_refresh_delay_cmd);
 	install_element(PIM_NODE, &pim_keep_alive_cmd);
 	install_element(PIM_NODE, &pim_rp_keep_alive_cmd);
 	install_element(PIM_NODE, &no_pim_keep_alive_cmd);

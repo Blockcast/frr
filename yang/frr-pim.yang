@@ -800,6 +800,13 @@ module frr-pim {
       description
         "Join Prune Send Interval in seconds.";
     }
+    leaf rpf-cache-refresh-delay {
+      type uint16;
+      default "50";
+      units "milliseconds";
+      description
+        "Delay used to batch RPF cache refresh requests.";
+    }
     leaf register-suppress-time {
       type uint16 {
         range "1..max";

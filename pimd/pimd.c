@@ -118,7 +118,8 @@ void pim_router_init(void)
 	router->infinite_assert_metric.route_metric =
 		PIM_ASSERT_ROUTE_METRIC_MAX;
 	router->infinite_assert_metric.ip_address = PIMADDR_ANY;
-	router->rpf_cache_refresh_delay_msec = 50;
+	router->rpf_cache_refresh_delay_msec =
+		PIM_DEFAULT_RPF_CACHE_REFRESH_DELAY_MSEC;
 	router->register_suppress_time = PIM_REGISTER_SUPPRESSION_TIME_DEFAULT;
 	router->packet_process = PIM_DEFAULT_PACKET_PROCESS;
 	router->register_probe_time = PIM_REGISTER_PROBE_TIME_DEFAULT;

@@ -99,6 +99,33 @@ int pim_process_no_join_prune_cmd(struct vty *vty)
 	return nb_cli_apply_changes(vty, NULL);
 }
 
+int pim_process_rpf_cache_refresh_delay_cmd(struct vty *vty,
+					    const char *delay_str)
+{
+	char xpath[XPATH_MAXLEN];
+
+	snprintf(xpath, sizeof(xpath), FRR_PIM_ROUTER_XPATH,
+		 FRR_PIM_AF_XPATH_VAL);
+	strlcat(xpath, "/rpf-cache-refresh-delay", sizeof(xpath));
+
+	nb_cli_enqueue_change(vty, xpath, NB_OP_MODIFY, delay_str);
+
+	return nb_cli_apply_changes(vty, NULL);
+}
+
+int pim_process_no_rpf_cache_refresh_delay_cmd(struct vty *vty)
+{
+	char xpath[XPATH_MAXLEN];
+
+	snprintf(xpath, sizeof(xpath), FRR_PIM_ROUTER_XPATH,
+		 FRR_PIM_AF_XPATH_VAL);
+	strlcat(xpath, "/rpf-cache-refresh-delay", sizeof(xpath));
+
+	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
+
+	return nb_cli_apply_changes(vty, NULL);
+}
+
 int pim_process_spt_switchover_infinity_cmd(struct vty *vty)
 {
 	char spt_plist_xpath[XPATH_MAXLEN + 40];
