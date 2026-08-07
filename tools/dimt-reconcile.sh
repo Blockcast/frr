@@ -198,7 +198,11 @@ validate_endpoints() {
 			log "ERROR: no managed underlay endpoint for overlay $overlay; refusing cutover"
 			return 1
 		}
-		if ! echo "$endpoint" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+		if ! echo "$endpoint" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' ||
+			! echo "$endpoint" | awk -F. '{
+				for (i = 1; i <= 4; i++)
+					if ($i < 0 || $i > 255) exit 1
+			}'; then
 			log "ERROR: invalid managed underlay endpoint '$endpoint' for overlay $overlay; refusing cutover"
 			return 1
 		fi

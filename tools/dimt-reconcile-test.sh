@@ -325,6 +325,27 @@ check "a3: incomplete map cannot delete the live tunnel" \
 check "a3: incomplete map fails before FOU or GRE probes" \
 	log_lacks "^ip fou add"
 
+# Out-of-range mappings are malformed even when they look like dotted quads.
+new_state a4
+cat > "$TESTDIR/underlay-out-of-range" <<'EOF'
+100.64.0.40 192.0.2.1
+100.64.0.47 999.999.999.999
+EOF
+echo "dimt-0-47 192.0.2.1 192.0.2.2 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47 \
+	--peers-file "$TESTDIR/no-such-file" \
+	--endpoints-file "$TESTDIR/underlay-out-of-range" 2>&1)
+rc=$?
+check "a4: out-of-range endpoint exits nonzero" [ "$rc" -ne 0 ]
+check "a4: invalid endpoint is explicit" err_has \
+	"invalid managed underlay endpoint '999.999.999.999'"
+check "a4: invalid endpoint cannot delete the live tunnel" \
+	log_lacks "^ip link del dimt-0-47$"
+check "a4: invalid endpoint fails before FOU or GRE probes" \
+	log_lacks "^ip fou add"
+check "a4: invalid endpoint cannot mutate FRR" \
+	vtysh_lacks "interface dimt-0-47"
+
 # --- (b) missing peers file refuses ----------------------------------
 new_state b
 echo "dimt-9-9 100.64.0.40 100.64.9.9" >> "$FAKEIP_DIR/links"
