@@ -120,59 +120,91 @@ def teardown_module(mod):
 
 
 class EventReader:
-    """Newline-delimited JSON off the event socket, handed out in arrival
-    order. A fresh instance re-connects, which is how snapshot behaviour is
-    exercised."""
+    """Buffers newline-delimited JSON off the event socket.
 
-    def __init__(self, path, connect_timeout=30):
+    Lifted from ../bgp_mvpn_gtm_events rather than re-derived: the socket has a
+    small control protocol, and the subscribe frame below is not optional. The
+    server only sets client->subscribed after parsing it, and an unsubscribed
+    client is offered no snapshot and sent no live events -- so a reader that
+    merely connects sees nothing at all.
+    """
+
+    def __init__(self, path, cursor=None, connect_timeout=30):
+        # The listener can lag a beat behind bgpd's config apply, so retry
+        # rather than single-shot (a bare connect races the bind).
         deadline = time.time() + connect_timeout
         while True:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(1)
             try:
-                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 self.sock.connect(path)
                 break
-            except OSError:
+            except (FileNotFoundError, ConnectionRefusedError, OSError):
                 self.sock.close()
-                if time.time() > deadline:
+                if time.time() >= deadline:
                     raise
                 time.sleep(0.5)
-        self.sock.settimeout(1.0)
         self.buf = b""
+        subscribe = {"type": "subscribe", "schema_version": 1}
+        if cursor is not None:
+            subscribe["last_boot_epoch"], subscribe["last_seq"] = cursor
+        self.sock.sendall((json.dumps(subscribe) + "\n").encode("utf-8"))
 
     def close(self):
         self.sock.close()
 
-    def read_event(self, timeout=20):
+    def read_event(self, timeout=15):
         deadline = time.time() + timeout
         while True:
-            if b"\n" in self.buf:
-                line, self.buf = self.buf.split(b"\n", 1)
-                if line.strip():
-                    return json.loads(line)
-                continue
-            if time.time() > deadline:
-                return None
+            nl = self.buf.find(b"\n")
+            if nl >= 0:
+                line, self.buf = self.buf[:nl], self.buf[nl + 1 :]
+                return json.loads(line.decode("utf-8"))
+            if time.time() >= deadline:
+                raise AssertionError(
+                    "no event received within {}s (buffered: {!r})".format(
+                        timeout, self.buf
+                    )
+                )
             try:
-                chunk = self.sock.recv(65536)
+                chunk = self.sock.recv(4096)
             except socket.timeout:
                 continue
             if not chunk:
-                return None
+                raise AssertionError("event socket closed by bgpd")
             self.buf += chunk
 
-    def collect_leaf_events(self, want, timeout=60):
+    def acknowledge_snapshot(self, event):
+        self.sock.sendall(
+            (
+                json.dumps(
+                    {
+                        "type": "snapshot_ack",
+                        "boot_epoch": event["boot_epoch"],
+                        "seq": event["seq"],
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+
+    def collect_leaf_events(self, want, timeout=90):
         """Drain until `want` leaf records have arrived, ignoring the Type-7
-        join traffic that shares this socket. Returns them in arrival order.
+        join traffic and snapshot framing that share this socket.
 
         Deliberately not "read N events and assert they are leaves": the join
-        and leaf streams are interleaved by design, so a test that assumed
-        adjacency would be asserting an ordering the contract does not make.
+        and leaf streams interleave by design, so a test that assumed adjacency
+        would be asserting an ordering the contract does not offer.
         """
         out = []
         deadline = time.time() + timeout
         while len(out) < want and time.time() < deadline:
-            ev = self.read_event(timeout=5)
-            if ev is None:
+            try:
+                ev = self.read_event(timeout=5)
+            except AssertionError:
+                continue  # quiet window; keep waiting until the outer deadline
+            if ev.get("type") == "snapshot_end":
+                self.acknowledge_snapshot(ev)
                 continue
             if ev.get("route_type") == ROUTE_TYPE_LEAF_AD:
                 out.append(ev)
