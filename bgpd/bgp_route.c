@@ -85,6 +85,7 @@
 #include "bgpd/bgp_flowspec_util.h"
 #include "bgpd/bgp_pbr.h"
 #include "bgpd/bgp_mvpn.h"
+#include "bgpd/bgp_mvpn_events.h"
 
 #include "bgpd/bgp_route_clippy.c"
 
@@ -4331,6 +4332,17 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 	    bgp_mvpn_gtm_active(bgp))
 		bgp_mvpn_reresolve_joins_for_route(bgp, afi,
 						   bgp_dest_get_prefix(dest));
+
+	/* The per-leaf settlement event set is derived from received Type-4
+	 * (Leaf A-D) routes, so it has to be re-derived whenever the MVPN RIB's
+	 * selection changes. Deliberately here rather than at NLRI-parse time:
+	 * a withdrawn Type-4 is only actually gone from the walk after
+	 * selection, and emitting on the parse path would leave a departed leaf
+	 * billed until the next unrelated UPDATE happened to arrive. The walk
+	 * is a full idempotent diff, so calling it more often than necessary
+	 * costs a table scan and emits nothing. */
+	if (safi == SAFI_MCAST_VPN && (old_select || new_select))
+		bgp_mvpn_events_reconcile_leaves(bgp);
 
 #ifdef ENABLE_BGP_VNC
 	if ((afi == AFI_IP || afi == AFI_IP6) && (safi == SAFI_UNICAST)) {

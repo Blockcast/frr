@@ -147,6 +147,8 @@ rejoins later gets a strictly higher `route_version`, not a restart from 1.
 | --- | --- |
 | `install` | A local (pimd-driven) Type-7 join is originated for a `(source, group)` this sink has not seen installed before (first join, or a rejoin after a prior withdraw). |
 | `withdraw` | The local Type-7 join for a `(source, group)` this sink previously observed installed is removed. |
+| `leaf_install` | A Type-4 (Leaf A-D) route learned from a peer appears for a `(source, group)`, naming one receiving PE in `leaf`. Under ingress replication a root emits one of these per leaf, and settlement bills each separately. |
+| `leaf_withdraw` | A previously emitted `(source, group, leaf)` Type-4 is no longer present in the MVPN RIB. |
 | `origin_change` | An already-installed join's resolved `(source_as, upstream_peer)` changes -- typically because the unicast route toward C-S changed (a new best path, a new/changed route-import RT or UMH large community, and so on). No withdraw/re-join occurs on the wire; the Type-7 route is re-originated in place. |
 
 A redundant re-resolution that produces the *same* `(source_as,
@@ -168,14 +170,15 @@ changing this join's resolved values) emits nothing.
 | `snapshot_count` | int | `snapshot_end` only | Number of snapshot install records preceding this frame. |
 | `cursor_status` | string | `snapshot_end` only | Producer comparison of the subscribe cursor with this snapshot baseline: `bootstrap`, `contiguous`, `gap`, `boot_boundary`, or `rollback`. `gap` and `rollback` require quarantine before snapshot application. |
 | `time_ns` | int | live lifecycle and snapshot install records | `CLOCK_REALTIME` nanoseconds since the Unix epoch, at emission time. |
-| `route_type` | int | live lifecycle and snapshot install records | `7` (RFC 6514 C-multicast Source Tree Join). Fixed today; present so a future record kind sharing this socket is distinguishable. |
+| `route_type` | int | live lifecycle and snapshot install records | `7` (RFC 6514 C-multicast Source Tree Join) on `install` / `withdraw` / `origin_change`; `4` (Leaf A-D) on `leaf_install` / `leaf_withdraw`. This is the discriminator between the two record kinds sharing this socket. |
 | `source` | string | live lifecycle and snapshot install records | C-S, canonical text (v4 or v6). |
 | `group` | string | live lifecycle and snapshot install records | C-G, canonical text (v4 or v6). |
 | `source_as` | int | live lifecycle and snapshot install records | RFC 6514 Section 4.6 Source AS from the Type-7 NLRI key (falls back to the local AS per RFC 6514 Section 4.6 when the source route carries no Source-AS community). |
 | `route_version` | string | live lifecycle and snapshot install records | Opaque, per-join monotonic. See above. |
 | `prior_route_version` | string | `origin_change` only | The join's `route_version` immediately before this transition -- lets a consumer close the old billing window and open a new one at the same instant. |
 | `lc_umh_origin` | string | when an upstream PE was resolved | `"<sourceAS>:1:<UMH-u32>"`, byte-for-byte the settlement contract's `SessionLease.lc_umh_origin` format. The literal function code point `1` here is a settlement-contract convention for the resolved-origin attestation; it is independent of the operator-configured `bgp mvpn umh-large-community <function>` decode knob, which selects which function code point bgpd itself trusts on the wire. Absent when no upstream PE could be resolved (RT-less origination; see `bgp_mvpn_source_tree_join_set()`). |
-| `upstream_peer` | string | when an upstream PE was resolved | The resolved upstream PE's IPv4 address (the RFC 7716 upstream-node-identifying Route Target's Global Administrator, or the large-community UMH when `bgp mvpn umh-large-community` is configured). This is the "peer/leaf next-hop" BLO-17645 and BLO-17650 refer to for counter identity. |
+| `upstream_peer` | string | when an upstream PE was resolved | The resolved upstream PE's IPv4 address (the RFC 7716 upstream-node-identifying Route Target's Global Administrator, or the large-community UMH when `bgp mvpn umh-large-community` is configured). **This is the UMH -- the next hop toward the source. It is NOT a leaf and must not be used as a subscriber identity.** Earlier revisions of this table called it the "peer/leaf next-hop … for counter identity"; that was wrong, and a consumer that billed it attributed every leaf behind a route reflector to the reflector. Per-leaf identity is the `leaf` field on `leaf_install` / `leaf_withdraw`. |
+| `leaf` | string | `leaf_install` / `leaf_withdraw` only | The Type-4 (Leaf A-D) route's leaf originator: the receiving PE's router-id, canonical text. This is the per-PE subscriber identity for settlement. Note the granularity: one Type-4 covers a whole PE, so every receiver behind that PE aggregates into this one identity. BGP carries nothing finer at any layer. |
 | `ipmsi_label` | int | live lifecycle and snapshot install records | This bgp instance's configured `bgp mvpn ipmsi-label` (0 = unlabeled GTM tunnel, RFC 6514 Section 5). The "MPLS label" BLO-17650's counter-identity key refers to. |
 | `vrf` | string | live lifecycle and snapshot install records | The bgp instance name, or `default`. |
 
