@@ -1170,9 +1170,23 @@ void bgp_mvpn_events_reconcile_leaves(struct bgp *bgp)
 			    m->route_type != BGP_MVPN_ROUTE_TYPE_LEAF_AD)
 				continue;
 
+			/* Valid AND selected, not merely "not removed".
+			 *
+			 * A Type-4 can sit in the RIB while being none of the
+			 * things that make it real: rejected by inbound policy,
+			 * invalidated by an unreachable next hop, or kept as a
+			 * non-selected alternate alongside a better path. Billing
+			 * any of those invents a leaf that is not installed.
+			 *
+			 * This is also what the post-best-path trigger already
+			 * assumes. Reconciling after selection and then ignoring
+			 * the selection flags contradicted the reason for hooking
+			 * there at all. */
 			for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
 				if (pi->peer != bgp->peer_self &&
-				    !CHECK_FLAG(pi->flags, BGP_PATH_REMOVED)) {
+				    !CHECK_FLAG(pi->flags, BGP_PATH_REMOVED) &&
+				    CHECK_FLAG(pi->flags, BGP_PATH_VALID) &&
+				    CHECK_FLAG(pi->flags, BGP_PATH_SELECTED)) {
 					from_peer = true;
 					break;
 				}
