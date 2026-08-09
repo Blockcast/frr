@@ -116,6 +116,7 @@ struct bgp_mvpn_event_sink {
 	uint64_t snapshot_index;
 	struct bgp_mvpn_event_client *snapshot_client;
 	struct event *t_snapshot_offer;
+	struct event *t_leaf_reconcile;
 };
 
 /*
@@ -658,6 +659,7 @@ void bgp_mvpn_events_stop(struct bgp *bgp)
 
 	sink->snapshot_pending = false;
 	event_cancel(&sink->t_snapshot_offer);
+	event_cancel(&sink->t_leaf_reconcile);
 	while (sink->clients)
 		bgp_mvpn_event_client_close(sink, sink->clients);
 
@@ -1203,4 +1205,37 @@ void bgp_mvpn_events_reconcile_leaves(struct bgp *bgp)
 		*link = next;
 		XFREE(MTYPE_MVPN_EVENT_LEAF, entry);
 	}
+}
+
+static void bgp_mvpn_events_leaf_reconcile_event(struct event *event)
+{
+	struct bgp_mvpn_event_sink *sink = EVENT_ARG(event);
+
+	bgp_mvpn_events_reconcile_leaves(sink->bgp);
+}
+
+/*
+ * Request a leaf reconcile, coalescing a burst into one walk.
+ *
+ * The reconcile is a full scan of both MVPN RIBs. Running it inline on every
+ * selected MCAST-VPN route made a burst of N arriving leaves do N full scans --
+ * O(N^2) on bgpd's main route-processing path, and worst exactly where per-leaf
+ * settlement is wanted, since needing it means having many leaves. Deferring to
+ * the event loop collapses a convergence burst into a single walk once the
+ * batch has settled.
+ *
+ * event_add_event() is a no-op while t_leaf_reconcile is already pending, so
+ * the coalescing is the scheduling primitive rather than a hand-rolled flag.
+ * Correctness does not depend on how many triggers collapse: the walk derives
+ * state from the RIB rather than from any one update, so one walk after N
+ * changes emits exactly what N walks would have.
+ */
+void bgp_mvpn_events_schedule_leaf_reconcile(struct bgp *bgp)
+{
+	struct bgp_mvpn_event_sink *sink = bgp->mvpn_event_sink;
+
+	if (!sink)
+		return;
+	event_add_event(bm->master, bgp_mvpn_events_leaf_reconcile_event, sink, 0,
+			&sink->t_leaf_reconcile);
 }

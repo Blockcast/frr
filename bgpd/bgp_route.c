@@ -4334,15 +4334,25 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 						   bgp_dest_get_prefix(dest));
 
 	/* The per-leaf settlement event set is derived from received Type-4
-	 * (Leaf A-D) routes, so it has to be re-derived whenever the MVPN RIB's
-	 * selection changes. Deliberately here rather than at NLRI-parse time:
-	 * a withdrawn Type-4 is only actually gone from the walk after
-	 * selection, and emitting on the parse path would leave a departed leaf
-	 * billed until the next unrelated UPDATE happened to arrive. The walk
-	 * is a full idempotent diff, so calling it more often than necessary
-	 * costs a table scan and emits nothing. */
-	if (safi == SAFI_MCAST_VPN && (old_select || new_select))
-		bgp_mvpn_events_reconcile_leaves(bgp);
+	 * (Leaf A-D) routes, so it has to be re-derived when MVPN selection
+	 * changes. Deliberately here rather than at NLRI-parse time: a withdrawn
+	 * Type-4 is only actually gone from the walk after selection, and
+	 * emitting on the parse path would leave a departed leaf billed until
+	 * the next unrelated UPDATE happened to arrive.
+	 *
+	 * Gated on the changed prefix actually being a Type-4, and scheduled
+	 * rather than walked inline. The reconcile is a full scan of both MVPN
+	 * RIBs, so an inline call per selected route turned a burst of N
+	 * arriving leaves into N full scans -- O(N^2) on this path, worst in
+	 * exactly the deployments with enough leaves to want per-leaf
+	 * settlement. Type-3/Type-7 churn no longer pays for it at all. */
+	if (safi == SAFI_MCAST_VPN && (old_select || new_select)) {
+		const struct prefix *mvpn_pfx = bgp_dest_get_prefix(dest);
+
+		if (mvpn_pfx->family == AF_MVPN &&
+		    mvpn_pfx->u.prefix_mvpn.route_type == BGP_MVPN_ROUTE_TYPE_LEAF_AD)
+			bgp_mvpn_events_schedule_leaf_reconcile(bgp);
+	}
 
 #ifdef ENABLE_BGP_VNC
 	if ((afi == AFI_IP || afi == AFI_IP6) && (safi == SAFI_UNICAST)) {
