@@ -425,6 +425,15 @@ def test_reconnect_snapshot_exposes_same_epoch_gap():
     global last_seq
 
     _leave()
+    _, withdraw_seq = topotest.run_and_expect(
+        lambda: json.loads(
+            get_topogen().gears["r1"].vtysh_cmd("show bgp mvpn events json")
+        ).get("seq"),
+        last_seq + 1,
+        count=30,
+        wait=0.1,
+    )
+    assert withdraw_seq == last_seq + 1, "withdraw was not sequenced before reconnect"
     reconnect = EventReader(EVENT_SOCK, cursor=(boot_epoch, last_seq))
     snapshot, snapshot_end = reconnect.read_snapshot()
     assert snapshot == []

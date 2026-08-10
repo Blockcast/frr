@@ -290,6 +290,8 @@ def test_address_failure_cleans_up_and_allows_tunnel_id_reuse():
 
 def test_delete_failure_retains_ownership_for_retry_and_reuse():
     router = get_topogen().gears["r1"]
+    if not router.run("command -v strace").strip():
+        pytest.skip("strace is required for netlink failure injection")
     installed = request("add", 5)
     assert installed["result"] == 0, installed
 
@@ -320,6 +322,8 @@ def zebra_ifindex(router, name):
 
 def test_queued_delete_does_not_remove_reused_ifindex():
     router = get_topogen().gears["r1"]
+    if not router.run("command -v strace").strip():
+        pytest.skip("strace is required to hold the dplane worker")
     installed = request("add", 6)
     assert installed["result"] == 0, installed
 
@@ -358,6 +362,8 @@ def test_queued_delete_does_not_remove_reused_ifindex():
 
 def test_add_during_inflight_delete_is_rejected():
     router = get_topogen().gears["r1"]
+    if not router.run("command -v strace").strip():
+        pytest.skip("strace is required to hold the dplane worker")
     installed = request("add", 9)
     assert installed["result"] == 0, installed
 
@@ -426,6 +432,8 @@ def test_uncertain_create_result_reconciles_surviving_link():
 
 def test_delete_encoded_before_replacement_binds_to_ifindex():
     router = get_topogen().gears["r1"]
+    if not router.run("command -v strace").strip():
+        pytest.skip("strace is required to hold the dplane worker")
     installed = request("add", 10)
     assert installed["result"] == 0, installed
 
@@ -469,6 +477,8 @@ def test_delete_encoded_before_replacement_binds_to_ifindex():
 
 def test_lost_delete_ack_reconciles_instead_of_resurrecting():
     router = get_topogen().gears["r1"]
+    if not router.run("command -v strace").strip():
+        pytest.skip("strace is required for netlink failure injection")
     installed = request("add", 11)
     assert installed["result"] == 0, installed
 
@@ -505,6 +515,8 @@ def test_lost_delete_ack_reconciles_instead_of_resurrecting():
 
 def test_skipped_delete_result_survives_mixed_batch():
     router = get_topogen().gears["r1"]
+    if not router.run("command -v strace").strip():
+        pytest.skip("strace is required to hold the dplane worker")
     replaced = request("add", 12)
     assert replaced["result"] == 0, replaced
     normal = request("add", 13)
