@@ -339,7 +339,13 @@ jobs:
           name: ${{ matrix.cfg.platform }}-image
           path: /tmp
       - name: Fetch previous results
+        # The seed artifact is (re-)created by Build's "Clear any previous
+        # results" step. A --failed-only re-run of just this job skips Build,
+        # so the seed from a prior attempt is never recreated and this
+        # download 404s. Tolerate that: the script below already handles a
+        # missing test-results-<platform> dir (BLO-21652).
         if: ${{ github.run_attempt > 1 }}
+        continue-on-error: true
         uses: actions/download-artifact@v7
         with:
           name: test-results-${{ matrix.cfg.platform }}
