@@ -310,9 +310,20 @@ jobs:
     name: ${{ matrix.cfg.name }}
     # Topotest runs can be long; still cap runtime for stuck jobs.
     timeout-minutes: 180
+    env:
+      # arc-e2e's DinD sidecar is capped at 2 CPUs. Nested Docker containers
+      # still see all 48 host CPUs, so nproc-based sizing launched 120 pytest
+      # workers per matrix leg and wedged a 64 GiB runner node under concurrent
+      # legs. Preserve the intended 2.5x oversubscription against the real
+      # cgroup budget instead.
+      TOPOTEST_WORKERS: "5"
     strategy:
       # Keep running remaining platforms when one leg fails.
       fail-fast: false
+      # Both privileged topotest legs create hundreds of network namespaces and
+      # write back through the same node-local DinD store. Run one leg per
+      # workflow at a time so a scheduler co-location cannot multiply that load.
+      max-parallel: 1
       matrix:
         cfg:
         -  { rel: '22.04', name: 'Ubuntu 22.04 amd64 Test', platform: 'amd64_u22' }
@@ -371,8 +382,10 @@ jobs:
           rm -rf test-results-${{ matrix.cfg.platform }}* /tmp/topotests
 
           echo RUN_TESTS: $run_tests
-          if docker run --init -i --privileged --name frr-${{ matrix.cfg.platform }}-cont ${ADD_DOCKER_ENV} -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
-            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest -n$(($(nproc) * 5 / 2)) --dist=loadfile '$run_tests; then
+          [[ "${TOPOTEST_WORKERS}" =~ ^[1-9][0-9]*$ ]]
+          if docker run --init -i --privileged --name frr-${{ matrix.cfg.platform }}-cont ${ADD_DOCKER_ENV} \
+            -e TOPOTEST_WORKERS="${TOPOTEST_WORKERS}" -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
+            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest -n"${TOPOTEST_WORKERS}" --dist=loadfile '$run_tests; then
             echo "All tests passed."
             exit 0
           fi
