@@ -35,11 +35,18 @@ from lib.topogen import Topogen, TopoRouter, get_topogen
 pytestmark = [pytest.mark.bgpd, pytest.mark.pim6d]
 
 PEER = {"r1": "10.0.0.2", "r2": "10.0.0.1"}
-REFLECTION_PEERS = (("r2", "10.0.1.2"), ("r3", "10.0.1.1"), ("r3", "10.0.2.1"), ("r1", "10.0.2.2"))
+REFLECTION_PEERS = (
+    ("r2", "10.0.1.2"),
+    ("r3", "10.0.1.1"),
+    ("r3", "10.0.2.1"),
+    ("r1", "10.0.2.2"),
+)
 SOURCE = "2001:db8::1"
 GROUP = "ff3e::1"
 PE_ORIGINATOR = "10.0.0.1"
-REFLECTED_TYPE1_DIAGNOSTIC = "MVPN Type-1 reflects the local originator; dropping duplicate"
+REFLECTED_TYPE1_DIAGNOSTIC = (
+    "MVPN Type-1 reflects the local originator; dropping duplicate"
+)
 
 
 def build_topo(tgen):
@@ -156,7 +163,7 @@ def _reflected_type1_seen_after(previous):
 
 
 def _assert_converged():
-    peers = list((router, PEER[router]) for router in ("r1", "r2"))
+    peers = [(router, PEER[router]) for router in ("r1", "r2")]
     peers.extend(REFLECTION_PEERS)
     for router, peer in peers:
         test_func = functools.partial(_established, router, peer)
