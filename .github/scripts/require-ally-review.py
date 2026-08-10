@@ -15,10 +15,13 @@ Reads the workflow event from GITHUB_EVENT_PATH, needs GITHUB_TOKEN with
 `statuses: write`.
 """
 
+import base64
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,12 +42,27 @@ TRUSTED_COLLABORATOR_PERMISSIONS = {"admin", "maintain", "write"}
 
 STATUS_CONTEXT = os.environ.get("STATUS_CONTEXT") or "review/ally-complete"
 
+# Best-known status-write coordinates, kept current by main() as each fact is
+# learned (token/repo first, payload head next, refetched head last). The
+# top-level handler in run() uses them to turn a crash into an `error` status
+# on the head instead of a silent non-zero exit: a run that dies before its
+# first write leaves an earlier same-head `success` standing as the visible
+# truth, which is the one direction a merge control must not fail.
+_STATUS_TARGET = {}
+
 # Sentinel (not a GitHub status state): a COMMENTED Ally review carrying no
-# blocking findings. Ally only ever COMMENTs -- never APPROVEs -- so this is
-# its "looks good". It is NOT an auto-pass: it stays overridable so the
-# review-gate-override label can clear it, but without the label the gate
-# posts `pending` (and so still blocks merge).
+# blocking findings. Ally historically only COMMENTed -- never APPROVEd --
+# so this is its "looks good". It is NOT a pass: since round 3 of the
+# multicast vendoring review the ONLY green for this context is an exact-head
+# App-seat APPROVED review, so a clean COMMENTED body holds `pending` until
+# the App seat approves.
 CLEAN_COMMENTED_STATUS = "clean-commented"
+# Round 2 of the #47 review: an APPROVED whose body is coordinator-
+# ambiguous is that seat's newest formal verdict but authorizes nothing
+# and withdraws nothing -- it supersedes the seat's own earlier success
+# while current_signals_per_login refuses to let it displace a standing
+# blocker. decide() maps it to pending.
+AMBIGUOUS_APPROVAL_STATUS = "ambiguous-approval"
 
 # A loose keyword scan over prose is unsafe: a *positive* review that merely
 # discusses security ("blocks a real security gap", "unsafe RBAC", "finding")
@@ -56,6 +74,138 @@ ACTION_REQUIRED_COMMENT_PATTERN = re.compile(
     r"critical issues? \([1-9]\d*\)|important issues? \([1-9]\d*\))",
     re.IGNORECASE,
 )
+
+# Negated forms CONTAIN the affirmative phrases as substrings, so the raw
+# pattern above read an all-clear ("No action required", "No changes
+# requested") as a changes-requested verdict -- the exact false-positive
+# direction the keyword scan's own comment promises to avoid. Negated forms
+# are masked out first; only text that survives the mask may count as
+# affirmative, so "No action required for X. Action required: fix Y." still
+# fails on the second, un-negated phrase. The mask must cover every phrase
+# family the affirmative pattern matches (action AND changes, with an
+# optional adjective/adverb slot: "no IMMEDIATE action required", "no
+# FURTHER changes requested", "no ADDITIONAL APPLICATION SOURCE CODE
+# changes requested" -- any number of modifier words, because the span is
+# a NEGATED NOUN PHRASE rather than a counted window. Three bounds keep it
+# one, and each is load-bearing for fail-closed behavior:
+#   1. Separators admit only horizontal whitespace: "\s+" would let a bare
+#      "No" on its own paragraph swallow a real "Action required:" verdict
+#      on the next line, erasing a blocking signal.
+#   2. Modifiers admit only word characters, so punctuation ends the span
+#      and a standalone "No." cannot swallow a separate affirmative
+#      sentence.
+#   3. Modifiers exclude the span-breaker words below: adversative and
+#      discourse pivots flip the polarity of what follows ("No reviewer
+#      responded BUT action required"), and auxiliary/copular verbs end
+#      any noun phrase ("no reviewer HAS responded ..."), so hitting one
+#      means the affirmative that follows is NOT under the negation.
+# A regex cannot fully parse English -- an exotic pivot outside the list
+# would still be consumed -- but the residual exposure is narrow because
+# the affirmative pattern requires its words ADJACENT: the mask only ever
+# erases a real verdict when a pivot immediately precedes it, and the
+# common pivots (and every auxiliary verb form) are listed. Errors from
+# over-listing fall in the safe direction: an unmasked negation can at
+# worst BLOCK a clean review, never pass a blocking one, because deletion
+# only removes text and no affirmative phrase can be created by removing
+# a negated one.
+_NEGATION_SPAN_BREAKERS = (
+    "but|yet|however|though|although|whereas|while|nevertheless|"
+    "nonetheless|instead|otherwise|rather|therefore|hence|thus|"
+    "consequently|accordingly|because|since|so|then|meanwhile|"
+    "is|are|was|were|be|been|being|has|have|had|do|does|did|not"
+)
+# Coordinators are deliberately NOT in the breaker list above: English
+# negation legitimately distributes across them ("no issues found or changes
+# requested" is an all-clear), so breaking on them would false-fail compound
+# negated prose. But a span that DID cross a coordinator is exactly where the
+# mask can consume a real verdict ("no reviewer responded AND action
+# required"). The STRICT variants below add the coordinators; the difference
+# between the two mask outcomes is the machine-detectable ambiguity signal
+# (see masked_blocking_ambiguity).
+_NEGATION_SPAN_COORDINATORS = "and|or|nor|plus"
+_STRICT_SPAN_BREAKERS = _NEGATION_SPAN_BREAKERS + "|" + _NEGATION_SPAN_COORDINATORS
+NO_ACTION_REQUIRED_PATTERN = re.compile(
+    r"\bno(?:[ \t]+(?!(?:" + _NEGATION_SPAN_BREAKERS + r")\b)\w+)*"
+    r"[ \t]+(?:action|changes?)[ \t]+"
+    r"(?:is[ \t]+|are[ \t]+|was[ \t]+|were[ \t]+)?(?:required|requested|needed)\b",
+    re.IGNORECASE,
+)
+NO_ACTION_REQUIRED_STRICT_PATTERN = re.compile(
+    r"\bno(?:[ \t]+(?!(?:" + _STRICT_SPAN_BREAKERS + r")\b)\w+)*"
+    r"[ \t]+(?:action|changes?)[ \t]+"
+    r"(?:is[ \t]+|are[ \t]+|was[ \t]+|were[ \t]+)?(?:required|requested|needed)\b",
+    re.IGNORECASE,
+)
+
+
+# The "request changes" affirmative family (scanned above) has its own
+# negated shapes the noun-phrase mask cannot reach: an infinitive after a
+# negated noun phrase ("no need to request changes") and direct verb
+# negation ("we do not request changes", "we won't request changes",
+# "we need not request changes"). The modal list includes semi-modal
+# "need" ("need not" / "needn't") -- the same negated-verb shape as the
+# core modals. Adjacency keeps this safe: "not ONLY request changes"
+# (which affirms) has an intervening word and never matches. Same clause
+# bounds as the main mask; same fail-closed footing -- under the
+# authorization inversion a mask error can only cause a false
+# failure-or-pending, never a false green.
+NO_REQUEST_CHANGES_PATTERN = re.compile(
+    r"(?:\bno(?:[ \t]+(?!(?:" + _NEGATION_SPAN_BREAKERS + r")\b)\w+)*"
+    r"[ \t]+to[ \t]+request[ \t]+changes?\b"
+    r"|\b(?:do|does|did|would|will|shall|should|could|can|must|may|might|need|dare)"
+    r"[ \t]+not[ \t]+request[ \t]+changes?\b"
+    r"|\b(?:don't|doesn't|didn't|won't|wouldn't|shan't|shouldn't|couldn't|can't|cannot|mustn't|needn't)"
+    r"[ \t]+request[ \t]+changes?\b)",
+    re.IGNORECASE,
+)
+NO_REQUEST_CHANGES_STRICT_PATTERN = re.compile(
+    r"(?:\bno(?:[ \t]+(?!(?:" + _STRICT_SPAN_BREAKERS + r")\b)\w+)*"
+    r"[ \t]+to[ \t]+request[ \t]+changes?\b"
+    r"|\b(?:do|does|did|would|will|shall|should|could|can|must|may|might|need|dare)"
+    r"[ \t]+not[ \t]+request[ \t]+changes?\b"
+    r"|\b(?:don't|doesn't|didn't|won't|wouldn't|shan't|shouldn't|couldn't|can't|cannot|mustn't|needn't)"
+    r"[ \t]+request[ \t]+changes?\b)",
+    re.IGNORECASE,
+)
+
+
+def has_action_required_language(body):
+    masked = NO_ACTION_REQUIRED_PATTERN.sub(" ", body)
+    masked = NO_REQUEST_CHANGES_PATTERN.sub(" ", masked)
+    return ACTION_REQUIRED_COMMENT_PATTERN.search(masked) is not None
+
+
+def masked_blocking_ambiguity(body):
+    """True when ONLY a coordinator-crossing negation span stands between this
+    body and a blocking verdict -- the machine-detectable signature of the
+    mask consuming a real verdict (review rounds 7-8).
+
+    Mechanics: the strict masks differ from the lenient ones in exactly one
+    way -- their spans additionally break on coordinators (and/or/nor/plus).
+    Strict spans are therefore a subset of lenient spans, so only three
+    outcomes exist:
+      - affirmative survives BOTH masks  -> real blocking; the failure paths
+        own it (has_action_required_language is true) and this returns False;
+      - affirmative survives NEITHER     -> a simple negated all-clear
+        ("No action required", "no further changes requested") -- not
+        ambiguous, may authorize;
+      - affirmative survives STRICT only -> the lenient span crossed a
+        coordinator. "No reviewer responded and action required: fix gate"
+        (a pivot reading -- blocking) is indistinguishable by regex from
+        "no issues found or changes requested" (a distributed negation --
+        clean). Ambiguity resolves fail-closed: the body may not authorize
+        green and may not be cleared by the override, no matter what pass
+        verdict or zero-count sections accompany it (review round 8: a
+        machine-readable all-clear must not launder a possibly-consumed
+        blocking verdict). Cost: a genuine distributed-negation all-clear
+        lands pending until re-worded -- a false HOLD, never a false green.
+    """
+    if has_action_required_language(body):
+        return False
+    strict_masked = NO_ACTION_REQUIRED_STRICT_PATTERN.sub(" ", body)
+    strict_masked = NO_REQUEST_CHANGES_STRICT_PATTERN.sub(" ", strict_masked)
+    return ACTION_REQUIRED_COMMENT_PATTERN.search(strict_masked) is not None
+
 
 # Explicit, machine-readable verdict markers. When any is present in an Ally
 # body we trust it over heuristics. Precedence: an explicit changes-requested
@@ -192,20 +342,22 @@ def is_issue_link_ally_comment_for_head(body, head_sha):
     )
 
 
-def self_review_signal(at, author, head_sha):
+def self_review_signal(at, author, head_sha, seat):
     """A clean self-review (the PR was authored by an Ally identity, and Ally
-    is reviewing its own PR) is not authoritative: Ally's own prose says
-    "formal review/approval must come from a human or a distinct reviewer
-    identity". Demoted to a non-authoritative "pending"; machine-readable
-    blocking findings are classified before reaching here and still fail
-    closed.
+    is reviewing its own PR) is not authoritative, and since round 3 of the
+    multicast vendoring review no substitute exists: the only identity that
+    may authorize this context is the App seat, which cannot approve its own
+    PR. App-authored heads stay pending until reopened under an independent
+    author. Machine-readable blocking findings are classified before reaching
+    here and still fail closed.
     """
     return {
         "at": str(at or ""),
         "author": author,
+        "seat": seat,
         "description": (
-            "Ally self-review on head %s is not authoritative; "
-            "needs a human or distinct reviewer." % short_sha(head_sha)
+            "Ally-authored PR: head %s cannot be App-self-approved; "
+            "reopen it under an independent author." % short_sha(head_sha)
         ),
         "kind": "self-review",
         "status": "pending",
@@ -235,11 +387,30 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
     signals = []
 
     for review in reviews:
-        login = (review.get("user") or {}).get("login")
+        user = review.get("user") or {}
+        login = user.get("login")
         if not isinstance(login, str) or login not in ally:
             continue
         if review.get("state") == "DISMISSED":
             continue
+        # POSITIVE Ally evidence must come from the App seat (REST
+        # `user.type == "Bot"`), never the shared `allyblockcast` User seat
+        # (review round 2 of the multicast vendoring): the org ruleset
+        # already counts that User as the singleton Ally-team approval, so
+        # accepting it here would let ONE User review satisfy BOTH controls
+        # while the required App review is absent. Blocking evidence stays
+        # identity-agnostic below -- dropping a User-seat CHANGES_REQUESTED
+        # or blocking count would be fail-open. The User seat still
+        # participates as a DISTINCT REVIEWER on App-authored PRs via the
+        # permission-checked distinct_reviewer path, which is a separate
+        # control.
+        is_app_seat = user.get("type") == "Bot"
+        # Round 2 of the #47 review: signals carry the SEAT alongside the
+        # login. GitHub REST may normalize the App login to the same string
+        # as the shared User login, and a login-only reduction key would then
+        # merge two distinct actors -- letting a normalized App approval
+        # erase the User seat's outstanding objection.
+        seat = "app" if is_app_seat else "user"
 
         body = str(review.get("body") or "")
         # Attestation gates CLEARING the gate, never BLOCKING it.
@@ -258,15 +429,43 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             continue
 
         at = review_signal_time(review)
+        # Round 7 of the #47 review: STATE-WITHDRAWAL AUTHORITY orders by
+        # submission time. review_signal_time() ranks a review at the later
+        # of submitted_at/last_edited_at so a body edited to ADD blocking
+        # findings ranks newest (fail closed) -- but that same edit-aware
+        # clock let an OLD approval, body-edited after a newer
+        # CHANGES_REQUESTED from the same identity, become the actor's
+        # newest clean placeholder and withdraw an objection that was never
+        # formally withdrawn. Positive and withdrawal signals (success,
+        # clean-commented, the User-seat withdrawal placeholder, the
+        # self-review placeholder) therefore bind to submitted_at; only
+        # fail-closed body-derived evidence (blocking findings, coordinator
+        # ambiguity) keeps the edit-aware time.
+        submitted = str(review.get("submitted_at") or "")
         state = review.get("state")
 
-        # Self-review cannot approve its own PR, but its machine-readable
-        # blocking findings must still fail closed and stay un-overridable.
-        if state == "COMMENTED" and has_blocking_count(body):
+        # Blocking body evidence is classified BEFORE the state branches
+        # (round 4 of the multicast vendoring review): the APPROVED branch
+        # used to return success without reading the body, so an exact-head
+        # App approval whose body still carried `Critical Issues (1)` -- or
+        # surviving (un-negated) action-required prose, or an explicit
+        # changes-requested verdict -- greened the gate. Contradiction
+        # resolves red for EVERY state, including a self-review, matching
+        # the comment path's rule that machine-readable blocking findings
+        # fail closed and stay un-overridable. The prose scan runs
+        # independently of the verdict (review round 7); incidental
+        # security/"blocking" mentions still do NOT match.
+        verdict = explicit_verdict(body)
+        if (
+            has_blocking_count(body)
+            or verdict == "changes-requested"
+            or has_action_required_language(body)
+        ):
             signals.append(
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "Ally review flagged blocking findings on head %s."
                     % short_sha(head_sha),
                     "kind": "formal-review",
@@ -275,19 +474,66 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             )
             continue
 
-        # Demote before reading the verdict so a bot review of its own PR can
-        # neither hard-pass (APPROVED) nor hard-fail (CHANGES_REQUESTED).
+        # Demote before reading the state so a bot review of its own PR can
+        # neither hard-pass (APPROVED) nor hard-fail (CHANGES_REQUESTED); its
+        # body-level blocking evidence has already failed closed above.
         if is_self_review:
-            signals.append(self_review_signal(at, login, head_sha))
+            signals.append(self_review_signal(submitted, login, head_sha, seat))
             continue
 
         if state == "APPROVED":
             if not attested:
+                # Unattested approvals bind nothing, in either direction.
+                continue
+            # The ambiguity check runs BEFORE either approval branch (round
+            # 2 of the #47 review): the lenient mask may have consumed a
+            # real blocking phrase, so an ambiguous approval may neither
+            # authorize green nor stand as this seat's clean verdict. It is
+            # emitted as the seat's current NON-success signal: it
+            # supersedes the same seat's earlier success (the newest look is
+            # no longer a clean approval), while current_signals_per_login
+            # refuses to let it displace a standing blocker -- fail closed
+            # in both directions. decide() maps it to pending.
+            if masked_blocking_ambiguity(body):
+                signals.append(
+                    {
+                        "at": at,
+                        "author": login,
+                        "seat": seat,
+                        "description": "Ally approval of head %s is "
+                        "coordinator-ambiguous; it neither authorizes nor "
+                        "withdraws." % short_sha(head_sha),
+                        "kind": "ambiguous-approval",
+                        "status": AMBIGUOUS_APPROVAL_STATUS,
+                    }
+                )
+                continue
+            if not is_app_seat:
+                # Round 4: an exact-head-attested User-seat approval carries
+                # no positive authority, but it IS that identity's newest
+                # formal verdict. Emit the clean-commented placeholder so the
+                # per-seat reduction in decide() lets the User seat withdraw
+                # ITS OWN earlier objection -- mirroring GitHub's rule that a
+                # reviewer's new approval supersedes their prior
+                # CHANGES_REQUESTED. decide() maps this status to pending, so
+                # it can never become the green.
+                signals.append(
+                    {
+                        "at": submitted,
+                        "author": login,
+                        "seat": seat,
+                        "description": "Ally User-seat approval of head %s "
+                        "(no positive authority)." % short_sha(head_sha),
+                        "kind": "user-seat-approval",
+                        "status": CLEAN_COMMENTED_STATUS,
+                    }
+                )
                 continue
             signals.append(
                 {
-                    "at": at,
+                    "at": submitted,
                     "author": login,
+                    "seat": seat,
                     "description": "Ally approved head %s." % short_sha(head_sha),
                     "kind": "formal-review",
                     "status": "success",
@@ -296,12 +542,19 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             continue
 
         # The canonical distinct-reviewer negative verdict. Stays red
-        # regardless of body prose or the override label.
+        # regardless of body prose or the override label. Round 8 of the
+        # #47 review: this STATE signal binds to submitted_at like every
+        # other formal-state signal -- editing an old objection's body must
+        # not re-time it past the same seat's newer formal approval and
+        # resurrect a formally withdrawn objection. An edit that ADDS
+        # machine-readable blocking evidence still fails closed through the
+        # edit-aware body-evidence branch above.
         if state == "CHANGES_REQUESTED":
             signals.append(
                 {
-                    "at": at,
+                    "at": submitted,
                     "author": login,
+                    "seat": seat,
                     "description": "Ally requested changes on head %s." % short_sha(head_sha),
                     "kind": "formal-review",
                     "status": "failure",
@@ -310,30 +563,50 @@ def review_signals_for_head(reviews, head_sha, ally_logins, is_self_review):
             continue
 
         if state == "COMMENTED":
-            verdict = explicit_verdict(body)
-            # An explicit changes-requested verdict, OR a machine-readable
-            # count > 0, is a real negative -- stays red, label or not.
-            # Incidental security/"blocking" prose does NOT match.
-            if verdict == "changes-requested" or (
-                verdict is None and ACTION_REQUIRED_COMMENT_PATTERN.search(body)
-            ):
+            if not attested or not is_app_seat:
+                continue
+            # A coordinator-ambiguous body may not authorize green no matter
+            # what pass verdict or zero counts accompany it (review round 8):
+            # the mask may have consumed a real blocking phrase, and a
+            # machine-readable all-clear must not launder that away. Round 6
+            # of the #47 review: the ambiguous review is EMITTED rather than
+            # discarded -- it is this App seat's newest formal look at the
+            # head, so it supersedes the seat's older approval to pending
+            # (while still never withdrawing a blocker, per the reduction).
+            if masked_blocking_ambiguity(body):
                 signals.append(
                     {
                         "at": at,
                         "author": login,
-                        "description": "Ally review flagged blocking findings on head %s."
-                        % short_sha(head_sha),
-                        "kind": "formal-review",
-                        "status": "failure",
+                        "seat": seat,
+                        "description": "Ally review of head %s is "
+                        "coordinator-ambiguous; it neither authorizes nor "
+                        "withdraws." % short_sha(head_sha),
+                        "kind": "ambiguous-commented-review",
+                        "status": AMBIGUOUS_APPROVAL_STATUS,
                     }
                 )
                 continue
-            if not attested:
+            # AUTHORIZATION INVERSION (review round 5): free prose never
+            # authorizes green. A clean-commented review counts only with a
+            # machine-readable all-clear -- an explicit pass verdict or
+            # BOTH zero-count sections. This removes the fail-open class
+            # where the negation mask over-consumed a real blocking phrase:
+            # a masked-away affirmative can now at worst leave the body
+            # unauthorized (pending), never authorize it. The masks' only
+            # remaining job is preventing false FAILURE from negated
+            # prose, so every mask error lands fail-closed.
+            has_zero_counts = (
+                extract_issue_count(body, "Critical Issues") == 0
+                and extract_issue_count(body, "Important Issues") == 0
+            )
+            if verdict != "pass" and not has_zero_counts:
                 continue
             signals.append(
                 {
-                    "at": at,
+                    "at": submitted,
                     "author": login,
+                    "seat": seat,
                     "description": "Ally reviewed head %s with no blocking findings."
                     % short_sha(head_sha),
                     "kind": "clean-commented-review",
@@ -433,6 +706,7 @@ def distinct_reviewer_signals_for_head(
         # commit_id; a drifting commit_id may add red, never green.
         positively_bound = attested or login in head_authorized_logins
 
+        seat = "app" if user.get("type") == "Bot" else "user"
         at = str(review.get("submitted_at") or "")
         if review.get("state") == "APPROVED":
             if not positively_bound:
@@ -441,6 +715,7 @@ def distinct_reviewer_signals_for_head(
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "%s approved head %s as a distinct reviewer."
                     % (login, short_sha(head_sha)),
                     "kind": "distinct-reviewer-approval",
@@ -452,6 +727,7 @@ def distinct_reviewer_signals_for_head(
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "%s requested changes on head %s."
                     % (login, short_sha(head_sha)),
                     "kind": "distinct-reviewer-changes-requested",
@@ -479,10 +755,18 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
     signals = []
 
     for comment in comments:
-        login = (comment.get("user") or {}).get("login")
+        user = comment.get("user") or {}
+        login = user.get("login")
         body = str(comment.get("body") or "")
         if not isinstance(login, str) or login not in ally:
             continue
+        # No positive seat gating here: since #45 the comment path carries
+        # no positive branch, and its blocking evidence is deliberately
+        # identity-agnostic (any Ally-login seat may fail the gate, no seat
+        # may green it from a comment). The seat still labels the signal so
+        # per-seat reduction in decide() keys distinct actors correctly even
+        # when REST normalizes both seats to the same login string.
+        seat = "app" if user.get("type") == "Bot" else "user"
 
         is_consolidated = is_consolidated_ally_comment_for_head(body, head_sha)
         is_issue_link = is_issue_link_ally_comment_for_head(body, head_sha)
@@ -490,10 +774,10 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
             continue
 
         # Order on the LATER of created_at/updated_at. GitHub keeps created_at
-        # immutable across edits, so an older clean comment edited to add
-        # blocking findings would otherwise keep losing latest_signal() to a
-        # newer clean signal and leave the gate green on a review that now says
-        # the opposite.
+        # immutable across edits, so an older comment edited to add blocking
+        # findings would otherwise carry a stale timestamp and lose
+        # latest_signal() to an earlier formal approval, leaving the gate
+        # green on a body that now says the opposite.
         at = comment_signal_time(comment)
 
         # Self-review cannot approve its own PR, but machine-readable blocking
@@ -503,6 +787,7 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "Ally comment requested action on head %s." % short_head,
                     "kind": "consolidated-comment",
                     "status": "failure",
@@ -519,21 +804,29 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
             continue
 
         if is_self_review:
-            signals.append(self_review_signal(at, login, head_sha))
+            # Binds to created_at (the submission analog): an edited old
+            # comment must not re-time this pending placeholder past the
+            # actor's newer blocking evidence (round 7 of the #47 review).
+            signals.append(
+                self_review_signal(
+                    str(comment.get("created_at") or ""), login, head_sha, seat
+                )
+            )
             continue
 
         verdict = explicit_verdict(body)
-        # FAILURE only on an actual changes-requested verdict: an explicit
-        # marker, a machine-readable count > 0, or the legacy action-required
-        # phrasing. A positive review that merely *mentions* security /
-        # "blocking" / "unsafe" / "finding" never fails here.
-        if verdict == "changes-requested" or (
-            verdict is None and ACTION_REQUIRED_COMMENT_PATTERN.search(body)
-        ):
+        # FAILURE on an actual changes-requested verdict OR surviving
+        # (un-negated) action-required prose -- checked INDEPENDENTLY of the
+        # verdict (review round 7): an explicit pass paired with "Action
+        # required: fix X." is contradictory prose, and contradiction resolves
+        # red. A positive review that merely *mentions* security / "blocking"
+        # / "unsafe" / "finding" never fails here.
+        if verdict == "changes-requested" or has_action_required_language(body):
             signals.append(
                 {
                     "at": at,
                     "author": login,
+                    "seat": seat,
                     "description": "Ally comment requested action on head %s." % short_head,
                     "kind": "consolidated-comment",
                     "status": "failure",
@@ -541,25 +834,18 @@ def comment_signals_for_head(comments, head_sha, ally_logins, is_self_review):
             )
             continue
 
-        # Positive only on an affirmative verdict: an explicit pass, or
-        # validated zero blocking counts. Silence is not consent -- a
-        # consolidated body with neither is ambiguous and stays pending.
-        has_zero_counts = (
-            extract_issue_count(body, "Critical Issues") == 0
-            and extract_issue_count(body, "Important Issues") == 0
-        )
-        if verdict != "pass" and not has_zero_counts:
-            continue
-
-        signals.append(
-            {
-                "at": at,
-                "author": login,
-                "description": "Ally clean comment on head %s." % short_head,
-                "kind": "ally-comment",
-                "status": "success",
-            }
-        )
+        # A coordinator-ambiguous body may not authorize green regardless of
+        # verdict or counts (review round 8; see masked_blocking_ambiguity).
+        # Round 2 of this PR's review removed the comment path's positive
+        # branch entirely: a clean consolidated comment used to emit
+        # `success`, which let an issue comment green `review/ally-complete`
+        # with no formal review having happened, and let a later clean
+        # comment out-rank an earlier formal blocking signal through
+        # latest_signal(). Comments now contribute ONLY blocking evidence
+        # (the failure appends above); the sole producer of `success` on
+        # this context is the formal exact-head App-seat APPROVED branch in
+        # review_signals_for_head. A clean comment is therefore inert here
+        # -- it neither greens the gate nor withdraws a standing signal.
 
     return signals
 
@@ -578,6 +864,108 @@ def latest_signal(signals):
     return sorted(signals, key=order)[-1]
 
 
+def canonical_actor_login(login, seat):
+    """One grouping key per identity across REST login spellings (round 5 of
+    the #47 review): the same GitHub App may surface as `x[bot]`, `app/x`,
+    or a normalized bare `x` in different rows, and splitting those left a
+    stale clean approval standing as a separate current `success` beside
+    the App's newer ambiguous verdict under the other spelling. Only the
+    App seat is normalized -- the shared User seat keeps its raw login, so
+    the seat separation from round 2 (normalized App vs User with the same
+    login string) is untouched: the seat component of the key still
+    distinguishes them.
+    """
+    if seat != "app":
+        return login
+    name = login
+    if name.startswith("app/"):
+        name = name[len("app/"):]
+    if name.endswith("[bot]"):
+        name = name[: -len("[bot]")]
+    return name
+
+
+def current_signals_per_login(signals):
+    """Each actor's CURRENT signal, independent of input order.
+
+    Round 3 of the #47 review: the previous incremental fold depended on the
+    order signals arrived -- decide() concatenates all reviews before all
+    comments, so a seat's ambiguous approval could be installed first and
+    that same seat's OLDER blocking comment then discarded as stale, erasing
+    a blocker the ambiguity rule was supposed to preserve. Each (login,
+    seat) group is now sorted before folding, so caller concatenation order
+    cannot change the result.
+
+    The key is (login, seat), not login alone (round 2 of the #47 review):
+    GitHub REST may normalize the App login to the same string as the shared
+    User login, and a login-only key would merge two distinct actors --
+    letting a normalized App approval erase the User seat's outstanding
+    objection.
+
+    Ordering inside one actor is chronological with a fail-closed tie rank:
+    on an equal timestamp, failure outranks ambiguity, and ambiguity
+    outranks any non-blocking state (a clean approval and an ambiguous
+    approval in the same second resolve to ambiguous -- pending, not
+    success). Across timestamps the chronologically newest signal wins,
+    EXCEPT that an AMBIGUOUS_APPROVAL_STATUS signal never displaces a
+    standing failure: the blocker stays current until an UNAMBIGUOUS
+    same-seat verdict supersedes it. Shared by the distinct-reviewer
+    reduction and by decide()'s reduction of Ally's own dual-seat signals --
+    the App seat and the shared User seat are distinct actors, so only the
+    same identity may supersede its own objection.
+    """
+
+    def tie_rank(signal):
+        # Higher rank folds LAST at an equal timestamp, so it wins the tie
+        # unless a fold rule (ambiguity-vs-failure) says otherwise. Every
+        # same-second pairing is deterministic (round 4 of the #47 review):
+        # failure > ambiguity > clean/pending > success. Ranking success
+        # LOWEST means an equal-second contradiction always resolves away
+        # from green -- a clean COMMENTED beside a same-second approval
+        # withdraws it to pending, never the reverse by REST list order.
+        if signal["status"] == "failure":
+            return 3
+        if signal["status"] == AMBIGUOUS_APPROVAL_STATUS:
+            return 2
+        if signal["status"] == "success":
+            return 0
+        return 1
+
+    grouped = {}
+    for signal in signals:
+        seat = signal.get("seat", "")
+        actor = (canonical_actor_login(signal["author"], seat), seat)
+        grouped.setdefault(actor, []).append(signal)
+
+    current_states = []
+    for group in grouped.values():
+        # Round 6 of the #47 review: reduce each TIMESTAMP BUCKET to its
+        # highest fail-closed precedence before applying it to prior state.
+        # Folding individual signals let a clean approval withdraw a
+        # standing blocker one step before the same-second ambiguous
+        # approval was processed -- the bucket's contradictory verdicts must
+        # collapse first (ambiguity beats the clean withdrawal), and an
+        # ambiguous bucket still cannot withdraw the seat's earlier blocker.
+        buckets = {}
+        for signal in group:
+            buckets.setdefault(str(signal["at"]), []).append(signal)
+        current = None
+        for at in sorted(buckets):
+            representative = max(buckets[at], key=tie_rank)
+            if (
+                current is not None
+                and current["status"] == "failure"
+                and representative["status"] == AMBIGUOUS_APPROVAL_STATUS
+            ):
+                # An ambiguous verdict cannot withdraw this seat's blocker.
+                continue
+            current = representative
+        if current is not None:
+            current_states.append(current)
+
+    return current_states
+
+
 def reduce_distinct_reviewer_signals(signals):
     """Reduce to each reviewer's CURRENT state, then fail if any reviewer is
     currently requesting changes.
@@ -588,22 +976,7 @@ def reduce_distinct_reviewer_signals(signals):
     an outstanding CHANGES_REQUESTED as blocking regardless of who reviewed
     later, and so does this.
     """
-    latest_by_author = {}
-    for signal in signals:
-        current = latest_by_author.get(signal["author"])
-        newer = current is None or str(signal["at"]) > str(current["at"])
-        # Same-second tie between opposite states from one reviewer: fail
-        # closed rather than let list order pick.
-        tie_blocking = (
-            current is not None
-            and str(signal["at"]) == str(current["at"])
-            and signal["status"] == "failure"
-            and current["status"] != "failure"
-        )
-        if newer or tie_blocking:
-            latest_by_author[signal["author"]] = signal
-
-    current_states = list(latest_by_author.values())
+    current_states = current_signals_per_login(signals)
     blocking = [s for s in current_states if s["status"] == "failure"]
     if blocking:
         return latest_signal(blocking)
@@ -677,60 +1050,64 @@ def decide(
         else []
     )
 
-    # A trusted distinct-reviewer approval only supersedes Ally's own signal
-    # when Ally's signal for this head is the non-authoritative self-review
-    # demotion (or absent) -- never when Ally already flagged blocking findings
-    # on this exact head.
-    ally_has_failure = any(entry["status"] == "failure" for entry in ally_signals)
-    if is_self_review and distinct_signals and not ally_has_failure:
-        # Per-reviewer reduction: one reviewer's later approval must not erase
-        # another's outstanding change request.
-        signal = reduce_distinct_reviewer_signals(distinct_signals)
+    # Round 4 of the multicast vendoring review: Ally's own signals reduce
+    # PER LOGIN, exactly like distinct reviewers, because the App seat and
+    # the shared User seat are distinct actors -- a later App approval must
+    # not erase a User-seat CHANGES_REQUESTED that its own identity never
+    # withdrew. After the reduction, selection is fail-closed by status:
+    # any outstanding blocker wins; otherwise a standing App-seat approval
+    # (only the formal App APPROVED branch can produce `success`, and only
+    # that login's own newer signal can supersede it); otherwise the newest
+    # clean/pending placeholder.
+    ally_current = current_signals_per_login(ally_signals)
+    ally_blocking = [s for s in ally_current if s["status"] == "failure"]
+    ally_successes = [s for s in ally_current if s["status"] == "success"]
+    if ally_blocking:
+        signal = latest_signal(ally_blocking)
+    elif ally_successes:
+        signal = latest_signal(ally_successes)
     else:
-        signal = latest_signal(ally_signals)
+        signal = latest_signal(ally_current)
 
-    # Escape hatch: Ally does not reliably auto-review, so a "Waiting for Ally
-    # review" pending can deadlock a PR forever. A maintainer can override --
-    # but the override NEVER bypasses a review that flagged issues: a `failure`
-    # on the current head stays red regardless. It only rescues the
-    # reviewer-never-ran case.
-    #
-    # Two independent conditions, because the label alone is PR-scoped and
-    # survives `synchronize`: it would silently clear every later unreviewed
-    # head. The label carries the authorization (only maintainers can apply
-    # one); a comment naming the full head SHA binds that authorization to a
-    # specific revision, so pushing new code revokes it automatically.
-    has_label = bool(override_label) and override_label in labels
-    override_logins = override_attestation_logins(comments, head_sha)
-    has_head_attestation = bool(override_logins & set(permission_trusted_logins))
-    has_override = has_label and has_head_attestation
+    # Distinct-reviewer evidence contributes ONLY blocking signals (round 3
+    # of the multicast vendoring review): this context's sole positive
+    # authority is the Ally App seat, and an App-authored PR cannot receive
+    # App approval -- it stays pending until reopened under an independent
+    # author. A trusted distinct reviewer's CHANGES_REQUESTED still fails
+    # closed (dropping it would be fail-open), and inside the per-reviewer
+    # reduction a reviewer's later approval still withdraws THEIR OWN earlier
+    # change request -- but a surviving approval maps to no signal, never
+    # success. Ally's own OUTSTANDING blocking findings outrank everything.
+    if is_self_review and distinct_signals and not ally_blocking:
+        reduced = reduce_distinct_reviewer_signals(distinct_signals)
+        if reduced is not None and reduced["status"] == "failure":
+            signal = reduced
 
-    if has_override and (signal is None or signal["status"] != "failure"):
-        return (
-            "success",
-            "Ally review gate overridden for head %s (label '%s' + head-bound authorization)."
-            % (short_sha(head_sha), override_label),
-        )
+    # There is deliberately NO maintainer override on this context (round 3
+    # of the multicast vendoring review): a head-bound label+comment override
+    # was a second path where a permission-trusted User could green a context
+    # whose sole positive authority is the App seat. Deadlock relief for a
+    # reviewer that never ran is an administrative action outside this
+    # context (branch-protection admin bypass), not a state this script will
+    # ever report as success.
 
     if signal is None:
-        if has_label and not has_head_attestation:
-            return (
-                "pending",
-                "Waiting for Ally review of head %s; label '%s' needs a "
-                "'review-gate-override: <full head SHA>' comment."
-                % (short_sha(head_sha), override_label),
-            )
         return "pending", "Waiting for Ally review of head %s." % short_sha(head_sha)
 
-    # A clean COMMENTED review (override didn't fire) is not a GitHub status
-    # state. Not blocked by findings, but not an auto-pass either: stay
-    # `pending` and tell the maintainer exactly what to do.
+    if signal["status"] == AMBIGUOUS_APPROVAL_STATUS:
+        return (
+            "pending",
+            "Ally approval of head %s is ambiguous; awaiting an unambiguous "
+            "App-seat APPROVED review." % short_sha(head_sha),
+        )
+
+    # A clean COMMENTED review is not a GitHub status state, and no label can
+    # clear it any more: hold pending until the App seat APPROVES this head.
     if signal["status"] == CLEAN_COMMENTED_STATUS:
         return (
             "pending",
-            "Ally reviewed head %s, no blocking findings; apply '%s' and comment "
-            "'review-gate-override: <full head SHA>'."
-            % (short_sha(head_sha), override_label),
+            "Ally reviewed head %s, no blocking findings; awaiting an "
+            "App-seat APPROVED review." % short_sha(head_sha),
         )
 
     return signal["status"], signal["description"]
@@ -747,6 +1124,98 @@ def _request(url, token, method="GET", payload=None):
     with urllib.request.urlopen(req) as response:
         body = response.read()
         return json.loads(body) if body else None
+
+
+# The issue_comment head probe is the single point where a transient API
+# failure used to leave a stale same-head `success` standing with no claim
+# and no error write (review round 7). Two hardening layers close most of
+# that window:
+#   1. Retries with backoff -- a rate-limit blip or one 5xx no longer
+#      forfeits the head.
+#   2. A git-transport fallback (`git ls-remote refs/pull/N/head`) -- an
+#      independent protocol path to the same immutable coordinate, so a
+#      REST-plane outage alone cannot hide the head. Once EITHER source
+#      yields the SHA it is claimed into _STATUS_TARGET, and any later
+#      crash posts `error` to it.
+# The residual window -- REST and git transport BOTH unreachable -- is
+# physically irreducible: with no addressable commit there is nothing any
+# code path could stamp, and posting the invalidating status itself
+# requires the REST plane. That case exits non-zero with no status write.
+_PROBE_ATTEMPTS = 3
+_sleep = time.sleep  # test seam
+
+
+def _probe_pull_request(url, token, attempts=_PROBE_ATTEMPTS):
+    """GET the PR with retries; returns the payload or None (never raises)."""
+    for attempt in range(attempts):
+        try:
+            payload = _request(url, token)
+        except Exception as error:  # noqa: BLE001 - each attempt is fallible
+            print(
+                "head probe attempt %d/%d failed: %s" % (attempt + 1, attempts, error),
+                file=sys.stderr,
+            )
+            payload = None
+        if payload:
+            return payload
+        if attempt + 1 < attempts:
+            _sleep(2 ** attempt)
+    return None
+
+
+def _parse_ls_remote_head(output):
+    """First 40-hex OID column of `git ls-remote` output, or None."""
+    for line in (output or "").splitlines():
+        oid = line.split("\t")[0].split(" ")[0].strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", oid):
+            return oid
+    return None
+
+
+def _git_pull_head_sha(owner, repo, pull_number, token):
+    """Resolve refs/pull/N/head over git smart-HTTP -- a transport
+    independent of the REST API plane. Returns the OID or None; never
+    raises.
+
+    The token travels via GIT_CONFIG_* environment variables, NEVER in
+    argv: on a shared self-hosted runner /proc/<pid>/cmdline is readable
+    by same-UID processes, and subprocess exceptions embed the full
+    command (review round 8). The URL itself stays credential-free, and
+    emitted error text is redacted as a second layer in case git echoes
+    configuration back.
+    """
+    server = (os.environ.get("GITHUB_SERVER_URL") or "https://github.com").rstrip("/")
+    url = "%s/%s/%s.git" % (server, owner, repo)
+    basic = base64.b64encode(("x-access-token:%s" % token).encode()).decode()
+
+    def redact(text):
+        return (text or "").replace(token, "***").replace(basic, "***")
+
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", url, "refs/pull/%d/head" % pull_number],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={
+                **os.environ,
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.%s/.extraheader" % server,
+                "GIT_CONFIG_VALUE_0": "Authorization: Basic %s" % basic,
+            },
+        )
+    except Exception as error:  # noqa: BLE001 - fallback is best-effort
+        print("git head fallback failed: %s" % redact(str(error)), file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        print(
+            "git head fallback exited %d: %s"
+            % (result.returncode, redact((result.stderr or "").strip())[:200]),
+            file=sys.stderr,
+        )
+        return None
+    return _parse_ls_remote_head(result.stdout)
 
 
 def fetch_paginated(api_base_url, path, token):
@@ -831,18 +1300,37 @@ def clamp_description(description):
 
 
 def set_commit_status(api_base_url, owner, repo, sha, token, state, description, target_url):
+    """POST the status with bounded retries. Status writes are the gate's
+    entire output: a transient REST failure that drops one turns an
+    evaluated verdict into silence, and silence in front of an earlier
+    same-head `success` is fail-open (review round 8). Retries convert
+    blip-length outages into eventual writes; a sustained outage still
+    raises, which callers escalate (crash handler -> `error` status when
+    possible, non-zero exit -> the required workflow check-run backstop
+    otherwise).
+    """
     url = "%s/repos/%s/%s/statuses/%s" % (api_base_url.rstrip("/"), owner, repo, sha)
-    _request(
-        url,
-        token,
-        method="POST",
-        payload={
-            "context": STATUS_CONTEXT,
-            "description": clamp_description(description),
-            "state": state,
-            "target_url": target_url,
-        },
-    )
+    payload = {
+        "context": STATUS_CONTEXT,
+        "description": clamp_description(description),
+        "state": state,
+        "target_url": target_url,
+    }
+    last_error = None
+    for attempt in range(_PROBE_ATTEMPTS):
+        try:
+            _request(url, token, method="POST", payload=payload)
+            return
+        except Exception as error:  # noqa: BLE001 - each attempt is fallible
+            last_error = error
+            print(
+                "status write attempt %d/%d for %s failed: %s"
+                % (attempt + 1, _PROBE_ATTEMPTS, short_sha(sha), error),
+                file=sys.stderr,
+            )
+            if attempt + 1 < _PROBE_ATTEMPTS:
+                _sleep(2 ** attempt)
+    raise last_error
 
 
 def enrich_reviews_with_edit_times(api_base_url, owner, repo, pull_number, token, reviews):
@@ -906,6 +1394,12 @@ def enrich_reviews_with_edit_times(api_base_url, owner, repo, pull_number, token
 
 
 def main():
+    # Fresh coordinates per invocation: the module-level target otherwise
+    # carries a previous in-process caller's repo/token/head into this run
+    # (only matters for tests -- CI is one process per run -- but stale
+    # coordinates in a crash write would point the error status at the wrong
+    # head, so clear defensively rather than rely on caller hygiene).
+    _STATUS_TARGET.clear()
     event_path = os.environ.get("GITHUB_EVENT_PATH")
     if not event_path:
         raise RuntimeError("GITHUB_EVENT_PATH is required")
@@ -924,6 +1418,7 @@ def main():
 
     owner, repo = full_name.split("/", 1)
     api_base_url = os.environ.get("GITHUB_API_URL") or "https://api.github.com"
+    _STATUS_TARGET.update({"api": api_base_url, "owner": owner, "repo": repo, "token": token})
 
     # Resolve the PR NUMBER from whatever payload the event carries, then
     # refetch the PR itself for EVERY event. The embedded pull_request object
@@ -946,27 +1441,149 @@ def main():
         print("No pull_request payload found; nothing to gate.")
         return
 
+    # Claim the context on the PAYLOAD head before the authoritative refetch.
+    # The refetch itself can raise (network, rate limit), and a run that dies
+    # with no write leaves a previous same-head `success` standing -- the gate
+    # failing open on exactly the kind of error it should hold for. A stale
+    # payload head is harmless here for the same reason a stale-event run is:
+    # the authoritative post-refetch write targets the real head, and a
+    # pending on a superseded head gates nothing. Gated on the snapshot
+    # claiming an open, non-draft PR so settled PRs are not stamped
+    # (issue_comment payloads carry no head and are skipped), and best-effort
+    # so a failed early write cannot itself kill the run before the
+    # authoritative path gets its turn.
+    payload_pr = event.get("pull_request") or {}
+    payload_head = (payload_pr.get("head") or {}).get("sha")
+    if not payload_head:
+        # issue_comment payloads carry no pull_request.head.sha, so without
+        # this probe the crash handler has no addressable commit: a refetch
+        # crash would skip the `error` write and leave an earlier same-head
+        # `success` standing -- fail-open on exactly the events that can
+        # REMOVE the evidence behind a green gate (comment edits/deletes).
+        # Resolve the head with a minimal retried fetch BEFORE any fallible
+        # processing so this path gets the same fail-closed claim as
+        # pull_request payloads. When the REST probe stays down, the git
+        # smart-HTTP fallback supplies the same immutable coordinate over an
+        # independent transport; the run then continues so the claim below
+        # lands `pending` on the real head, and any later crash escalates it
+        # to `error`. Only when BOTH transports fail is there no addressable
+        # commit anywhere -- the raised error fails the workflow run visibly,
+        # the documented irreducible residual (see _probe_pull_request).
+        probe = _probe_pull_request(
+            "%s/repos/%s/%s/pulls/%d" % (api_base_url.rstrip("/"), owner, repo, pull_number),
+            token,
+        )
+        if probe:
+            payload_pr = probe
+            payload_head = (probe.get("head") or {}).get("sha")
+        else:
+            fallback_head = _git_pull_head_sha(owner, repo, pull_number, token)
+            if not fallback_head:
+                raise RuntimeError(
+                    "PR #%s head could not be resolved for the fail-closed claim "
+                    "(REST probe and git fallback both failed)" % pull_number
+                )
+            print(
+                "REST head probe failed; git fallback resolved head %s"
+                % short_sha(fallback_head)
+            )
+            # Draft/state unknown without the REST payload; an empty snapshot
+            # falls through the claim gate below as open/non-draft, which is
+            # the fail-closed direction (a stray pending blocks, never clears,
+            # and resolve_early_claim cleans up if the refetch later says
+            # settled).
+            payload_pr = {}
+            payload_head = fallback_head
+    early_claim_active = False
+    if payload_head:
+        _STATUS_TARGET["sha"] = payload_head
+        if not payload_pr.get("draft") and (payload_pr.get("state") or "open") == "open":
+            try:
+                set_commit_status(
+                    api_base_url,
+                    owner,
+                    repo,
+                    payload_head,
+                    token,
+                    "pending",
+                    "Evaluating Ally review of head %s..." % short_sha(payload_head),
+                    os.environ.get("STATUS_TARGET_URL"),
+                )
+                early_claim_active = True
+            except Exception as error:  # noqa: BLE001 - the claim is best-effort
+                print(
+                    "early pending claim on payload head %s failed (continuing): %s"
+                    % (short_sha(payload_head), error),
+                    file=sys.stderr,
+                )
+
+    # Resolves an early claim that turned out to target a PR the refetch says
+    # not to gate. The stale-HEAD case needs no cleanup (a pending on a
+    # superseded head gates nothing), but when the payload head IS the current
+    # head, a silent early return would strand the claim: on a merged/closed
+    # PR nothing ever re-evaluates, leaving a required context yellow forever
+    # on a commit that reached the base branch. Best-effort like the claim
+    # itself.
+    def resolve_early_claim(state, description):
+        if not early_claim_active:
+            return
+        try:
+            set_commit_status(
+                api_base_url,
+                owner,
+                repo,
+                payload_head,
+                token,
+                state,
+                description,
+                os.environ.get("STATUS_TARGET_URL"),
+            )
+        except Exception as error:  # noqa: BLE001 - cleanup is best-effort
+            print(
+                "resolving early claim on %s failed: %s" % (short_sha(payload_head), error),
+                file=sys.stderr,
+            )
+
     pull_request = _request(
         "%s/repos/%s/%s/pulls/%d" % (api_base_url.rstrip("/"), owner, repo, pull_number),
         token,
     )
     if not pull_request:
-        print("PR #%s could not be fetched; nothing to gate." % pull_number)
-        return
+        # An empty refetch is indistinguishable from an outage. Returning
+        # zero here would leave whatever status history the head already has
+        # as the visible truth -- fail-open when that history is a stale
+        # `success` and the early claim happened to fail. Raise instead: the
+        # crash handler escalates to `error` on the claimed head when the
+        # REST plane allows, and the non-zero exit trips the required
+        # workflow check-run backstop when it does not.
+        raise RuntimeError("PR #%s could not be fetched; refusing to gate on absence" % pull_number)
 
     if pull_request.get("state") and pull_request.get("state") != "open":
         # A delayed event can arrive after merge/close; there is no head left
-        # to gate and a status write would be noise on a settled PR.
+        # to gate. The early claim (if any) must not be left stranded: a
+        # settled PR gets no future evaluation, so a lingering `pending`
+        # would sit yellow forever. `success` is safe here -- the PR cannot
+        # merge again, so the context gates nothing.
         print("PR #%s is %s; nothing to gate." % (pull_number, pull_request["state"]))
+        resolve_early_claim(
+            "success", "PR is %s; nothing to gate." % pull_request["state"]
+        )
         return
 
     if pull_request.get("draft"):
+        # Keep the claim PENDING (fail-closed: a draft can return to ready at
+        # this same head, and a `success` here would pre-clear it), but say
+        # why -- the next ready_for_review event re-evaluates and overwrites.
         print("PR is a draft; nothing to gate.")
+        resolve_early_claim(
+            "pending", "PR is a draft; will re-evaluate when it becomes ready."
+        )
         return
 
     head_sha = (pull_request.get("head") or {}).get("sha")
     if not head_sha:
         raise RuntimeError("pull_request.head.sha is required")
+    _STATUS_TARGET["sha"] = head_sha
 
     pull_number = pull_request["number"]
     ally_logins = parse_list(os.environ.get("ALLY_REVIEWER_LOGINS"), DEFAULT_ALLY_LOGINS)
@@ -1058,7 +1675,6 @@ def main():
 
     # Status descriptions fit GitHub's 140-char cap, so they name the override
     # command generically. The copy-pasteable form lives here in the log.
-    print("Head-bound override command: review-gate-override: %s" % head_sha)
 
     set_commit_status(
         api_base_url,
@@ -1073,9 +1689,37 @@ def main():
     print("%s: %s" % (STATUS_CONTEXT, description))
 
 
-if __name__ == "__main__":
+def run():
     try:
         main()
     except Exception as error:  # noqa: BLE001 - surface message, non-zero exit
         print(str(error), file=sys.stderr)
+        # A crash must stay VISIBLE on the head, not just in the workflow log:
+        # with no write, an earlier same-head `success` remains the status the
+        # merge control reads, and the failed run is indistinguishable from no
+        # run at all. Best-effort by construction -- the write needs whatever
+        # coordinates main() managed to learn before dying, and a failure to
+        # record the crash must not mask the original error's exit.
+        target = dict(_STATUS_TARGET)
+        if all(target.get(key) for key in ("api", "owner", "repo", "token", "sha")):
+            try:
+                set_commit_status(
+                    target["api"],
+                    target["owner"],
+                    target["repo"],
+                    target["sha"],
+                    target["token"],
+                    "error",
+                    "review-gate crashed before posting a verdict: %s" % error,
+                    os.environ.get("STATUS_TARGET_URL"),
+                )
+            except Exception as status_error:  # noqa: BLE001 - keep the original exit
+                print(
+                    "failed to record the crash as an error status: %s" % status_error,
+                    file=sys.stderr,
+                )
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    run()

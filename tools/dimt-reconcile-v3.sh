@@ -81,6 +81,12 @@
 #   tunnels are shared dual-stack inner).  "default <peer>" catches
 #   unmatched v4 SSM sources, "default6 <peer>" the v6 ones.  A map
 #   entry overrides BGP UMH discovery (O2).
+#
+# Managed-underlay cutover is deliberately a v2 transport concern.  Set
+# DIMT_ENDPOINTS_FILE (or wrap v2 with --endpoints-file) to map overlay
+# identities onto tunnelsync-managed GRE endpoints.  This daemon continues
+# to record and delegate overlay identities, preserving inner addresses and
+# BGP UMH resolution while v2 changes only the GRE local/remote endpoints.
 
 set -u
 

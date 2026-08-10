@@ -10,9 +10,13 @@ Stdlib only, no network -- decide() is a pure function.
 Run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
+import re
+import subprocess
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -57,8 +61,12 @@ def review(state, commit=HEAD, body=None, login="allyblockcast[bot]", at="2026-0
     return row
 
 
-def comment(body, login="allyblockcast[bot]", at="2026-07-27T10:00:00Z", updated=None):
-    row = {"body": body, "user": {"login": login}, "created_at": at}
+def comment(body, login="allyblockcast[bot]", at="2026-07-27T10:00:00Z", updated=None,
+            utype="Bot"):
+    """Defaults to the App seat (type Bot): positive Ally evidence requires
+    it, and most fixtures exercise the authoritative path. Pass utype="User"
+    to model the shared `allyblockcast` User seat."""
+    row = {"body": body, "user": {"login": login, "type": utype}, "created_at": at}
     if updated is not None:
         row["updated_at"] = updated
     return row
@@ -115,10 +123,12 @@ class TestCleanCommented(unittest.TestCase):
     """Branch 3 — Ally only ever COMMENTs, so a clean comment must NOT auto-pass."""
 
     def test_clean_commented_holds_pending_and_names_the_label(self):
-        state, desc = decide(reviews=[review("COMMENTED", body=CONSOLIDATED)])
+        # CLEAN (zero counts), not bare CONSOLIDATED prose: the inversion
+        # requires a machine-readable all-clear for the review to count.
+        state, desc = decide(reviews=[review("COMMENTED", body=CLEAN)])
         self.assertEqual(state, "pending")
         self.assertIn("no blocking findings", desc)
-        self.assertIn(OVERRIDE, desc)
+        self.assertIn("App-seat APPROVED", desc)
 
     def test_clean_commented_label_alone_does_not_clear(self):
         """The label is PR-scoped and survives `synchronize`. On its own it
@@ -128,17 +138,19 @@ class TestCleanCommented(unittest.TestCase):
             reviews=[review("COMMENTED", body=CONSOLIDATED)], labels=[OVERRIDE]
         )
         self.assertEqual(state, "pending")
-        self.assertIn("review-gate-override: <full head SHA>", desc)
+        self.assertIn("Waiting for Ally review", desc)
 
-    def test_clean_commented_clears_with_label_and_head_attestation(self):
+    def test_former_override_combination_no_longer_clears(self):
+        # Round 3 of the multicast vendoring review: the label+comment
+        # override was a User-authorized success path on a context whose
+        # sole positive authority is the App seat. It now clears nothing.
         state, desc = decide(
             reviews=[review("COMMENTED", body=CONSOLIDATED)],
             comments=[comment(override_body(HEAD), login=HUMAN)],
             labels=[OVERRIDE],
             trusted={HUMAN},
         )
-        self.assertEqual(state, "success")
-        self.assertIn("overridden", desc)
+        self.assertEqual(state, "pending")
 
 
 class TestBlockingFindings(unittest.TestCase):
@@ -192,7 +204,7 @@ class TestPositiveProseIsNotAVerdict(unittest.TestCase):
         body = CONSOLIDATED + "### Recommended Action\n\nMerge.\n"
         state, desc = decide(reviews=[review("COMMENTED", body=body)])
         self.assertEqual(state, "pending")
-        self.assertIn(OVERRIDE, desc)
+        self.assertIn("App-seat APPROVED", desc)
 
 
 class TestSelfReview(unittest.TestCase):
@@ -203,7 +215,7 @@ class TestSelfReview(unittest.TestCase):
             reviews=[review("APPROVED")], author="app/allyblockcast"
         )
         self.assertEqual(state, "pending")
-        self.assertIn("not authoritative", desc)
+        self.assertIn("independent author", desc)
 
     def test_self_review_blocking_findings_still_fail_closed(self):
         body = CONSOLIDATED + "### Critical Issues (1)\n"
@@ -228,8 +240,10 @@ class TestSelfReview(unittest.TestCase):
             author="app/allyblockcast",
             trusted={HUMAN},
         )
-        self.assertEqual(state, "success")
-        self.assertIn("distinct reviewer", desc)
+        # Round 3: App-authored PRs stay pending regardless of distinct
+        # approvals; reopen the head under an independent author.
+        self.assertEqual(state, "pending")
+        self.assertIn("independent author", desc)
 
     def test_distinct_approval_trusted_via_collaborator_permission(self):
         """Branch 8 — association is CONTRIBUTOR (the visibility-gated false
@@ -247,7 +261,9 @@ class TestSelfReview(unittest.TestCase):
             author="app/allyblockcast",
             trusted={HUMAN},
         )
-        self.assertEqual(state, "success")
+        # Round 3: pending — the permission lookup still resolves trust, but
+        # a distinct approval can no longer green this context.
+        self.assertEqual(state, "pending")
 
     def test_bot_ally_identity_cannot_be_its_own_distinct_reviewer(self):
         state, _ = decide(
@@ -275,11 +291,16 @@ class TestSelfReview(unittest.TestCase):
 
 
 class TestCommentSignals(unittest.TestCase):
-    """Consolidated / issue-link comments count as signals for the head."""
+    """Consolidated / issue-link comments contribute BLOCKING signals only.
 
-    def test_consolidated_comment_with_zero_counts_is_clean(self):
-        state, _ = decide(comments=[comment(CLEAN)])
-        self.assertEqual(state, "success")
+    Round 2 of this PR's review removed the comment path's positive branch:
+    a clean consolidated comment used to return `success`, which let an
+    issue comment green the gate with no formal review having happened."""
+
+    def test_consolidated_clean_comment_is_inert(self):
+        state, desc = decide(comments=[comment(CLEAN)])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
 
     def test_consolidated_comment_without_a_verdict_stays_pending(self):
         """Silence is not consent: no pass verdict and no zero counts is
@@ -342,8 +363,12 @@ class TestFullShaAttestation(unittest.TestCase):
         self.assertIn("Waiting for Ally review", desc)
 
     def test_full_sha_comment_counts(self):
-        state, _ = decide(comments=[comment(CLEAN)])
-        self.assertEqual(state, "success")
+        # Positive comment evidence is inert since round 2 of this PR's
+        # review, so full-SHA attestation recognition is pinned through the
+        # blocking path: an unrecognized comment could not fail the gate.
+        body = attest(HEAD, "### Critical Issues (2)\n")
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
 
 
 class TestCommitIdIsNotProofOfCoverage(unittest.TestCase):
@@ -448,7 +473,10 @@ class TestConflictingReviewers(unittest.TestCase):
             author="app/allyblockcast",
             trusted={"reviewer-a"},
         )
-        self.assertEqual(state, "success")
+        # The later approval withdraws reviewer-a's own objection, but a
+        # surviving distinct approval maps to NO signal (round 3): pending,
+        # never success.
+        self.assertEqual(state, "pending")
 
 
 class TestOverrideIsHeadBound(unittest.TestCase):
@@ -471,7 +499,7 @@ class TestOverrideIsHeadBound(unittest.TestCase):
     def test_label_without_attestation_names_the_required_comment(self):
         state, desc = decide(labels=[OVERRIDE], trusted={HUMAN})
         self.assertEqual(state, "pending")
-        self.assertIn("review-gate-override: <full head SHA>", desc)
+        self.assertIn("Waiting for Ally review", desc)
 
     def test_attestation_without_label_does_not_clear(self):
         state, _ = decide(
@@ -523,7 +551,11 @@ class TestEditedCommentOrdering(unittest.TestCase):
         )
         self.assertEqual(state, "failure")
 
-    def test_unedited_ordering_is_unchanged(self):
+    def test_later_clean_comment_cannot_clear_blocking_comment(self):
+        # Inverted in round 2 of this PR's review: a newer clean comment used
+        # to supersede an older blocking one via latest_signal(). Clean
+        # comments are inert now, so the blocking signal stands until a
+        # formal App-seat APPROVED review of this head supersedes it.
         blocking = CONSOLIDATED + "### Important Issues (1)\n"
         state, _ = decide(
             comments=[
@@ -531,7 +563,7 @@ class TestEditedCommentOrdering(unittest.TestCase):
                 comment(CLEAN, at="2026-07-27T12:00:00Z"),
             ]
         )
-        self.assertEqual(state, "success")
+        self.assertEqual(state, "failure")
 
     def test_missing_updated_at_falls_back_to_created_at(self):
         self.assertEqual(
@@ -562,7 +594,7 @@ class TestEditedReviewOrdering(unittest.TestCase):
         state, _ = decide(
             reviews=[
                 review("COMMENTED", body=blocking, at="2026-07-27T09:00:00Z"),
-                review("COMMENTED", body=CONSOLIDATED, at="2026-07-27T12:00:00Z"),
+                review("COMMENTED", body=CLEAN, at="2026-07-27T12:00:00Z"),
             ]
         )
         self.assertEqual(state, "pending")  # newest is clean-commented
@@ -580,25 +612,39 @@ class TestQualifiedMergeVerdicts(unittest.TestCase):
     Merge. A loose prefix match laundered 'Merge only after requested changes
     are addressed' into a clean signal that cleared the gate."""
 
-    def _comment_state(self, verdict_line):
+    def _review_state(self, verdict_line):
         body = attest(HEAD, "### Recommended Action\n\n%s\n" % verdict_line)
-        state, _ = decide(comments=[comment(body)])
-        return state
+        return decide(reviews=[review("COMMENTED", body=body)])
 
     def test_standalone_merge_is_a_pass(self):
-        self.assertEqual(self._comment_state("Merge."), "success")
+        # Round 2 of this PR's review made the comment path positive-inert,
+        # so the verdict matcher's discrimination shows on the review path:
+        # a standalone Merge lands the clean-commented pending, a qualified
+        # Merge contributes no clean signal at all.
+        state, desc = self._review_state("Merge.")
+        self.assertEqual(state, "pending")
+        self.assertIn("no blocking findings", desc)
 
     def test_merge_only_after_changes_is_not_a_pass(self):
-        self.assertEqual(
-            self._comment_state("Merge only after requested changes are addressed."),
-            "pending",
+        state, desc = self._review_state(
+            "Merge only after requested changes are addressed."
         )
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+
+    def test_merge_verdict_comment_is_inert(self):
+        body = attest(HEAD, "### Recommended Action\n\nMerge.\n")
+        state, desc = decide(comments=[comment(body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
 
     def test_merge_after_fixes_is_not_a_pass(self):
-        self.assertEqual(self._comment_state("Merge after fixes"), "pending")
+        state, _ = self._review_state("Merge after fixes")
+        self.assertEqual(state, "pending")
 
     def test_merge_must_be_blocked_is_not_a_pass(self):
-        self.assertEqual(self._comment_state("Merge must be blocked"), "pending")
+        state, _ = self._review_state("Merge must be blocked")
+        self.assertEqual(state, "pending")
 
 
 class TestDescriptionLength(unittest.TestCase):
@@ -626,6 +672,13 @@ class TestDescriptionLength(unittest.TestCase):
                 trusted={HUMAN},
             ),
             decide(reviews=[review("COMMENTED", body=blocking)]),  # failure
+            decide(  # override refused: mask-ambiguous body
+                reviews=[review("COMMENTED", body=attest(
+                    HEAD, "No reviewer responded and action required: fix gate."))],
+                comments=[comment(override_body(HEAD), login=HUMAN)],
+                labels=[OVERRIDE],
+                trusted={HUMAN},
+            ),
             decide(reviews=[review("CHANGES_REQUESTED")]),  # changes requested
             decide(reviews=[review("APPROVED")]),  # approved
             decide(reviews=[review("APPROVED")], author="app/allyblockcast"),  # self demoted
@@ -677,9 +730,13 @@ class TestContradictoryCounts(unittest.TestCase):
         self.assertEqual(state, "failure")
 
     def test_duplicate_zero_headings_stay_clean(self):
+        # Via the review path since round 2 of this PR's review: the
+        # clean-commented description proves the duplicate zero headings
+        # were read as clean, which a positive-inert comment cannot show.
         body = CLEAN + "\n### Critical Issues (0)\n"
-        state, _ = decide(comments=[comment(body)])
-        self.assertEqual(state, "success")
+        state, desc = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("no blocking findings", desc)
 
 
 class TestSameTimestampTies(unittest.TestCase):
@@ -754,7 +811,10 @@ class TestDistinctReviewerHeadBinding(unittest.TestCase):
             author="app/allyblockcast",
             trusted={HUMAN},
         )
-        self.assertEqual(state, "success")
+        # Round 3: distinct approvals no longer produce success anywhere;
+        # binding now only governs whether an approval may withdraw the SAME
+        # reviewer's earlier change request.
+        self.assertEqual(state, "pending")
 
     def test_authorization_comment_binds_an_empty_body_approval(self):
         state, _ = decide(
@@ -763,7 +823,7 @@ class TestDistinctReviewerHeadBinding(unittest.TestCase):
             author="app/allyblockcast",
             trusted={HUMAN},
         )
-        self.assertEqual(state, "success")
+        self.assertEqual(state, "pending")
 
     def test_authorization_by_a_different_login_does_not_bind(self):
         # The approver must bind their own approval; a third party's
@@ -803,7 +863,9 @@ class TestApprovalAndRecency(unittest.TestCase):
         self.assertNotEqual(state, "failure")
 
     def test_latest_signal_wins(self):
-        clean = CONSOLIDATED
+        # Under the authorization inversion the newest review only counts as
+        # clean via machine-readable zero counts (CLEAN), not bare prose.
+        clean = CLEAN
         blocking = CONSOLIDATED + "### Important Issues (1)\n"
         state, _ = decide(
             reviews=[
@@ -816,14 +878,15 @@ class TestApprovalAndRecency(unittest.TestCase):
 
 
 class TestStalePayloadOrchestration(unittest.TestCase):
-    """The workflow cancels the active run on any PR event, so main() must be
-    unconditionally willing to replace what it cancelled. Round 7: a delayed
-    event whose stale snapshot still said draft:true cancelled the in-flight
-    ready-PR run and then skipped the job on a workflow-level payload
-    predicate -- the current head was left with no status. The predicate is
-    gone; these fixtures prove the script layer makes that safe in BOTH stale
-    directions by reading only the PR number from the payload and taking
-    draft state from the authoritative refetch."""
+    """Runs serialize on a shared group and must be unconditionally willing to
+    evaluate current state, whatever stale snapshot woke them. Round 7: a
+    delayed event whose stale snapshot still said draft:true cancelled the
+    then-cancellable in-flight ready-PR run and skipped the job on a
+    workflow-level payload predicate -- the current head was left with no
+    status. The predicate is gone; these fixtures prove the script layer makes
+    that safe in BOTH stale directions by reading only the PR number (and a
+    best-effort early-claim head) from the payload and taking draft state from
+    the authoritative refetch."""
 
     STALE_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -883,7 +946,10 @@ class TestStalePayloadOrchestration(unittest.TestCase):
 
     def test_stale_ready_payload_does_not_gate_a_draft_pr(self):
         # The inverse staleness: payload says ready, the PR has since gone
-        # back to draft. No status may be written against a draft head.
+        # back to draft. The ready-claiming payload earns a best-effort early
+        # pending on ITS OWN (stale) head -- harmless, a superseded head gates
+        # nothing (the draft resolve keeps it pending with a note) -- but the
+        # draft PR's current head must get no status.
         _, statuses = self._run_main(
             payload_draft=False,
             refetched={
@@ -895,7 +961,1371 @@ class TestStalePayloadOrchestration(unittest.TestCase):
                 "labels": [],
             },
         )
+        self.assertEqual({sha for sha, _ in statuses}, {self.STALE_HEAD})
+        self.assertEqual({state for _, state in statuses}, {"pending"})
+        self.assertNotIn(HEAD, {sha for sha, _ in statuses})
+
+    def test_settled_pr_resolves_the_early_claim(self):
+        # Round 2: a delayed event whose payload still said open earns the
+        # early claim, then the refetch says merged/closed AT THE SAME HEAD.
+        # A silent return would strand a required context yellow forever on a
+        # commit that reached the base branch -- nothing re-evaluates a
+        # settled PR. The claim must resolve to success (the PR cannot merge
+        # again, so the context gates nothing).
+        _, statuses = self._run_main(
+            payload_draft=False,
+            refetched={
+                "number": 7,
+                "state": "closed",
+                "draft": False,
+                "head": {"sha": self.STALE_HEAD},
+                "user": {"login": HUMAN},
+                "labels": [],
+            },
+        )
+        self.assertEqual(
+            statuses,
+            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "success")],
+        )
+
+    def test_draft_pr_same_head_keeps_the_claim_failclosed(self):
+        # Same-head draft: the PR can return to ready at this exact head, so
+        # resolving to success would pre-clear the gate (fail-open). The
+        # claim stays pending -- self-healing via the next ready_for_review.
+        _, statuses = self._run_main(
+            payload_draft=False,
+            refetched={
+                "number": 7,
+                "state": "open",
+                "draft": True,
+                "head": {"sha": self.STALE_HEAD},
+                "user": {"login": HUMAN},
+                "labels": [],
+            },
+        )
+        self.assertEqual(
+            statuses,
+            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "pending")],
+        )
+
+
+class TestNegatedActionRequired(unittest.TestCase):
+    """"No action required" contains "action required" as a substring, so the
+    raw affirmative scan read Ally's all-clear as a changes-requested verdict.
+    Negated forms are masked before the scan; a separate un-negated
+    affirmative in the same body must still fail."""
+
+    def test_no_action_required_comment_is_not_a_failure(self):
+        # The mask's only job is preventing a false FAILURE from negated
+        # prose. On the (positive-inert) comment path that shows as pending
+        # rather than failure; on the review path the clean-commented
+        # description additionally proves the body was read as clean.
+        body = attest(
+            HEAD,
+            "No action required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, description = decide(comments=[comment(body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", description)
+        state, description = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("no blocking findings", description)
+
+    def test_no_further_action_required_variant(self):
+        body = attest(
+            HEAD,
+            "No further action is required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+
+    def test_no_changes_requested_is_not_a_failure(self):
+        # Review round 2: the mask covered only the "action required" phrase
+        # family; "No changes requested." hit the sibling `changes requested`
+        # alternation and produced the same false failure.
+        body = attest(
+            HEAD,
+            "No changes requested.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+
+    def test_adverb_does_not_defeat_the_mask(self):
+        body = attest(
+            HEAD,
+            "No immediate action required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+
+    def test_no_changes_needed_variant(self):
+        body = attest(
+            HEAD,
+            "No changes are needed.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+
+    def test_multi_modifier_negations_do_not_defeat_the_mask(self):
+        # Review rounds 3-4: the mask first allowed exactly zero or one
+        # modifier word, then an arbitrary cap of three -- each left some
+        # ordinary multi-modifier all-clear prose ("no ADDITIONAL
+        # APPLICATION SOURCE CODE changes requested") with the affirmative
+        # substring behind, blocking a clean review. The span is now
+        # clause-bounded instead of counted.
+        for text in (
+            "No additional code changes requested.",
+            "No immediate further action required.",
+            "No additional application source code changes requested.",
+        ):
+            body = attest(
+                HEAD,
+                text + "\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+            )
+            state, _ = decide(reviews=[review("COMMENTED", body=body)])
+            self.assertEqual(state, "pending", text)
+
+    def test_mask_window_does_not_cross_punctuation(self):
+        # The clause-bounded window must not let a standalone "No." swallow
+        # a separate affirmative sentence: modifiers admit only word
+        # characters, so punctuation ends the span.
+        body = attest(HEAD, "No. Changes requested: fix the overflow before merge.")
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+    def test_mask_span_stops_at_pivots_and_verbs(self):
+        # Review round 5 CRITICAL: the unbounded modifier run accepted every
+        # word, so a same-line pivot let the mask consume a genuine verdict
+        # ("No reviewer has responded but action required:" masked to
+        # ": ..."), flipping the gate fail-open. Modifiers now exclude
+        # adversative/discourse pivots and auxiliary verbs -- both fixtures
+        # die at "has" before even reaching the conjunction.
+        for text in (
+            "No reviewer has responded but action required: fix the gate.",
+            "No reviewer requested this but changes requested: fix the gate.",
+        ):
+            body = attest(HEAD, text)
+            state, _ = decide(comments=[comment(body)])
+            self.assertEqual(state, "failure", repr(text))
+
+    def test_mask_window_does_not_cross_line_boundaries(self):
+        # Review round 4 CRITICAL: with "\s+" separators the mask crossed a
+        # paragraph boundary -- a bare "No" ending one paragraph erased a
+        # real blocking verdict opening the next ("No\n\nAction required:"
+        # became ": ..."), flipping the gate fail-open. Separators admit
+        # only horizontal whitespace, so a line boundary ends the span and
+        # the blocking verdict survives the mask.
+        for text in (
+            "No\n\nAction required: fix the gate.",
+            "No\n\nChanges requested: fix the gate.",
+        ):
+            body = attest(HEAD, text)
+            state, _ = decide(comments=[comment(body)])
+            self.assertEqual(state, "failure", repr(text))
+
+    def test_affirmative_changes_requested_still_fails(self):
+        body = attest(HEAD, "Changes requested: the overflow must be fixed first.")
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+    def test_no_action_required_review_is_not_a_failure(self):
+        body = attest(
+            HEAD,
+            "No action required.\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        )
+        state, description = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("no blocking findings", description)
+
+    def test_affirmative_action_required_still_fails(self):
+        body = attest(HEAD, "Action required: fix the overflow before merge.")
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+    def test_negation_does_not_mask_a_separate_affirmative(self):
+        body = attest(
+            HEAD,
+            "No action required for the docs change. Action required: fix the gate.",
+        )
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+
+class TestCrashVisibility(unittest.TestCase):
+    """A run that dies must not exit silently. With no write, an earlier
+    same-head `success` remains the visible truth (fail-open), and a crash
+    before the refetch previously left no record at all. run() turns any
+    crash into an `error` status on the best-known head, and main() claims a
+    best-effort `pending` on the payload head BEFORE the fallible refetch."""
+
+    STALE_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+    def setUp(self):
+        gate._STATUS_TARGET.clear()
+        self.addCleanup(gate._STATUS_TARGET.clear)
+
+    def _run(self, payload_draft=False, request=None, paginated=None):
+        event = {
+            "pull_request": {
+                "number": 7,
+                "draft": payload_draft,
+                "head": {"sha": self.STALE_HEAD},
+            },
+            "repository": {"full_name": "Blockcast/frr"},
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+            event_path = handle.name
+        self.addCleanup(os.unlink, event_path)
+        env = {
+            "GITHUB_EVENT_PATH": event_path,
+            "GITHUB_REPOSITORY": "Blockcast/frr",
+            "GITHUB_TOKEN": "test-token",
+        }
+        calls = []
+
+        def record_status(api, owner, repo, sha, token, state, description,
+                          target_url=None):
+            calls.append(("status", sha, state))
+
+        def record_request(url, token, method="GET", payload=None):
+            calls.append(("request", url))
+            if isinstance(request, Exception):
+                raise request
+            return request
+
+        def record_paginated(api, path, token):
+            if isinstance(paginated, Exception):
+                raise paginated
+            return []
+
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "_request", side_effect=record_request), \
+                mock.patch.object(gate, "set_commit_status", side_effect=record_status), \
+                mock.patch.object(gate, "fetch_paginated", side_effect=record_paginated), \
+                mock.patch.object(gate, "enrich_reviews_with_edit_times"):
+            with self.assertRaises(SystemExit) as caught:
+                gate.run()
+        self.assertEqual(caught.exception.code, 1)
+        statuses = [(c[1], c[2]) for c in calls if c[0] == "status"]
+        return statuses, calls
+
+    def test_refetch_crash_posts_error_to_payload_head(self):
+        statuses, _ = self._run(request=RuntimeError("refetch boom"))
+        self.assertEqual(
+            statuses,
+            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "error")],
+        )
+
+    def test_crash_after_refetch_posts_error_to_current_head(self):
+        refetched = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+            "user": {"login": HUMAN},
+            "labels": [],
+        }
+        statuses, _ = self._run(request=refetched, paginated=RuntimeError("reviews boom"))
+        # Early claim on the payload head, authoritative claim on the real
+        # head, then the crash recorded against the real head -- never the
+        # stale one.
+        self.assertEqual(statuses[-1], (HEAD, "error"))
+        self.assertIn((HEAD, "pending"), statuses)
+
+    def test_early_claim_lands_before_the_refetch(self):
+        refetched = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+            "user": {"login": HUMAN},
+            "labels": [],
+        }
+        _, calls = self._run(request=refetched, paginated=RuntimeError("boom"))
+        kinds = [c[0] for c in calls]
+        self.assertEqual(kinds[0], "status", "the payload-head claim must precede the refetch")
+        self.assertEqual(kinds[1], "request")
+
+    def test_draft_payload_makes_no_early_claim_but_crash_stays_visible(self):
+        statuses, _ = self._run(payload_draft=True, request=RuntimeError("boom"))
+        self.assertEqual(statuses, [(self.STALE_HEAD, "error")])
+
+    def test_status_write_failure_does_not_mask_the_exit(self):
+        event = {
+            "pull_request": {"number": 7, "draft": False, "head": {"sha": self.STALE_HEAD}},
+            "repository": {"full_name": "Blockcast/frr"},
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+            event_path = handle.name
+        self.addCleanup(os.unlink, event_path)
+        env = {
+            "GITHUB_EVENT_PATH": event_path,
+            "GITHUB_REPOSITORY": "Blockcast/frr",
+            "GITHUB_TOKEN": "test-token",
+        }
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "_request", side_effect=RuntimeError("api down")), \
+                mock.patch.object(gate, "set_commit_status", side_effect=RuntimeError("statuses down")):
+            with self.assertRaises(SystemExit) as caught:
+                gate.run()
+        self.assertEqual(caught.exception.code, 1)
+
+
+class TestWorkflowContracts(unittest.TestCase):
+    """Regex checks over the two workflow files, pinning the properties the
+    vendoring overlay must preserve. Stdlib-only on purpose: the selftest
+    environment guarantees no third-party YAML parser."""
+
+    WORKFLOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows")
+
+    def _read(self, name):
+        with open(os.path.join(self.WORKFLOWS, name), encoding="utf8") as handle:
+            return handle.read()
+
+    def test_gate_workflow_never_cancels_in_flight_runs(self):
+        # Cancellation is not atomic: a cancelled run can land an in-flight
+        # final status POST after the superseding run wrote its verdict for
+        # the same SHA. Every run recomputes full state, so serialization
+        # loses nothing and closes that write race.
+        gate_yml = self._read("review-gate.yml")
+        self.assertRegex(gate_yml, r"(?m)^\s*cancel-in-progress:\s*false\s*$")
+        self.assertNotIn("cancel-in-progress: ${{", gate_yml)
+
+    def test_gate_job_name_is_the_required_backstop_check(self):
+        # Branch protection requires the check-run named after the gate job
+        # ("Ally review gate") ALONGSIDE the review/ally-complete commit
+        # status (review round 8): a run that cannot reach the REST plane
+        # cannot write any status, but its non-zero exit still reports
+        # through the Actions plane and turns this check red on
+        # pull_request_target heads -- the fail-closed backstop for
+        # REST-outage runs. Renaming the job or adding continue-on-error
+        # silently detaches it from the protection rule.
+        gate_yml = self._read("review-gate.yml")
+        self.assertRegex(gate_yml, r"(?m)^\s*name:\s*Ally review gate\s*$")
+        self.assertNotIn("continue-on-error", gate_yml)
+
+    def test_selftest_push_covers_both_fleet_default_branches(self):
+        # frr's default branch is master; vendored repos default to main. A
+        # master-only push trigger silently never runs the post-merge
+        # self-test on those repos. Anchored on the trigger-level `push:` key
+        # (2-space indent at line start), not a positional split -- the token
+        # can legitimately appear earlier in a comment or a new trigger, and
+        # a positional split would silently retarget this assertion.
+        selftest_yml = self._read("review-gate-selftest.yml")
+        trigger = re.search(r"(?m)^\s{2}push:\s*$", selftest_yml)
+        self.assertIsNotNone(trigger, "selftest must keep a push trigger")
+        push_block = selftest_yml[trigger.end():]
+        branches = re.findall(r"(?m)^\s*-\s*([\w./-]+)\s*$", push_block.split("paths:", 1)[0])
+        self.assertLessEqual({"master", "main"}, set(branches))
+
+    def test_workflows_share_one_self_hosted_runner_label(self):
+        # The vendoring overlay's single allowed diff is the runner label,
+        # applied uniformly. Asserting consistency (not a hardcoded name)
+        # keeps this test itself byte-identical across the fleet. Each file
+        # must contribute at least one scalar match: an overlay rewriting one
+        # workflow to a list/expression form (`runs-on: [self-hosted, gpu]`)
+        # would otherwise contribute zero labels and the consistency check
+        # would pass on exactly the divergence it exists to catch.
+        labels = set()
+        for name in ("review-gate.yml", "review-gate-selftest.yml"):
+            matches = re.findall(r"(?m)^\s*runs-on:\s*(\S+)\s*$", self._read(name))
+            self.assertTrue(
+                matches,
+                "%s has no scalar runs-on -- overlay must keep the scalar form" % name,
+            )
+            labels.update(matches)
+        self.assertEqual(len(labels), 1, "gate and selftest must run on the same label: %s" % labels)
+        label = next(iter(labels))
+        self.assertNotRegex(
+            label, r"(?i)\b(?:ubuntu|macos|windows)-", "hosted runner labels are forbidden"
+        )
+
+
+class TestUserSeatCannotProvidePositiveEvidence(unittest.TestCase):
+    """Multicast-vendoring review round 2 CRITICAL: the org ruleset counts the
+    shared `allyblockcast` User as the singleton Ally-team approval, so if the
+    gate also accepted that User's reviews as positive Ally evidence, ONE User
+    review would satisfy BOTH controls while the required App review is
+    absent. Positive evidence therefore requires `user.type == "Bot"` (the
+    App seat); blocking evidence stays identity-agnostic (dropping a User-seat
+    CHANGES_REQUESTED would be fail-open); and the User seat keeps its
+    separate, permission-checked DISTINCT-REVIEWER role on App-authored PRs.
+    """
+
+    def _user_review(self, state, body=None, **kw):
+        return review(state, body=body, login="allyblockcast", utype="User", **kw)
+
+    def test_user_seat_attested_approval_alone_stays_pending(self):
+        # Round 4: the exact-head-attested User-seat approval now emits the
+        # clean-commented placeholder (so it can withdraw its own earlier
+        # objection under per-login reduction), but it still cannot green --
+        # the gate pends awaiting the formal App-seat approval.
+        state, desc = decide(reviews=[self._user_review("APPROVED", body=attest(HEAD))])
+        self.assertEqual(state, "pending")
+        self.assertIn("awaiting an App-seat APPROVED", desc)
+
+    def test_user_seat_zero_count_commented_review_stays_pending(self):
+        state, desc = decide(reviews=[self._user_review("COMMENTED", body=CLEAN)])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+
+    def test_user_seat_clean_consolidated_comment_stays_pending(self):
+        state, _ = decide(comments=[comment(CLEAN, login="allyblockcast", utype="User")])
+        self.assertEqual(state, "pending")
+
+    def test_user_seat_pass_verdict_comment_stays_pending(self):
+        body = attest(HEAD, "### Recommended Action\n\nMerge.\n")
+        state, _ = decide(comments=[comment(body, login="allyblockcast", utype="User")])
+        self.assertEqual(state, "pending")
+
+    def test_user_seat_changes_requested_still_fails(self):
+        state, _ = decide(reviews=[self._user_review("CHANGES_REQUESTED")])
+        self.assertEqual(state, "failure")
+
+    def test_user_seat_blocking_count_still_fails(self):
+        blocking = attest(HEAD, "### Critical Issues (2)\n")
+        state, _ = decide(reviews=[self._user_review("COMMENTED", body=blocking)])
+        self.assertEqual(state, "failure")
+        state, _ = decide(
+            comments=[comment(blocking, login="allyblockcast", utype="User")]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_user_seat_positive_does_not_shadow_bot_blocking(self):
+        # A newer User-seat all-clear contributes NO signal, so it cannot
+        # out-recency an older App-seat blocking review.
+        blocking = attest(HEAD, "### Important Issues (1)\n")
+        state, _ = decide(
+            reviews=[
+                review("COMMENTED", body=blocking, at="2026-07-27T09:00:00Z"),
+                self._user_review("APPROVED", body=attest(HEAD),
+                                  at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_app_seat_approval_still_succeeds(self):
+        state, _ = decide(reviews=[review("APPROVED")])
+        self.assertEqual(state, "success")
+
+    def test_user_seat_distinct_approval_cannot_green_app_authored_pr(self):
+        # Inverted per round 3 of the multicast vendoring review: the
+        # merge-token User seat (or ANY trusted distinct approval) can no
+        # longer substitute for the App signal on an App-authored PR. Such
+        # heads stay pending until reopened under an independent author.
+        state, _ = decide(
+            reviews=[review("APPROVED", login="allyblockcast", utype="User",
+                            at="2026-07-27T11:00:00Z")],
+            author="app/allyblockcast",
+            trusted={"allyblockcast"},
+        )
+        self.assertEqual(state, "pending")
+
+
+
+class TestIssueCommentCrashClaim(unittest.TestCase):
+    """Review round 5 CRITICAL 2 / round 7 CRITICAL 2: issue_comment payloads
+    carry no pull_request.head.sha, so a refetch crash previously skipped the
+    `error` write and left an earlier same-head `success` standing -- fail-open
+    on exactly the events (comment edit/delete) that can REMOVE the evidence
+    behind a green gate. main() now probes the head FIRST (with retries), falls
+    back to git transport when the REST plane is down, and claims whichever
+    source yields the SHA -- so the crash handler always has an addressable
+    commit. Only when BOTH transports fail does the run exit non-zero with no
+    write: with no addressable commit there is nothing any code path could
+    stamp, and posting the invalidating status itself requires the REST plane
+    -- the physically irreducible residual."""
+
+    def setUp(self):
+        gate._STATUS_TARGET.clear()
+        self.addCleanup(gate._STATUS_TARGET.clear)
+
+    def _run(self, request_effects, git_fallback=None, expect_exit=True,
+             status_error=None):
+        event = {
+            "issue": {"number": 7, "pull_request": {"url": "x"}},
+            "repository": {"full_name": "Blockcast/frr"},
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+            event_path = handle.name
+        self.addCleanup(os.unlink, event_path)
+        env = {
+            "GITHUB_EVENT_PATH": event_path,
+            "GITHUB_REPOSITORY": "Blockcast/frr",
+            "GITHUB_TOKEN": "test-token",
+        }
+        calls = []
+        effects = list(request_effects)
+
+        def record_status(api, owner, repo, sha, token, state, description,
+                          target_url=None):
+            calls.append(("status", sha, state))
+            if status_error is not None:
+                raise status_error
+
+        def record_request(url, token, method="GET", payload=None):
+            calls.append(("request", url))
+            effect = effects.pop(0) if effects else None
+            if isinstance(effect, Exception):
+                raise effect
+            return effect
+
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "_request", side_effect=record_request), \
+                mock.patch.object(gate, "set_commit_status", side_effect=record_status), \
+                mock.patch.object(gate, "_sleep", lambda seconds: None), \
+                mock.patch.object(gate, "_git_pull_head_sha",
+                                  return_value=git_fallback), \
+                mock.patch.object(gate, "fetch_paginated", return_value=[]), \
+                mock.patch.object(gate, "enrich_reviews_with_edit_times"):
+            if expect_exit:
+                with self.assertRaises(SystemExit) as caught:
+                    gate.run()
+                self.assertEqual(caught.exception.code, 1)
+            else:
+                gate.run()
+        return [(c[1], c[2]) for c in calls if c[0] == "status"]
+
+    def test_refetch_crash_after_probe_posts_error_to_probed_head(self):
+        probe = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+        }
+        statuses = self._run([probe, RuntimeError("refetch boom")])
+        self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
+
+    def test_probe_retry_recovers_from_a_transient_failure(self):
+        # One 5xx/rate-limit blip must no longer forfeit the head: attempt 2
+        # succeeds, the claim lands, and the later refetch crash escalates it.
+        probe = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+        }
+        statuses = self._run(
+            [RuntimeError("transient 502"), probe, RuntimeError("refetch boom")]
+        )
+        self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
+
+    def test_git_fallback_claims_the_head_when_rest_probe_is_down(self):
+        # Review round 7 CRITICAL 2: the head comes from an independent
+        # transport when every REST probe attempt fails, so the claim (and any
+        # later crash escalation) still reaches the exact head whose comment
+        # evidence changed -- stale green cannot survive a REST-plane blip.
+        statuses = self._run(
+            [
+                RuntimeError("rest down"),
+                RuntimeError("rest down"),
+                RuntimeError("rest down"),
+                RuntimeError("refetch boom"),
+            ],
+            git_fallback=HEAD,
+        )
+        self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
+
+    def test_both_transports_failing_fails_the_run(self):
+        # The irreducible residual: REST and git transport both unreachable
+        # means no addressable commit exists anywhere -- and the invalidating
+        # status write itself needs the REST plane. Non-zero exit is the only
+        # remaining signal.
+        statuses = self._run(
+            [RuntimeError("rest down")] * 3,
+            git_fallback=None,
+        )
         self.assertEqual(statuses, [])
+
+    def test_status_write_failure_after_git_fallback_still_exits_nonzero(self):
+        # Review round 8 CRITICAL 2: git resolves the head but the REST plane
+        # stays down, so the pending claim AND the crash-handler error write
+        # both fail. Nothing addressed to the head can land -- the run must
+        # exit non-zero so the required workflow check-run (the Actions-plane
+        # backstop that needs no REST write from us) turns red. Both writes
+        # must still have been ATTEMPTED against the exact fallback head.
+        statuses = self._run(
+            [RuntimeError("rest down")] * 4,
+            git_fallback=HEAD,
+            status_error=RuntimeError("statuses down"),
+        )
+        self.assertEqual(statuses, [(HEAD, "pending"), (HEAD, "error")])
+
+
+class TestGitHeadFallbackParsing(unittest.TestCase):
+    def test_parses_the_oid_column(self):
+        self.assertEqual(
+            gate._parse_ls_remote_head("%s\trefs/pull/7/head\n" % HEAD), HEAD
+        )
+
+    def test_rejects_non_oid_output(self):
+        for output in ("", "not-a-sha\trefs/pull/7/head\n", "fatal: auth failed\n"):
+            self.assertIsNone(gate._parse_ls_remote_head(output), repr(output))
+
+
+class TestGitFallbackTokenHygiene(unittest.TestCase):
+    """Review round 8 Important: /proc/<pid>/cmdline is readable by same-UID
+    processes on the shared self-hosted runner, and subprocess exceptions
+    embed argv -- so the token must never appear on the git command line. It
+    travels via GIT_CONFIG_* environment variables, and any emitted error
+    text is redacted as a second layer."""
+
+    TOKEN = "sekret-token-value"
+
+    def test_token_absent_from_argv_and_present_in_env_config(self):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["env"] = kwargs.get("env") or {}
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="%s\trefs/pull/7/head\n" % HEAD, stderr=""
+            )
+
+        with mock.patch.object(gate.subprocess, "run", side_effect=fake_run):
+            sha = gate._git_pull_head_sha("Blockcast", "frr", 7, self.TOKEN)
+        self.assertEqual(sha, HEAD)
+        joined = " ".join(captured["argv"])
+        self.assertNotIn(self.TOKEN, joined)
+        self.assertNotIn("x-access-token", joined)
+        header_values = [
+            value
+            for key, value in captured["env"].items()
+            if key.startswith("GIT_CONFIG_VALUE")
+        ]
+        expected = gate.base64.b64encode(
+            ("x-access-token:%s" % self.TOKEN).encode()
+        ).decode()
+        self.assertTrue(
+            any(expected in value for value in header_values),
+            "credential must travel via GIT_CONFIG_* env: %s" % header_values,
+        )
+
+    def test_error_text_is_redacted(self):
+        def fake_run(argv, **kwargs):
+            raise RuntimeError("boom %s boom" % self.TOKEN)
+
+        stderr = io.StringIO()
+        with mock.patch.object(gate.subprocess, "run", side_effect=fake_run), \
+                contextlib.redirect_stderr(stderr):
+            self.assertIsNone(
+                gate._git_pull_head_sha("Blockcast", "frr", 7, self.TOKEN)
+            )
+        output = stderr.getvalue()
+        self.assertIn("git head fallback failed", output)
+        self.assertNotIn(self.TOKEN, output)
+
+
+class TestAuthorizationInversion(unittest.TestCase):
+    """Review round 5 CRITICAL 1: prose must never authorize green. The
+    conjunction probes below defeat the negation mask by construction (an
+    unlisted pivot can always exist) -- under the inversion that mask error
+    can no longer authorize anything, because a review without an explicit
+    pass verdict or machine-readable zero counts contributes no clean
+    signal. NOT-success is the fail-closed contract here; the negation mask
+    only prevents false failures."""
+
+    def test_conjunction_probes_cannot_authorize_green(self):
+        for text in (
+            "No reviewer responded and action required: fix the gate.",
+            "No reviewer replied or changes requested: fix the gate.",
+        ):
+            body = attest(HEAD, text)
+            state, _ = decide(reviews=[review("COMMENTED", body=body)])
+            self.assertNotEqual(state, "success", repr(text))
+            state, _ = decide(comments=[comment(body)])
+            self.assertNotEqual(state, "success", repr(text))
+
+    def test_bare_prose_review_no_longer_authorizes(self):
+        # The pre-inversion behavior: an attested body whose only signal is
+        # the ABSENCE of blocking prose. Silence is not authorization.
+        body = attest(HEAD, "Looks good overall.")
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+
+    def test_negated_request_changes_family_masks(self):
+        # Review round 5 Important + round 7 Important: the "request changes"
+        # affirmative family was scanned but had no negated forms in the mask,
+        # so clean prose blocked. Round 7 adds the semi-modal "need not" /
+        # "needn't" shapes. With CLEAN counts present these must authorize.
+        for text in (
+            "No need to request changes.",
+            "We do not request changes.",
+            "We need not request changes.",
+            "We needn't request changes.",
+        ):
+            self.assertFalse(
+                gate.has_action_required_language(text), repr(text)
+            )
+            body = attest(
+                HEAD,
+                text + "\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+            )
+            state, _ = decide(reviews=[review("COMMENTED", body=body)])
+            self.assertEqual(state, "pending", repr(text))
+
+    def test_affirmative_need_to_request_changes_still_fails(self):
+        # Adjacency control for the widened modal list: "need TO request
+        # changes" and "not ONLY request changes" are affirmative -- an
+        # intervening word breaks the negated-verb shape, so neither may mask.
+        for text in (
+            "We need to request changes here.",
+            "You must not only request changes but also fix the docs.",
+        ):
+            self.assertTrue(gate.has_action_required_language(text), repr(text))
+
+
+class TestPassBlockingContradiction(unittest.TestCase):
+    """Review round 7 CRITICAL 3: an explicit pass verdict must not suppress
+    surviving (un-negated) blocking prose in the same body. Contradiction
+    resolves red, exactly as contradictory issue counts do."""
+
+    CONTRADICTORY = (
+        "### Recommended Action\n\nMerge.\n\nAction required: fix the gate.\n"
+    )
+
+    def test_pass_plus_blocking_prose_fails_in_a_review(self):
+        body = attest(HEAD, self.CONTRADICTORY)
+        state, _ = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "failure")
+
+    def test_pass_plus_blocking_prose_fails_in_a_comment(self):
+        body = attest(HEAD, self.CONTRADICTORY)
+        state, _ = decide(comments=[comment(body)])
+        self.assertEqual(state, "failure")
+
+    def test_pass_plus_negated_prose_stays_clean(self):
+        # The mask still protects genuinely negated prose alongside a pass:
+        # only SURVIVING affirmative phrases contradict. The comment path is
+        # positive-inert (pending, not failure); the review path lands the
+        # clean-commented pending.
+        body = attest(
+            HEAD, "### Recommended Action\n\nMerge.\n\nNo action required.\n"
+        )
+        state, desc = decide(comments=[comment(body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+        state, desc = decide(reviews=[review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+        self.assertIn("no blocking findings", desc)
+
+
+class TestOverrideMaskAmbiguity(unittest.TestCase):
+    """Review round 7 CRITICAL 1: the negation mask can consume a REAL
+    blocking phrase behind an unlisted pivot ("No reviewer responded AND
+    action required"). Under the inversion that body authorizes nothing --
+    but the maintainer override then cleared the head, laundering the mask
+    error into green. Bodies whose only escape from a blocking verdict is
+    the mask (no pass verdict, no zero counts) are ambiguous, and the
+    override refuses them."""
+
+    AMBIGUOUS = "No reviewer responded and action required: fix gate."
+
+    def _with_override(self, reviews):
+        return decide(
+            reviews=reviews,
+            comments=[comment(override_body(HEAD), login=HUMAN)],
+            labels=[OVERRIDE],
+            trusted={HUMAN},
+        )
+
+    def test_mask_ambiguous_review_stays_pending_despite_override_combo(self):
+        # Ally's round-7 probe: attested review whose blocking phrase the
+        # mask erased, plus the full FORMER override combination. With the
+        # override removed (round 3), nothing can clear it.
+        body = attest(HEAD, self.AMBIGUOUS)
+        state, _ = self._with_override([review("COMMENTED", body=body)])
+        self.assertEqual(state, "pending")
+
+    def test_mask_ambiguous_comment_stays_pending_despite_override_combo(self):
+        state, desc = decide(
+            comments=[
+                comment(attest(HEAD, self.AMBIGUOUS)),
+                comment(override_body(HEAD), login=HUMAN),
+            ],
+            labels=[OVERRIDE],
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "pending")
+
+    def test_zero_count_body_with_negated_prose_holds_clean_commented(self):
+        # The normal clean-commented -> override flow must survive: zero
+        # counts are Ally's machine-readable summary and outrank prose
+        # scanning, so "No action required" alongside them is not ambiguous.
+        body = attest(
+            HEAD,
+            "### Critical Issues (0)\n\n### Important Issues (0)\n\n"
+            "No action required.\n",
+        )
+        state, desc = self._with_override([review("COMMENTED", body=body)])
+        # Round 3: only an App-seat APPROVED review clears; the clean-
+        # commented state holds pending even with the former override.
+        self.assertEqual(state, "pending")
+        self.assertIn("App-seat APPROVED", desc)
+
+    def test_reviewer_never_ran_stays_pending_despite_override_combo(self):
+        state, desc = self._with_override([])
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+
+    def test_ambiguity_is_not_laundered_by_machine_readable_all_clears(self):
+        # Review round 8 CRITICAL 1: adding `ally-verdict: pass` or both
+        # zero-count headings to a mask-erased blocking body must not make it
+        # authorize. Both combinations, both signal paths.
+        for all_clear in (
+            "\n\nally-verdict: pass\n",
+            "\n\n### Critical Issues (0)\n\n### Important Issues (0)\n",
+        ):
+            body = attest(HEAD, self.AMBIGUOUS + all_clear)
+            state, _ = decide(comments=[comment(body)])
+            self.assertEqual(state, "pending", repr(all_clear))
+            state, _ = decide(reviews=[review("COMMENTED", body=body)])
+            self.assertEqual(state, "pending", repr(all_clear))
+            # ...and the former override combination clears nothing either.
+            state, _ = self._with_override([review("COMMENTED", body=body)])
+            self.assertEqual(state, "pending", repr(all_clear))
+
+    def test_masked_blocking_ambiguity_unit_matrix(self):
+        cases = [
+            # Coordinator-crossing span: the pivot reading may be blocking.
+            (self.AMBIGUOUS, True),
+            # All-clears do not launder ambiguity (round 8).
+            (self.AMBIGUOUS + "\nally-verdict: pass", True),
+            (
+                self.AMBIGUOUS
+                + "\n### Critical Issues (0)\n### Important Issues (0)\n",
+                True,
+            ),
+            # Distributed negation across a coordinator is regex-
+            # indistinguishable from the pivot reading: a false HOLD by
+            # design, never a false green.
+            ("No issues found or changes requested.", True),
+            # Surviving blocking phrase: the failure paths own it.
+            ("Action required: fix the gate.", False),
+            # Simple negated all-clears mask under BOTH variants.
+            ("No action required.", False),
+            ("No further changes requested.", False),
+            # Per-conjunct negation re-states "no", so strict spans never
+            # need to cross the coordinator.
+            ("No critical issues and no changes requested.", False),
+            # No affirmative vocabulary at all.
+            ("Looks good overall.", False),
+        ]
+        for text, expected in cases:
+            self.assertEqual(
+                gate.masked_blocking_ambiguity(text), expected, repr(text)
+            )
+
+
+class TestSuccessExclusivity(unittest.TestCase):
+    """Round 2 of this PR's review: `success` has exactly ONE producer -- the
+    formal exact-head App-seat APPROVED review. Every other positive-looking
+    shape of Ally evidence lands pending, and positive comment evidence is
+    inert entirely. This is the machine-checkable form of the sole-authority
+    invariant this change claims."""
+
+    def test_only_a_formal_app_seat_approval_returns_success(self):
+        cases = [
+            ("formal-app-seat-approved",
+             dict(reviews=[review("APPROVED")]), "success"),
+            ("clean-commented-review",
+             dict(reviews=[review("COMMENTED", body=CLEAN)]), "pending"),
+            ("clean-consolidated-comment",
+             dict(comments=[comment(CLEAN)]), "pending"),
+            ("pass-verdict-comment",
+             dict(comments=[comment(
+                 attest(HEAD, "### Recommended Action\n\nMerge.\n"))]),
+             "pending"),
+            ("user-seat-approval",
+             dict(reviews=[review("APPROVED", login="allyblockcast",
+                                  utype="User")]), "pending"),
+            ("unattested-app-approval",
+             dict(reviews=[review("APPROVED", body=attest(OTHER))]), "pending"),
+            ("app-self-approval",
+             dict(reviews=[review("APPROVED")], author="app/allyblockcast"),
+             "pending"),
+            ("trusted-distinct-approval-on-app-authored-pr",
+             dict(reviews=[review("APPROVED", login=HUMAN, utype="User")],
+                  author="app/allyblockcast", trusted={HUMAN}), "pending"),
+        ]
+        for name, kwargs, expected in cases:
+            state, _ = decide(**kwargs)
+            self.assertEqual(state, expected, name)
+
+    def test_later_clean_comment_cannot_outrank_a_formal_blocking_review(self):
+        # The round-2 Critical's second half: latest_signal() must never let
+        # a clean comment supersede formal blocking evidence. Inert positive
+        # comments cannot -- the blocking review stays the newest signal.
+        state, _ = decide(
+            reviews=[review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z")],
+            comments=[comment(CLEAN, at="2026-07-27T12:00:00Z")],
+        )
+        self.assertEqual(state, "failure")
+
+    def test_later_clean_comment_does_not_withdraw_a_formal_approval(self):
+        state, _ = decide(
+            reviews=[review("APPROVED", at="2026-07-27T09:00:00Z")],
+            comments=[comment(CLEAN, at="2026-07-27T12:00:00Z")],
+        )
+        self.assertEqual(state, "success")
+
+    def test_later_blocking_comment_still_fails_over_a_formal_approval(self):
+        state, _ = decide(
+            reviews=[review("APPROVED", at="2026-07-27T09:00:00Z")],
+            comments=[comment(attest(HEAD, "### Critical Issues (1)\n"),
+                              at="2026-07-27T12:00:00Z")],
+        )
+        self.assertEqual(state, "failure")
+
+
+class TestApprovedBodyContradiction(unittest.TestCase):
+    """Round 4 CRITICAL 1: blocking body evidence is classified before the
+    state branches, so an exact-head App APPROVED whose body still carries
+    machine-readable blocking findings (or surviving action-required prose)
+    is a contradiction and resolves red -- it must never green the gate."""
+
+    def test_approved_with_nonzero_counts_fails(self):
+        body = attest(HEAD, "### Critical Issues (1)\n")
+        state, desc = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "failure")
+        self.assertIn("blocking findings", desc)
+
+    def test_approved_with_action_required_prose_fails(self):
+        body = attest(HEAD, "Action required: fix the decode bounds.\n")
+        state, _ = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "failure")
+
+    def test_approved_with_changes_requested_verdict_fails(self):
+        body = attest(
+            HEAD, "### Recommended Action\n\nRequest changes before merge.\n"
+        )
+        state, _ = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "failure")
+
+    def test_approved_with_negated_prose_still_greens(self):
+        # The negation mask keeps protecting genuine all-clear prose in an
+        # approval body -- only SURVIVING affirmatives contradict.
+        body = attest(
+            HEAD,
+            "No action required.\n\n### Critical Issues (0)\n\n"
+            "### Important Issues (0)\n",
+        )
+        state, _ = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "success")
+
+    def test_approved_with_masked_ambiguous_body_stays_pending(self):
+        # Round-8 invariant extended to the APPROVED branch: a body whose
+        # only escape from a blocking phrase is the lenient mask may not
+        # authorize green even with the formal state. Fail-closed = pending.
+        body = attest(
+            HEAD, "No reviewer responded and action required: fix the gate.\n"
+        )
+        state, _ = decide(reviews=[review("APPROVED", body=body)])
+        self.assertEqual(state, "pending")
+
+    def test_self_review_with_blocking_counts_fails(self):
+        # Body-level blocking evidence now fails closed BEFORE the
+        # self-review demotion, matching the comment path's rule.
+        body = attest(HEAD, "### Important Issues (2)\n")
+        state, _ = decide(
+            reviews=[review("APPROVED", body=body)], author="app/allyblockcast"
+        )
+        self.assertEqual(state, "failure")
+
+
+class TestPerLoginSeatReduction(unittest.TestCase):
+    """Round 4 CRITICAL 2: Ally's App and User seats are distinct actors.
+    A later App approval must not erase a User-seat CHANGES_REQUESTED the
+    User identity never withdrew; only the same identity supersedes its own
+    objection."""
+
+    def _user_review(self, state, body=None, **kw):
+        return review(state, body=body, login="allyblockcast", utype="User", **kw)
+
+    def test_app_approval_does_not_erase_user_seat_changes_requested(self):
+        state, desc = decide(
+            reviews=[
+                self._user_review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+        self.assertIn("requested changes", desc)
+
+    def test_user_seat_withdraws_its_own_objection_via_attested_approval(self):
+        state, _ = decide(
+            reviews=[
+                self._user_review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z"),
+                self._user_review(
+                    "APPROVED", body=attest(HEAD), at="2026-07-27T10:00:00Z"
+                ),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_unattested_user_approval_does_not_withdraw(self):
+        # An approval that neither matches the head nor attests it binds
+        # nothing in either direction; the User objection stands.
+        state, _ = decide(
+            reviews=[
+                self._user_review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z"),
+                self._user_review(
+                    "APPROVED",
+                    body=attest(OTHER),
+                    commit=OTHER,
+                    at="2026-07-27T10:00:00Z",
+                ),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_user_withdrawal_newest_does_not_unseat_app_approval(self):
+        # Selection is by status priority after per-login reduction: with no
+        # outstanding blocker, the App seat's standing approval greens even
+        # when a User-seat placeholder is globally newest.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+                self._user_review(
+                    "APPROVED", body=attest(HEAD), at="2026-07-27T13:00:00Z"
+                ),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_apps_own_newer_clean_review_still_supersedes_its_approval(self):
+        # Same-login supersession is preserved: the App seat's newest signal
+        # is its current state, so its own later clean COMMENTED review
+        # returns the gate to pending-awaiting-approval.
+        state, desc = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+                review("COMMENTED", body=CLEAN, at="2026-07-27T13:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("awaiting an App-seat APPROVED", desc)
+
+
+class TestSeatAwareReduction(unittest.TestCase):
+    """Round 2 of the #47 review: reduction keys are (login, seat), and
+    ambiguous approvals fail closed against prior state in both directions.
+    """
+
+    AMBIGUOUS = "No reviewer responded and action required: fix the gate.\n"
+
+    def test_normalized_app_login_does_not_merge_seats(self):
+        # GitHub REST may normalize the App login to the same string as the
+        # shared User login. The seats are still distinct actors: a
+        # normalized App approval must not erase the User seat's objection.
+        state, desc = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="Bot",
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+        self.assertIn("requested changes", desc)
+
+    def test_same_seat_same_login_still_supersedes(self):
+        # The seat-aware key must not break same-actor withdrawal: the same
+        # (login, seat) pair's newer approval supersedes its own objection.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="Bot",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="Bot",
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_apps_own_ambiguous_approval_supersedes_its_success(self):
+        # An ambiguous approval is the seat's newest formal verdict: the
+        # earlier clean success is no longer current, and the gate pends.
+        state, desc = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T10:00:00Z"),
+                review("APPROVED", body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("ambiguous", desc)
+
+    def test_ambiguous_user_approval_does_not_withdraw_blocker(self):
+        # Fail closed in the other direction: an ambiguous User-seat
+        # approval must not act as that seat's withdrawal, so the objection
+        # survives a standing App approval.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T10:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_unambiguous_user_approval_still_withdraws_after_ambiguous(self):
+        # The seat's own UNAMBIGUOUS approval remains the withdrawal path
+        # even after an ambiguous attempt.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T10:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T11:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_reduction_is_input_order_independent_across_sources(self):
+        # Round 3 of the #47 review: decide() concatenates all reviews
+        # before all comments, so the User seat's ambiguous approval (10:00)
+        # used to install first and that seat's OLDER blocking comment
+        # (09:00) was discarded as stale -- erasing the blocker by input
+        # order. The per-actor fold now sorts chronologically first: the
+        # blocker installs, the ambiguous approval cannot withdraw it, and
+        # the separate App approval must not green the head.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T10:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ],
+            comments=[
+                comment(attest(HEAD, "### Critical Issues (1)\n"),
+                        login="allyblockcast", utype="User",
+                        at="2026-07-27T09:00:00Z"),
+            ],
+        )
+        self.assertEqual(state, "failure")
+
+    def test_same_second_clean_and_ambiguous_approvals_resolve_ambiguous(self):
+        # Round 3 of the #47 review: at an equal timestamp ambiguity
+        # outranks a non-blocking success, in either input order, so a
+        # clean and an ambiguous App approval in the same second land
+        # pending rather than letting list order pick success.
+        clean = review("APPROVED", at="2026-07-27T12:00:00Z")
+        ambiguous = review("APPROVED", body=attest(HEAD, self.AMBIGUOUS),
+                           at="2026-07-27T12:00:00Z")
+        for ordering in ([clean, ambiguous], [ambiguous, clean]):
+            state, desc = decide(reviews=list(ordering))
+            self.assertEqual(state, "pending")
+            self.assertIn("ambiguous", desc)
+
+    def test_same_second_failure_still_outranks_ambiguity(self):
+        # Tie precedence is failure > ambiguity > non-blocking.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T12:00:00Z"),
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_same_second_success_and_clean_review_resolve_pending(self):
+        # Round 4 of the #47 review: success and clean-commented both ranked
+        # 0, so REST list order decided a same-second approval-vs-clean-
+        # review tie. The full precedence (failure > ambiguity >
+        # clean/pending > success) now resolves an equal-second
+        # contradiction away from green in either input order.
+        approved = review("APPROVED", at="2026-07-27T12:00:00Z")
+        clean = review("COMMENTED", body=CLEAN, at="2026-07-27T12:00:00Z")
+        for ordering in ([approved, clean], [clean, approved]):
+            state, desc = decide(reviews=list(ordering))
+            self.assertEqual(state, "pending")
+            self.assertIn("awaiting an App-seat APPROVED", desc)
+
+    def test_app_login_aliases_group_as_one_actor(self):
+        # Round 5 of the #47 review: REST may expose the same App seat as
+        # `allyblockcast[bot]` in one row and normalized `allyblockcast` in
+        # another. Splitting them left an older clean approval standing as a
+        # separate current success beside the App's newer ambiguous verdict.
+        # Both alias directions must reduce to one actor: the ambiguous
+        # approval is that actor's newest signal, and the gate pends.
+        for old_login, new_login in (
+            ("allyblockcast[bot]", "allyblockcast"),
+            ("allyblockcast", "allyblockcast[bot]"),
+        ):
+            state, desc = decide(
+                reviews=[
+                    review("APPROVED", login=old_login,
+                           at="2026-07-27T10:00:00Z"),
+                    review("APPROVED", login=new_login,
+                           body=attest(HEAD, self.AMBIGUOUS),
+                           at="2026-07-27T12:00:00Z"),
+                ]
+            )
+            self.assertEqual(state, "pending", (old_login, new_login))
+            self.assertIn("ambiguous", desc)
+
+    def test_alias_canonicalization_keeps_seats_apart(self):
+        # The round-2 property survives round 5: a normalized App approval
+        # and a User-seat objection under the SAME login string stay
+        # distinct actors (the seat component of the key separates them).
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login="allyblockcast[bot]", utype="Bot",
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_same_second_clean_and_ambiguous_bucket_cannot_clear_blocker(self):
+        # Round 6 of the #47 review: folding individual signals let the
+        # clean approval withdraw the 09:00 blocker one step before the
+        # same-second ambiguous approval was processed, and a separate App
+        # approval then greened. Each timestamp bucket now collapses to its
+        # highest fail-closed precedence first: the 10:00 bucket is
+        # ambiguous, ambiguity cannot withdraw the blocker, and the head
+        # stays failure -- in either bucket input order.
+        blocker = review("CHANGES_REQUESTED", login="allyblockcast",
+                         utype="User", at="2026-07-27T09:00:00Z")
+        clean = review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T10:00:00Z")
+        ambiguous = review("APPROVED", login="allyblockcast", utype="User",
+                           body=attest(HEAD, self.AMBIGUOUS),
+                           at="2026-07-27T10:00:00Z")
+        app = review("APPROVED", at="2026-07-27T12:00:00Z")
+        for ordering in ([blocker, clean, ambiguous, app],
+                         [blocker, ambiguous, clean, app]):
+            state, _ = decide(reviews=list(ordering))
+            self.assertEqual(state, "failure")
+
+    def test_newer_ambiguous_commented_review_supersedes_approval(self):
+        # Round 6 of the #47 review: an attested App-seat ambiguous
+        # COMMENTED review was discarded, so an older App approval stayed
+        # green. It is now the seat's current non-success signal: the gate
+        # returns to pending.
+        state, desc = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T09:00:00Z"),
+                review("COMMENTED", body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("ambiguous", desc)
+
+    def test_ambiguous_commented_review_still_cannot_withdraw_blocker(self):
+        # The emitted ambiguous review obeys the same reduction rule as
+        # ambiguous approvals: it never withdraws its own seat's blocker.
+        # Both signals are App-seat here -- a User-seat ambiguous COMMENTED
+        # emits nothing at all (the branch is App-gated before ambiguity).
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", at="2026-07-27T09:00:00Z"),
+                review("COMMENTED", body=attest(HEAD, self.AMBIGUOUS),
+                       at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_edited_old_approval_cannot_withdraw_newer_objection(self):
+        # Round 7 of the #47 review: withdrawal authority binds to
+        # submitted_at. The edit-aware clock let an old User approval,
+        # body-edited AFTER the same identity's newer CHANGES_REQUESTED,
+        # become the actor's newest clean placeholder -- withdrawing an
+        # objection no new formal review ever withdrew, and letting a
+        # separate App approval green the head.
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T12:00:00Z"),
+                review("APPROVED", at="2026-07-27T14:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_edited_old_app_approval_cannot_outrank_newer_clean_review(self):
+        # The same submitted_at rule for the success signal: editing an old
+        # App approval's body must not rank it past the seat's newer clean
+        # COMMENTED look, which holds the gate pending awaiting a NEW formal
+        # approval.
+        state, desc = decide(
+            reviews=[
+                review("APPROVED", at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("COMMENTED", body=CLEAN, at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("awaiting an App-seat APPROVED", desc)
+
+    def test_review_edited_to_add_blocking_still_ranks_newest(self):
+        # The fail-closed half of the round-7 rule is unchanged: blocking
+        # evidence keeps the edit-aware clock, so an old clean review edited
+        # to ADD findings outranks the seat's newer approval.
+        state, _ = decide(
+            reviews=[
+                review("COMMENTED",
+                       body=attest(HEAD, "### Critical Issues (1)\n"),
+                       at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("APPROVED", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
+
+    def test_edited_old_objection_cannot_resurrect_past_withdrawal(self):
+        # Round 8 of the #47 review: the CHANGES_REQUESTED state signal
+        # binds to submitted_at too. Editing an old objection's plain body
+        # (no blocking counts or prose) must not re-time the STATE past the
+        # same seat's newer formal approval -- the 12:00 approval remains
+        # the User seat's current verdict and the App approval greens.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T12:00:00Z"),
+                review("APPROVED", at="2026-07-27T14:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "success")
+
+    def test_objection_edited_to_add_blocking_counts_stays_red(self):
+        # The symmetric fail-closed pin: when the edit ADDS machine-readable
+        # blocking evidence, the edit-aware body-evidence branch (not the
+        # state branch) emits the failure at edit time, outranking the
+        # seat's 12:00 withdrawal.
+        state, _ = decide(
+            reviews=[
+                review("CHANGES_REQUESTED", login="allyblockcast", utype="User",
+                       body=attest(HEAD, "### Critical Issues (1)\n"),
+                       at="2026-07-27T09:00:00Z",
+                       edited="2026-07-27T13:00:00Z"),
+                review("APPROVED", login="allyblockcast", utype="User",
+                       body=attest(HEAD), at="2026-07-27T12:00:00Z"),
+                review("APPROVED", at="2026-07-27T14:00:00Z"),
+            ]
+        )
+        self.assertEqual(state, "failure")
 
 
 if __name__ == "__main__":

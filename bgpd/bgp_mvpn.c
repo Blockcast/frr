@@ -172,6 +172,32 @@ static void bgp_mvpn_put_ipaddr(struct stream *s, const struct ipaddr *a)
 		stream_put(s, &a->ipaddr_v4, IPV4_MAX_BYTELEN);
 }
 
+static uint8_t bgp_mvpn_ipaddr_len(const struct ipaddr *a)
+{
+	return IS_IPADDR_V6(a) ? IPV6_MAX_BYTELEN : IPV4_MAX_BYTELEN;
+}
+
+static uint8_t bgp_mvpn_caddr_len(const struct ipaddr *a)
+{
+	return 1 + bgp_mvpn_ipaddr_len(a);
+}
+
+static uint8_t bgp_mvpn_type3_spec_len(const struct mvpn_addr *m)
+{
+	return 8 + bgp_mvpn_caddr_len(&m->src) +
+	       bgp_mvpn_caddr_len(&m->grp) +
+	       bgp_mvpn_ipaddr_len(&m->originator);
+}
+
+static bool bgp_mvpn_type3_length_valid(uint8_t length)
+{
+	return length == BGP_MVPN_TYPE3_V4_SPEC_LEN ||
+	       length == BGP_MVPN_TYPE3_V4_SPEC_LEN +
+			 IPV6_MAX_BYTELEN - IPV4_MAX_BYTELEN ||
+	       length == BGP_MVPN_TYPE3_V6_V4_SPEC_LEN ||
+	       length == BGP_MVPN_TYPE3_V6_SPEC_LEN;
+}
+
 static void bgp_mvpn_put_type3_body(struct stream *s, const struct mvpn_addr *m)
 {
 	stream_put(s, NULL, 8); /* RD = 0 (GTM) */
@@ -253,13 +279,13 @@ static void bgp_mvpn_encode_type3(struct stream *s, const struct prefix *p, bool
 				  uint32_t addpath_tx_id)
 {
 	const struct mvpn_addr *m = &p->u.prefix_mvpn;
-	bool v6 = IS_IPADDR_V6(&m->src);
+	uint8_t length = bgp_mvpn_type3_spec_len(m);
 
 	if (addpath_capable)
 		stream_putl(s, addpath_tx_id);
 
 	stream_putc(s, BGP_MVPN_ROUTE_TYPE_S_PMSI_AD);
-	stream_putc(s, v6 ? BGP_MVPN_TYPE3_V6_SPEC_LEN : BGP_MVPN_TYPE3_V4_SPEC_LEN);
+	stream_putc(s, length);
 	bgp_mvpn_put_type3_body(s, m);
 }
 
@@ -267,15 +293,17 @@ static void bgp_mvpn_encode_type4(struct stream *s, const struct prefix *p, bool
 				  uint32_t addpath_tx_id)
 {
 	const struct mvpn_addr *m = &p->u.prefix_mvpn;
-	bool v6 = IS_IPADDR_V6(&m->src);
+	uint8_t key_length = bgp_mvpn_type3_spec_len(m);
+	uint8_t length = 2 + key_length +
+			 bgp_mvpn_ipaddr_len(&m->leaf_originator);
 
 	if (addpath_capable)
 		stream_putl(s, addpath_tx_id);
 
 	stream_putc(s, BGP_MVPN_ROUTE_TYPE_LEAF_AD);
-	stream_putc(s, v6 ? BGP_MVPN_TYPE4_V6_SPEC_LEN : BGP_MVPN_TYPE4_V4_SPEC_LEN);
+	stream_putc(s, length);
 	stream_putc(s, BGP_MVPN_ROUTE_TYPE_S_PMSI_AD);
-	stream_putc(s, v6 ? BGP_MVPN_TYPE3_V6_SPEC_LEN : BGP_MVPN_TYPE3_V4_SPEC_LEN);
+	stream_putc(s, key_length);
 	bgp_mvpn_put_type3_body(s, m);
 	bgp_mvpn_put_ipaddr(s, &m->leaf_originator);
 }
@@ -442,25 +470,24 @@ stream_failure:
  */
 static int bgp_mvpn_parse_sg_body(struct peer *peer, struct stream *data, uint8_t route_type,
 				  uint8_t length, uint8_t rd[8], struct ipaddr *src,
-				  struct ipaddr *grp, uint32_t *source_as)
+				  struct ipaddr *grp, uint32_t *source_as,
+				  bool *trailing_v6)
 {
 	bool type7 = route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN;
 	bool type3 = route_type == BGP_MVPN_ROUTE_TYPE_S_PMSI_AD;
-	uint8_t v4_spec_len = type7   ? BGP_MVPN_TYPE7_V4_SPEC_LEN
-			      : type3 ? BGP_MVPN_TYPE3_V4_SPEC_LEN
-				      : BGP_MVPN_TYPE5_V4_SPEC_LEN;
-	uint8_t v6_spec_len = type7   ? BGP_MVPN_TYPE7_V6_SPEC_LEN
-			      : type3 ? BGP_MVPN_TYPE3_V6_SPEC_LEN
-				      : BGP_MVPN_TYPE5_V6_SPEC_LEN;
+	size_t body_start = stream_get_getp(data);
+	size_t body_end = body_start + length;
 	uint8_t src_len;
 	uint8_t grp_len;
+	size_t trailing;
+	uint8_t minimum_length = type7 ? BGP_MVPN_TYPE7_V4_SPEC_LEN
+				       : type3 ? BGP_MVPN_TYPE3_V4_SPEC_LEN
+					       : BGP_MVPN_TYPE5_V4_SPEC_LEN;
 
-	if (length != v4_spec_len && length != v6_spec_len) {
-		flog_err(EC_BGP_UPDATE_RCV,
-			 "%s [Error] MVPN Type-%u bad length %u (expected %u or %u)", peer->host,
-			 route_type, length, v4_spec_len, v6_spec_len);
-		return BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
-	}
+	if (trailing_v6)
+		*trailing_v6 = false;
+	if (length < minimum_length)
+		goto bad_length;
 
 	/* RD (8 octets): read for validation after the body is fully consumed
 	 * (GTM requires RD == 0). */
@@ -470,6 +497,8 @@ static int bgp_mvpn_parse_sg_body(struct peer *peer, struct stream *data, uint8_
 		STREAM_GETL(data, *source_as);
 
 	STREAM_GETC(data, src_len);
+	if (stream_get_getp(data) + PSIZE(src_len) > body_end)
+		goto bad_length;
 	switch (bgp_mvpn_read_caddr(data, src, src_len)) {
 	case MVPN_CADDR_OK:
 		break;
@@ -481,7 +510,11 @@ static int bgp_mvpn_parse_sg_body(struct peer *peer, struct stream *data, uint8_
 		return BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
 	}
 
+	if (stream_get_getp(data) >= body_end)
+		goto bad_length;
 	STREAM_GETC(data, grp_len);
+	if (stream_get_getp(data) + PSIZE(grp_len) > body_end)
+		goto bad_length;
 	switch (bgp_mvpn_read_caddr(data, grp, grp_len)) {
 	case MVPN_CADDR_OK:
 		break;
@@ -493,16 +526,29 @@ static int bgp_mvpn_parse_sg_body(struct peer *peer, struct stream *data, uint8_
 		return BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
 	}
 
-	/* C-S and C-G share a family, and the route Length must match it. */
-	if (src_len != grp_len ||
-	    length != (src_len == IPV6_MAX_BITLEN ? v6_spec_len : v4_spec_len)) {
+	if (src_len != grp_len) {
 		flog_err(EC_BGP_UPDATE_RCV,
 			 "%s [Error] MVPN Type-%u addr family/length mismatch (src %u grp %u len %u)",
 			 peer->host, route_type, src_len, grp_len, length);
 		return BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
 	}
 
-	return BGP_NLRI_PARSE_OK;
+	trailing = body_end - stream_get_getp(data);
+	if (type3 && (trailing == IPV4_MAX_BYTELEN ||
+		      trailing == IPV6_MAX_BYTELEN)) {
+		if (trailing_v6)
+			*trailing_v6 = trailing == IPV6_MAX_BYTELEN;
+		return BGP_NLRI_PARSE_OK;
+	}
+	if (!type3 && trailing == 0)
+		return BGP_NLRI_PARSE_OK;
+
+bad_length:
+	flog_err(EC_BGP_UPDATE_RCV,
+		 "%s [Error] MVPN Type-%u body does not match advertised length %u",
+		 peer->host, route_type, length);
+	return BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
+
 stream_failure:
 	return -1;
 }
@@ -632,15 +678,21 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			break;
 
 		case BGP_MVPN_ROUTE_TYPE_S_PMSI_AD: {
-			bool v6 = length == BGP_MVPN_TYPE3_V6_SPEC_LEN;
+			bool originator_v6;
+			size_t nlri_end = stream_get_getp(data) + length;
 
 			ret = bgp_mvpn_parse_sg_body(peer, data, route_type, length, rd, &src,
-						     &grp, &source_as);
+						     &grp, &source_as, &originator_v6);
 			if (ret == -1)
 				goto stream_failure;
-			if (ret != BGP_NLRI_PARSE_OK)
-				goto done;
-			ret = bgp_mvpn_read_originator(data, &originator, v6);
+			if (ret != BGP_NLRI_PARSE_OK) {
+				/* The outer length was checked above, so discard only this
+				 * malformed NLRI and preserve the following route boundary. */
+				stream_set_getp(data, nlri_end);
+				ret = BGP_NLRI_PARSE_OK;
+				continue;
+			}
+			ret = bgp_mvpn_read_originator(data, &originator, originator_v6);
 			if (ret != BGP_NLRI_PARSE_OK)
 				goto stream_failure;
 			bgp_mvpn_build_prefix_type3(&p, &src, &grp, &originator);
@@ -650,42 +702,56 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		case BGP_MVPN_ROUTE_TYPE_LEAF_AD: {
 			uint8_t key_type;
 			uint8_t key_length;
-			bool v6;
+			bool originator_v6;
+			bool leaf_v6;
+			uint8_t leaf_length;
+			size_t nlri_end = stream_get_getp(data) + length;
 
-			if (length != BGP_MVPN_TYPE4_V4_SPEC_LEN &&
-			    length != BGP_MVPN_TYPE4_V6_SPEC_LEN) {
+			if (length < 2) {
 				flog_err(EC_BGP_UPDATE_RCV,
-					 "%s [Error] MVPN Type-4 bad length %u (expected %u or %u)",
-					 peer->host, length, BGP_MVPN_TYPE4_V4_SPEC_LEN,
-					 BGP_MVPN_TYPE4_V6_SPEC_LEN);
+					 "%s [Error] MVPN Type-4 bad length %u",
+					 peer->host, length);
 				ret = BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
 				goto done;
 			}
-
-			v6 = length == BGP_MVPN_TYPE4_V6_SPEC_LEN;
 			STREAM_GETC(data, key_type);
 			STREAM_GETC(data, key_length);
 			if (key_type != BGP_MVPN_ROUTE_TYPE_S_PMSI_AD ||
-			    key_length != (v6 ? BGP_MVPN_TYPE3_V6_SPEC_LEN
-					      : BGP_MVPN_TYPE3_V4_SPEC_LEN)) {
+			    key_length > length - 2 ||
+			    !bgp_mvpn_type3_length_valid(key_length)) {
 				flog_err(EC_BGP_UPDATE_RCV,
 					 "%s [Error] MVPN Type-4 malformed S-PMSI route key (type %u length %u)",
 					 peer->host, key_type, key_length);
 				/* The outer Type-4 length is valid, so its boundary is
 				 * trustworthy even though the embedded route key is not.
 				 * Discard this NLRI without resetting the BGP session. */
-				stream_forward_getp(data, length - 2);
+				stream_set_getp(data, nlri_end);
 				continue;
 			}
 
 			ret = bgp_mvpn_parse_sg_body(peer, data, key_type, key_length, rd, &src,
-						     &grp, &source_as);
+						     &grp, &source_as, &originator_v6);
 			if (ret == -1)
 				goto stream_failure;
-			if (ret != BGP_NLRI_PARSE_OK)
-				goto done;
-			if (bgp_mvpn_read_originator(data, &originator, v6) != BGP_NLRI_PARSE_OK ||
-			    bgp_mvpn_read_originator(data, &leaf_originator, v6) !=
+			if (ret != BGP_NLRI_PARSE_OK) {
+				stream_set_getp(data, nlri_end);
+				ret = BGP_NLRI_PARSE_OK;
+				continue;
+			}
+			leaf_length = length - 2 - key_length;
+			if (leaf_length != IPV4_MAX_BYTELEN &&
+			    leaf_length != IPV6_MAX_BYTELEN) {
+				flog_err(EC_BGP_UPDATE_RCV,
+					 "%s [Error] MVPN Type-4 bad leaf originator length %u",
+					 peer->host, leaf_length);
+				stream_set_getp(data, nlri_end);
+				ret = BGP_NLRI_PARSE_OK;
+				continue;
+			}
+			leaf_v6 = leaf_length == IPV6_MAX_BYTELEN;
+			if (bgp_mvpn_read_originator(data, &originator, originator_v6) !=
+				    BGP_NLRI_PARSE_OK ||
+			    bgp_mvpn_read_originator(data, &leaf_originator, leaf_v6) !=
 				    BGP_NLRI_PARSE_OK)
 				goto stream_failure;
 			bgp_mvpn_build_prefix_type4(&p, &src, &grp, &originator, &leaf_originator);
@@ -695,7 +761,7 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		case BGP_MVPN_ROUTE_TYPE_SOURCE_ACTIVE:
 		case BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN:
 			ret = bgp_mvpn_parse_sg_body(peer, data, route_type, length, rd, &src,
-						     &grp, &source_as);
+						     &grp, &source_as, NULL);
 			if (ret == -1)
 				goto stream_failure;
 			if (ret != BGP_NLRI_PARSE_OK)
@@ -749,6 +815,15 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		 * Checked on install only; a withdraw (including the NULL-attr
 		 * treat-as-withdraw case) matches on the NLRI key alone.
 		 */
+		if (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI && !is_withdraw &&
+		    peer != peer->bgp->peer_self && IS_IPADDR_V4(&p.prefix.src) &&
+		    p.prefix.src.ipaddr_v4.s_addr == peer->bgp->router_id.s_addr) {
+			flog_err(EC_BGP_UPDATE_RCV,
+				 "%s [Error] MVPN Type-1 reflects the local originator; dropping duplicate",
+				 peer->host);
+			continue;
+		}
+
 		if (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI && !is_withdraw &&
 		    bgp_attr_get_pmsi_tnl_type(attr) != PMSI_TNLTYPE_INGR_REPL) {
 			flog_err(EC_BGP_UPDATE_RCV,

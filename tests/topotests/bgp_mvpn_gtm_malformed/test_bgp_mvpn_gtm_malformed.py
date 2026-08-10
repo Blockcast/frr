@@ -62,8 +62,12 @@ TYPE3_ORIGINATOR = "10.0.0.2"
 TYPE4_LEAF = "10.0.0.3"
 NO_PMSI_SG = ("10.30.30.9", "232.30.30.9")
 V6_SELECTIVE_SG = ("2001:db8:30::1", "ff3e::30")
-V6_TYPE3_ORIGINATOR = "2001:db8:ffff::2"
-V6_TYPE4_LEAF = "2001:db8:ffff::3"
+V6_TYPE3_ORIGINATOR = "10.0.0.2"
+V6_TYPE4_LEAF = "10.0.0.3"
+V6_RECOVER_SG = ("2001:db8:40::1", "ff3e::40")
+V6_TYPE4_RECOVER_SG = ("2001:db8:40::2", "ff3e::41")
+V6_TRUNC_RECOVER_SG = ("2001:db8:40::3", "ff3e::42")
+V6_NESTED_RECOVER_SG = ("2001:db8:40::4", "ff3e::43")
 SELECTIVE_LABEL = 0x12345
 
 
@@ -243,7 +247,7 @@ def test_valid_type3_and_type4_accepted():
 
 
 def test_valid_ipv6_type3_and_type4_accepted():
-    """IPv6 Type-3/4 keys and the PMSI L-bit survive raw-peer exchange."""
+    """IPv6 (S,G) with IPv4 router-id originators remains correctly framed."""
 
     def _present():
         routes = _mvpn_routes("r1", v6=True)
@@ -262,10 +266,28 @@ def test_valid_ipv6_type3_and_type4_accepted():
         type3 = next(route for route in routes if route.get("routeType") == 3)
         if not type3.get("pmsiTunnel", {}).get("leafInfoRequired"):
             return "IPv6 Type-3 PMSI L-bit was not preserved: {}".format(type3)
+        if not _has_type5(routes, V6_RECOVER_SG):
+            return "Type-5 following IPv6 Type-3 was desynchronized: {}".format(routes)
+        if not _has_type5(routes, V6_TYPE4_RECOVER_SG):
+            return "Type-5 following IPv6 Type-4 was desynchronized: {}".format(routes)
+        if not _has_type5(routes, V6_TRUNC_RECOVER_SG):
+            return "Type-3 consumed the following Type-5 route-type byte: {}".format(
+                routes
+            )
+        if not _has_type5(routes, V6_NESTED_RECOVER_SG):
+            return "malformed Type-4 nested body consumed trailing Type-5: {}".format(
+                routes
+            )
         return None
 
     _, result = topotest.run_and_expect(_present, None, count=60, wait=1)
     assert result is None, result
+
+
+def test_reflected_local_type1_rejected():
+    """A peer cannot install a second Type-1 for this router's originator."""
+    routes = [r for r in _mvpn_routes("r1") if r.get("routeType") == 1]
+    assert len(routes) == 1 and routes[0].get("selfOriginated"), routes
 
 
 def test_type3_without_pmsi_rejected():

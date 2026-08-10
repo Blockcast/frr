@@ -54,12 +54,15 @@
 #include "json.h"
 
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_table.h"
+#include "bgpd/bgp_route.h"
 #include "bgpd/bgp_mvpn.h"
 #include "bgpd/bgp_mvpn_events.h"
 
 DEFINE_MTYPE_STATIC(BGPD, MVPN_EVENT_SINK, "MVPN event sink");
 DEFINE_MTYPE_STATIC(BGPD, MVPN_EVENT_CLIENT, "MVPN event sink client");
 DEFINE_MTYPE_STATIC(BGPD, MVPN_EVENT_JOIN, "MVPN event join state");
+DEFINE_MTYPE_STATIC(BGPD, MVPN_EVENT_LEAF, "MVPN event leaf state");
 DEFINE_MTYPE_STATIC(BGPD, MVPN_EVENT_PATH, "MVPN event socket path");
 DEFINE_MTYPE_STATIC(BGPD, MVPN_EVENT_LINE, "MVPN event wire line");
 
@@ -106,12 +109,40 @@ struct bgp_mvpn_event_sink {
 	uint64_t boot_epoch;
 	uint64_t seq;
 	struct bgp_mvpn_event_join *joins;
+	struct bgp_mvpn_event_leaf *leaves;
 	bool snapshot_pending;
 	bool snapshot_replay_active;
 	bool snapshot_delivery_failed;
 	uint64_t snapshot_index;
 	struct bgp_mvpn_event_client *snapshot_client;
 	struct event *t_snapshot_offer;
+	struct event *t_leaf_reconcile;
+};
+
+/*
+ * Per-leaf settlement state, keyed (C-S, C-G, leaf).
+ *
+ * A join is per (C-S, C-G) because it describes THIS PE's own upstream
+ * interest. A leaf is one level deeper: under ingress replication the root
+ * replicates one (C-S, C-G) stream to many leaves, and settlement bills each
+ * of them separately. The leaf identity is the Type-4 (Leaf A-D) route's
+ * leaf_originator -- the leaf PE's router-id, already carried in the MVPN RIB
+ * key by bgp_mvpn_build_prefix_type4().
+ *
+ * `seen` is reconcile scratch, not state: cleared at the start of a walk, set
+ * for every leaf still present in the RIB, and anything left clear afterwards
+ * is withdrawn. That makes the walk idempotent and self-correcting -- a
+ * trigger this file fails to hook costs latency on the next walk, never a
+ * wrong bill, which is the failure direction a settlement path wants.
+ */
+struct bgp_mvpn_event_leaf {
+	struct bgp_mvpn_event_leaf *next;
+	struct ipaddr src;
+	struct ipaddr grp;
+	struct ipaddr leaf;
+	uint32_t generation;
+	bool installed;
+	bool seen;
 };
 
 static bool bgp_mvpn_event_deliver(struct bgp_mvpn_event_sink *sink,
@@ -188,6 +219,9 @@ static bool bgp_mvpn_event_snapshot_offer(struct bgp_mvpn_event_sink *sink,
 	sink->snapshot_delivery_failed = false;
 	sink->snapshot_index = 0;
 	bgp_mvpn_reemit_local_joins(sink->bgp);
+	/* A subscriber that only saw joins would have no leaf set at all until
+	 * the next RIB change, and would bill nothing per-leaf in the meantime. */
+	bgp_mvpn_events_reconcile_leaves(sink->bgp);
 	sink->snapshot_replay_active = false;
 
 	/* Private delivery may synchronously close the owner. Defer promotion so
@@ -618,12 +652,14 @@ void bgp_mvpn_events_stop(struct bgp *bgp)
 {
 	struct bgp_mvpn_event_sink *sink = bgp->mvpn_event_sink;
 	struct bgp_mvpn_event_join *join;
+	struct bgp_mvpn_event_leaf *leaf;
 
 	if (!sink)
 		return;
 
 	sink->snapshot_pending = false;
 	event_cancel(&sink->t_snapshot_offer);
+	event_cancel(&sink->t_leaf_reconcile);
 	while (sink->clients)
 		bgp_mvpn_event_client_close(sink, sink->clients);
 
@@ -637,6 +673,12 @@ void bgp_mvpn_events_stop(struct bgp *bgp)
 		join = sink->joins;
 		sink->joins = join->next;
 		XFREE(MTYPE_MVPN_EVENT_JOIN, join);
+	}
+
+	while (sink->leaves) {
+		leaf = sink->leaves;
+		sink->leaves = leaf->next;
+		XFREE(MTYPE_MVPN_EVENT_LEAF, leaf);
 	}
 
 	XFREE(MTYPE_MVPN_EVENT_PATH, sink->path);
@@ -1007,4 +1049,207 @@ void bgp_mvpn_event_withdrawn(struct bgp *bgp, const struct ipaddr *src,
 
 	if (jo)
 		bgp_mvpn_event_broadcast(sink, jo);
+}
+
+static struct bgp_mvpn_event_leaf *bgp_mvpn_event_leaf_find(struct bgp_mvpn_event_sink *sink,
+							    const struct ipaddr *src,
+							    const struct ipaddr *grp,
+							    const struct ipaddr *leaf)
+{
+	struct bgp_mvpn_event_leaf *entry;
+
+	for (entry = sink->leaves; entry; entry = entry->next)
+		if (ipaddr_cmp(&entry->src, src) == 0 && ipaddr_cmp(&entry->grp, grp) == 0 &&
+		    ipaddr_cmp(&entry->leaf, leaf) == 0)
+			return entry;
+	return NULL;
+}
+
+static struct bgp_mvpn_event_leaf *bgp_mvpn_event_leaf_get(struct bgp_mvpn_event_sink *sink,
+							   const struct ipaddr *src,
+							   const struct ipaddr *grp,
+							   const struct ipaddr *leaf)
+{
+	struct bgp_mvpn_event_leaf *entry = bgp_mvpn_event_leaf_find(sink, src, grp, leaf);
+
+	if (entry)
+		return entry;
+
+	entry = XCALLOC(MTYPE_MVPN_EVENT_LEAF, sizeof(*entry));
+	entry->src = *src;
+	entry->grp = *grp;
+	entry->leaf = *leaf;
+	entry->next = sink->leaves;
+	sink->leaves = entry;
+	return entry;
+}
+
+/*
+ * Emit one leaf lifecycle event.
+ *
+ * The leaf carries its OWN route_version generation, independent of the
+ * (C-S, C-G) join's. A leaf joining or leaving does not change the join's
+ * upstream origin, and bumping the join's generation for it would tell every
+ * other leaf's settlement window to close for no reason.
+ */
+static void bgp_mvpn_event_leaf_emit(struct bgp_mvpn_event_sink *sink,
+				     struct bgp_mvpn_event_leaf *entry, const char *event_type)
+{
+	struct json_object *jo;
+	char route_version[32], leafbuf[INET6_ADDRSTRLEN];
+	uint32_t next_generation;
+
+	/* A snapshot restates current state to one subscriber; it is not a
+	 * producer transition and must not mint a new route_version. Mirrors
+	 * bgp_mvpn_event_join_resolved(). */
+	next_generation = sink->snapshot_replay_active && entry->installed ? entry->generation
+									  : entry->generation + 1;
+	bgp_mvpn_event_route_version(route_version, sizeof(route_version), sink->boot_epoch,
+				     next_generation);
+
+	jo = bgp_mvpn_event_new(sink, event_type, &entry->src, &entry->grp, 0, route_version);
+	if (jo) {
+		json_object_int_add(jo, "route_type", BGP_MVPN_ROUTE_TYPE_LEAF_AD);
+		json_object_string_add(jo, "leaf",
+				       ipaddr2str(&entry->leaf, leafbuf, sizeof(leafbuf)));
+	}
+
+	entry->generation = next_generation;
+
+	if (jo) {
+		if (sink->snapshot_replay_active)
+			(void)bgp_mvpn_event_deliver(sink, sink->snapshot_client, jo);
+		else
+			bgp_mvpn_event_broadcast(sink, jo);
+	}
+}
+
+/*
+ * Reconcile the emitted leaf set against the Type-4 (Leaf A-D) routes actually
+ * in the MVPN RIB, emitting leaf_install / leaf_withdraw for the difference.
+ *
+ * Only routes learned from a peer count. Our own Type-4 (originated by
+ * bgp_mvpn_leaf_from_type3_set) carries bgp->router_id as leaf_originator --
+ * this router advertising ITSELF as a leaf to the upstream PE. Billing that
+ * would invoice the root for its own delivery.
+ *
+ * Type-4 routes exist only where a received Type-3 S-PMSI asked for them
+ * (ingress replication with LEAF_INFO_REQUIRED, see
+ * bgp_mvpn_type3_leaf_required). Outside that, there is no leaf set in BGP and
+ * this walk correctly emits nothing.
+ */
+void bgp_mvpn_events_reconcile_leaves(struct bgp *bgp)
+{
+	struct bgp_mvpn_event_sink *sink = bgp->mvpn_event_sink;
+	struct bgp_mvpn_event_leaf *entry, *next, **link;
+	afi_t afi;
+
+	if (!sink)
+		return;
+	if (sink->snapshot_replay_active &&
+	    (!sink->snapshot_client || sink->snapshot_delivery_failed))
+		return;
+
+	for (entry = sink->leaves; entry; entry = entry->next)
+		entry->seen = false;
+
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++) {
+		struct bgp_table *table = bgp->rib[afi][SAFI_MCAST_VPN];
+		struct bgp_dest *dest;
+
+		if (!table)
+			continue;
+
+		for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
+			const struct prefix *pfx = bgp_dest_get_prefix(dest);
+			const struct mvpn_addr *m = &pfx->u.prefix_mvpn;
+			struct bgp_path_info *pi;
+			bool from_peer = false;
+
+			if (pfx->family != AF_MVPN ||
+			    m->route_type != BGP_MVPN_ROUTE_TYPE_LEAF_AD)
+				continue;
+
+			/* Valid AND selected, not merely "not removed".
+			 *
+			 * A Type-4 can sit in the RIB while being none of the
+			 * things that make it real: rejected by inbound policy,
+			 * invalidated by an unreachable next hop, or kept as a
+			 * non-selected alternate alongside a better path. Billing
+			 * any of those invents a leaf that is not installed.
+			 *
+			 * This is also what the post-best-path trigger already
+			 * assumes. Reconciling after selection and then ignoring
+			 * the selection flags contradicted the reason for hooking
+			 * there at all. */
+			for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
+				if (pi->peer != bgp->peer_self &&
+				    !CHECK_FLAG(pi->flags, BGP_PATH_REMOVED) &&
+				    CHECK_FLAG(pi->flags, BGP_PATH_VALID) &&
+				    CHECK_FLAG(pi->flags, BGP_PATH_SELECTED)) {
+					from_peer = true;
+					break;
+				}
+			if (!from_peer)
+				continue;
+
+			entry = bgp_mvpn_event_leaf_get(sink, &m->src, &m->grp,
+							&m->leaf_originator);
+			entry->seen = true;
+			if (!entry->installed || sink->snapshot_replay_active) {
+				bgp_mvpn_event_leaf_emit(sink, entry, "leaf_install");
+				entry->installed = true;
+			}
+		}
+	}
+
+	/* A snapshot restates what is present; it must not withdraw. */
+	if (sink->snapshot_replay_active)
+		return;
+
+	link = &sink->leaves;
+	for (entry = *link; entry; entry = next) {
+		next = entry->next;
+		if (entry->seen) {
+			link = &entry->next;
+			continue;
+		}
+		if (entry->installed)
+			bgp_mvpn_event_leaf_emit(sink, entry, "leaf_withdraw");
+		*link = next;
+		XFREE(MTYPE_MVPN_EVENT_LEAF, entry);
+	}
+}
+
+static void bgp_mvpn_events_leaf_reconcile_event(struct event *event)
+{
+	struct bgp_mvpn_event_sink *sink = EVENT_ARG(event);
+
+	bgp_mvpn_events_reconcile_leaves(sink->bgp);
+}
+
+/*
+ * Request a leaf reconcile, coalescing a burst into one walk.
+ *
+ * The reconcile is a full scan of both MVPN RIBs. Running it inline on every
+ * selected MCAST-VPN route made a burst of N arriving leaves do N full scans --
+ * O(N^2) on bgpd's main route-processing path, and worst exactly where per-leaf
+ * settlement is wanted, since needing it means having many leaves. Deferring to
+ * the event loop collapses a convergence burst into a single walk once the
+ * batch has settled.
+ *
+ * event_add_event() is a no-op while t_leaf_reconcile is already pending, so
+ * the coalescing is the scheduling primitive rather than a hand-rolled flag.
+ * Correctness does not depend on how many triggers collapse: the walk derives
+ * state from the RIB rather than from any one update, so one walk after N
+ * changes emits exactly what N walks would have.
+ */
+void bgp_mvpn_events_schedule_leaf_reconcile(struct bgp *bgp)
+{
+	struct bgp_mvpn_event_sink *sink = bgp->mvpn_event_sink;
+
+	if (!sink)
+		return;
+	event_add_event(bm->master, bgp_mvpn_events_leaf_reconcile_event, sink, 0,
+			&sink->t_leaf_reconcile);
 }

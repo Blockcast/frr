@@ -79,6 +79,36 @@ extern void bgp_mvpn_event_join_resolved(struct bgp *bgp, const struct ipaddr *s
 extern void bgp_mvpn_event_withdrawn(struct bgp *bgp, const struct ipaddr *src,
 				     const struct ipaddr *grp);
 
+/*
+ * Reconcile emitted per-leaf state against the Type-4 (Leaf A-D) routes in the
+ * MVPN RIB, emitting "leaf_install" / "leaf_withdraw" for the difference.
+ *
+ * A join event is per (C-S, C-G) and describes this PE's own upstream
+ * interest; a leaf event is one level deeper and names a receiving PE, so that
+ * a root doing ingress replication can bill each leaf separately. The leaf
+ * identity is the Type-4 leaf_originator, already in the RIB key.
+ *
+ * Only routes learned from a peer are emitted: our own Type-4 carries
+ * bgp->router_id (this router advertising itself as a leaf) and billing it
+ * would invoice the root for its own delivery.
+ *
+ * Safe and cheap to call on any MVPN RIB change. The walk is a full diff, so
+ * it is idempotent and self-correcting: a trigger that fails to fire costs
+ * latency until the next call, never a wrong or duplicated bill.
+ */
+extern void bgp_mvpn_events_reconcile_leaves(struct bgp *bgp);
+
+/*
+ * Coalescing front door for the above: schedules one reconcile on the event
+ * loop instead of walking inline. Call this from route-processing paths.
+ *
+ * The walk is a full scan of both MVPN RIBs, so running it inline per update
+ * turned a burst of N arriving leaves into N full scans -- O(N^2) on the main
+ * route-processing path, worst in exactly the deployments large enough to want
+ * per-leaf settlement. Repeated calls while one is pending are free.
+ */
+extern void bgp_mvpn_events_schedule_leaf_reconcile(struct bgp *bgp);
+
 /* `bgp mvpn event-socket ...` running-config emission. This instance-wide
  * command must be written from BGP_NODE before any address-family block. */
 extern void bgp_mvpn_events_config_write(struct vty *vty, struct bgp *bgp);
