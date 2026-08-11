@@ -13,9 +13,11 @@
 
 r1 originates the Type-1, r2 propagates it to r3, and r3 sends it back to r1.
 r1 blocks direct MVPN export to r3 and r3 applies AS override toward r1, so the
-return update must reach the MVPN-specific reflected-local rejection path.  An
-MLDv2 (S,G) join and leave drive the mixed-family IPv6 MVPN NLRI path while
-session counters prove neither transition reset the primary BGP session.
+return update must reach the MVPN-specific reflected-local rejection path.  The
+auxiliary reflection sessions are then disabled while an MLDv2 (S,G) join and
+leave drive the mixed-family IPv6 MVPN NLRI path, preventing the reflector ring
+from retaining selective routes.  Re-enabling the ring proves the rejection
+path again while session counters prove the primary BGP session never reset.
 """
 
 import functools
@@ -116,6 +118,13 @@ def _established(router, peer=None):
     return "{} session to {} is {}".format(router, peer or PEER[router], state)
 
 
+def _not_established(router, peer):
+    state = _neighbor(router, peer).get("bgpState")
+    if state != "Established":
+        return None
+    return "{} auxiliary session to {} is still Established".format(router, peer)
+
+
 def _type1_unique():
     routes = [
         route
@@ -162,13 +171,30 @@ def _reflected_type1_seen_after(previous):
     return "reflected-local Type-1 rejection count stayed at {}".format(count)
 
 
-def _assert_converged():
-    peers = [(router, PEER[router]) for router in ("r1", "r2")]
-    peers.extend(REFLECTION_PEERS)
+def _assert_sessions(peers, check=_established):
     for router, peer in peers:
-        test_func = functools.partial(_established, router, peer)
+        test_func = functools.partial(check, router, peer)
         _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
         assert result is None, result
+
+
+def _assert_primary_converged():
+    _assert_sessions([(router, PEER[router]) for router in ("r1", "r2")])
+
+
+def _set_reflection_enabled(enabled):
+    command = "no neighbor" if enabled else "neighbor"
+    r3 = get_topogen().gears["r3"]
+    r3.vtysh_cmd(
+        """
+configure terminal
+router bgp 65003
+ {} 10.0.1.1 shutdown
+ {} 10.0.2.1 shutdown
+""".format(command, command)
+    )
+    check = _established if enabled else _not_established
+    _assert_sessions(REFLECTION_PEERS, check)
 
 
 def _assert_unique_type1(stage):
@@ -199,7 +225,8 @@ def test_ipv6_mvpn_join_leave_and_reestablish():
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
-    _assert_converged()
+    _assert_primary_converged()
+    _assert_sessions(REFLECTION_PEERS)
     baseline = {
         router: _neighbor(router).get("connectionsEstablished")
         for router in ("r1", "r2")
@@ -208,6 +235,9 @@ def test_ipv6_mvpn_join_leave_and_reestablish():
     _assert_reflected_type1(0, "initial reflection")
     _assert_unique_type1("before join")
     _assert_no_parse_errors("before join")
+
+    _set_reflection_enabled(False)
+    _assert_primary_converged()
 
     tgen.gears["r2"].vtysh_cmd(
         """
@@ -221,7 +251,7 @@ interface r2-eth1
         functools.partial(_type7_present, True), None, count=90, wait=1
     )
     assert result is None, result
-    _assert_converged()
+    _assert_primary_converged()
     assert {
         router: _neighbor(router).get("connectionsEstablished")
         for router in ("r1", "r2")
@@ -241,7 +271,7 @@ interface r2-eth1
         functools.partial(_type7_present, False), None, count=90, wait=1
     )
     assert result is None, result
-    _assert_converged()
+    _assert_primary_converged()
     assert {
         router: _neighbor(router).get("connectionsEstablished")
         for router in ("r1", "r2")
@@ -249,13 +279,21 @@ interface r2-eth1
     _assert_unique_type1("after leave")
     _assert_no_parse_errors("after leave")
 
-    reflected_before_clear = _reflected_type1_rejections()
-    tgen.gears["r1"].vtysh_cmd("clear bgp {}".format(PEER["r1"]))
-    _assert_converged()
-    assert _neighbor("r1").get("connectionsEstablished") > baseline["r1"], (
-        "controlled clear did not re-establish the BGP session"
+    reflected_before_reestablish = _reflected_type1_rejections()
+    _set_reflection_enabled(True)
+    _assert_reflected_type1(
+        reflected_before_reestablish, "post-reestablishment reflection"
     )
-    _assert_reflected_type1(reflected_before_clear, "post-reestablishment reflection")
+    assert {
+        router: _neighbor(router).get("connectionsEstablished")
+        for router in ("r1", "r2")
+    } == baseline, "auxiliary re-establishment reset the primary BGP session"
+    _, result = topotest.run_and_expect(
+        functools.partial(_type7_present, False), None, count=30, wait=1
+    )
+    assert result is None, "reflection reintroduced a withdrawn Type-7: {}".format(
+        result
+    )
     _assert_unique_type1("after controlled re-establishment")
     _assert_no_parse_errors("after controlled re-establishment")
 
