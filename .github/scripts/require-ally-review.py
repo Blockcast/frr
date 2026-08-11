@@ -16,6 +16,7 @@ Reads the workflow event from GITHUB_EVENT_PATH, needs GITHUB_TOKEN with
 """
 
 import base64
+import http.client
 import json
 import os
 import re
@@ -1113,6 +1114,98 @@ def decide(
     return signal["status"], signal["description"]
 
 
+# BLO-19826: ported from Blockcast/onprem-k8s .github/scripts/require-ally-
+# review.py @ c48c4489085ef50569c6f7c187d430362d398088 (2026-08-06). Every
+# call below used to be single-shot, so one 502 aborted main() and the
+# top-level handler turned it into a red job. Worst case was a 502 from the
+# FINAL set_commit_status() -- after decide() had already computed a verdict
+# (BLO-19194, run 30584001403): the real work was discarded, the context was
+# left on the pre-claimed "Evaluating..." pending, and a maintainer had to
+# hand-diagnose "infra noise or gate verdict?" and re-run. Retrying removes
+# that ambiguity without touching the fail-closed posture: an exhausted retry
+# still raises, so the context stays `pending` and the job still exits
+# non-zero.
+#
+# Three independent bounds, so a retry storm can never stall the merge path:
+#   * REQUEST_MAX_ATTEMPTS  -- total tries for one call (so at most 3 retries).
+#   * REQUEST_TIMEOUT_SECONDS -- per attempt. urlopen() has NO default timeout,
+#     so without this a single hung socket blocks forever and the wall-clock
+#     bound below would be unenforceable.
+#   * REQUEST_RETRY_BUDGET_SECONDS -- across all retries of one call. A retry
+#     is only started if it can BEGIN inside the budget, so the worst case is
+#     the budget plus one final attempt's timeout (~65s), not attempts x
+#     timeout.
+#
+# Retrying the two POSTs here is safe because both are effectively idempotent:
+# the GraphQL call is a pure read, and re-POSTing a commit status with the same
+# context+state converges on the same effective status for that context.
+#
+# INTERACTION WITH THIS FILE'S OWN _PROBE_ATTEMPTS RETRY LAYER (below): this
+# repo already has two hand-rolled outer retry wrappers -- _probe_pull_request
+# (with a git-transport fallback the onprem-k8s design has no counterpart
+# for) and set_commit_status -- that catch ANY exception from _request and
+# retry up to _PROBE_ATTEMPTS=3 times on their own 1s/2s schedule via the
+# _sleep test seam. Those are UNCHANGED by this port and still wrap the new,
+# now-internally-retrying _request(). The composition is safe but not free:
+# a permanent 5xx now takes up to _PROBE_ATTEMPTS outer attempts, each
+# retrying up to REQUEST_MAX_ATTEMPTS times internally, before either wrapper
+# gives up -- strictly more resilience, at the cost of a longer worst-case
+# failure path (bounded: each layer bounds its own attempts and budget, nothing
+# nests unboundedly). A permanent 4xx that _request() now fast-fails on the
+# first attempt is still retried by the outer wrappers exactly as before this
+# change, since they catch any exception unconditionally -- that pre-existing
+# behavior is untouched here.
+REQUEST_MAX_ATTEMPTS = 4
+REQUEST_TIMEOUT_SECONDS = 20.0
+REQUEST_RETRY_BUDGET_SECONDS = 45.0
+REQUEST_BACKOFF_SECONDS = 1.0
+
+
+def _retry_backoff_seconds(attempt):
+    """Exponential backoff: 1s, 2s, 4s before attempts 2, 3, 4."""
+    return REQUEST_BACKOFF_SECONDS * (2 ** (attempt - 1))
+
+
+def _http_error_diagnostics(error):
+    """Best-effort snapshot of a 4xx HTTPError: body + rate-limit headers.
+
+    _request() used to raise straight off `error.code` with nothing else
+    logged, so a rate-limited 403 and a genuine permission 403 were
+    indistinguishable from the job log -- this class of failure was
+    otherwise unreadable (BLO-20820). Kept permanently, not just for the
+    retry decision below.
+    """
+    try:
+        body = error.read()
+        body_text = body.decode("utf-8", "replace")[:500] if body else ""
+    except Exception:
+        body_text = "<body unreadable>"
+    headers = error.headers or {}
+    return {
+        "body": body_text,
+        "retry_after": headers.get("Retry-After"),
+        "rate_remaining": headers.get("X-RateLimit-Remaining"),
+        "rate_reset": headers.get("X-RateLimit-Reset"),
+    }
+
+
+def _rate_limit_wait_seconds(diagnostics):
+    """Seconds GitHub asked us to wait, from whichever header carries it."""
+    retry_after = diagnostics["retry_after"]
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except (TypeError, ValueError):
+            pass
+    rate_reset = diagnostics["rate_reset"]
+    if rate_reset:
+        try:
+            return max(0.0, float(rate_reset) - time.time())
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
 def _request(url, token, method="GET", payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -1121,9 +1214,97 @@ def _request(url, token, method="GET", payload=None):
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
     if data is not None:
         req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req) as response:
-        body = response.read()
-        return json.loads(body) if body else None
+
+    deadline = time.monotonic() + REQUEST_RETRY_BUDGET_SECONDS
+    for attempt in range(1, REQUEST_MAX_ATTEMPTS + 1):
+        explicit_backoff = None
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                body = response.read()
+                return json.loads(body) if body else None
+        except urllib.error.HTTPError as error:
+            # HTTPError subclasses URLError, so this arm MUST precede the next.
+            diagnostics = _http_error_diagnostics(error)
+            print(
+                "GitHub API %s %s -> HTTP %d: %s "
+                "(retry-after=%s x-ratelimit-remaining=%s x-ratelimit-reset=%s)"
+                % (
+                    method,
+                    url,
+                    error.code,
+                    diagnostics["body"] or "<empty body>",
+                    diagnostics["retry_after"],
+                    diagnostics["rate_remaining"],
+                    diagnostics["rate_reset"],
+                ),
+                file=sys.stderr,
+            )
+            # A 429 is unambiguously rate-limited even when GitHub omits its
+            # optional rate-limit headers. A 403 is ambiguous, so require an
+            # explicit "not so fast" signal (Retry-After, or a zero primary
+            # budget) before treating it as transient. This keeps genuine
+            # permission failures fast while honoring all 429s with bounded
+            # backoff (BLO-20820).
+            # Any OTHER 4xx is a real ANSWER from GitHub -- auth, permission,
+            # not-found -- retrying it would bury a genuine misconfiguration
+            # under backoff, and callers branch on the code
+            # (fetch_collaborator_permission treats 404 as "not a
+            # collaborator"), so it must surface immediately and unchanged.
+            rate_limited = error.code == 429 or (
+                error.code == 403
+                and (
+                    diagnostics["retry_after"]
+                    or diagnostics["rate_remaining"] == "0"
+                )
+            )
+            if error.code < 500 and not rate_limited:
+                raise
+            transient = error
+            # Only a CONFIRMED rate-limited 4xx gets the explicit GitHub-
+            # provided wait time. An ordinary 5xx commonly carries the same
+            # X-RateLimit-Reset header even though it was never rate-limited;
+            # reading it here would let an unrelated hourly reset overrun the
+            # retry budget and abort a plain transient 5xx that
+            # _retry_backoff_seconds() would otherwise retry fine.
+            explicit_backoff = (
+                _rate_limit_wait_seconds(diagnostics) if rate_limited else None
+            )
+            # Retry-After: 0 is a rate-limit signal, but a zero-second sleep
+            # would hot-loop. Use the ordinary bounded schedule when GitHub
+            # supplies no positive wait.
+            if explicit_backoff is not None and explicit_backoff <= 0:
+                explicit_backoff = None
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            # No HTTP response at all: DNS, refused connection, TLS failure,
+            # reset peer, or a read that outran REQUEST_TIMEOUT_SECONDS.
+            transient = error
+        except http.client.HTTPException as error:
+            # Protocol-level damage on an otherwise-open connection
+            # (IncompleteRead, BadStatusLine on a half-closed keepalive).
+            # Not an OSError, so it needs its own arm.
+            transient = error
+
+        if attempt == REQUEST_MAX_ATTEMPTS:
+            raise transient
+        backoff = (
+            explicit_backoff if explicit_backoff is not None
+            else _retry_backoff_seconds(attempt)
+        )
+        if time.monotonic() + backoff >= deadline:
+            # Out of wall-clock budget. Fail closed rather than keep a
+            # required check waiting. A rate-limit reset can be much further
+            # out than this budget (e.g. an hourly repo cap) -- that is
+            # intentional: a single job run should not block on it, and the
+            # diagnostics above already state why it failed.
+            raise transient
+        print(
+            "GitHub API %s %s failed transiently (%s); retry %d/%d in %.0fs"
+            % (method, url, transient, attempt, REQUEST_MAX_ATTEMPTS - 1, backoff),
+            file=sys.stderr,
+        )
+        time.sleep(backoff)
+
+    raise AssertionError("unreachable: the retry loop must return or raise")
 
 
 # The issue_comment head probe is the single point where a transient API

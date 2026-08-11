@@ -17,9 +17,11 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 import unittest.mock as mock
+import urllib.error
 
 _SPEC = importlib.util.spec_from_file_location(
     "require_ally_review",
@@ -2326,6 +2328,395 @@ class TestSeatAwareReduction(unittest.TestCase):
             ]
         )
         self.assertEqual(state, "failure")
+
+
+class _FakeResponse:
+    """Minimal urlopen() context-manager stand-in."""
+
+    def __init__(self, payload):
+        self._body = b"" if payload is None else json.dumps(payload).encode()
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _http_error(code):
+    return urllib.error.HTTPError(
+        "https://api.github.com/x", code, "synthetic", {}, None
+    )
+
+
+def _rate_limit_error(code, retry_after=None, rate_remaining=None, rate_reset=None):
+    headers = {}
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+    if rate_remaining is not None:
+        headers["X-RateLimit-Remaining"] = str(rate_remaining)
+    if rate_reset is not None:
+        headers["X-RateLimit-Reset"] = str(rate_reset)
+    return urllib.error.HTTPError(
+        "https://api.github.com/x", code, "synthetic", headers, None
+    )
+
+
+class TestTransientRetry(unittest.TestCase):
+    """BLO-19826, porting BLO-19194 from onprem-k8s. A transient 5xx used to
+    abort main() and turn infra noise into a red required check -- worst case
+    from the FINAL set_commit_status(), discarding an already-computed
+    verdict. _request() now retries transients, WITHOUT loosening the
+    fail-closed posture: an exhausted retry still raises, so the context
+    stays `pending` and never `success`.
+
+    This exercises _request() directly at the http layer, independent of
+    this file's OWN outer _PROBE_ATTEMPTS retry wrappers around
+    _probe_pull_request and set_commit_status (see TestExhaustedRetryFails
+    Closed for the composed, main()-level behaviour)."""
+
+    def setUp(self):
+        # No test may sleep for real; assert on the backoff instead.
+        self.sleeps = []
+        patcher = mock.patch.object(
+            gate.time, "sleep", side_effect=self.sleeps.append
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _urlopen(self, side_effect):
+        return mock.patch.object(
+            gate.urllib.request, "urlopen", side_effect=side_effect
+        )
+
+    def test_5xx_then_200_succeeds(self):
+        """(a) The headline case: one 502, then a good response -> the call
+        returns its payload and the job does not fail."""
+        with self._urlopen(
+            [_http_error(502), _FakeResponse({"ok": True})]
+        ) as urlopen:
+            self.assertEqual(gate._request("https://api/x", "t"), {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(self.sleeps, [1.0])
+
+    def test_every_5xx_is_retried(self):
+        for code in (500, 502, 503, 504):
+            with self.subTest(code=code):
+                with self._urlopen(
+                    [_http_error(code), _FakeResponse({"ok": code})]
+                ) as urlopen:
+                    self.assertEqual(gate._request("https://api/x", "t"), {"ok": code})
+                self.assertEqual(urlopen.call_count, 2)
+
+    def test_connection_errors_are_retried(self):
+        """"Connection errors" in the AC: no HTTP response at all. HTTPError
+        subclasses URLError, so the 4xx arm has to be matched first -- these
+        fixtures prove the non-HTTP transports still reach the retry."""
+        transients = [
+            urllib.error.URLError("dns"),
+            ConnectionResetError("peer reset"),
+            TimeoutError("read timed out"),
+            gate.http.client.IncompleteRead(b"partial"),
+        ]
+        for transient in transients:
+            with self.subTest(transient=type(transient).__name__):
+                with self._urlopen(
+                    [transient, _FakeResponse({"ok": True})]
+                ) as urlopen:
+                    self.assertEqual(gate._request("https://api/x", "t"), {"ok": True})
+                self.assertEqual(urlopen.call_count, 2)
+
+    def test_4xx_is_not_retried(self):
+        """(b) A non-rate-limit 4xx is a real answer -- auth, permission,
+        not-found. Burying it under backoff would turn a misconfigured token
+        into a slow mystery instead of a fast, legible failure. Attempted
+        exactly once, with zero backoff."""
+        for code in (400, 401, 404, 422):
+            with self.subTest(code=code):
+                with self._urlopen([_http_error(code)] * 8) as urlopen:
+                    with self.assertRaises(urllib.error.HTTPError) as caught:
+                        gate._request("https://api/x", "t")
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(urlopen.call_count, 1, "4xx must not be retried")
+                self.assertEqual(self.sleeps, [], "4xx must not back off")
+
+    def test_404_still_reaches_its_caller_unchanged(self):
+        """The 4xx passthrough is load-bearing for a CALLER that branches on
+        the code: a 404 here means "not a collaborator", i.e. no permission.
+        Retrying or reclassifying it would corrupt a trust lookup."""
+        with self._urlopen([_http_error(404)] * 8) as urlopen:
+            self.assertIsNone(
+                gate.fetch_collaborator_permission(
+                    "https://api", "Blockcast", "frr", "nobody", "t"
+                )
+            )
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_retries_are_bounded_by_attempt_count(self):
+        """(c) part 1: retries are finite. A permanent 5xx exhausts exactly
+        REQUEST_MAX_ATTEMPTS tries and then raises -- it cannot spin."""
+        with self._urlopen([_http_error(503)] * 50) as urlopen:
+            with self.assertRaises(urllib.error.HTTPError):
+                gate._request("https://api/x", "t")
+        self.assertEqual(urlopen.call_count, gate.REQUEST_MAX_ATTEMPTS)
+        # Backoff only BETWEEN attempts: never after the last one.
+        self.assertEqual(self.sleeps, [1.0, 2.0, 4.0])
+        self.assertEqual(len(self.sleeps), gate.REQUEST_MAX_ATTEMPTS - 1)
+
+    def test_retries_are_bounded_by_wall_clock(self):
+        """(c) part 2: the attempt count is not the only bound. If attempts
+        themselves burn time, the budget stops the retry rather than letting
+        attempts x timeout hold the merge path open."""
+        with mock.patch.object(gate.time, "monotonic", side_effect=[0.0, 10_000.0]):
+            with self._urlopen([_http_error(503)] * 50) as urlopen:
+                with self.assertRaises(urllib.error.HTTPError):
+                    gate._request("https://api/x", "t")
+        self.assertEqual(urlopen.call_count, 1, "budget must stop further attempts")
+        self.assertEqual(self.sleeps, [], "no sleep once the budget is spent")
+
+    def test_a_per_attempt_timeout_is_always_passed(self):
+        """urlopen() has no default timeout, so the wall-clock bound is only
+        real if every attempt carries one -- otherwise one hung socket hangs
+        the job forever and no budget can preempt it."""
+        with self._urlopen([_FakeResponse({"ok": True})]) as urlopen:
+            gate._request("https://api/x", "t")
+        self.assertEqual(
+            urlopen.call_args.kwargs.get("timeout"), gate.REQUEST_TIMEOUT_SECONDS
+        )
+
+
+class TestRateLimitRetry(unittest.TestCase):
+    """BLO-20820, porting from onprem-k8s. A rate-limited 403/429 used to be
+    indistinguishable from a genuine permission failure and aborted the run
+    outright. _request() now retries every 429 and a 403 carrying an
+    explicit rate-limit signal (`Retry-After`, or `X-RateLimit-Remaining:
+    0`). An ambiguous 403 with neither signal still fails fast and unchanged,
+    exactly as covered by TestTransientRetry.test_4xx_is_not_retried."""
+
+    def setUp(self):
+        self.sleeps = []
+        patcher = mock.patch.object(
+            gate.time, "sleep", side_effect=self.sleeps.append
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _urlopen(self, side_effect):
+        return mock.patch.object(
+            gate.urllib.request, "urlopen", side_effect=side_effect
+        )
+
+    def test_403_with_retry_after_is_retried(self):
+        with self._urlopen(
+            [_rate_limit_error(403, retry_after=3), _FakeResponse({"ok": True})]
+        ) as urlopen:
+            self.assertEqual(gate._request("https://api/x", "t"), {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(
+            self.sleeps, [3.0], "backoff must honor Retry-After, not the default schedule"
+        )
+
+    def test_429_with_retry_after_is_retried(self):
+        with self._urlopen(
+            [_rate_limit_error(429, retry_after=2), _FakeResponse({"ok": True})]
+        ) as urlopen:
+            self.assertEqual(gate._request("https://api/x", "t"), {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(self.sleeps, [2.0])
+
+    def test_429_is_retried(self):
+        """The AC's headline case: a 429 IS retried, unconditionally."""
+        with self._urlopen(
+            [_http_error(429), _FakeResponse({"ok": True})]
+        ) as urlopen:
+            self.assertEqual(gate._request("https://api/x", "t"), {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(self.sleeps, [1.0])
+
+    def test_403_with_zero_remaining_falls_back_to_rate_limit_reset(self):
+        with mock.patch.object(gate.time, "time", return_value=1_000.0):
+            with self._urlopen(
+                [
+                    _rate_limit_error(403, rate_remaining=0, rate_reset=1_005),
+                    _FakeResponse({"ok": True}),
+                ]
+            ) as urlopen:
+                self.assertEqual(gate._request("https://api/x", "t"), {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(self.sleeps, [5.0])
+
+    def test_403_without_rate_limit_headers_still_raises(self):
+        """A genuine permission 403 carries neither signal and must still
+        surface immediately -- this is the exact posture the 4xx arm exists
+        to preserve for callers like fetch_collaborator_permission."""
+        with self._urlopen([_http_error(403)] * 8) as urlopen:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                gate._request("https://api/x", "t")
+        self.assertEqual(caught.exception.code, 403)
+        self.assertEqual(urlopen.call_count, 1, "unsignaled 403 must not be retried")
+        self.assertEqual(self.sleeps, [])
+
+    def test_zero_retry_after_does_not_hot_loop(self):
+        with self._urlopen(
+            [_rate_limit_error(429, retry_after=0), _FakeResponse({"ok": True})]
+        ) as urlopen:
+            self.assertEqual(gate._request("https://api/x", "t"), {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(self.sleeps, [1.0])
+
+    def test_retry_after_beyond_budget_fails_fast_without_sleeping(self):
+        """An hourly repo rate-limit reset can be far outside a single call's
+        REQUEST_RETRY_BUDGET_SECONDS. Retrying must not hang the job for an
+        hour -- it fails closed exactly like an exhausted 5xx retry, only now
+        with the rate-limit diagnostics already printed to the job log."""
+        with mock.patch.object(gate.time, "monotonic", side_effect=[0.0, 0.0]):
+            with self._urlopen(
+                [_rate_limit_error(403, retry_after=3600)] * 8
+            ) as urlopen:
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    gate._request("https://api/x", "t")
+        self.assertEqual(caught.exception.code, 403)
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(self.sleeps, [])
+
+
+class TestExhaustedRetryFailsClosed(unittest.TestCase):
+    """BLO-19194's safety half, ported, exercised at the composed main()/
+    run() level. Retrying must not become a way to fail OPEN: when every
+    layer's retries run out, no status write may ever tell GitHub `success`,
+    and the job has to exit non-zero.
+
+    frr's own run() additionally writes an `error` status from its crash
+    handler (a pre-existing hardening beyond onprem-k8s/trafficcontrol, see
+    the _PROBE_ATTEMPTS interaction note above _request()), and
+    set_commit_status() already retries via that _PROBE_ATTEMPTS wrapper
+    around the now also-retrying _request(). This fixture makes EVERY status
+    write past the two early "pending" claims fail, so both the final
+    verdict write and the crash-handler's error write exhaust their retries
+    -- proving the composition still cannot produce a false `success`."""
+
+    def setUp(self):
+        gate._STATUS_TARGET.clear()
+        self.addCleanup(gate._STATUS_TARGET.clear)
+
+    def _event(self):
+        event = {
+            "pull_request": {
+                "number": 7,
+                "state": "open",
+                "draft": False,
+                "head": {"sha": HEAD},
+            },
+            "repository": {"full_name": "Blockcast/frr"},
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def _run_with_dying_status_writes(self):
+        """The observed shape: decide() has already returned, and every
+        status write from that point on keeps 502ing. Keyed on call ORDER,
+        not on the state value -- the two early claims and the verdict can
+        all legitimately be `pending`, and the real defect was a later write
+        dying whatever the verdict happened to be."""
+        refetched = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": HEAD},
+            "user": {"login": HUMAN},
+            "labels": [],
+        }
+        env = {
+            "GITHUB_EVENT_PATH": self._event(),
+            "GITHUB_REPOSITORY": "Blockcast/frr",
+            "GITHUB_TOKEN": "test-token",
+        }
+        statuses = []
+        graphql_response = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviews": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [],
+                        }
+                    }
+                }
+            }
+        }
+
+        # Nothing here mocks set_commit_status or _request -- every failure
+        # is raised from the HTTP layer, so main()'s and run()'s real
+        # pre-claim/crash-handler ordering is exercised end to end.
+        def urlopen(req, *args, **kwargs):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "/statuses/" in url:
+                statuses.append(json.loads(req.data.decode())["state"])
+                if len(statuses) <= 2:
+                    return _FakeResponse(None)  # both early claims land
+                raise _http_error(502)  # every later write dies
+            if url.endswith("/graphql"):
+                return _FakeResponse(graphql_response)
+            if url.rstrip("/").endswith("/pulls/7"):
+                return _FakeResponse(refetched)
+            # paginated reviews/comments fetches
+            return _FakeResponse([])
+
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate.time, "sleep"), \
+                mock.patch.object(gate, "_sleep", lambda seconds: None), \
+                mock.patch.object(gate.urllib.request, "urlopen", side_effect=urlopen):
+            with self.assertRaises(SystemExit) as caught:
+                gate.run()
+        self.assertEqual(caught.exception.code, 1, "run() must exit non-zero")
+        return statuses
+
+    def test_no_successful_status_survives_an_exhausted_retry(self):
+        """The property that actually matters: whatever else happened,
+        GitHub was never told `success`. A green required check written by a
+        run that then died is the one outcome a merge control must never
+        produce."""
+        statuses = self._run_with_dying_status_writes()
+        self.assertEqual(statuses[0], "pending", "the early payload-head claim must run first")
+        self.assertEqual(statuses[1], "pending", "the authoritative pre-claim must run next")
+        self.assertNotIn("success", statuses)
+
+    def test_both_dying_writes_retry_a_bounded_number_of_times(self):
+        """(c): the composition of set_commit_status's outer _PROBE_ATTEMPTS
+        wrapper and _request's own inner REQUEST_MAX_ATTEMPTS retry is still
+        finite -- two failing writes (the verdict, then the crash handler's
+        error write) cannot spin forever."""
+        statuses = self._run_with_dying_status_writes()
+        expected_total = 2 + 2 * gate._PROBE_ATTEMPTS * gate.REQUEST_MAX_ATTEMPTS
+        self.assertEqual(
+            len(statuses),
+            expected_total,
+            "both the exhausted verdict write and the exhausted crash-handler "
+            "error write must retry exactly _PROBE_ATTEMPTS x REQUEST_MAX_ATTEMPTS "
+            "times each, then give up",
+        )
+
+    def test_the_top_level_handler_exits_non_zero_as_a_subprocess(self):
+        """run() raising SystemExit(1) is only meaningful if the actual
+        process exit code reflects it. Exercised as a real subprocess so the
+        exit code is the actual contract, not a mock."""
+        script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "require-ally-review.py"
+        )
+        completed = subprocess.run(
+            [sys.executable, script],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "")},
+        )
+        # No GITHUB_EVENT_PATH -> main() raises -> run() exits non-zero.
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("GITHUB_EVENT_PATH", completed.stderr)
 
 
 if __name__ == "__main__":
