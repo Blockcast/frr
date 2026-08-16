@@ -219,22 +219,39 @@ static void pim_dimt_upstream_unpin(struct pim_instance *pim,
 	pim_upstream_update_join_desired(pim, up);
 }
 
-/* Authoritative pin resolution for one upstream: pin it when a usable
- * pim-type mapping covers the source, otherwise drop any pin DIMT owns. */
-void pim_dimt_upstream_apply(struct pim_instance *pim,
-			     struct pim_upstream *up)
+/* Is this upstream DIMT-steered *by intent* -- does a usable pim-type
+ * mapping claim its source?  Deliberately distinct from
+ * PIM_UPSTREAM_FLAG_SRC_DIMT, which records the achieved state: that flag is
+ * set only inside pim_dimt_upstream_pin(), so it means "the RPF is pinned
+ * onto a DIMT netdev", not "this path is ours".
+ *
+ * Readiness reporting needs intent, not achievement.  When a tunnel fails to
+ * create there is no netdev to pin, so the flag is never set -- and keying
+ * the report off it makes FWD_FAILED structurally unreachable: the path
+ * disappears from `show ... dimt forwarding` entirely instead of reporting
+ * the failure D3 requires.  Reporting nothing is strictly worse than the
+ * "sits in requested forever" failure the contract set out to kill.
+ *
+ * The claiming mapping is returned via *umhp so callers need not look it up
+ * twice; it is non-NULL exactly when this returns true.
+ */
+static bool pim_dimt_upstream_steered(struct pim_instance *pim,
+				      struct pim_upstream *up,
+				      struct pim_dimt_umh **umhp)
 {
 	struct pim_dimt_umh *umh;
-	struct interface *ifp = NULL;
+
+	*umhp = NULL;
 
 	if (pim_addr_is_any(up->sg.src))
-		return;
+		return false;
 	/* STATIC_IIF set by another owner (e.g. pim_vxlan): keep theirs.
 	 * Only upstreams DIMT pinned itself, or unpinned ones, are
-	 * eligible. */
+	 * eligible -- and DIMT has nothing to report about a path it does
+	 * not own. */
 	if (PIM_UPSTREAM_FLAG_TEST_STATIC_IIF(up->flags) &&
 	    !PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags))
-		return;
+		return false;
 
 	umh = pim_dimt_umh_lookup(pim, up->sg.src);
 
@@ -243,8 +260,24 @@ void pim_dimt_upstream_apply(struct pim_instance *pim,
 	 * PE: our own origination echoes back through the loc-RIB hook) --
 	 * normal RPF toward the local source applies, never a pin toward
 	 * ourselves. */
-	if (umh && umh->umh_type == ZAPI_UMH_TYPE_PIM &&
-	    !if_lookup_address_local(&umh->umh, PIM_AF, pim->vrf->vrf_id)) {
+	if (!umh || umh->umh_type != ZAPI_UMH_TYPE_PIM)
+		return false;
+	if (if_lookup_address_local(&umh->umh, PIM_AF, pim->vrf->vrf_id))
+		return false;
+
+	*umhp = umh;
+	return true;
+}
+
+/* Authoritative pin resolution for one upstream: pin it when a usable
+ * pim-type mapping covers the source, otherwise drop any pin DIMT owns. */
+void pim_dimt_upstream_apply(struct pim_instance *pim,
+			     struct pim_upstream *up)
+{
+	struct pim_dimt_umh *umh;
+	struct interface *ifp = NULL;
+
+	if (pim_dimt_upstream_steered(pim, up, &umh)) {
 		ifp = pim_dimt_light_iface(pim, umh->umh);
 		if (!ifp && PIM_DEBUG_PIM_TRACE)
 			zlog_debug("DIMT: UMH %pPAs covers %s but no light interface resolves; not pinning",
@@ -660,28 +693,20 @@ static void pim_dimt_tunnel_build_req(struct pim_instance *pim,
 }
 
 /* Does this upstream demand a native DIMT tunnel, and toward which UMH?
- * Returns NULL when the upstream is not DIMT-steered at all. */
+ * Returns NULL when the upstream is not DIMT-steered at all.
+ *
+ * Demand and readiness-reporting are the SAME predicate, deliberately
+ * sharing one implementation: a tunnel exists because some upstream
+ * demanded it, so every tunnel must have at least one upstream reporting
+ * on it.  These were two hand-copied bodies until the copies drifted --
+ * readiness kept its own SRC_DIMT test, which is the achieved-pin flag, so
+ * a tunnel whose create failed raised demand but reported nothing at all. */
 static struct pim_dimt_umh *pim_dimt_upstream_demand(struct pim_instance *pim,
 						     struct pim_upstream *up)
 {
 	struct pim_dimt_umh *umh;
 
-	if (pim_addr_is_any(up->sg.src))
-		return NULL;
-	/* A STATIC_IIF owned by someone else (pim_vxlan) is not ours to
-	 * steer, so it raises no tunnel demand. */
-	if (PIM_UPSTREAM_FLAG_TEST_STATIC_IIF(up->flags) &&
-	    !PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags))
-		return NULL;
-
-	umh = pim_dimt_umh_lookup(pim, up->sg.src);
-	if (!umh || umh->umh_type != ZAPI_UMH_TYPE_PIM)
-		return NULL;
-	/* We ARE the UMH: no tunnel to ourselves. */
-	if (if_lookup_address_local(&umh->umh, PIM_AF, pim->vrf->vrf_id))
-		return NULL;
-
-	return umh;
+	return pim_dimt_upstream_steered(pim, up, &umh) ? umh : NULL;
 }
 
 /* Recompute tunnel demand across every upstream and drive the resulting
@@ -944,12 +969,12 @@ pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up)
 	/* Not DIMT-steered: this contract proves DIMT forwarding and has
 	 * nothing to say about a path it does not own.  PENDING is the
 	 * fail-closed reading, and PR 4 gates its additive
-	 * forwarding_ready on READY only. */
-	if (!PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags))
-		return ZAPI_MVPN_SG_FWD_PENDING;
-
-	umh = pim_dimt_umh_lookup(pim, up->sg.src);
-	if (!umh)
+	 * forwarding_ready on READY only.
+	 *
+	 * Keyed on the mapping, NOT on PIM_UPSTREAM_FLAG_SRC_DIMT: the flag
+	 * means "already pinned", so reading it here would collapse "the
+	 * tunnel failed" into "not ours" and lose FWD_FAILED entirely. */
+	if (!pim_dimt_upstream_steered(pim, up, &umh))
 		return ZAPI_MVPN_SG_FWD_PENDING;
 
 	tun = pim_dimt_tunnel_find(pim, umh->umh);
@@ -1112,20 +1137,20 @@ void pim_dimt_show_forwarding(struct pim_instance *pim, struct vty *vty,
 		/* Only DIMT-steered upstreams: this contract has nothing to
 		 * say about a path it does not own, and listing every
 		 * upstream as "pending" would invite exactly that misreading.
-		 */
-		if (!PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags))
+		 *
+		 * Steered-by-intent, not SRC_DIMT: a tunnel that failed to
+		 * create was never pinned, and skipping it here is what made
+		 * the D3 `failed` state invisible to the operator and to the
+		 * D6 boundary that asserts it. */
+		if (!pim_dimt_upstream_steered(pim, up, &umh))
 			continue;
 
 		state = pim_dimt_forwarding_state(pim, up);
-		umh = pim_dimt_umh_lookup(pim, up->sg.src);
 		ifp = up->rpf.source_nexthop.interface;
 		ifname = ifp ? ifp->name : "-";
 
-		if (umh)
-			snprintfrr(umh_str, sizeof(umh_str), "%pPAs",
-				   &umh->umh);
-		else
-			snprintf(umh_str, sizeof(umh_str), "-");
+		/* Non-NULL whenever the upstream is steered. */
+		snprintfrr(umh_str, sizeof(umh_str), "%pPAs", &umh->umh);
 
 		if (jobj) {
 			json_object *jup = json_object_new_object();
