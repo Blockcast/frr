@@ -116,6 +116,13 @@ void pim_dimt_iface_up(struct pim_instance *pim, struct interface *ifp);
 void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json);
 void pim_dimt_show_tunnel(struct pim_instance *pim, struct vty *vty, bool json);
 
+/* Per-(S,G) readiness aggregation.  The verdict is otherwise unobservable:
+ * pim_dimt_forwarding_state() only ever leaves pimd as a zapi re-ADD toward
+ * bgpd, gated on `mvpn-gtm` plus gtm-announced, so D6's readiness boundary
+ * has nothing to assert against without this. */
+void pim_dimt_show_forwarding(struct pim_instance *pim, struct vty *vty,
+			      bool json);
+
 /* --- explicit endpoint configuration (D2) --- */
 
 /* Install/replace the row for `umh`.  Returns false only on a malformed row
