@@ -105,6 +105,7 @@ pytestmark = [pytest.mark.bgpd, pytest.mark.pimd]
 SOURCE = "10.10.10.10"
 GROUP = "232.1.1.10"
 SG = "(10.10.10.10,232.1.1.10)"
+SRC_PREFIX = "10.10.10.0/24"
 UMH = "10.99.0.1"
 INNER_LOCAL = "10.99.0.2"
 OUTER_LOCAL = "10.0.0.2"
@@ -164,6 +165,19 @@ def tunnel_entry(router):
     """The DIMT tunnel row for UMH, or None if pimd has not created one."""
     output = json.loads(router.vtysh_cmd("show ip pim dimt tunnel json"))
     return output.get(UMH)
+
+
+def umh_entry(router):
+    """The UMH mapping row for the advertised source prefix, or None.
+
+    NOTE the keying difference from tunnel_entry(): `show ip pim dimt umh json`
+    is keyed by the *source prefix* the mapping covers -- pim_dimt_show_umh()
+    keys on `%pFX` of `umh->prefix` -- whereas `dimt tunnel json` is keyed by
+    the UMH address.  The UMH is a field *inside* the umh row, so looking the
+    UMH up as a key there silently never matches.
+    """
+    output = json.loads(router.vtysh_cmd("show ip pim dimt umh json"))
+    return output.get(SRC_PREFIX)
 
 
 def check_tunnel_state(router, state):
@@ -233,11 +247,7 @@ def test_join_requests_tunnel_and_zebra_creates_it():
     r2 = tgen.gears["r2"]
 
     # The mapping has to arrive before anything else can be true.
-    expect(
-        lambda: None
-        if UMH in json.loads(r2.vtysh_cmd("show ip pim dimt umh json"))
-        else "pimd has no UMH mapping yet"
-    )
+    expect(lambda: None if umh_entry(r2) else "pimd has no UMH mapping yet")
 
     expect(lambda: check_tunnel_state(r2, "installed"))
 
