@@ -2703,6 +2703,28 @@ DEFPY (show_ip_pim_dimt_tunnel,
 	return CMD_SUCCESS;
 }
 
+DEFPY (show_ip_pim_dimt_forwarding,
+       show_ip_pim_dimt_forwarding_cmd,
+       "show ip pim [vrf NAME] dimt forwarding [json$json]",
+       SHOW_STR
+       IP_STR
+       PIM_STR
+       VRF_CMD_HELP_STR
+       "DIMT dynamic multicast tunneling\n"
+       "Per-(S,G) forwarding readiness aggregation\n"
+       JSON_STR)
+{
+	struct vrf *v;
+
+	v = vrf_lookup_by_name(vrf ? vrf : VRF_DEFAULT_NAME);
+	if (!v || !v->info)
+		return CMD_WARNING;
+
+	pim_dimt_show_forwarding(v->info, vty, !!json);
+
+	return CMD_SUCCESS;
+}
+
 /*
  * Explicit per-UMH tunnel endpoint (contract D2).
  *
@@ -9686,6 +9708,7 @@ void pim_cmd_init(void)
 	install_element(VIEW_NODE, &show_ip_pim_channel_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_dimt_umh_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_dimt_tunnel_cmd);
+	install_element(VIEW_NODE, &show_ip_pim_dimt_forwarding_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_join_desired_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_rpf_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_rp_cmd);

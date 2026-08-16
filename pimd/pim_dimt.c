@@ -1036,3 +1036,87 @@ done:
 	if (jobj)
 		vty_json(vty, jobj);
 }
+
+/*
+ * Per-(S,G) readiness, the aggregation this PR exists to produce.
+ *
+ * Without this the verdict is unobservable: pim_dimt_forwarding_state() is
+ * reachable only through pim_gtm_forwarding_update(), which drops it on the
+ * floor unless `mvpn-gtm` is configured AND the upstream is gtm-announced,
+ * and even then it leaves only as a zapi re-ADD toward bgpd.  A topotest
+ * cannot assert D6's readiness boundary against a value that never surfaces.
+ *
+ * Reading this is NOT the evidence -- that would be the vacuous
+ * control-plane read G10 forbids.  The evidence stays kernel-side (`ip -d
+ * link show` for the netdev, /proc/net/ip_mr_cache for the admitted
+ * incoming vif); this command exposes pimd's *aggregation* of those facts so
+ * a test can assert the two agree.  Disagreement is precisely the bug class
+ * the contract targets, and it is undetectable while one side is invisible.
+ *
+ * `refcount` and `interface` come from the tunnel; `forwarding` is recomputed
+ * live rather than cached, so it can never report a stale edge.
+ */
+void pim_dimt_show_forwarding(struct pim_instance *pim, struct vty *vty,
+			      bool json)
+{
+	struct pim_upstream *up;
+	json_object *jobj = NULL;
+	static const char *const fwd[] = {
+		[ZAPI_MVPN_SG_FWD_PENDING] = "pending",
+		[ZAPI_MVPN_SG_FWD_READY] = "ready",
+		[ZAPI_MVPN_SG_FWD_FAILED] = "failed",
+	};
+
+	if (json)
+		jobj = json_object_new_object();
+	else
+		vty_out(vty, "%-34s %-10s %-16s %s\n", "Source,Group",
+			"Forwarding", "Interface", "UMH");
+
+	frr_each (rb_pim_upstream, &pim->upstream_head, up) {
+		enum zapi_mvpn_sg_forwarding state;
+		struct pim_dimt_umh *umh;
+		struct interface *ifp;
+		const char *ifname;
+		char umh_str[PIM_ADDRSTRLEN];
+
+		/* Only DIMT-steered upstreams: this contract has nothing to
+		 * say about a path it does not own, and listing every
+		 * upstream as "pending" would invite exactly that misreading.
+		 */
+		if (!PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags))
+			continue;
+
+		state = pim_dimt_forwarding_state(pim, up);
+		umh = pim_dimt_umh_lookup(pim, up->sg.src);
+		ifp = up->rpf.source_nexthop.interface;
+		ifname = ifp ? ifp->name : "-";
+
+		if (umh)
+			snprintfrr(umh_str, sizeof(umh_str), "%pPAs",
+				   &umh->umh);
+		else
+			snprintf(umh_str, sizeof(umh_str), "-");
+
+		if (jobj) {
+			json_object *jup = json_object_new_object();
+
+			json_object_string_add(jup, "forwarding", fwd[state]);
+			json_object_string_add(jup, "interface", ifname);
+			json_object_string_add(jup, "umh", umh_str);
+			/* The kernel-side conjunct, split out so a failing
+			 * test says WHICH of the three did not hold. */
+			json_object_boolean_add(jup, "mfcInstalled",
+						up->channel_oil &&
+							up->channel_oil
+								->installed);
+			json_object_object_add(jobj, up->sg_str, jup);
+		} else {
+			vty_out(vty, "%-34s %-10s %-16s %s\n", up->sg_str,
+				fwd[state], ifname, umh_str);
+		}
+	}
+
+	if (jobj)
+		vty_json(vty, jobj);
+}
