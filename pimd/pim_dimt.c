@@ -7,8 +7,14 @@
  * stateless UMH relay. For every (S,G) upstream whose source is covered by
  * a mapping, RPF is pinned to the PIM Light interface whose connected
  * subnet contains the UMH, with rpf_addr = UMH -- the pim_vxlan
- * "orig mroute" STATIC_IIF pattern. This replaces Phase A's per-source
- * static route.
+ * "orig mroute" STATIC_IIF pattern.
+ *
+ * This is the sole receiver-driven RPF override. tools/dimt-reconcile-v3.sh
+ * is retired in the same commit, and that ordering is a correctness fix
+ * rather than cleanup: v3 drove staticd `ip mroute` from BGP UMH state
+ * scraped out of `show bgp` *text* output, so until it was removed two
+ * independent overrides answered to the same UMH with nothing coordinating
+ * them. Leaving both live races the pin against a text-scraping poll loop.
  */
 
 #include <zebra.h>
