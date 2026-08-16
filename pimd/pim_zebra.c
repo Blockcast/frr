@@ -417,6 +417,8 @@ void sched_rpf_cache_refresh(struct pim_instance *pim)
 
 static void pim_zebra_connected(struct zclient *zclient)
 {
+	struct pim_instance *pim = pim_get_pim_instance(VRF_DEFAULT);
+
 #if PIM_IPV == 4
 	/* Send the client registration */
 	bfd_client_sendmsg(zclient, ZEBRA_BFD_CLIENT_REGISTER, router->vrf_id);
@@ -424,8 +426,24 @@ static void pim_zebra_connected(struct zclient *zclient)
 
 	zclient_send_reg_requests(zclient, router->vrf_id);
 
+	/* DIMT: the previous zebra session owned every outstanding tunnel
+	 * request, so no ack from it can still arrive.  Drop acknowledgement
+	 * state (readiness collapses to PENDING) while keeping tunnel
+	 * identity, so the re-ADD below re-adopts surviving netdevs instead
+	 * of stranding them. */
+	if (pim)
+		pim_dimt_tunnel_session_reset(pim);
+
 	/* (re-)subscribe to bgpd's DIMT UMH mappings */
 	pim_zebra_umh_subscribe(zclient);
+
+	/* Re-drive tunnel demand from re-derived state.  Readiness is not
+	 * asserted here: it is re-earned only when a fresh INSTALLED notify
+	 * plus the kernel MFC check say so (D4). */
+	if (pim) {
+		pim_dimt_reconcile(pim);
+		pim_dimt_readiness_update(pim);
+	}
 
 #if PIM_IPV == 4
 	/* request for VxLAN BUM group addresses */
@@ -471,10 +489,16 @@ static void pim_zebra_mvpn_sg_send(struct pim_upstream *up, uint8_t role, bool a
 	sg.grp.ipaddr_v6 = up->sg.grp;
 #endif
 	sg.role = role;
+	/* Proven-forwarding state travels on the same message as the role:
+	 * pimd is the only daemon that observes all three preconditions, and
+	 * riding the existing message makes restart replay correct for free.
+	 * PENDING is the fail-closed value for anything not DIMT-steered. */
+	sg.forwarding = pim_dimt_forwarding_state(up->pim, up);
+	up->gtm_forwarding = sg.forwarding;
 
 	if (PIM_DEBUG_ZEBRA)
-		zlog_debug("MVPN_SG %s %pSG role=%u to zebra",
-			   add ? "ADD" : "DEL", &up->sg, role);
+		zlog_debug("MVPN_SG %s %pSG role=%u fwd=%u to zebra",
+			   add ? "ADD" : "DEL", &up->sg, role, sg.forwarding);
 
 	s = pim_zclient->obuf;
 	zapi_mvpn_sg_encode(s, add ? ZEBRA_MVPN_SG_ADD : ZEBRA_MVPN_SG_DEL,
@@ -532,6 +556,36 @@ void pim_gtm_upstream_update(struct pim_instance *pim, struct pim_upstream *up,
 	}
 }
 
+/* Relay a change in proven-forwarding state for an already-announced (S,G).
+ * Edge-triggered: an unchanged state sends nothing, so this is safe to call
+ * from every event that could plausibly have moved readiness.
+ *
+ * Only announced upstreams are relayed.  Readiness for an (S,G) bgpd has no
+ * route for is not a thing bgpd can act on, and re-announcing here would
+ * race the ADD that pim_gtm_upstream_update() owns. */
+void pim_gtm_forwarding_update(struct pim_instance *pim,
+			       struct pim_upstream *up)
+{
+	uint8_t forwarding;
+
+	if (!pim->gtm_enable || !up->gtm_announced)
+		return;
+
+	forwarding = pim_dimt_forwarding_state(pim, up);
+	if (forwarding == up->gtm_forwarding)
+		return;
+
+	if (PIM_DEBUG_ZEBRA)
+		zlog_debug("GTM forwarding edge %pSG: %u -> %u", &up->sg,
+			   up->gtm_forwarding, forwarding);
+
+	/* Re-ADD carrying the new forwarding byte.  bgpd treats the ADD as
+	 * idempotent for entitlement -- install/origin_change timing is
+	 * unchanged (D4) -- and PR 4 turns this edge into the additive
+	 * forwarding_ready / forwarding_lost event. */
+	pim_zebra_mvpn_sg_send(up, up->gtm_role, true);
+}
+
 /* bgpd (via zebra) asked pimd to re-dump its announced MVPN SG set, e.g. after
  * a bgpd restart re-subscribed. Re-send an ADD for every announced (S,G). */
 static int pim_zebra_mvpn_sg_replay(ZAPI_CALLBACK_ARGS)
@@ -565,6 +619,26 @@ static int pim_zebra_umh(ZAPI_CALLBACK_ARGS)
 	}
 
 	pim_dimt_umh_update(pim, &zumh, cmd == ZEBRA_UMH_ADD);
+	return 0;
+}
+
+/* Native DIMT tunnel acknowledgement from zebra.  ZAPI has no request-id, so
+ * the pimd-allocated tunnel_id cookie re-echoed here is the correlation. */
+static int pim_zebra_dimt_tunnel_notify(ZAPI_CALLBACK_ARGS)
+{
+	struct pim_instance *pim = pim_get_pim_instance(vrf_id);
+	struct zapi_dimt_tunnel_notify notify;
+
+	if (!pim)
+		return 0;
+
+	if (zapi_dimt_tunnel_notify_decode(zclient->ibuf, &notify) < 0) {
+		zlog_warn("%s: DIMT tunnel notify decode failed (vrf %u)",
+			  __func__, vrf_id);
+		return 0;
+	}
+
+	pim_dimt_tunnel_notify(pim, &notify);
 	return 0;
 }
 
@@ -604,6 +678,9 @@ static zclient_handler *const pim_handlers[] = {
 	/* DIMT: bgpd-learned UMH mappings (AF filter inside). */
 	[ZEBRA_UMH_ADD] = pim_zebra_umh,
 	[ZEBRA_UMH_DEL] = pim_zebra_umh,
+
+	/* DIMT: native tunnel request acknowledgement. */
+	[ZEBRA_DIMT_TUNNEL_NOTIFY_OWNER] = pim_zebra_dimt_tunnel_notify,
 
 #if PIM_IPV == 4
 	[ZEBRA_VXLAN_SG_ADD] = pim_zebra_vxlan_sg_proc,

@@ -701,10 +701,32 @@ enum zapi_mvpn_sg_role {
 	ZAPI_MVPN_SG_SOURCE = 1,
 };
 
+/*
+ * Proven-forwarding state for an (S,G), aggregated by pimd and relayed to
+ * bgpd on the same message as the role.  pimd is the single authority: it is
+ * the only daemon that observes all three preconditions (tunnel netlink ack,
+ * RPF pin, kernel MFC admission).  Putting readiness on this message rather
+ * than inventing a channel makes restart replay correct for free, since
+ * ZEBRA_MVPN_SG_REPLAY already re-derives from pimd's own state.
+ *
+ * Additive: the byte is appended after `role`, and the decoder tolerates its
+ * absence so a peer built before this field still interoperates (an old
+ * sender is read as FWD_PENDING, which is the fail-closed default).
+ */
+enum zapi_mvpn_sg_forwarding {
+	/* join known; forwarding NOT proven */
+	ZAPI_MVPN_SG_FWD_PENDING = 0,
+	/* tunnel ack'd AND RPF pinned AND MFC admitted with the DIMT vif */
+	ZAPI_MVPN_SG_FWD_READY = 1,
+	/* a required step failed */
+	ZAPI_MVPN_SG_FWD_FAILED = 2,
+};
+
 struct zapi_mvpn_sg {
 	struct ipaddr src;
 	struct ipaddr grp;
-	uint8_t role; /* enum zapi_mvpn_sg_role */
+	uint8_t role;	    /* enum zapi_mvpn_sg_role */
+	uint8_t forwarding; /* enum zapi_mvpn_sg_forwarding */
 };
 
 /*

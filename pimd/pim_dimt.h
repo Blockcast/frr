@@ -29,6 +29,65 @@ struct pim_dimt_umh {
 	uint8_t preference; /* 0-15, higher preferred */
 };
 
+/*
+ * One explicitly configured tunnel endpoint for a UMH (contract D2).
+ *
+ * D2 refuses the Phase-A `10.99.X.Y <-> 100.64.X.Y` derivation outright: it is
+ * not injective, the v2/v3 shells disagree on `x.x.0.0` inputs, it cannot
+ * express an IPv6 outer, and it couples the settlement identity (the UMH) to
+ * subnet arithmetic.  So every field below is stated, never computed, and a
+ * UMH with no row simply gets no tunnel -- there is deliberately no default,
+ * no wildcard and no fallback mapping.
+ *
+ * The inner peer is not stored: it *is* the UMH, which is the list key.
+ */
+struct pim_dimt_endpoint {
+	pim_addr umh; /* key; also the inner peer address */
+	struct ipaddr inner_local;
+	struct ipaddr outer_local;
+	struct ipaddr outer_remote;
+	uint8_t encap; /* enum zapi_dimt_tunnel_encap */
+	uint16_t dport;
+	uint32_t key;
+	uint32_t mtu;
+	bool key_set;
+	bool mtu_set;
+};
+
+/*
+ * Tunnel request/ack state (contract D3).  Every transition is edge-triggered
+ * by a zapi notify, a routing event or an interface event; there is no timer,
+ * no poll and no hold-down anywhere in this state machine.
+ */
+enum pim_dimt_tunnel_state {
+	/* no request outstanding and nothing installed */
+	PIM_DIMT_TUNNEL_IDLE = 0,
+	/* ZEBRA_DIMT_TUNNEL_ADD sent, awaiting NOTIFY_OWNER */
+	PIM_DIMT_TUNNEL_REQUESTED,
+	/* NOTIFY_OWNER carried INSTALLED: positive netlink ack */
+	PIM_DIMT_TUNNEL_INSTALLED,
+	/* NOTIFY_OWNER carried FAIL_INSTALL */
+	PIM_DIMT_TUNNEL_FAILED,
+	/* ZEBRA_DIMT_TUNNEL_DEL sent, awaiting NOTIFY_OWNER */
+	PIM_DIMT_TUNNEL_REMOVING,
+};
+
+/* One native DIMT tunnel toward a UMH.  Demand is per-UMH, not per-(S,G):
+ * several upstreams may ride the same tunnel, so `refcount` gates the
+ * ADD/DEL edges. */
+struct pim_dimt_tunnel {
+	pim_addr umh; /* key */
+	uint32_t tunnel_id;
+	/* exact request last sent; zebra treats a byte-identical re-ADD as
+	 * idempotent (memcmp), which is what makes reconnect replay safe */
+	struct zapi_dimt_tunnel req;
+	enum pim_dimt_tunnel_state state;
+	ifindex_t ifindex;	 /* learned from the notify, 0 until then */
+	char ifname[IFNAMSIZ];	 /* dimt-%08x, re-derived from tunnel_id */
+	uint32_t refcount;	 /* upstreams demanding this tunnel */
+	bool readd_pending;	 /* demand returned while REMOVING */
+};
+
 void pim_dimt_init(struct pim_instance *pim);
 void pim_dimt_terminate(struct pim_instance *pim);
 
@@ -55,5 +114,46 @@ void pim_dimt_iface_down(struct pim_instance *pim, struct interface *ifp);
 void pim_dimt_iface_up(struct pim_instance *pim, struct interface *ifp);
 
 void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json);
+void pim_dimt_show_tunnel(struct pim_instance *pim, struct vty *vty, bool json);
+
+/* --- explicit endpoint configuration (D2) --- */
+
+/* Install/replace the row for `umh`.  Returns false only on a malformed row
+ * (mismatched families, gre-in-fou without a dport). */
+bool pim_dimt_endpoint_set(struct pim_instance *pim,
+			   const struct pim_dimt_endpoint *ep);
+void pim_dimt_endpoint_unset(struct pim_instance *pim, pim_addr umh);
+int pim_dimt_endpoint_config_write(struct pim_instance *pim, struct vty *vty);
+
+/* --- tunnel request/ack state machine (D3) --- */
+
+/* ZEBRA_DIMT_TUNNEL_NOTIFY_OWNER from zebra: the only ack that counts. */
+void pim_dimt_tunnel_notify(struct pim_instance *pim,
+			    const struct zapi_dimt_tunnel_notify *notify);
+
+/* Recompute tunnel demand and readiness across every upstream.  Called on a
+ * UMH change, an interface event, and on zebra reconnect. */
+void pim_dimt_reconcile(struct pim_instance *pim);
+
+/* Drop acknowledgement state for every tunnel without sending anything --
+ * the zebra session that owned those requests is gone, so nothing can be
+ * acked over it.  Tunnel identity (id + request bytes) is deliberately kept
+ * so the reconnect re-ADD is byte-identical and re-adopts the surviving
+ * netdev; kernel netdevs survive on purpose and zebra MUST NOT sweep them. */
+void pim_dimt_tunnel_session_reset(struct pim_instance *pim);
+
+/* True once zebra has positively acked the netdev backing this upstream's
+ * UMH.  Readiness proper additionally requires the kernel MFC check. */
+enum zapi_mvpn_sg_forwarding
+pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up);
+
+/* Re-evaluate readiness for every upstream and relay any edge to bgpd.
+ * Cheap and idempotent: only a changed state produces a message. */
+void pim_dimt_readiness_update(struct pim_instance *pim);
+
+/* An interface pimd asked zebra to create just appeared (or got its inner
+ * address): adopt it as a PIM Light interface so it can carry the pin and
+ * become a vif.  No-op for interfaces we did not request. */
+void pim_dimt_ifp_adopt(struct pim_instance *pim, struct interface *ifp);
 
 #endif /* PIM_DIMT_H */
