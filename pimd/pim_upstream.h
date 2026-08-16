@@ -265,6 +265,10 @@ struct pim_upstream {
 	 * role (enum zapi_mvpn_sg_role) so the withdraw matches the announce. */
 	bool gtm_announced;
 	uint8_t gtm_role;
+	/* Last forwarding state (enum zapi_mvpn_sg_forwarding) relayed to
+	 * bgpd for this (S,G).  Kept so readiness is re-announced only on a
+	 * real edge rather than on every reconcile pass. */
+	uint8_t gtm_forwarding;
 
 	int ref_count;
 

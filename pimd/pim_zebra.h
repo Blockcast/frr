@@ -37,4 +37,9 @@ void pim_zebra_interface_set_master(struct interface *vrf,
  * deleting=true just before the upstream is torn down. */
 void pim_gtm_upstream_update(struct pim_instance *pim, struct pim_upstream *up,
 			     bool deleting);
+
+/* Relay a change in DIMT proven-forwarding state for an already-announced
+ * (S,G).  Edge-triggered: an unchanged state sends nothing. */
+void pim_gtm_forwarding_update(struct pim_instance *pim,
+			       struct pim_upstream *up);
 #endif /* PIM_ZEBRA_H */

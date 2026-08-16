@@ -4201,6 +4201,7 @@ int zapi_mvpn_sg_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
 	stream_put_ipaddr(s, &sg->src);
 	stream_put_ipaddr(s, &sg->grp);
 	stream_putc(s, sg->role);
+	stream_putc(s, sg->forwarding);
 
 	/* Put length at the first point of the stream. */
 	stream_putw_at(s, 0, stream_get_endp(s));
@@ -4215,6 +4216,17 @@ int zapi_mvpn_sg_decode(struct stream *s, struct zapi_mvpn_sg *sg)
 	STREAM_GET_IPADDR(s, &sg->src);
 	STREAM_GET_IPADDR(s, &sg->grp);
 	STREAM_GETC(s, sg->role);
+
+	/*
+	 * `forwarding` is additive.  A peer built before it simply stops the
+	 * message after `role`; memset() above already left the field at
+	 * ZAPI_MVPN_SG_FWD_PENDING, which is the fail-closed reading.
+	 */
+	if (STREAM_READABLE(s) >= 1)
+		STREAM_GETC(s, sg->forwarding);
+
+	if (sg->forwarding > ZAPI_MVPN_SG_FWD_FAILED)
+		return -1;
 
 	return 0;
 
