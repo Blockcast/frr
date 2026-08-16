@@ -159,8 +159,26 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 {
 	if (PIM_UPSTREAM_FLAG_TEST_STATIC_IIF(up->flags) &&
 	    up->rpf.source_nexthop.interface == ifp &&
-	    !pim_addr_cmp(up->rpf.rpf_addr, umh->umh))
+	    !pim_addr_cmp(up->rpf.rpf_addr, umh->umh)) {
+		/* The pin is unchanged, but the vif index backing it may not
+		 * be.  pim_if_add_vif() refuses an interface whose primary
+		 * address is still unset (pim_iface.c, -4), and a DIMT netdev
+		 * is adopted on the INSTALLED notify -- which zebra emits off
+		 * the dplane ack, before the inner address it just programmed
+		 * has come back round to pimd as a connected route.  So the
+		 * first pin here routinely runs with mroute_vif_index == -1
+		 * and programs a bogus iif.  pim_if_addr_add() later retries
+		 * pim_if_add_vif() and the vif becomes real, but it reaches
+		 * this pin through pim_dimt_iface_up() -- which lands exactly
+		 * on this early return, so nothing would ever re-program the
+		 * MFC and readiness could never see the DIMT vif admitted.
+		 * Refresh it here: the helper recomputes the iif from the
+		 * interface and no-ops when it is genuinely unchanged. */
+		if (up->channel_oil)
+			pim_upstream_mroute_iif_update(up->channel_oil,
+						       __func__);
 		return;
+	}
 
 	if (PIM_DEBUG_PIM_TRACE)
 		zlog_debug("DIMT: pinning %s RPF to %s via UMH %pPAs",
@@ -678,6 +696,17 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 	struct pim_dimt_endpoint *ep;
 
 	if (!pim->dimt_tunnel_list || !pim->dimt_endpoint_list)
+		return;
+
+	/* Both lists are allocated unconditionally by pim_dimt_init(), so the
+	 * NULL check above never fires on a live instance.  This one does:
+	 * with no endpoint rows no tunnel can be created (the walk below needs
+	 * an ep), and with no tunnels there is nothing to tear down -- so the
+	 * answer cannot change and the upstream walk is pure cost.  That keeps
+	 * the pim_upstream_new()/pim_upstream_del() hooks free for every
+	 * deployment not using DIMT, which is the overwhelming majority. */
+	if (!listcount(pim->dimt_endpoint_list) &&
+	    !listcount(pim->dimt_tunnel_list))
 		return;
 
 	/* Recount demand from scratch rather than incrementing on events:
