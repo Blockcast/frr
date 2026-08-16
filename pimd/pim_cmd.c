@@ -9405,6 +9405,8 @@ static void pim_install_deprecated(void)
 {
 	install_element(CONFIG_NODE, &ip_pim_rp_cmd);
 	install_element(VRF_NODE, &ip_pim_rp_cmd);
+	install_element(CONFIG_NODE, &pim_dimt_tunnel_endpoint_cmd);
+	install_element(VRF_NODE, &pim_dimt_tunnel_endpoint_cmd);
 	install_element(CONFIG_NODE, &no_ip_pim_rp_cmd);
 	install_element(VRF_NODE, &no_ip_pim_rp_cmd);
 	install_element(CONFIG_NODE, &ip_pim_rp_prefix_list_cmd);
@@ -9679,6 +9681,7 @@ void pim_cmd_init(void)
 	install_element(VIEW_NODE, &show_ip_pim_upstream_vrf_all_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_channel_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_dimt_umh_cmd);
+	install_element(VIEW_NODE, &show_ip_pim_dimt_tunnel_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_join_desired_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_rpf_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_rp_cmd);

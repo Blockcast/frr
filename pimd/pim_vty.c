@@ -30,6 +30,7 @@
 #include "pim_bfd.h"
 #include "pim_bsm.h"
 #include "pim_vxlan.h"
+#include "pim_dimt.h"
 #include "pim_nht.h"
 #include "pim6_mld.h"
 
@@ -296,6 +297,11 @@ int pim_global_config_write_worker(struct pim_instance *pim, struct vty *vty)
 		vty_out(vty, " shutdown\n");
 		++writes;
 	}
+
+	/* Explicit DIMT tunnel-endpoint rows (contract D2). These are pure
+	 * configuration -- there is no derivation that could regenerate them --
+	 * so they must round-trip through the running config. */
+	writes += pim_dimt_endpoint_config_write(pim, vty);
 
 	return writes;
 }
