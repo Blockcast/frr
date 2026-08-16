@@ -595,6 +595,31 @@ keyword at the end.
    interface.  Only ``pim``-type mappings steer RPF; ``amt-relay`` mappings
    are recorded and displayed but not acted on.
 
+   ``PinSource`` reports which resolver chose that interface, and is the way to
+   tell a healthy pin from a stalled one:
+
+   ``tunnel``
+      the native DIMT tunnel netdev serving this UMH.
+
+   ``light``
+      a configured PIM Light interface whose connected subnet covers the UMH.
+      Only used when no DIMT tunnel exists for it.
+
+   ``tunnel-pending``
+      a tunnel is demanded but its netdev is not usable yet, so nothing is
+      pinned.  Pinning a covering non-tunnel interface instead would never
+      satisfy the readiness check, so this state deliberately waits rather than
+      pinning somewhere that cannot forward.
+
+   ``none``
+      nothing resolves.
+
+   ``Shadowed`` (``shadowedInterface`` in JSON, omitted when empty) names a PIM
+   Light interface that also covers the UMH but did **not** get the pin, because
+   a DIMT tunnel takes it unconditionally.  Its presence means the
+   configuration is ambiguous -- more than one interface could have carried the
+   pin -- and it is shown so that resolution is auditable rather than silent.
+
 .. clicmd:: show ip pim [vrf NAME] dimt tunnel [json]
 
    Display the DIMT tunnel request/acknowledgement state, one row per UMH:

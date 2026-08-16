@@ -116,12 +116,34 @@ static struct pim_dimt_umh *pim_dimt_umh_lookup(struct pim_instance *pim,
 	return best;
 }
 
-/* The light interface facing a UMH: pim and pim-light enabled and a
- * connected (or ptp peer) subnet containing the UMH address.  Requiring
- * pim_enable filters out interfaces that cannot send joins and interfaces
- * mid-teardown by `no ip pim`. */
-static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
-					      pim_addr umh_addr)
+static struct pim_dimt_tunnel *pim_dimt_tunnel_find(struct pim_instance *pim,
+						    pim_addr umh);
+
+/* Is this interface usable as an RPF pin target?  pim_enable filters out
+ * interfaces that cannot send joins and interfaces mid-teardown by
+ * `no ip pim`; pim_light_enable is what makes a neighborless pin legal. */
+static bool pim_dimt_iface_pinnable(struct interface *ifp)
+{
+	struct pim_interface *pim_ifp;
+
+	if (!ifp)
+		return false;
+
+	pim_ifp = ifp->info;
+
+	return pim_ifp && pim_ifp->pim_enable && pim_ifp->pim_light_enable &&
+	       if_is_operative(ifp);
+}
+
+/* First pinnable, *non-tunnel* light interface whose connected subnet (or ptp
+ * peer) covers the UMH.  This is the Phase-B resolver, and it is retained
+ * verbatim for the no-tunnel case -- but it is order-dependent by nature
+ * (FOR_ALL_INTERFACES has no defined order w.r.t. netdev creation), so it is
+ * never allowed to answer for a UMH that has a tunnel.  `skip` excludes the
+ * DIMT netdev so the result is a genuine second candidate. */
+static struct interface *pim_dimt_covering_iface(struct pim_instance *pim,
+						 pim_addr umh_addr,
+						 const struct interface *skip)
 {
 	struct interface *ifp;
 	struct prefix pumh;
@@ -129,11 +151,9 @@ static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
 	pim_addr_to_prefix(&pumh, umh_addr);
 
 	FOR_ALL_INTERFACES (pim->vrf, ifp) {
-		struct pim_interface *pim_ifp = ifp->info;
 		struct connected *c;
 
-		if (!pim_ifp || !pim_ifp->pim_enable ||
-		    !pim_ifp->pim_light_enable || !if_is_operative(ifp))
+		if (ifp == skip || !pim_dimt_iface_pinnable(ifp))
 			continue;
 
 		frr_each (if_connected, ifp->connected, c) {
@@ -148,6 +168,104 @@ static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
 	}
 
 	return NULL;
+}
+
+/* How a UMH's RPF pin resolved.  Recorded so the choice is observable:
+ * the failure this exists to kill was silent precisely because a wrong
+ * answer and a right answer were indistinguishable from the box. */
+enum pim_dimt_pin_source {
+	/* nothing resolves; no pin */
+	PIM_DIMT_PIN_NONE = 0,
+	/* the DIMT netdev serving this UMH */
+	PIM_DIMT_PIN_TUNNEL,
+	/* a configured pim-light interface covering the UMH (no tunnel) */
+	PIM_DIMT_PIN_LIGHT,
+	/* a tunnel is demanded but its netdev is not pinnable yet */
+	PIM_DIMT_PIN_TUNNEL_PENDING,
+};
+
+struct pim_dimt_pin {
+	struct interface *ifp; /* pin target, NULL when unresolved */
+	enum pim_dimt_pin_source source;
+	/* A covering non-tunnel interface that did NOT get the pin.  Only the
+	 * tunnel cases can shadow, and reporting it is the whole point: an
+	 * operator can see which interface lost. */
+	struct interface *shadowed;
+};
+
+/* Resolve the RPF pin for a UMH, deterministically.
+ *
+ * The rule: if a DIMT tunnel exists for this UMH, that tunnel's netdev is the
+ * ONLY legal pin target.  Otherwise fall back to the Phase-B covering-subnet
+ * search.
+ *
+ * Why the tunnel wins outright rather than merely being preferred: the old
+ * resolver matched per-interface with no tunnel preference, so a `/24` underlay
+ * covering the UMH was exactly as good a match as the tunnel's own `/32` ptp
+ * peer, and FOR_ALL_INTERFACES order decided which won.  When the underlay won,
+ * readiness conjunct (2) in pim_dimt_forwarding_state() -- rpf interface ==
+ * tunnel ifindex -- could never hold, so the tunnel installed clean and never
+ * forwarded, with no error and no log.  Preferring the ptp match would only
+ * narrow that race (any other ptp link toward the UMH re-opens it); resolving
+ * from the tunnel list closes it.
+ *
+ * Fail-closed while the tunnel is pending: no pin at all, rather than a
+ * transient pin onto the underlay.  A pin the tunnel does not own can never
+ * satisfy conjunct (2), so it buys no forwarding -- it only reintroduces the
+ * ambiguity.  pim_dimt_ifp_adopt() -> pim_dimt_iface_up() re-resolves every
+ * upstream the moment the netdev appears, which is what makes waiting safe. */
+static void pim_dimt_resolve_pin(struct pim_instance *pim, pim_addr umh_addr,
+				 struct pim_dimt_pin *pin)
+{
+	struct pim_dimt_tunnel *tun;
+	struct interface *tun_ifp = NULL;
+
+	memset(pin, 0, sizeof(*pin));
+
+	tun = pim_dimt_tunnel_find(pim, umh_addr);
+	if (!tun) {
+		pin->ifp = pim_dimt_covering_iface(pim, umh_addr, NULL);
+		pin->source = pin->ifp ? PIM_DIMT_PIN_LIGHT : PIM_DIMT_PIN_NONE;
+		return;
+	}
+
+	/* ifindex is 0 until the INSTALLED notify lands, and is reset to 0 on
+	 * FAIL_INSTALL and REMOVED -- so a non-zero ifindex is exactly "zebra
+	 * has acked a netdev for this tunnel". */
+	if (tun->ifindex)
+		tun_ifp = if_lookup_by_index(tun->ifindex, pim->vrf->vrf_id);
+
+	pin->shadowed = pim_dimt_covering_iface(pim, umh_addr, tun_ifp);
+
+	if (pim_dimt_iface_pinnable(tun_ifp)) {
+		pin->ifp = tun_ifp;
+		pin->source = PIM_DIMT_PIN_TUNNEL;
+	} else {
+		/* Deliberately no fallback: see the comment above. */
+		pin->source = PIM_DIMT_PIN_TUNNEL_PENDING;
+	}
+}
+
+/* The interface a UMH's RPF pin belongs on, or NULL. */
+static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
+					      pim_addr umh_addr)
+{
+	struct pim_dimt_pin pin;
+
+	pim_dimt_resolve_pin(pim, umh_addr, &pin);
+
+	if (PIM_DEBUG_PIM_TRACE && pin.shadowed)
+		zlog_debug("DIMT: UMH %pPAs pin resolves to %s; covering interface %s does not carry it",
+			   &umh_addr,
+			   pin.ifp ? pin.ifp->name : "none (tunnel pending)",
+			   pin.shadowed->name);
+
+	if (PIM_DEBUG_PIM_TRACE &&
+	    pin.source == PIM_DIMT_PIN_TUNNEL_PENDING)
+		zlog_debug("DIMT: UMH %pPAs has a tunnel but its netdev is not pinnable yet; not pinning",
+			   &umh_addr);
+
+	return pin.ifp;
 }
 
 /* Pin an upstream's RPF onto the light interface facing its UMH.
@@ -480,21 +598,34 @@ void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json)
 	struct listnode *node;
 	struct pim_dimt_umh *umh;
 	json_object *jobj = NULL;
+	/* Which resolver answered.  "tunnel-pending" is not cosmetic: it is the
+	 * state that used to be indistinguishable from a healthy pin. */
+	static const char *const sources[] = {
+		[PIM_DIMT_PIN_NONE] = "none",
+		[PIM_DIMT_PIN_TUNNEL] = "tunnel",
+		[PIM_DIMT_PIN_LIGHT] = "light",
+		[PIM_DIMT_PIN_TUNNEL_PENDING] = "tunnel-pending",
+	};
 
 	if (json)
 		jobj = json_object_new_object();
 	else
-		vty_out(vty, "%-22s %-16s %-10s %-4s %s\n", "Prefix", "UMH",
-			"Type", "Pref", "Interface");
+		vty_out(vty, "%-22s %-16s %-10s %-4s %-16s %-14s %s\n", "Prefix",
+			"UMH", "Type", "Pref", "Interface", "PinSource",
+			"Shadowed");
 
 	for (ALL_LIST_ELEMENTS_RO(pim->dimt_umh_list, node, umh)) {
-		struct interface *ifp = pim_dimt_light_iface(pim, umh->umh);
+		struct pim_dimt_pin pin;
+		struct interface *ifp;
 		const char *type = umh->umh_type == ZAPI_UMH_TYPE_PIM
 					   ? "pim"
 					   : (umh->umh_type ==
 						      ZAPI_UMH_TYPE_AMT_RELAY
 						      ? "amt-relay"
 						      : "unknown");
+
+		pim_dimt_resolve_pin(pim, umh->umh, &pin);
+		ifp = pin.ifp;
 
 		if (jobj) {
 			json_object *jumh = json_object_new_object();
@@ -511,11 +642,21 @@ void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json)
 					    umh->preference);
 			json_object_string_add(jumh, "interface",
 					       ifp ? ifp->name : "none");
+			json_object_string_add(jumh, "pinSource",
+					       sources[pin.source]);
+			/* Present only when a covering interface actually lost,
+			 * so its mere presence is the ambiguity signal. */
+			if (pin.shadowed)
+				json_object_string_add(jumh, "shadowedInterface",
+						       pin.shadowed->name);
 			json_object_object_add(jobj, pfx_str, jumh);
 		} else {
-			vty_out(vty, "%-22pFX %-16pPAs %-10s %-4u %s\n",
+			vty_out(vty,
+				"%-22pFX %-16pPAs %-10s %-4u %-16s %-14s %s\n",
 				&umh->prefix, &umh->umh, type,
-				umh->preference, ifp ? ifp->name : "none");
+				umh->preference, ifp ? ifp->name : "none",
+				sources[pin.source],
+				pin.shadowed ? pin.shadowed->name : "-");
 		}
 	}
 
