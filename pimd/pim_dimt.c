@@ -950,7 +950,11 @@ pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up)
 	pim_ifp = ifp->info;
 	if (!pim_ifp || pim_ifp->mroute_vif_index < 0)
 		return ZAPI_MVPN_SG_FWD_PENDING;
-	if (*oil_incoming_vif(c_oil) != (vifi_t)pim_ifp->mroute_vif_index)
+	/* Compare through int: this file is in pim_common, so it is compiled
+	 * for pim6d as well, where oil_incoming_vif() returns mifi_t rather
+	 * than vifi_t (and vifi_t is an IPv4-only mroute type). int is wide
+	 * enough for both and keeps the comparison free of -Wsign-compare. */
+	if ((int)*oil_incoming_vif(c_oil) != (int)pim_ifp->mroute_vif_index)
 		return ZAPI_MVPN_SG_FWD_PENDING;
 
 	return ZAPI_MVPN_SG_FWD_READY;
