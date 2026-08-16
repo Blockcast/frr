@@ -291,6 +291,14 @@ struct pim_upstream *pim_upstream_del(struct pim_instance *pim,
 
 	XFREE(MTYPE_PIM_UPSTREAM, up);
 
+	/* Deliberately after rb_pim_upstream_del() + XFREE: pim_dimt_reconcile()
+	 * recounts demand by walking upstream_head, so it must not still see
+	 * this one.  This is the leave edge -- nothing else decrements tunnel
+	 * demand (there is no refcount--; the recount is from scratch by
+	 * design), so without this a tunnel stays `installed` forever after the
+	 * last receiver goes away. */
+	pim_dimt_reconcile(pim);
+
 	return NULL;
 }
 
@@ -1318,6 +1326,15 @@ static struct pim_upstream *pim_upstream_new(struct pim_instance *pim,
 	/* DIMT: a bgpd-learned UMH mapping overrides the RPF just
 	 * computed (or repairs a failed one). */
 	pim_dimt_upstream_apply(pim, up);
+
+	/* ...and this new upstream may be fresh tunnel demand.  Applying the
+	 * pin is not enough: pim_dimt_reconcile() is the only thing that
+	 * recounts demand and drives the ADD/DEL edges, so without this a
+	 * tunnel is created only when the UMH mapping happens to arrive after
+	 * the upstream (mapping-arrival reconciles and finds it).  Reverse
+	 * that order -- mapping already present, receiver joins later, which
+	 * is the steady-state case -- and no tunnel would ever be built. */
+	pim_dimt_reconcile(pim);
 
 	if (PIM_DEBUG_PIM_TRACE) {
 		zlog_debug(
