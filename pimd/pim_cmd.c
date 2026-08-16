@@ -2751,20 +2751,24 @@ DEFPY (pim_dimt_tunnel_endpoint,
 	ep.inner_local.ipa_type = IPADDR_V4;
 	ep.inner_local.ipaddr_v4 = inner_local;
 
-	if (outer_local_str && strchr(outer_local_str, ':')) {
+	/* A <A.B.C.D|X:X::X:X>$name token merges to clippy's IPGenHandler, so
+	 * the generated argument is a "const union sockunion *" -- there is no
+	 * $name_v4 / $name_v6 pair.  Take the family from the sockunion clippy
+	 * already parsed rather than re-sniffing $name_str for a ':'. */
+	if (outer_local->sa.sa_family == AF_INET6) {
 		ep.outer_local.ipa_type = IPADDR_V6;
-		ep.outer_local.ipaddr_v6 = outer_local_v6;
+		ep.outer_local.ipaddr_v6 = outer_local->sin6.sin6_addr;
 	} else {
 		ep.outer_local.ipa_type = IPADDR_V4;
-		ep.outer_local.ipaddr_v4 = outer_local_v4;
+		ep.outer_local.ipaddr_v4 = outer_local->sin.sin_addr;
 	}
 
-	if (outer_remote_str && strchr(outer_remote_str, ':')) {
+	if (outer_remote->sa.sa_family == AF_INET6) {
 		ep.outer_remote.ipa_type = IPADDR_V6;
-		ep.outer_remote.ipaddr_v6 = outer_remote_v6;
+		ep.outer_remote.ipaddr_v6 = outer_remote->sin6.sin6_addr;
 	} else {
 		ep.outer_remote.ipa_type = IPADDR_V4;
-		ep.outer_remote.ipaddr_v4 = outer_remote_v4;
+		ep.outer_remote.ipaddr_v4 = outer_remote->sin.sin_addr;
 	}
 
 	ep.encap = strmatch(encap, "gre-in-fou")

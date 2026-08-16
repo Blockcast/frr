@@ -37,6 +37,7 @@
 #include "pim_oil.h"
 #include "pim_mroute.h"
 #include "pim_str.h"
+#include "pim_zebra.h"
 #include "pim_dimt.h"
 
 extern struct zclient *pim_zclient;
