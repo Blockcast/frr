@@ -943,7 +943,26 @@ pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up)
 	 * incoming vif of that entry.  c_oil->installed is set only from the
 	 * return of the actual MRT_ADD_MFC setsockopt, so this reads kernel
 	 * acceptance rather than pimd's intent -- asking pimd whether pimd
-	 * believes it programmed the OIL would be vacuous. */
+	 * believes it programmed the OIL would be vacuous (G10).
+	 *
+	 * NOTE -- deliberate divergence from the contract's wording, not from
+	 * its intent.  D3/D4/D6 each say "DIMT vif in the OIL" / "DIMT oif".
+	 * Read literally that is wrong for the daemon that runs this code:
+	 * this is the *requesting*, receiver-side router (D3 create: "Local
+	 * join ... -> pimd resolves UMH -> ZEBRA_DIMT_TUNNEL_ADD"), so
+	 * multicast ARRIVES over the tunnel.  The DIMT vif is therefore the
+	 * incoming vif; a DIMT vif in that router's OIL would be a forwarding
+	 * loop, and gating readiness on it would mean gating on a bug.
+	 *
+	 * The incoming-vif reading is also the only one that makes D3's three
+	 * conjuncts independent: (1) is zebra's netlink ack, (2) is pimd's
+	 * own control-plane RPF belief, and (3) is what the KERNEL actually
+	 * admitted.  Under an OIL reading, (3) collapses into (2) and the
+	 * contract loses exactly the control-plane-vs-kernel distinction it
+	 * exists to enforce.  "OIL" is read as shorthand for "the kernel MFC
+	 * entry".  Raised for a wording erratum on BLO-27738; the strict
+	 * incoming-vif check is the stronger of the two readings, so it is
+	 * safe to land ahead of that. */
 	c_oil = up->channel_oil;
 	if (!c_oil || !c_oil->installed)
 		return ZAPI_MVPN_SG_FWD_PENDING;
