@@ -178,12 +178,51 @@ def check_no_ip_mr_cache(router, source, group):
     return "kernel MFC still holds ({},{}): {}".format(source, group, matches)
 
 
+def link_names(router):
+    """Every netdev name the kernel currently holds, or None if unreadable.
+
+    Enumerating is what lets absence be asserted from positive evidence.
+    Asking about one device cannot: `ip link show dev X` fails the same
+    visible way whether X is gone, the name was mistyped, or `ip` itself
+    could not run, so a checker built on it reports "absent" for all three.
+    """
+    output = router.run("ip -o link show 2>&1")
+    names = set()
+    for line in output.splitlines():
+        match = re.match(r"^\d+:\s+([^:@\s]+)", line)
+        if match:
+            names.add(match.group(1))
+    # Every namespace has a loopback; an enumeration without one did not run.
+    if not names:
+        return None
+    return names
+
+
 def check_link_absent(router, interface):
     """Check a netdev is gone from the kernel entirely."""
-    output = router.run("ip link show dev {} 2>&1".format(shlex.quote(interface)))
-    if re.search(r"^\d+:\s+{}(?:@\S+)?:".format(re.escape(interface)), output, re.M):
-        return "kernel link {} still present: {}".format(interface, output.strip())
+    names = link_names(router)
+    if names is None:
+        return "could not enumerate kernel links on {}, so the absence of {} is unproven".format(
+            router.name, interface
+        )
+    if interface in names:
+        return "kernel link {} still present: {}".format(
+            interface, sorted(names)
+        )
     return None
+
+
+def link_ifindex(router, interface):
+    """The kernel ifindex of a netdev, or None when it does not exist.
+
+    Identity, not just existence: a netdev deleted and rebuilt under the same
+    name is a different device, and the ifindex is what says so.
+    """
+    output = router.run(
+        "ip -o link show dev {} 2>&1".format(shlex.quote(interface))
+    )
+    match = re.match(r"^(\d+):\s+{}(?:@\S+)?:".format(re.escape(interface)), output)
+    return int(match.group(1)) if match else None
 
 
 def check_gre_link(router, interface, local, remote, mtu=None, expected_up=True):

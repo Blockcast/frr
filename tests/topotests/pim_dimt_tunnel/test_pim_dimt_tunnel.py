@@ -96,6 +96,7 @@ from lib.kernel_state import (
     check_ip_mr_cache_iif,
     check_link_absent,
     check_no_ip_mr_cache,
+    link_ifindex,
     resolve_mr_vif,
 )
 from lib.topogen import Topogen, TopoRouter, get_topogen
@@ -113,6 +114,11 @@ OUTER_REMOTE = "10.0.0.1"
 # Second outer for the endpoint re-point stage.  On the same underlay subnet as
 # OUTER_REMOTE, so the only thing that changes is the value in the request.
 NEW_OUTER_REMOTE = "10.0.0.9"
+# A second (S,G) inside the same advertised source prefix, so it resolves to
+# the same UMH and therefore rides the tunnel that already exists.
+SECOND_SOURCE = "10.10.10.11"
+SECOND_GROUP = "232.1.1.11"
+SECOND_SG = "(10.10.10.11,232.1.1.11)"
 
 
 def build_topo(tgen):
@@ -636,6 +642,162 @@ def umh_pin_row_present(router):
         "dimt tunnel-endpoint" in ln
         for ln in router.vtysh_cmd("show running-config").splitlines()
     )
+
+
+# --- D8.3: the verdict bgpd was given, not the one recomputed on read -----
+
+
+def forwarding_entry(router, sg):
+    output = json.loads(router.vtysh_cmd("show ip pim dimt forwarding json"))
+    return output.get(sg)
+
+
+def check_announced(router, sg, expected):
+    """What pimd last SENT for this (S,G), not what it would compute now.
+
+    `forwarding` is recalculated on every read of the show command, so it is
+    right whenever anyone looks and says nothing about whether the edge was
+    ever relayed.  `announcedForwarding` is the byte that actually left on
+    the wire, which is the only thing bgpd can act on.
+    """
+    entry = forwarding_entry(router, sg)
+    if entry is None:
+        return "pimd reports no DIMT-steered upstream for {}".format(sg)
+    if not entry.get("announced"):
+        return "{} is not announced to bgpd yet: {}".format(sg, entry)
+    if entry.get("announcedForwarding") != expected:
+        return "{} was announced as {}, expected {}: {}".format(
+            sg, entry.get("announcedForwarding"), expected, entry
+        )
+    return None
+
+
+def test_second_sg_on_a_live_tunnel_is_announced_ready():
+    """A later (S,G) shares the existing tunnel and is announced ready.
+
+    Every earlier stage drives a single (S,G), so nothing pinned what happens
+    when demand for a UMH arrives more than once: that the second join rides
+    the tunnel already built (refcount, not a second netdev), that the kernel
+    admits it on the same vif, and that bgpd is told it forwards.
+
+    This is a regression guard, not the proof of a fix.  It was written to
+    catch a suspected gap -- a second (S,G) getting neither a notify nor an
+    interface event, and so never having its verdict relayed -- and it does
+    not: removing the announce hooks that gap would need leaves this green,
+    because the (S,G) does not reach JOINED (and so is not announced at all)
+    until after its MFC is installed, and the announcing ADD therefore
+    already carries the right byte.  The check is on `announcedForwarding`
+    rather than `forwarding` regardless, since the latter is recomputed on
+    every read and could not distinguish the two cases.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    r2 = tgen.gears["r2"]
+
+    # Precondition: the tunnel is up and serving the original (S,G).
+    expect(lambda: check_tunnel_state(r2, "installed"))
+    ifname = tunnel_ifname(r2)
+    before = tunnel_entry(r2)
+
+    r2.vtysh_cmd(
+        "conf t\ninterface r2-eth1\nip igmp static-group {} {}".format(
+            SECOND_GROUP, SECOND_SOURCE
+        )
+    )
+
+    # The kernel admits it on the same DIMT vif...
+    vif, error = resolve_mr_vif(r2, ifname)
+    assert error is None, error
+    expect(
+        lambda: check_ip_mr_cache_iif(r2, SECOND_SOURCE, SECOND_GROUP, vif)
+    )
+
+    # ...and bgpd is told so.
+    expect(lambda: check_announced(r2, SECOND_SG, "ready"))
+
+    # Riding the existing tunnel, not building a second one: same tunnel id,
+    # so the refcount -- not a new netdev -- is what carried the new demand.
+    after = tunnel_entry(r2)
+    assert after["tunnelId"] == before["tunnelId"], (
+        "the second (S,G) minted a new tunnel instead of sharing: "
+        "{} -> {}".format(before, after)
+    )
+
+    r2.vtysh_cmd(
+        "conf t\ninterface r2-eth1\nno ip igmp static-group {} {}".format(
+            SECOND_GROUP, SECOND_SOURCE
+        )
+    )
+    expect(lambda: check_no_ip_mr_cache(r2, SECOND_SOURCE, SECOND_GROUP))
+
+
+# --- D4: a zebra reconnect must not disturb a tunnel nobody stopped wanting
+
+
+def test_zebra_reconnect_holds_demand_while_bgpd_is_away():
+    """A zebra reconnect must not tear down a tunnel nobody stopped wanting.
+
+    Re-subscribing to the UMH relay used to empty the mapping table first and
+    recount demand from it.  An emptied table reads as zero demand, so the
+    reconnect itself tore the tunnel down -- a control-plane event destroying
+    a data plane that was never in question.
+
+    bgpd is stopped first, which is what makes the difference observable.
+    With bgpd running the replay lands within milliseconds and rebuilds
+    everything, so both behaviours look alike from outside; with bgpd away
+    nothing can rebuild, and only held demand keeps the tunnel up.  It also
+    exercises the case the hold exists for: the mappings are still true, it
+    is the daemon that can restate them that is missing.
+
+    Then the other half, which is why holding is bounded: once the grace
+    expires with no replay, the mappings really are gone and the tunnel is
+    taken down rather than held forever.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    r2 = tgen.gears["r2"]
+
+    expect(lambda: check_tunnel_state(r2, "installed"))
+    ifname = tunnel_ifname(r2)
+    before = link_ifindex(r2, ifname)
+    assert before is not None, "no kernel link {} before the restart".format(ifname)
+
+    kill_router_daemons(tgen, "r2", ["bgpd"])
+
+    kill_router_daemons(tgen, "r2", ["zebra"])
+    start_router_daemons(tgen, "r2", ["zebra"])
+
+    # Settle before asserting.  Polling immediately would read the state from
+    # before the restart and pass without pimd having processed the reconnect
+    # at all -- the tunnel row does not change until then, so an early match
+    # proves nothing.  Well inside the grace period either way.
+    topotest.sleep(8, "waiting for pimd to process the zebra reconnect")
+
+    # Demand survived the reconnect, so the tunnel is re-requested from the
+    # identity that was kept, and acked against the netdev already there.
+    expect(lambda: check_tunnel_state(r2, "installed"), count=10)
+    after = link_ifindex(r2, ifname)
+    assert after == before, (
+        "the DIMT netdev was replaced across the zebra restart "
+        "(ifindex {} -> {})".format(before, after)
+    )
+
+    # ...and the hold is bounded: with no replay to reassert them, the
+    # mappings expire and the tunnel goes away rather than lingering.
+    expect(lambda: None if not umh_entry(r2) else "UMH mapping still held",
+           count=60)
+    expect(lambda: check_no_tunnel(r2), count=30)
+    expect(lambda: check_link_absent(r2, ifname), count=30)
+
+    # bgpd back: the mapping returns and so does the tunnel, so the sweep
+    # cleared state rather than wedging it.
+    start_router_daemons(tgen, "r2", ["bgpd"])
+    expect(lambda: None if umh_entry(r2) else "UMH mapping did not return",
+           count=60)
+    expect(lambda: check_tunnel_state(r2, "installed"), count=60)
+    expect(lambda: check_forwarding(r2, "ready"), count=60)
 
 
 if __name__ == "__main__":
