@@ -19,6 +19,34 @@ from lib.topogen import Topogen, get_topogen
 
 pytestmark = [pytest.mark.zebra]
 
+# These are failure-injection tests: a skipped one is indistinguishable from a
+# passing one in the job conclusion, so for eight of them the absence of strace
+# meant they never ran at all while CI stayed green (BLO-28043). strace is
+# installed by docker/ubuntu-ci/Dockerfile, so its absence here means the test
+# image regressed -- that is a failure, not a reason to stand down.
+#
+# This is deliberately strict by DEFAULT rather than gated on a CI env var: the
+# topotest container is started with only TOPOTEST_WORKERS (and optionally
+# MROUTE_VRF_MISSING) in its environment, so a check for CI/GITHUB_ACTIONS
+# would never fire in CI and would silently reintroduce the same blind spot.
+# A local run on a host without strace can opt out explicitly.
+ALLOW_MISSING_STRACE = os.environ.get("TOPOTESTS_ALLOW_MISSING_STRACE") == "1"
+
+
+def tracing_unavailable(reason):
+    """Fail by default; skip only under the explicit local opt-out."""
+    if ALLOW_MISSING_STRACE:
+        pytest.skip(reason)
+    pytest.fail(reason)
+
+
+def require_strace(router):
+    if not router.run("command -v strace").strip():
+        tracing_unavailable(
+            "strace not found in the test image -- it is required for netlink "
+            "failure injection and for holding the dplane worker"
+        )
+
 
 def build_topo(tgen):
     tgen.add_router("r1")
@@ -50,8 +78,7 @@ def request(action, tunnel_id, encap="gre"):
 
 
 def inject_netlink_syscall_failure(router, syscall, when):
-    if not router.run("command -v strace").strip():
-        pytest.skip("strace is required for netlink failure injection")
+    require_strace(router)
     zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
     dplane_tid = router.run(
         f"for task in /proc/{zebra_pid}/task/*; do "
@@ -59,7 +86,9 @@ def inject_netlink_syscall_failure(router, syscall, when):
         "done"
     ).strip()
     if not dplane_tid:
-        pytest.skip("zebra_dplane worker is required for netlink failure injection")
+        tracing_unavailable(
+            "zebra_dplane worker not found -- netlink failure injection cannot run"
+        )
     tracer = router.popen(
         [
             "strace",
@@ -77,7 +106,9 @@ def inject_netlink_syscall_failure(router, syscall, when):
     time.sleep(0.2)
     if tracer.poll() is not None:
         _stdout, stderr = tracer.communicate()
-        pytest.skip("strace attach failed: {}".format(stderr.decode().strip()))
+        tracing_unavailable(
+            "strace attach failed: {}".format(stderr.decode().strip())
+        )
     return tracer
 
 
@@ -119,11 +150,12 @@ def sendmsg_entered(router, trace_file):
 
 def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
                           trace_file=None):
-    if not router.run("command -v strace").strip():
-        pytest.skip("strace is required to hold the dplane worker")
+    require_strace(router)
     worker = dplane_tid(router)
     if not worker:
-        pytest.skip("zebra_dplane worker is required")
+        tracing_unavailable(
+            "zebra_dplane worker not found -- cannot hold the dplane worker"
+        )
     cmd = [
         "strace",
         "-qq",
@@ -140,7 +172,9 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
     time.sleep(0.3)
     if tracer.poll() is not None:
         _stdout, stderr = tracer.communicate()
-        pytest.skip("strace attach failed: {}".format(stderr.decode().strip()))
+        tracing_unavailable(
+            "strace attach failed: {}".format(stderr.decode().strip())
+        )
     return tracer
 
 
@@ -290,8 +324,6 @@ def test_address_failure_cleans_up_and_allows_tunnel_id_reuse():
 
 def test_delete_failure_retains_ownership_for_retry_and_reuse():
     router = get_topogen().gears["r1"]
-    if not router.run("command -v strace").strip():
-        pytest.skip("strace is required for netlink failure injection")
     installed = request("add", 5)
     assert installed["result"] == 0, installed
 
@@ -322,8 +354,6 @@ def zebra_ifindex(router, name):
 
 def test_queued_delete_does_not_remove_reused_ifindex():
     router = get_topogen().gears["r1"]
-    if not router.run("command -v strace").strip():
-        pytest.skip("strace is required to hold the dplane worker")
     installed = request("add", 6)
     assert installed["result"] == 0, installed
 
@@ -362,8 +392,6 @@ def test_queued_delete_does_not_remove_reused_ifindex():
 
 def test_add_during_inflight_delete_is_rejected():
     router = get_topogen().gears["r1"]
-    if not router.run("command -v strace").strip():
-        pytest.skip("strace is required to hold the dplane worker")
     installed = request("add", 9)
     assert installed["result"] == 0, installed
 
@@ -432,8 +460,6 @@ def test_uncertain_create_result_reconciles_surviving_link():
 
 def test_delete_encoded_before_replacement_binds_to_ifindex():
     router = get_topogen().gears["r1"]
-    if not router.run("command -v strace").strip():
-        pytest.skip("strace is required to hold the dplane worker")
     installed = request("add", 10)
     assert installed["result"] == 0, installed
 
@@ -477,8 +503,6 @@ def test_delete_encoded_before_replacement_binds_to_ifindex():
 
 def test_lost_delete_ack_reconciles_instead_of_resurrecting():
     router = get_topogen().gears["r1"]
-    if not router.run("command -v strace").strip():
-        pytest.skip("strace is required for netlink failure injection")
     installed = request("add", 11)
     assert installed["result"] == 0, installed
 
@@ -515,8 +539,6 @@ def test_lost_delete_ack_reconciles_instead_of_resurrecting():
 
 def test_skipped_delete_result_survives_mixed_batch():
     router = get_topogen().gears["r1"]
-    if not router.run("command -v strace").strip():
-        pytest.skip("strace is required to hold the dplane worker")
     replaced = request("add", 12)
     assert replaced["result"] == 0, replaced
     normal = request("add", 13)
