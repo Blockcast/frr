@@ -1357,6 +1357,22 @@ void pim_dimt_show_forwarding(struct pim_instance *pim, struct vty *vty,
 						up->channel_oil &&
 							up->channel_oil
 								->installed);
+			/*
+			 * What bgpd was actually told, as against the
+			 * `forwarding` above, which is recomputed on every
+			 * read of this command.
+			 *
+			 * The two are the same only while every readiness
+			 * edge is announced, which is the property worth
+			 * asserting -- a verdict that is right whenever an
+			 * operator asks and wrong on the wire is the exact
+			 * failure this field exists to expose.  Reading the
+			 * recomputed value alone cannot see it.
+			 */
+			json_object_boolean_add(jup, "announced",
+						up->gtm_announced);
+			json_object_string_add(jup, "announcedForwarding",
+					       fwd[up->gtm_forwarding]);
 			json_object_object_add(jobj, up->sg_str, jup);
 		} else {
 			vty_out(vty, "%-34s %-10s %-16s %s\n", up->sg_str,
