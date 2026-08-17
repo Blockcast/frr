@@ -477,6 +477,9 @@ static struct pim_dimt_endpoint *pim_dimt_endpoint_find(struct pim_instance *pim
 	return NULL;
 }
 
+static void pim_dimt_endpoint_apply_change(struct pim_instance *pim,
+					   const struct pim_dimt_endpoint *ep);
+
 bool pim_dimt_endpoint_set(struct pim_instance *pim,
 			   const struct pim_dimt_endpoint *in)
 {
@@ -502,6 +505,11 @@ bool pim_dimt_endpoint_set(struct pim_instance *pim,
 		listnode_add(pim->dimt_endpoint_list, ep);
 	}
 	*ep = *in;
+
+	/* Re-point any tunnel already built from the previous row.  reconcile()
+	 * alone cannot do this: it builds the request only when it creates the
+	 * tunnel, so an edited row would otherwise never reach the netdev. */
+	pim_dimt_endpoint_apply_change(pim, ep);
 
 	pim_dimt_reconcile(pim);
 	return true;
@@ -690,6 +698,76 @@ static void pim_dimt_tunnel_build_req(struct pim_instance *pim,
 	}
 
 	snprintf(tun->ifname, sizeof(tun->ifname), "dimt-%08x", tun->tunnel_id);
+}
+
+/* An endpoint row was edited.  Re-point any tunnel already built from the
+ * previous version of it.
+ *
+ * pim_dimt_reconcile() cannot do this on its own: it calls
+ * pim_dimt_tunnel_build_req() only on the path that CREATES a tunnel, so for a
+ * UMH that already has one the edited row was previously accepted into the
+ * config, echoed back by `show running-config`, and never reached the netdev.
+ * The tunnel kept encapsulating to the old outer endpoint, and because none of
+ * the three readiness conjuncts inspects the outer address it still reported
+ * READY -- config and kernel silently disagreeing, which is exactly the failure
+ * mode this contract exists to eliminate.
+ *
+ * A re-ADD cannot express the change: zebra memcmp()s the stored request and
+ * answers a differing one with FAIL_INSTALL rather than mutating the netdev in
+ * place, so the only path is DEL then ADD.  That is what readd_pending already
+ * means, so this reuses it rather than inventing a second mechanism.
+ *
+ * The request is rebuilt unconditionally at the end, and the comparison is made
+ * against the rebuilt bytes rather than against the endpoint struct: those
+ * bytes are what zebra actually compares, so this cannot drift from zebra's own
+ * notion of "identical".  Rebuilding before the DEL is safe -- zebra's delete
+ * path matches on tunnel_id and owner only, never on the tunnel parameters.
+ */
+static void pim_dimt_endpoint_apply_change(struct pim_instance *pim,
+					   const struct pim_dimt_endpoint *ep)
+{
+	struct pim_dimt_tunnel *tun = pim_dimt_tunnel_find(pim, ep->umh);
+	struct zapi_dimt_tunnel prev;
+
+	if (!tun)
+		return;
+
+	prev = tun->req;
+	pim_dimt_tunnel_build_req(pim, tun, ep);
+
+	/* build_req() memset()s the request first, so padding is deterministic
+	 * and this memcmp is well-defined.  It is also the same comparison
+	 * zebra makes. */
+	if (!memcmp(&prev, &tun->req, sizeof(prev)))
+		return;
+
+	if (PIM_DEBUG_PIM_TRACE)
+		zlog_debug("DIMT: endpoint for UMH %pPAs changed; rebuilding tunnel %s (state %d)",
+			   &ep->umh, tun->ifname, tun->state);
+
+	switch (tun->state) {
+	case PIM_DIMT_TUNNEL_INSTALLED:
+	case PIM_DIMT_TUNNEL_REQUESTED:
+		/* A netdev exists (or is being built) with the old parameters.
+		 * Tear it down; the ADD is re-issued from the rebuilt request
+		 * when REMOVED lands. */
+		if (pim_dimt_tunnel_send(tun, false)) {
+			tun->state = PIM_DIMT_TUNNEL_REMOVING;
+			tun->readd_pending = true;
+		}
+		break;
+	case PIM_DIMT_TUNNEL_REMOVING:
+		/* Already tearing down; the re-ADD picks up the new request. */
+		tun->readd_pending = true;
+		break;
+	case PIM_DIMT_TUNNEL_IDLE:
+	case PIM_DIMT_TUNNEL_FAILED:
+		/* No netdev to replace.  reconcile() re-ADDs from the rebuilt
+		 * request on the demand edge that follows, and FAILED
+		 * re-requesting here is correct: an edited endpoint is exactly
+		 * the operator action that can fix a failed outer. */
+		break;
+	}
 }
 
 /* Does this upstream demand a native DIMT tunnel, and toward which UMH?

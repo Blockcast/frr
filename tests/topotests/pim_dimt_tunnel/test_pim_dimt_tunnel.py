@@ -110,6 +110,9 @@ UMH = "10.99.0.1"
 INNER_LOCAL = "10.99.0.2"
 OUTER_LOCAL = "10.0.0.2"
 OUTER_REMOTE = "10.0.0.1"
+# Second outer for the endpoint re-point stage.  On the same underlay subnet as
+# OUTER_REMOTE, so the only thing that changes is the value in the request.
+NEW_OUTER_REMOTE = "10.0.0.9"
 
 
 def build_topo(tgen):
@@ -457,6 +460,90 @@ def test_create_failure_lands_in_failed_without_kernel_state():
     expect(lambda: check_no_ip_mr_cache(r2, SOURCE, GROUP))
 
     r2.run("ip link del {}".format(ifname))
+
+
+# --- Endpoint re-point: an edited row must reach the netdev ---------------
+
+
+def set_endpoint(router, outer_remote):
+    """Write the D2 endpoint row for UMH with the given outer remote.
+
+    Entered at the top level, which is where the command is installed
+    (CONFIG_NODE/VRF_NODE), matching r2/pimd.conf.
+    """
+    router.vtysh_cmd(
+        "conf t\ndimt tunnel-endpoint {} inner-local {} outer-local {} "
+        "outer {} encap gre".format(UMH, INNER_LOCAL, OUTER_LOCAL, outer_remote)
+    )
+
+
+def test_endpoint_change_repoints_the_live_tunnel():
+    """Editing an endpoint row must re-point a tunnel already built from it.
+
+    The regression this pins: pim_dimt_tunnel_build_req() is called only on the
+    path that CREATES a tunnel, so for a UMH that already had one the edited row
+    was accepted into the running config and never reached the netdev.  The
+    kernel kept encapsulating to the OLD outer while `show running-config`
+    displayed the new one -- and because none of the three readiness conjuncts
+    inspects the outer address, readiness still reported `ready`.  A tunnel that
+    reports healthy while pointing somewhere the operator has already moved away
+    from is precisely the config-vs-kernel divergence D3 exists to prevent.
+
+    zebra cannot absorb the change either: it memcmp()s the stored request and
+    answers a differing re-ADD with FAIL_INSTALL rather than mutating the link,
+    so the only correct path is DEL then ADD.
+
+    The assertion is deliberately kernel-side (`ip -d link show` via
+    check_gre_link) rather than `show ip pim dimt tunnel`: asking pimd whether
+    pimd believes it re-pointed the tunnel is exactly the vacuous reading G10
+    warns about -- and it is the reading under which the unfixed code passes,
+    since pimd's endpoint list was updated correctly all along.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    r2 = tgen.gears["r2"]
+
+    # 1. Recover from the `failed` state the previous stage parked in, so the
+    #    tunnel is genuinely INSTALLED with the original outer before the edit.
+    r2.vtysh_cmd(
+        "conf t\ninterface r2-eth1\nno ip igmp static-group {} {}".format(
+            GROUP, SOURCE
+        )
+    )
+    expect(lambda: check_no_tunnel(r2))
+    r2.vtysh_cmd(
+        "conf t\ninterface r2-eth1\nip igmp static-group {} {}".format(
+            GROUP, SOURCE
+        )
+    )
+    expect(lambda: check_tunnel_state(r2, "installed"))
+
+    ifname = tunnel_ifname(r2)
+
+    # 2. The kernel really does carry the ORIGINAL outer.  Without this the
+    #    step-4 assertion could pass against a link that never had it.
+    expect(
+        lambda: check_gre_link(r2, ifname, OUTER_LOCAL, OUTER_REMOTE)
+    )
+
+    # 3. Re-point the row.  Same UMH, so the same tunnel_id and the same
+    #    netdev name -- only the outer moves.  That is the case a re-ADD
+    #    cannot express and the one the old code dropped on the floor.
+    set_endpoint(r2, NEW_OUTER_REMOTE)
+
+    # 4. The KERNEL must now carry the new outer.
+    expect(lambda: check_gre_link(r2, ifname, OUTER_LOCAL, NEW_OUTER_REMOTE))
+
+    # 5. And the tunnel must come back to a healthy, forwarding state rather
+    #    than being left torn down by the rebuild.
+    expect(lambda: check_tunnel_state(r2, "installed"))
+    expect(lambda: check_forwarding(r2, "ready"))
+
+    # 6. Restore the original row so later stages see the documented topology.
+    set_endpoint(r2, OUTER_REMOTE)
+    expect(lambda: check_gre_link(r2, ifname, OUTER_LOCAL, OUTER_REMOTE))
+    expect(lambda: check_forwarding(r2, "ready"))
 
 
 if __name__ == "__main__":
