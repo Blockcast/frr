@@ -195,6 +195,10 @@ enum pim_dimt_pin_source {
 	 * self-heals.  pim_dimt_forwarding_state() already separates them.
 	 */
 	PIM_DIMT_PIN_TUNNEL_FAILED,
+
+	/* Sentinel, so the string table below can be size-checked.  Keep it
+	 * last and add new sources above it. */
+	PIM_DIMT_PIN_MAX,
 };
 
 /* Which resolver answered.  Not cosmetic: "tunnel-pending" and
@@ -207,6 +211,20 @@ static const char *const pim_dimt_pin_source_str[] = {
 	[PIM_DIMT_PIN_TUNNEL_PENDING] = "tunnel-pending",
 	[PIM_DIMT_PIN_TUNNEL_FAILED] = "tunnel-failed",
 };
+
+/*
+ * The table is indexed by pin.source directly, unbounded, at three call
+ * sites.  Adding an enum source without a string would make that an
+ * out-of-bounds read rather than a build error, so tie the two together.
+ *
+ * The check has to be against the sentinel, not against
+ * PIM_DIMT_PIN_TUNNEL_FAILED + 1: appending a source below FAILED changes
+ * neither FAILED's value nor -- absent a new entry -- array_size(), so that
+ * form would still compile and still read past the end.  PIM_DIMT_PIN_MAX
+ * is the only expression here that grows with the enum.
+ */
+static_assert(array_size(pim_dimt_pin_source_str) == PIM_DIMT_PIN_MAX,
+	      "pim_dimt_pin_source_str is missing an entry for a pin source");
 
 struct pim_dimt_pin {
 	struct interface *ifp; /* pin target, NULL when unresolved */
