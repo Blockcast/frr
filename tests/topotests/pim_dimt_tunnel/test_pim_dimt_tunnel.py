@@ -546,6 +546,64 @@ def test_endpoint_change_repoints_the_live_tunnel():
     expect(lambda: check_forwarding(r2, "ready"))
 
 
+def test_endpoint_row_round_trips_through_running_config():
+    """The written D2 row must parse back at the node it is installed at.
+
+    `dimt tunnel-endpoint` is installed at CONFIG_NODE.  It was previously
+    *written* indented, inside the `router pim` frame opened by
+    pim_router_config_write() -- so the emitted config could not be read back
+    at the node that produced it.
+
+    That was not cosmetic.  On reload the line fails to match at PIM_NODE and
+    command_config_read_one_line() retries at successive parents; reaching
+    CONFIG_NODE pops the vty out of `router pim` as a side effect, so every
+    following line in that block parses at the wrong node.  And because the
+    handler's PIM_DECLVAR_CONTEXT_VRF resolves CONFIG_NODE to VRF_DEFAULT, a
+    row written under `router pim vrf red` came back applied to the DEFAULT
+    vrf -- silently, with the config file still displaying the operator's
+    intent.
+
+    The row is pure configuration; nothing can regenerate it (pim_vty.c says
+    exactly that).  So "it round-trips" is the whole requirement.
+
+    Asserted at column 0 rather than merely "present": an indented row still
+    parses when fed to `conf t` on its own, so a presence-only check passes
+    against the unfixed code.  The indentation IS the defect.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    r2 = tgen.gears["r2"]
+
+    running = r2.vtysh_cmd("show running-config")
+    rows = [ln for ln in running.splitlines() if "dimt tunnel-endpoint" in ln]
+    assert rows, "running-config carries no dimt tunnel-endpoint row:\n{}".format(
+        running
+    )
+
+    for row in rows:
+        assert not row.startswith(" "), (
+            "dimt tunnel-endpoint is written indented (inside `router pim`), "
+            "but the command is installed at CONFIG_NODE: {!r}".format(row)
+        )
+
+    # Corroborate by actually replaying the emitted config: feeding it back
+    # must not produce a parse error for any line.
+    r2.run("vtysh -c 'show running-config' > /tmp/dimt-rc.conf")
+    out = r2.run("vtysh -f /tmp/dimt-rc.conf 2>&1")
+    for bad in ("Unknown command", "% Unknown", "Invalid input"):
+        assert bad not in out, "replaying running-config failed: {}".format(out)
+
+    # And the row survived the replay with its values intact.
+    running2 = r2.vtysh_cmd("show running-config")
+    rows2 = [ln.strip() for ln in running2.splitlines()
+             if "dimt tunnel-endpoint" in ln]
+    assert sorted(rows2) == sorted(r.strip() for r in rows), (
+        "endpoint rows changed across a running-config replay:\n"
+        "before: {}\nafter:  {}".format(rows, rows2)
+    )
+
+
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
     sys.exit(pytest.main(args))

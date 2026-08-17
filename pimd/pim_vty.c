@@ -298,11 +298,6 @@ int pim_global_config_write_worker(struct pim_instance *pim, struct vty *vty)
 		++writes;
 	}
 
-	/* Explicit DIMT tunnel-endpoint rows (contract D2). These are pure
-	 * configuration -- there is no derivation that could regenerate them --
-	 * so they must round-trip through the running config. */
-	writes += pim_dimt_endpoint_config_write(pim, vty);
-
 	return writes;
 }
 
