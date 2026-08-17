@@ -302,11 +302,13 @@ keyword at the end.
    (``pim`` or ``amt-relay``), its preference, and the PIM Light interface
    the (S,G) RPF is pinned to.
 
-   ``PinSource`` reports which resolver chose that interface (``tunnel``,
-   ``light``, ``tunnel-pending`` or ``none``) and ``Shadowed``
-   (``shadowedInterface`` in JSON) names a covering PIM Light interface that did
-   not get the pin because a DIMT tunnel took it.  See
-   :clicmd:`show ip pim dimt umh [json]` for the full meaning of both fields.
+   ``PinSource`` reports which resolver chose that interface, and ``Shadowed``
+   (``shadowedInterface`` in JSON) names a covering PIM Light interface that
+   did not get the pin.  Both take the same values and carry the same meaning
+   as they do for IPv4, and are enumerated once, there:
+   :clicmd:`show ip pim [vrf NAME] dimt umh [json]`.  The list is deliberately
+   not repeated on this page -- an inline copy is what left it documenting a
+   closed set that no longer held.
 
 .. clicmd:: ipv6 pim bsm
 
