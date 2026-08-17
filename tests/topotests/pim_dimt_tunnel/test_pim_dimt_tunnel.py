@@ -576,31 +576,65 @@ def test_endpoint_row_round_trips_through_running_config():
     r2 = tgen.gears["r2"]
 
     running = r2.vtysh_cmd("show running-config")
-    rows = [ln for ln in running.splitlines() if "dimt tunnel-endpoint" in ln]
+
+    # Walk the emitted config tracking the `router pim` frame, because "is the
+    # row inside that frame" IS the invariant -- not merely "is the row
+    # present".  An indented row still parses when fed to `conf t` on its own,
+    # so a presence-only check passes against the unfixed code.
+    rows = []
+    offenders = []
+    in_router_pim = False
+    for line in running.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("router pim"):
+            in_router_pim = True
+            continue
+        if in_router_pim and stripped in ("exit", "end"):
+            in_router_pim = False
+            continue
+        if "dimt tunnel-endpoint" not in line:
+            continue
+        rows.append(stripped)
+        if in_router_pim or line.startswith((" ", "\t")):
+            offenders.append((line, in_router_pim))
+
     assert rows, "running-config carries no dimt tunnel-endpoint row:\n{}".format(
         running
     )
+    assert not offenders, (
+        "dimt tunnel-endpoint is written inside the `router pim` frame or "
+        "indented, but the command is installed at CONFIG_NODE -- on reload it "
+        "matches only after the parent-node retry pops the vty out of `router "
+        "pim`, and PIM_DECLVAR_CONTEXT_VRF then resolves it to VRF_DEFAULT: "
+        "{}".format(offenders)
+    )
 
-    for row in rows:
-        assert not row.startswith(" "), (
-            "dimt tunnel-endpoint is written indented (inside `router pim`), "
-            "but the command is installed at CONFIG_NODE: {!r}".format(row)
-        )
+    # Corroborate that the emitted text is actually a valid command (catches a
+    # write that is correctly placed but malformed): drop the row and re-apply
+    # the config exactly as written.
+    row = rows[0]
+    r2.vtysh_cmd("conf t\nno {}".format(row))
+    expect(lambda: None if not umh_pin_row_present(r2) else "endpoint still set")
 
-    # Corroborate by actually replaying the emitted config: feeding it back
-    # must not produce a parse error for any line.
-    r2.run("vtysh -c 'show running-config' > /tmp/dimt-rc.conf")
-    out = r2.run("vtysh -f /tmp/dimt-rc.conf 2>&1")
-    for bad in ("Unknown command", "% Unknown", "Invalid input"):
-        assert bad not in out, "replaying running-config failed: {}".format(out)
-
-    # And the row survived the replay with its values intact.
+    r2.vtysh_cmd("conf t\n{}".format(row))
     running2 = r2.vtysh_cmd("show running-config")
     rows2 = [ln.strip() for ln in running2.splitlines()
              if "dimt tunnel-endpoint" in ln]
-    assert sorted(rows2) == sorted(r.strip() for r in rows), (
-        "endpoint rows changed across a running-config replay:\n"
+    assert sorted(rows2) == sorted(rows), (
+        "the emitted row did not re-apply verbatim:\n"
         "before: {}\nafter:  {}".format(rows, rows2)
+    )
+
+    # And the tunnel is back, so the round-trip restored working state rather
+    # than just matching text.
+    expect(lambda: check_forwarding(r2, "ready"))
+
+
+def umh_pin_row_present(router):
+    """True while any dimt tunnel-endpoint row is in the running config."""
+    return any(
+        "dimt tunnel-endpoint" in ln
+        for ln in router.vtysh_cmd("show running-config").splitlines()
     )
 
 
