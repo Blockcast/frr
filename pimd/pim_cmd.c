@@ -9431,8 +9431,6 @@ static void pim_install_deprecated(void)
 {
 	install_element(CONFIG_NODE, &ip_pim_rp_cmd);
 	install_element(VRF_NODE, &ip_pim_rp_cmd);
-	install_element(CONFIG_NODE, &pim_dimt_tunnel_endpoint_cmd);
-	install_element(VRF_NODE, &pim_dimt_tunnel_endpoint_cmd);
 	install_element(CONFIG_NODE, &no_ip_pim_rp_cmd);
 	install_element(VRF_NODE, &no_ip_pim_rp_cmd);
 	install_element(CONFIG_NODE, &ip_pim_rp_prefix_list_cmd);
@@ -9868,6 +9866,26 @@ void pim_cmd_init(void)
 	install_element(VRF_NODE, &ip_igmp_group_watermark_cmd);
 	install_element(CONFIG_NODE, &no_ip_igmp_group_watermark_cmd);
 	install_element(VRF_NODE, &no_ip_igmp_group_watermark_cmd);
+
+	/* DIMT explicit tunnel endpoints (contract D2).
+	 *
+	 * CONFIG_NODE only, and deliberately NOT VRF_NODE.  The handler uses
+	 * PIM_DECLVAR_CONTEXT_VRF, whose CONFIG_NODE arm resolves to
+	 * VRF_DEFAULT -- and the request this row produces is sent with a
+	 * hardcoded VRF_DEFAULT in pim_dimt_tunnel_send(), so a row entered
+	 * under `vrf red` would be stored on red's instance, requested as
+	 * default, and never correlated with its own ack.  Installing at
+	 * VRF_NODE would therefore accept configuration that structurally
+	 * cannot work.  DIMT is default-VRF-only until that is addressed.
+	 *
+	 * Not PIM_NODE either: `router pim` pushes an XPATH context
+	 * (VTY_PUSH_XPATH), so VTY_GET_CONTEXT(vrf) has nothing to return
+	 * there.  Reaching PIM_NODE means converting this command to
+	 * northbound, which is a YANG change, not a registration change.
+	 * pim_dimt_endpoint_config_write() writes the row at top level to
+	 * match this, so it round-trips.
+	 */
+	install_element(CONFIG_NODE, &pim_dimt_tunnel_endpoint_cmd);
 
 	pim_install_deprecated();
 }

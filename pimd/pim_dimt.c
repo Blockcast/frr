@@ -560,7 +560,12 @@ int pim_dimt_endpoint_config_write(struct pim_instance *pim, struct vty *vty)
 		return 0;
 
 	for (ALL_LIST_ELEMENTS_RO(pim->dimt_endpoint_list, node, ep)) {
-		vty_out(vty, " dimt tunnel-endpoint %pPA inner-local %pIA outer-local %pIA outer %pIA encap %s",
+		/* Column 0, NOT indented into the `router pim` block: this
+		 * command is installed at CONFIG_NODE, and the written form
+		 * has to parse back at the node it is installed at.  See
+		 * pim_router_config_write() for what an indented row did on
+		 * reload. */
+		vty_out(vty, "dimt tunnel-endpoint %pPA inner-local %pIA outer-local %pIA outer %pIA encap %s",
 			&ep->umh, &ep->inner_local, &ep->outer_local,
 			&ep->outer_remote,
 			ep->encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU
