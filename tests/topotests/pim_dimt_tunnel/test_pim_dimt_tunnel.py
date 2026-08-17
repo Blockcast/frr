@@ -46,10 +46,12 @@ ambiguity on purpose.
 
 Historically that resolver returned the FIRST pim-light interface whose
 connected address or point-to-point destination prefix-matched the UMH, with no
-preference for the tunnel, so a `/24` underlay covering the UMH was exactly as
-good a match as the tunnel's own `/32` peer and FOR_ALL_INTERFACES order decided
-which won.  When the underlay won, the tunnel installed clean and never
-forwarded, silently (BLO-27869).
+preference for the tunnel, so a `/24` covering the UMH was exactly as good a
+match as the tunnel's own `/32` peer and FOR_ALL_INTERFACES order decided which
+won.  That order is by interface NAME -- `RB_FOREACH (ifp, if_name_head,
+&vrf->ifaces_by_name)` in `lib/if.h` -- not by ifindex and not by the order
+things were configured.  When a covering interface sorted before `dimt-%08x`
+and won, the tunnel installed clean and never forwarded, silently (BLO-27869).
 
 WHAT IS EVIDENCE HERE
 ---------------------
@@ -127,11 +129,18 @@ SECOND_SOURCE = "10.10.10.11"
 SECOND_GROUP = "232.1.1.11"
 SECOND_SG = "(10.10.10.11,232.1.1.11)"
 
-# BLO-27869: an address on r2-eth0 whose /24 covers the UMH, used to build the
-# shadowing case deliberately.  10.99.0.3/24 covers 10.99.0.1 exactly the way a
-# directly-connected UMH segment would.
+# BLO-27869: a covering interface used to build the shadowing case on purpose.
+# 10.99.0.3/24 covers the UMH 10.99.0.1 exactly the way a directly-connected UMH
+# segment would.
+#
+# The NAME matters and is the whole point.  FOR_ALL_INTERFACES walks
+# vrf->ifaces_by_name (lib/if.h), so the pre-fix resolver picked the
+# alphabetically first covering interface.  `aaa0` sorts before `dimt-%08x`;
+# `r2-eth0` does not, so using an existing interface here would let the tunnel
+# win by luck and the stage would prove nothing.  Created as a dummy by the
+# stage itself.
 COVERING_ADDR = "10.99.0.3/24"
-COVERING_IFACE = "r2-eth0"
+COVERING_IFACE = "aaa0"
 
 
 def build_topo(tgen):
@@ -847,19 +856,23 @@ def test_covering_light_interface_does_not_shadow_the_tunnel():
 
     This is the case the rest of the suite deliberately avoids by putting the
     UMH on a loopback (see the module docstring).  Here it is constructed on
-    purpose: r2-eth0 gets 10.99.0.3/24 -- which covers the UMH 10.99.0.1 -- plus
-    `ip pim light`, so BOTH the DIMT netdev's /32 point-to-point peer and
-    r2-eth0's /24 connected subnet prefix-match the UMH.
+    purpose: a dummy netdev gets 10.99.0.3/24 -- which covers the UMH 10.99.0.1
+    -- plus `ip pim light`, so BOTH the DIMT netdev's /32 point-to-point peer
+    and the dummy's /24 connected subnet prefix-match the UMH.
 
-    ORDERING IS THE POINT.  The covering interface is configured while the
-    tunnel is DOWN, so it is already a resolvable candidate, with a lower
-    ifindex, before the netdev is created.  Under the old per-interface search
-    -- which had no preference for the point-to-point/tunnel case and returned
-    the FIRST match FOR_ALL_INTERFACES reached -- that is the order in which
-    r2-eth0 wins: the pin lands on the underlay, readiness conjunct (2)
-    (rpf interface == tunnel ifindex) can never hold, and forwarding sits at
-    `pending` forever with no error and no log.  So this stage fails against the
-    unfixed resolver rather than passing for the wrong reason.
+    ORDERING IS THE POINT, AND THE ORDER IS BY NAME.  `FOR_ALL_INTERFACES` is
+    `RB_FOREACH (ifp, if_name_head, &vrf->ifaces_by_name)` (`lib/if.h`), so the
+    old resolver -- which had no preference for the tunnel and returned the
+    FIRST covering match it reached -- was decided by interface *name*, not by
+    ifindex and not by configuration order.
+
+    Hence the dummy is named `aaa0`: it sorts before `dimt-%08x`, so the old
+    resolver reaches it first and pins there.  Readiness conjunct (2) (rpf
+    interface == tunnel ifindex) can then never hold, and forwarding sits at
+    `pending` forever with no error and no log.  A covering interface named
+    `r2-eth0` would NOT reproduce this -- `dimt-` sorts before `r2-`, so the
+    tunnel would win by luck and the stage would pass against the unfixed
+    resolver for the wrong reason.
 
     Step 2 asserts the covering interface genuinely resolves while no tunnel
     exists.  That keeps the test honest twice over: it proves the shadow
@@ -883,7 +896,11 @@ def test_covering_light_interface_does_not_shadow_the_tunnel():
     expect(lambda: check_no_tunnel(r2))
 
     # 2. Build the ambiguity while no tunnel exists, and prove the covering
-    #    interface really does resolve the pin on its own.
+    #    interface really does resolve the pin on its own.  A dummy rather than
+    #    an existing interface, because the name is what decides the old
+    #    resolver and no interface in this topology sorts before `dimt-`.
+    r2.run("ip link add {} type dummy".format(COVERING_IFACE))
+    r2.run("ip link set {} up".format(COVERING_IFACE))
     r2.vtysh_cmd(
         "conf t\ninterface {}\nip address {}\nip pim\nip pim light".format(
             COVERING_IFACE, COVERING_ADDR
@@ -891,8 +908,8 @@ def test_covering_light_interface_does_not_shadow_the_tunnel():
     )
     expect(lambda: check_pin(r2, COVERING_IFACE, "light"))
 
-    # 3. Now bring the tunnel back.  Its netdev is created *after* r2-eth0 is
-    #    already a candidate.
+    # 3. Now bring the tunnel back.  Its netdev is created *after* the covering
+    #    interface is already a candidate, and sorts after it by name.
     r2.vtysh_cmd(
         "conf t\ninterface r2-eth1\nip igmp static-group {} {}".format(
             GROUP, SOURCE
@@ -902,17 +919,18 @@ def test_covering_light_interface_does_not_shadow_the_tunnel():
     ifname = tunnel_ifname(r2)
 
     # 4. The netdev still carries the UMH as its ptp peer, so the tunnel and
-    #    r2-eth0 are both genuine prefix matches -- the ambiguity is real.
+    #    the covering interface are both genuine prefix matches -- the
+    #    ambiguity is real.
     address = r2.run("ip -o address show dev {}".format(ifname))
     assert "{} peer {}/32".format(INNER_LOCAL, UMH) in address, address
 
-    # 5. The pin lands on the tunnel, and r2-eth0 is reported as the covering
-    #    interface that lost it -- the ambiguity is observable, not silent.
+    # 5. The pin lands on the tunnel, and the covering interface is reported as
+    #    the one that lost it -- the ambiguity is observable, not silent.
     expect(lambda: check_pin(r2, ifname, "tunnel", shadowed=COVERING_IFACE))
 
     # 6. Readiness follows, corroborated kernel-side: the admitted incoming vif
-    #    must be the DIMT vif, not the underlay's.  Per G10 the kernel is the
-    #    evidence; the JSON above is only pimd's aggregation of it.
+    #    must be the DIMT vif, not the covering interface's.  Per G10 the kernel
+    #    is the evidence; the JSON above is only pimd's aggregation of it.
     def kernel_admitted():
         vif, error = resolve_mr_vif(r2, ifname)
         if error:
@@ -927,6 +945,15 @@ def test_covering_light_interface_does_not_shadow_the_tunnel():
         ]
         == ifname
     )
+
+    # 7. Put the ambiguity away.  This is the last stage today, but leaving a
+    #    covering pim-light interface behind would silently change the premise
+    #    of anything appended after it -- and the name was chosen to win the
+    #    resolver, so it would win in stages that do not expect a competitor.
+    r2.vtysh_cmd("conf t\nno interface {}".format(COVERING_IFACE))
+    r2.run("ip link del {}".format(COVERING_IFACE))
+    expect(lambda: check_pin(r2, ifname, "tunnel"))
+    expect(lambda: check_forwarding(r2, "ready"))
 
 
 if __name__ == "__main__":
