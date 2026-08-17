@@ -670,8 +670,17 @@ pim_dimt_tunnel_find_by_id(struct pim_instance *pim, uint32_t tunnel_id)
  * allocation time and never recomputed, because zebra treats a
  * byte-identical re-ADD as idempotent (it memcmp()s the stored request) --
  * that is exactly what makes reconnect replay safe, and it only holds if
- * we resend the identical struct. */
-static bool pim_dimt_tunnel_send(struct pim_dimt_tunnel *tun, bool add)
+ * we resend the identical struct.
+ *
+ * The VRF is the instance's, not a hardcoded VRF_DEFAULT.  Only the default
+ * VRF can hold endpoint rows today (the `dimt tunnel-endpoint` command lives
+ * at CONFIG_NODE), so every tunnel that exists is a default-VRF tunnel and
+ * the two agree -- but stating VRF_DEFAULT here made that coincidence look
+ * like an invariant.  Should a row ever become configurable per-VRF, a
+ * hardcoded id would address the ack to the wrong instance rather than fail,
+ * which is the kind of bug that surfaces as an unexplained missing notify. */
+static bool pim_dimt_tunnel_send(struct pim_instance *pim,
+				 struct pim_dimt_tunnel *tun, bool add)
 {
 	struct stream *s;
 
@@ -685,7 +694,7 @@ static bool pim_dimt_tunnel_send(struct pim_dimt_tunnel *tun, bool add)
 	s = pim_zclient->obuf;
 	zapi_dimt_tunnel_encode(s, add ? ZEBRA_DIMT_TUNNEL_ADD
 				       : ZEBRA_DIMT_TUNNEL_DEL,
-				VRF_DEFAULT, &tun->req);
+				pim->vrf->vrf_id, &tun->req);
 
 	return zclient_send_message(pim_zclient) != ZCLIENT_SEND_FAILURE;
 }
@@ -776,7 +785,7 @@ static void pim_dimt_endpoint_apply_change(struct pim_instance *pim,
 		/* A netdev exists (or is being built) with the old parameters.
 		 * Tear it down; the ADD is re-issued from the rebuilt request
 		 * when REMOVED lands. */
-		if (pim_dimt_tunnel_send(tun, false)) {
+		if (pim_dimt_tunnel_send(pim, tun, false)) {
 			tun->state = PIM_DIMT_TUNNEL_REMOVING;
 			tun->readd_pending = true;
 		}
@@ -879,7 +888,7 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 				 * (new demand, endpoint change, reconnect) --
 				 * never on a timer, so a persistently broken
 				 * outer cannot become a retry loop. */
-				if (pim_dimt_tunnel_send(tun, true))
+				if (pim_dimt_tunnel_send(pim, tun, true))
 					tun->state = PIM_DIMT_TUNNEL_REQUESTED;
 				break;
 			case PIM_DIMT_TUNNEL_REMOVING:
@@ -900,7 +909,7 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 		case PIM_DIMT_TUNNEL_INSTALLED:
 		case PIM_DIMT_TUNNEL_REQUESTED:
 			tun->readd_pending = false;
-			if (pim_dimt_tunnel_send(tun, false))
+			if (pim_dimt_tunnel_send(pim, tun, false))
 				tun->state = PIM_DIMT_TUNNEL_REMOVING;
 			break;
 		case PIM_DIMT_TUNNEL_IDLE:
@@ -1000,7 +1009,7 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
 		tun->ifindex = 0;
 		if (tun->readd_pending) {
 			tun->readd_pending = false;
-			tun->state = pim_dimt_tunnel_send(tun, true)
+			tun->state = pim_dimt_tunnel_send(pim, tun, true)
 					     ? PIM_DIMT_TUNNEL_REQUESTED
 					     : PIM_DIMT_TUNNEL_IDLE;
 			break;
