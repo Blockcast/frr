@@ -27,6 +27,7 @@
 #include "zclient.h"
 #include "stream.h"
 #include "jhash.h"
+#include "frrevent.h"
 
 #include "pimd.h"
 #include "pim_instance.h"
@@ -73,6 +74,7 @@ void pim_dimt_init(struct pim_instance *pim)
 
 void pim_dimt_terminate(struct pim_instance *pim)
 {
+	event_cancel(&pim->dimt_umh_resync_timer);
 	if (pim->dimt_umh_list)
 		list_delete(&pim->dimt_umh_list);
 	if (pim->dimt_endpoint_list)
@@ -376,6 +378,9 @@ void pim_dimt_umh_update(struct pim_instance *pim,
 #endif
 		umh->umh_type = zumh->umh_type;
 		umh->preference = zumh->preference;
+		/* A mapping the replay reasserts is live again, whether or not
+		 * anything in it changed. */
+		umh->stale = false;
 
 		if (PIM_DEBUG_PIM_TRACE)
 			zlog_debug("DIMT: UMH add %pFX -> %pPAs (type %u pref %u)",
@@ -403,24 +408,71 @@ void pim_dimt_umh_update(struct pim_instance *pim,
 	pim_dimt_readiness_update(pim);
 }
 
-void pim_dimt_umh_flush(struct pim_instance *pim)
+/* Grace period for the UMH re-dump requested at zebra reconnect.
+ *
+ * Sized for a relay round trip (pimd -> zebra -> bgpd -> N ADDs -> zebra ->
+ * pimd), which is sub-second in practice, with a wide margin for a busy or
+ * concurrently-restarting bgpd.  It is not sized to cover BGP convergence:
+ * a bgpd that restarted has an empty shadow table and re-announces each
+ * mapping as it re-learns the route, through the ordinary add path, so
+ * convergence does not depend on this timer at all.
+ */
+#define PIM_DIMT_UMH_RESYNC_GRACE_MSEC 30000
+
+/* Grace expired: every mapping the replay did not reassert is gone. */
+static void pim_dimt_umh_resync_sweep(struct event *t)
 {
+	struct pim_instance *pim = EVENT_ARG(t);
+	struct listnode *node, *nnode;
+	struct pim_dimt_umh *umh;
 	struct pim_upstream *up;
+	unsigned int swept = 0;
+
+	for (ALL_LIST_ELEMENTS(pim->dimt_umh_list, node, nnode, umh)) {
+		if (!umh->stale)
+			continue;
+		if (PIM_DEBUG_PIM_TRACE)
+			zlog_debug("DIMT: UMH %pFX -> %pPAs not replayed within grace; dropping",
+				   &umh->prefix, &umh->umh);
+		listnode_delete(pim->dimt_umh_list, umh);
+		pim_dimt_umh_free(umh);
+		swept++;
+	}
+
+	if (!swept)
+		return;
+
+	frr_each (rb_pim_upstream, &pim->upstream_head, up)
+		pim_dimt_upstream_apply(pim, up);
+
+	/* Only now can demand legitimately fall, so only now may a tunnel be
+	 * torn down.  Tunnels still holding a kernel netdev leave by DEL, not
+	 * by being forgotten -- see pim_dimt_tunnel::kernel_present. */
+	pim_dimt_reconcile(pim);
+	pim_dimt_readiness_update(pim);
+}
+
+void pim_dimt_umh_resync_begin(struct pim_instance *pim)
+{
+	struct listnode *node;
+	struct pim_dimt_umh *umh;
 
 	if (!pim->dimt_umh_list)
 		return;
 
 	if (PIM_DEBUG_PIM_TRACE)
-		zlog_debug("DIMT: flushing %u UMH mappings",
+		zlog_debug("DIMT: holding %u UMH mappings pending replay",
 			   listcount(pim->dimt_umh_list));
 
-	list_delete_all_node(pim->dimt_umh_list);
+	for (ALL_LIST_ELEMENTS_RO(pim->dimt_umh_list, node, umh))
+		umh->stale = true;
 
-	frr_each (rb_pim_upstream, &pim->upstream_head, up)
-		pim_dimt_upstream_apply(pim, up);
-
-	pim_dimt_reconcile(pim);
-	pim_dimt_readiness_update(pim);
+	/* Re-arm from scratch: a second reconnect inside the window restarts
+	 * the wait rather than expiring against the first one's deadline. */
+	event_cancel(&pim->dimt_umh_resync_timer);
+	event_add_timer_msec(router->master, pim_dimt_umh_resync_sweep, pim,
+			     PIM_DIMT_UMH_RESYNC_GRACE_MSEC,
+			     &pim->dimt_umh_resync_timer);
 }
 
 void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json)
@@ -914,6 +966,26 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 			break;
 		case PIM_DIMT_TUNNEL_IDLE:
 		case PIM_DIMT_TUNNEL_FAILED:
+			if (tun->kernel_present) {
+				/* Reached only after a zebra reconnect
+				 * collapsed the ack state: the record says
+				 * IDLE but a netdev built by the previous
+				 * session is still out there.  Forgetting it
+				 * here would strand that netdev with nothing
+				 * left holding its name, so ask for the
+				 * delete instead.  Harmless if zebra has no
+				 * such tunnel -- an unknown id is answered
+				 * REMOVED, which frees the record on the
+				 * notify. */
+				tun->readd_pending = false;
+				if (pim_dimt_tunnel_send(pim, tun, false)) {
+					tun->state = PIM_DIMT_TUNNEL_REMOVING;
+					break;
+				}
+				/* Socket unusable: keep the record (and the
+				 * name) so the next reconnect can retry. */
+				break;
+			}
 			listnode_delete(pim->dimt_tunnel_list, tun);
 			pim_dimt_tunnel_free(tun);
 			break;
@@ -991,6 +1063,7 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
 	case ZAPI_DIMT_TUNNEL_INSTALLED:
 		tun->state = PIM_DIMT_TUNNEL_INSTALLED;
 		tun->ifindex = notify->ifindex;
+		tun->kernel_present = true;
 		/* Positive netlink ack.  That is precondition (1) of three;
 		 * readiness still needs the RPF pin and kernel MFC
 		 * admission, which pim_dimt_forwarding_state() checks. */
@@ -1004,9 +1077,11 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
 		 * rather than building a tunnel through itself. */
 		tun->state = PIM_DIMT_TUNNEL_FAILED;
 		tun->ifindex = 0;
+		tun->kernel_present = false;
 		break;
 	case ZAPI_DIMT_TUNNEL_REMOVED:
 		tun->ifindex = 0;
+		tun->kernel_present = false;
 		if (tun->readd_pending) {
 			tun->readd_pending = false;
 			tun->state = pim_dimt_tunnel_send(pim, tun, true)
@@ -1058,6 +1133,12 @@ void pim_dimt_tunnel_session_reset(struct pim_instance *pim)
 			   listcount(pim->dimt_tunnel_list));
 
 	for (ALL_LIST_ELEMENTS_RO(pim->dimt_tunnel_list, node, tun)) {
+		/* Whatever the old session had already built stays built:
+		 * remember that a netdev may be out there, so that if demand
+		 * does not survive the reconnect the tunnel leaves by DEL
+		 * instead of being silently forgotten. */
+		if (tun->state != PIM_DIMT_TUNNEL_IDLE)
+			tun->kernel_present = true;
 		tun->state = PIM_DIMT_TUNNEL_IDLE;
 		tun->ifindex = 0;
 		tun->readd_pending = false;

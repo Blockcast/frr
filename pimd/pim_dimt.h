@@ -27,6 +27,10 @@ struct pim_dimt_umh {
 	uint8_t umh_type;   /* enum zapi_umh_type; only PIM mappings drive
 			     * pins, AMT stored/displayed only */
 	uint8_t preference; /* 0-15, higher preferred */
+	/* Marked when a zebra reconnect asks bgpd to re-dump: the mapping is
+	 * held, still driving demand, until the replay either refreshes it or
+	 * the grace period expires.  See pim_dimt_umh_resync_begin(). */
+	bool stale;
 };
 
 /*
@@ -56,8 +60,13 @@ struct pim_dimt_endpoint {
 
 /*
  * Tunnel request/ack state (contract D3).  Every transition is edge-triggered
- * by a zapi notify, a routing event or an interface event; there is no timer,
- * no poll and no hold-down anywhere in this state machine.
+ * by a zapi notify, a routing event or an interface event; the tunnel state
+ * machine has no timer, no poll and no hold-down anywhere in it.
+ *
+ * (The one timer DIMT owns is not in here: it bounds how long a zebra
+ * reconnect waits for bgpd's UMH re-dump before declaring the unreplayed
+ * mappings gone.  It gates *mapping* expiry, never a tunnel transition, so
+ * no state below is entered or left on a clock.)
  */
 enum pim_dimt_tunnel_state {
 	/* no request outstanding and nothing installed */
@@ -86,6 +95,19 @@ struct pim_dimt_tunnel {
 	char ifname[IFNAMSIZ];	 /* dimt-%08x, re-derived from tunnel_id */
 	uint32_t refcount;	 /* upstreams demanding this tunnel */
 	bool readd_pending;	 /* demand returned while REMOVING */
+	/*
+	 * A netdev for this tunnel may exist in the kernel right now.
+	 *
+	 * State alone cannot answer that after a zebra reconnect.  IDLE means
+	 * two different things: "never requested, nothing exists" (free the
+	 * record and no netdev is stranded) and "acknowledgement state was
+	 * dropped because the session that owned it died, but the netdev
+	 * deliberately outlives a zebra restart".  Freeing the record in the
+	 * second case leaks the netdev with nothing left that knows its name.
+	 * So teardown consults this rather than state: set it and a DEL goes
+	 * out, clear it and the record is simply forgotten.
+	 */
+	bool kernel_present;
 };
 
 void pim_dimt_init(struct pim_instance *pim);
@@ -95,10 +117,26 @@ void pim_dimt_terminate(struct pim_instance *pim);
 void pim_dimt_umh_update(struct pim_instance *pim,
 			 const struct zapi_umh *zumh, bool add);
 
-/* Drop every mapping and unpin all DIMT-owned upstreams.  Used when
- * re-subscribing to the relay: the replay that follows is authoritative,
- * stale mappings from a previous bgpd must not survive. */
-void pim_dimt_umh_flush(struct pim_instance *pim);
+/*
+ * Begin a mapping resync: hold every mapping, marked stale, while bgpd is
+ * asked to re-dump.  Used when (re-)subscribing to the relay.
+ *
+ * The obvious thing -- drop every mapping and let the replay repopulate --
+ * is wrong, because the emptied table is briefly indistinguishable from
+ * "nobody wants anything".  Demand is recounted from that empty table, every
+ * tunnel falls to zero refcount, and a control-socket bounce alone would
+ * tear down a data plane that was never in question.  Holding the mappings
+ * keeps demand truthful across the gap, so the tunnels are re-ADDed
+ * byte-identically and zebra re-adopts the surviving netdevs.
+ *
+ * Expiry cannot be event-driven: the replay has no end marker, and bgpd
+ * sends nothing at all when it has nothing (including when it is not
+ * running), so "no message" is not evidence either way.  A bounded grace
+ * period is the only available answer -- mappings the replay does not
+ * refresh within it are declared gone and swept, which is what stops a dead
+ * bgpd's mappings from living forever.
+ */
+void pim_dimt_umh_resync_begin(struct pim_instance *pim);
 
 /* Steer a (possibly new) upstream's RPF onto the light interface facing its
  * source's UMH; no-op when no mapping covers the source. */

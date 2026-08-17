@@ -181,6 +181,9 @@ struct pim_instance {
 	/* DIMT: live tunnel request/ack state, one per UMH under demand
 	 * (struct pim_dimt_tunnel) */
 	struct list *dimt_tunnel_list;
+	/* DIMT: bounds how long a zebra reconnect holds unreplayed mappings
+	 * before declaring them gone (pim_dimt_umh_resync_begin()) */
+	struct event *dimt_umh_resync_timer;
 	pim_addr ssmpingd_group_addr;
 
 	unsigned int gm_socket_if_count;

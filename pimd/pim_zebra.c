@@ -437,9 +437,12 @@ static void pim_zebra_connected(struct zclient *zclient)
 	/* (re-)subscribe to bgpd's DIMT UMH mappings */
 	pim_zebra_umh_subscribe(zclient);
 
-	/* Re-drive tunnel demand from re-derived state.  Readiness is not
-	 * asserted here: it is re-earned only when a fresh INSTALLED notify
-	 * plus the kernel MFC check say so (D4). */
+	/* Re-drive tunnel demand from re-derived state.  Demand is unchanged
+	 * across the reconnect (the mappings are held, not dropped), so this
+	 * re-ADDs each surviving tunnel byte-identically and zebra re-adopts
+	 * its netdev.  Readiness is not asserted here: it is re-earned only
+	 * when a fresh INSTALLED notify plus the kernel MFC check say so
+	 * (D4). */
 	if (pim) {
 		pim_dimt_reconcile(pim);
 		pim_dimt_readiness_update(pim);
@@ -651,11 +654,15 @@ static void pim_zebra_umh_subscribe(struct zclient *zclient)
 	if (!zclient || zclient->sock < 0)
 		return;
 
-	/* The replay re-dump is authoritative: mappings from a previous
-	 * bgpd whose DELs were lost across a restart/session bounce must
-	 * not survive. */
+	/* The replay re-dump is authoritative, but only once it has had a
+	 * chance to arrive.  Hold the mappings, marked stale, rather than
+	 * dropping them: an emptied table reads as zero demand, and the
+	 * teardown that follows from that would destroy tunnels this
+	 * reconnect never put in question.  Anything the replay does not
+	 * reassert is swept when the grace period expires, which is what
+	 * keeps a previous bgpd's lost DELs from surviving forever. */
 	if (pim)
-		pim_dimt_umh_flush(pim);
+		pim_dimt_umh_resync_begin(pim);
 
 	s = zclient->obuf;
 	stream_reset(s);
