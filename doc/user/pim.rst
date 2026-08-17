@@ -611,14 +611,25 @@ keyword at the end.
       satisfy the readiness check, so this state deliberately waits rather than
       pinning somewhere that cannot forward.
 
+   ``tunnel-failed``
+      the tunnel for this UMH is in state ``failed``, so nothing will become
+      pinnable on its own.  Unlike ``tunnel-pending`` this is terminal until
+      demand changes -- the tunnel provider's anti-recursion refusal lands
+      here, and waiting will not clear it.  Check
+      :clicmd:`show ip pim [vrf NAME] dimt tunnel [json]` and the endpoint row.
+
    ``none``
       nothing resolves.
 
    ``Shadowed`` (``shadowedInterface`` in JSON, omitted when empty) names a PIM
-   Light interface that also covers the UMH but did **not** get the pin, because
-   a DIMT tunnel takes it unconditionally.  Its presence means the
-   configuration is ambiguous -- more than one interface could have carried the
-   pin -- and it is shown so that resolution is auditable rather than silent.
+   Light interface that also covers the UMH but did **not** get the pin.  In
+   the ``tunnel`` case that is because a DIMT tunnel takes the pin
+   unconditionally; in the ``tunnel-pending`` and ``tunnel-failed`` cases
+   nothing took the pin at all, and the field reports the interface that would
+   otherwise have been eligible.  Its presence means the configuration is
+   ambiguous -- more than one interface could have carried the pin -- and it is
+   shown so that resolution is auditable rather than silent.  The tunnel's own
+   netdev is never reported here.
 
 .. clicmd:: show ip pim [vrf NAME] dimt tunnel [json]
 
