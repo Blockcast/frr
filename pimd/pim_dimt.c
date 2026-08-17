@@ -310,6 +310,21 @@ void pim_dimt_iface_up(struct pim_instance *pim, struct interface *ifp)
 
 	frr_each (rb_pim_upstream, &pim->upstream_head, up)
 		pim_dimt_upstream_apply(pim, up);
+
+	/* This is the path on which readiness normally becomes true, so the
+	 * edge has to be relayed from here.  A DIMT netdev is adopted on the
+	 * INSTALLED notify, before the inner address it just programmed has
+	 * come back round as a connected route -- so at notify time the vif
+	 * does not exist yet and conjunct (3) is false.  pim_if_addr_add()
+	 * reaches us once the address lands, the pin above re-programs the MFC,
+	 * and only then do all three conjuncts hold.  Without this the
+	 * PENDING -> READY transition is computed correctly but never announced
+	 * to bgpd until some later, unrelated event happens to call it.
+	 *
+	 * Edge-triggered downstream (pim_gtm_forwarding_update() returns
+	 * immediately when the state is unchanged), so this is cheap and safe
+	 * to call on every interface-up. */
+	pim_dimt_readiness_update(pim);
 }
 
 /* The pinned light interface went down or away.  STATIC_IIF exists to make
@@ -330,6 +345,11 @@ void pim_dimt_iface_down(struct pim_instance *pim, struct interface *ifp)
 		pim_dimt_upstream_unpin(pim, up);
 		pim_dimt_upstream_apply(pim, up);
 	}
+
+	/* The mirror of the iface_up case: losing the pin drops readiness out
+	 * of READY, and that edge is just as much bgpd's business as the one
+	 * that established it. */
+	pim_dimt_readiness_update(pim);
 }
 
 void pim_dimt_umh_update(struct pim_instance *pim,
