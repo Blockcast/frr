@@ -293,9 +293,9 @@ keyword at the end.
    address.  Cannot be combined with ``ipv6 pim passive``.  Instead of a
    static route, the RPF may be steered by a BGP-learned Upstream Multicast
    Hop mapping (``set extcommunity umh`` in bgpd); see
-   :clicmd:`show ipv6 pim dimt umh [json]`.
+   :clicmd:`show ipv6 pim [vrf NAME] dimt umh [json]`.
 
-.. clicmd:: show ipv6 pim dimt umh [json]
+.. clicmd:: show ipv6 pim [vrf NAME] dimt umh [json]
 
    Display the bgpd-learned DIMT Upstream Multicast Hop mappings: for each
    IPv6 source prefix, the UMH address joins are sent toward, its type
