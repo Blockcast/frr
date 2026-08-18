@@ -192,8 +192,13 @@ def link_names(router):
         match = re.match(r"^\d+:\s+([^:@\s]+)", line)
         if match:
             names.add(match.group(1))
-    # Every namespace has a loopback; an enumeration without one did not run.
-    if not names:
+    # Every namespace has a loopback, so an enumeration without one did not
+    # run: `ip` failed, or its diagnostic went to stdout and parsed to
+    # nothing.  Testing for `lo` rather than for emptiness is what makes this
+    # a real sanity check -- a single stray parseable line would otherwise
+    # read as an authoritative enumeration and let absence be "proven" from
+    # output that never listed the device in the first place.
+    if "lo" not in names:
         return None
     return names
 
