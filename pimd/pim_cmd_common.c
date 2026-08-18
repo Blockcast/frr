@@ -6052,8 +6052,10 @@ int pim_router_config_write(struct vty *vty)
 		 * Only the default VRF is written, matching the CONFIG_NODE-
 		 * only installation: the grammar carries no `vrf NAME` token,
 		 * so a non-default row has no representation that could round-
-		 * trip, and pim_dimt_tunnel_send() hardcodes VRF_DEFAULT
-		 * anyway. */
+		 * trip.  (pim_dimt_tunnel_send() now addresses the instance
+		 * VRF rather than hardcoding VRF_DEFAULT, so the transport is
+		 * no longer the limiting factor -- the missing grammar token
+		 * is, and it is sufficient on its own.) */
 		if (vrf->vrf_id == VRF_DEFAULT)
 			writes += pim_dimt_endpoint_config_write(pim, vty);
 
