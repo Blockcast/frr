@@ -2196,6 +2196,27 @@ static int pim_ifp_up(struct interface *ifp)
 
 	pim_ifp = ifp->info;
 
+	/*
+	 * DIMT: the adoption hook in pim_ifp_create() sits inside that
+	 * function's if_is_operative(ifp) block, so it is skipped whenever the
+	 * interface-add arrives before the link is up.  That ordering is the
+	 * normal one for a netdev pimd just asked zebra to build: a freshly
+	 * created GRE link has IFF_UP clear on its first RTM_NEWLINK, and
+	 * zebra brings it up as a second, separate netlink operation.  Without
+	 * a second adoption point nothing would ever set pim_light_enable for
+	 * that interface, pim_dimt_light_iface() would keep rejecting it, and
+	 * readiness for every (S,G) riding the tunnel would stay PENDING
+	 * forever -- the same failure the create-path hook was added to close,
+	 * reached from the other arrival order.
+	 *
+	 * This must run before the double-activation guard below, which
+	 * returns early for any interface that already has a vif and would
+	 * otherwise skip adoption on exactly the interfaces that need it.
+	 * pim_dimt_ifp_adopt() is idempotent and a no-op for any interface
+	 * pimd did not request, so the extra call is harmless.
+	 */
+	pim_dimt_ifp_adopt(pim, ifp);
+
 	/* Avoid enabling the same interface twice */
 	if (pim_ifp && pim_ifp->mroute_vif_index != -1)
 		return 0;
