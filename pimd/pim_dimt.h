@@ -106,6 +106,17 @@ struct pim_dimt_tunnel {
 	 * second case leaks the netdev with nothing left that knows its name.
 	 * So teardown consults this rather than state: set it and a DEL goes
 	 * out, clear it and the record is simply forgotten.
+	 *
+	 * It is a LATCH, and that is load-bearing.  Set on INSTALLED and on a
+	 * zebra session reset; cleared ONLY by REMOVED, because REMOVED is the
+	 * only result that proves the netdev is gone.  In particular
+	 * FAIL_INSTALL must not clear it: FAIL_INSTALL means "this ADD did not
+	 * take", and zebra answers an ADD that differs from a live netdev that
+	 * way rather than mutating it in place, so a netdev from an earlier
+	 * ADD provably survives the refusal.  Clearing on FAIL_INSTALL
+	 * reinstates exactly the stranded-netdev leak this flag exists to
+	 * close.  Erring toward a redundant DEL is safe -- zebra answers a DEL
+	 * for an id it does not know with REMOVED, which frees the record.
 	 */
 	bool kernel_present;
 };

@@ -641,9 +641,13 @@ int pim_dimt_endpoint_config_write(struct pim_instance *pim, struct vty *vty)
  *
  * Edge-triggered throughout: every transition below is driven by a zapi
  * notify, a UMH mapping change, an interface event or a zebra reconnect.
- * There is no timer, no polling loop and no hold-down anywhere in this
- * file -- that absence is the requirement Phase A structurally could not
- * meet, so it is load-bearing rather than stylistic.
+ * No timer, polling loop or hold-down participates in any tunnel state
+ * transition -- that absence is the requirement Phase A structurally could
+ * not meet, so it is load-bearing rather than stylistic.  The one timer in
+ * this file is the resync grace timer armed by
+ * pim_dimt_umh_resync_begin(); it gates expiry of stale UMH *mappings*
+ * after a zebra reconnect and drives no transition here.  See the
+ * pim_dimt.h header comment for why that carve-out is safe.
  * ------------------------------------------------------------------------
  */
 
@@ -848,6 +852,22 @@ static void pim_dimt_endpoint_apply_change(struct pim_instance *pim,
 		break;
 	case PIM_DIMT_TUNNEL_IDLE:
 	case PIM_DIMT_TUNNEL_FAILED:
+		if (tun->kernel_present) {
+			/* IDLE/FAILED says only that *this* session holds no
+			 * acknowledgement -- after a zebra reconnect
+			 * pim_dimt_tunnel_session_reset() sets IDLE while a
+			 * netdev built by the previous session is still out
+			 * there, and a FAIL_INSTALL refusal leaves the older
+			 * netdev untouched.  Re-ADDing differing bytes over a
+			 * live netdev is exactly what zebra refuses, so drive
+			 * the replacement through a DEL and let the re-ADD
+			 * ride the REMOVED notify. */
+			if (pim_dimt_tunnel_send(pim, tun, false)) {
+				tun->state = PIM_DIMT_TUNNEL_REMOVING;
+				tun->readd_pending = true;
+			}
+			break;
+		}
 		/* No netdev to replace.  reconcile() re-ADDs from the rebuilt
 		 * request on the demand edge that follows, and FAILED
 		 * re-requesting here is correct: an edited endpoint is exactly
@@ -1074,10 +1094,21 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
 	case ZAPI_DIMT_TUNNEL_FAIL_INSTALL:
 		/* Includes zebra's anti-recursion refusal: an outer endpoint
 		 * that resolves through a DIMT interface is rejected here
-		 * rather than building a tunnel through itself. */
+		 * rather than building a tunnel through itself.
+		 *
+		 * kernel_present is deliberately NOT cleared here.
+		 * FAIL_INSTALL means "this ADD did not take", which is not
+		 * the same claim as "no netdev with this id exists": zebra
+		 * answers an ADD that differs from a live netdev with
+		 * FAIL_INSTALL rather than mutating it in place, so the
+		 * previous netdev provably survives the refusal.  Clearing
+		 * the flag here would let the demand-drop path at
+		 * pim_dimt_reconcile() free the record instead of sending a
+		 * DEL, stranding a live dimt-%08x link with nothing holding
+		 * its name.  REMOVED is the only result that proves absence,
+		 * so it is the only result that clears the flag. */
 		tun->state = PIM_DIMT_TUNNEL_FAILED;
 		tun->ifindex = 0;
-		tun->kernel_present = false;
 		break;
 	case ZAPI_DIMT_TUNNEL_REMOVED:
 		tun->ifindex = 0;
