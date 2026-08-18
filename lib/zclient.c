@@ -4225,8 +4225,17 @@ int zapi_mvpn_sg_decode(struct stream *s, struct zapi_mvpn_sg *sg)
 	if (STREAM_READABLE(s) >= 1)
 		STREAM_GETC(s, sg->forwarding);
 
+	/*
+	 * An unrecognised value is clamped to the same fail-closed reading as
+	 * an absent byte rather than rejected.  Returning -1 here would fail
+	 * the whole decode and discard src/grp/role too, so the day a fourth
+	 * enum zapi_mvpn_sg_forwarding member is added, every older peer would
+	 * stop processing MVPN SG messages entirely -- a strictly worse
+	 * outcome than the mixed-version case this additive framing exists to
+	 * survive.
+	 */
 	if (sg->forwarding > ZAPI_MVPN_SG_FWD_FAILED)
-		return -1;
+		sg->forwarding = ZAPI_MVPN_SG_FWD_PENDING;
 
 	return 0;
 
