@@ -77,7 +77,7 @@ def request(action, tunnel_id, encap="gre"):
     return json.loads(output)
 
 
-def inject_netlink_syscall_failure(router, syscall, when):
+def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
     require_strace(router)
     zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
     dplane_tid = router.run(
@@ -96,7 +96,7 @@ def inject_netlink_syscall_failure(router, syscall, when):
             "-e",
             "trace={}".format(syscall),
             "-e",
-            "inject={}:error=EIO:when={}".format(syscall, when),
+            "inject={}:error={}:when={}".format(syscall, errno_name, when),
             "-p",
             dplane_tid,
         ],
@@ -114,6 +114,27 @@ def inject_netlink_syscall_failure(router, syscall, when):
 
 def inject_netlink_send_failure(router, when):
     return inject_netlink_syscall_failure(router, "sendmsg", when)
+
+
+def inject_netlink_recv_failure(router, when):
+    """Drop one netlink response read, simulating a lost ack.
+
+    The errno is load-bearing and must stay EAGAIN. zebra tolerates only
+    EWOULDBLOCK/EAGAIN/EMSGSIZE out of netlink_recv_msg()
+    (zebra/kernel_netlink.c); every other errno is a deliberate upstream
+    fatal path that logs "recvmsg overrun" and calls
+    frr_exit_with_buffer_flush(-1), killing the daemon and every later
+    test in this module rather than exercising anything.
+
+    EAGAIN is exactly the semantics these callers want: netlink_recv_msg()
+    returns 0, nl_batch_read_resp() drains the batch marking DIMT ADD/DEL
+    contexts ZEBRA_DPLANE_REQUEST_FAILURE, and zebra survives. The request
+    itself was already delivered by sendmsg, so the kernel applied it --
+    the reported failure is a lost verdict, not an authoritative one, and
+    the unread ack stays queued in the socket buffer to be discarded by
+    sequence comparison on the next read. That is the lost-ack window.
+    """
+    return inject_netlink_syscall_failure(router, "recvmsg", when, errno_name="EAGAIN")
 
 
 def hold_dplane_worker(router, delay_usecs=6000000):
@@ -431,7 +452,7 @@ def test_uncertain_create_result_reconciles_surviving_link():
     router = get_topogen().gears["r1"]
     # Fail the response read: the RTM_NEWLINK reaches the kernel but its
     # ack is lost, so the reported failure is not an authoritative verdict.
-    tracer = inject_netlink_syscall_failure(router, "recvmsg", 1)
+    tracer = inject_netlink_recv_failure(router, 1)
     try:
         failed = request("add", 8)
     finally:
@@ -510,7 +531,7 @@ def test_lost_delete_ack_reconciles_instead_of_resurrecting():
     # converge on reconciled interface state -- REMOVED now, or
     # REMOVE_FAIL then REMOVED on retry -- and never report INSTALLED for
     # a link that no longer exists.
-    tracer = inject_netlink_syscall_failure(router, "recvmsg", 1)
+    tracer = inject_netlink_recv_failure(router, 1)
     try:
         removed = request("del", 11)
     finally:
