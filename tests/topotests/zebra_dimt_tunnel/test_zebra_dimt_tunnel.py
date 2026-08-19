@@ -101,11 +101,14 @@ def require_strace(router):
 #              uninjected run ESCAPES this marker instead of being absorbed:
 #              the test reporting xfail is itself the proof it fired.
 #
-#   BLO-29000  zebra accepts an ADD issued while a DELETE for the same tunnel
-#              id is still in flight -- the readd returns result=0 with a live
-#              ifindex where the test requires rejection (result=1). Surfaced
-#              by removing the seven BLO-28405 markers that had absorbed it;
-#              it is neither BLO-28405 nor BLO-28406.
+#   BLO-29000  a HARNESS defect, not a zebra one. hold_dplane_worker() does
+#              not hold the `del 9` client: it exits with result=2 (REMOVED)
+#              before the readd runs, so the test has never opened the window
+#              it is named for. The zebra defect first filed here -- "readd
+#              returns result=0" -- was a phantom: a post-delete ADD succeeding
+#              is correct, and this test's own tail asserts exactly that. The
+#              two observables are bit-for-bit identical, which is why the
+#              precondition guard is the only thing that could tell them apart.
 #
 # These are marked xfail rather than skipped so the harness fix could land
 # without waiting on the zebra work -- a skip would recreate the very blind spot
@@ -145,14 +148,23 @@ XFAIL_BLO_28406 = pytest.mark.xfail(
 )
 
 
+# raises=pytest.fail.Exception, NOT AssertionError: the expected failure here is
+# the precondition guard, which deliberately uses pytest.fail() so it can escape
+# a raises=AssertionError marker. Narrowing to Failed keeps that property -- the
+# behavioural assertion below it is an AssertionError and would NOT be absorbed,
+# so if the hold ever starts working and zebra then misbehaves, that surfaces as
+# a hard failure rather than hiding under this marker.
 XFAIL_BLO_29000 = pytest.mark.xfail(
     strict=True,
-    raises=AssertionError,
+    raises=pytest.fail.Exception,
     reason=(
-        "BLO-29000: zebra accepts an ADD issued while a DELETE for the same "
-        "tunnel id is in flight -- the readd returns result=0 with a live "
-        "ifindex instead of being rejected with result=1. Remove this marker "
-        "in the BLO-29000 fix PR."
+        "BLO-29000: this test does not currently exercise its own window -- "
+        "hold_dplane_worker() does not hold the `del 9` client, which exits "
+        "with result=2 (REMOVED) before the readd runs. Measured, not "
+        "inferred: the pending.poll() guard fires. The zebra defect originally "
+        "filed here was a phantom -- a post-delete ADD succeeding is correct, "
+        "and this test's own tail asserts it. Remove this marker when the hold "
+        "works and the guard stops firing."
     ),
 )
 
@@ -748,6 +760,28 @@ def test_add_during_inflight_delete_is_rejected():
             stderr=subprocess.PIPE,
         )
         time.sleep(0.3)
+        # The whole test is "an ADD *while a DELETE is in flight*". If the
+        # worker hold silently no-ops, the del completes during the sleep above
+        # and the add below then succeeds for the ORDINARY reason -- which this
+        # test's own tail asserts is correct post-delete behaviour. That failure
+        # is bit-for-bit the same observable as the defect BLO-29000 claims, and
+        # raises=AssertionError would absorb it into a green xfail. So establish
+        # the precondition before asserting on it.
+        #
+        # pytest.fail(), not assert: Failed escapes raises=AssertionError, an
+        # AssertionError here would be swallowed by the very marker this guard
+        # exists to keep honest. Same reasoning as assert_injection_fired().
+        if pending.poll() is not None:
+            out, err = pending.communicate(timeout=5)
+            pytest.fail(
+                "the `del 9` client already exited (rc={}), so nothing was in "
+                "flight when the readd below ran. The dplane worker hold did "
+                "not take, and anything asserted past this point describes an "
+                "ordinary post-delete ADD, not an ADD racing a live DELETE. "
+                "Treat this as the test not having executed.\nstdout: {}\n"
+                "stderr: {}".format(pending.returncode,
+                                    _text(out).strip() or "(empty)",
+                                    _text(err).strip() or "(empty)"))
         # An identical ADD while the delete is in flight must be rejected
         # instead of rebinding ownership: the delete completion belongs to
         # the delete requester.
@@ -869,7 +903,14 @@ def test_lost_delete_ack_reconciles_instead_of_resurrecting():
     try:
         removed = request("del", 11)
     finally:
-        stop_tracer(tracer)
+        trace = stop_tracer(tracer)
+    # Without this the test is a permanent green pass on an unverified window:
+    # under a no-op injection the ack is not lost, the delete simply completes,
+    # and every assertion below is satisfied for the ordinary reason. A
+    # SUCCESSFUL recv injection writes nothing to zebra.out either (EAGAIN is
+    # the normal batch terminator), so strace's own output is the only evidence
+    # that exists -- and it was being discarded.
+    assert_injection_fired(trace, tracer.injection_label)
     assert removed["result"] in (2, 3), removed
     _, link = topotest.run_and_expect(
         lambda: router.run("ip link show dimt-0000000b 2>/dev/null"),
