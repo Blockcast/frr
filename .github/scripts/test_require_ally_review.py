@@ -217,7 +217,7 @@ class TestSelfReview(unittest.TestCase):
             reviews=[review("APPROVED")], author="app/allyblockcast"
         )
         self.assertEqual(state, "pending")
-        self.assertIn("independent author", desc)
+        self.assertIn("write-access human", desc)
 
     def test_self_review_blocking_findings_still_fail_closed(self):
         body = CONSOLIDATED + "### Critical Issues (1)\n"
@@ -242,10 +242,12 @@ class TestSelfReview(unittest.TestCase):
             author="app/allyblockcast",
             trusted={HUMAN},
         )
-        # Round 3: App-authored PRs stay pending regardless of distinct
-        # approvals; reopen the head under an independent author.
-        self.assertEqual(state, "pending")
-        self.assertIn("independent author", desc)
+        # BLO-25488: a distinct, permission-trusted, non-Ally approval at the
+        # exact head now clears an App-authored PR. Ally's own App-seat
+        # APPROVED on its own PR is demoted to a self-review placeholder
+        # (never success), so the human's is the only signal available.
+        self.assertEqual(state, "success")
+        self.assertIn("approved head", desc)
 
     def test_distinct_approval_trusted_via_collaborator_permission(self):
         """Branch 8 — association is CONTRIBUTOR (the visibility-gated false
@@ -263,9 +265,9 @@ class TestSelfReview(unittest.TestCase):
             author="app/allyblockcast",
             trusted={HUMAN},
         )
-        # Round 3: pending — the permission lookup still resolves trust, but
-        # a distinct approval can no longer green this context.
-        self.assertEqual(state, "pending")
+        # BLO-25488: the permission lookup resolves trust, and a non-Ally
+        # distinct approval now clears this context.
+        self.assertEqual(state, "success")
 
     def test_bot_ally_identity_cannot_be_its_own_distinct_reviewer(self):
         state, _ = decide(
@@ -475,10 +477,9 @@ class TestConflictingReviewers(unittest.TestCase):
             author="app/allyblockcast",
             trusted={"reviewer-a"},
         )
-        # The later approval withdraws reviewer-a's own objection, but a
-        # surviving distinct approval maps to NO signal (round 3): pending,
-        # never success.
-        self.assertEqual(state, "pending")
+        # BLO-25488: the later approval withdraws reviewer-a's own objection,
+        # and a surviving non-Ally distinct approval now clears the gate.
+        self.assertEqual(state, "success")
 
 
 class TestOverrideIsHeadBound(unittest.TestCase):
@@ -813,10 +814,9 @@ class TestDistinctReviewerHeadBinding(unittest.TestCase):
             author="app/allyblockcast",
             trusted={HUMAN},
         )
-        # Round 3: distinct approvals no longer produce success anywhere;
-        # binding now only governs whether an approval may withdraw the SAME
-        # reviewer's earlier change request.
-        self.assertEqual(state, "pending")
+        # BLO-25488: the head-attested body binds this as a genuine non-Ally
+        # distinct approval, which now clears the gate.
+        self.assertEqual(state, "success")
 
     def test_authorization_comment_binds_an_empty_body_approval(self):
         state, _ = decide(
@@ -825,7 +825,9 @@ class TestDistinctReviewerHeadBinding(unittest.TestCase):
             author="app/allyblockcast",
             trusted={HUMAN},
         )
-        self.assertEqual(state, "pending")
+        # BLO-25488: the reviewer's own head-bound authorization comment
+        # binds their empty-body approval, clearing the gate.
+        self.assertEqual(state, "success")
 
     def test_authorization_by_a_different_login_does_not_bind(self):
         # The approver must bind their own approval; a third party's
@@ -1413,10 +1415,13 @@ class TestUserSeatCannotProvidePositiveEvidence(unittest.TestCase):
         self.assertEqual(state, "success")
 
     def test_user_seat_distinct_approval_cannot_green_app_authored_pr(self):
-        # Inverted per round 3 of the multicast vendoring review: the
-        # merge-token User seat (or ANY trusted distinct approval) can no
-        # longer substitute for the App signal on an App-authored PR. Such
-        # heads stay pending until reopened under an independent author.
+        # BLO-25488: a genuinely distinct, non-Ally, trusted reviewer's
+        # approval CAN now clear an App-authored PR (see TestSuccessExclusivity
+        # and TestSelfReview), but the shared `allyblockcast` User seat is
+        # still Ally's own identity (BLO-24056: 661 App-authored approvals
+        # org-wide), not an independent reviewer -- it must stay excluded
+        # even though it structurally qualifies as "distinct" for the
+        # CHANGES_REQUESTED-still-binds property.
         state, _ = decide(
             reviews=[review("APPROVED", login="allyblockcast", utype="User",
                             at="2026-07-27T11:00:00Z")],
@@ -1823,13 +1828,15 @@ class TestOverrideMaskAmbiguity(unittest.TestCase):
 
 
 class TestSuccessExclusivity(unittest.TestCase):
-    """Round 2 of this PR's review: `success` has exactly ONE producer -- the
-    formal exact-head App-seat APPROVED review. Every other positive-looking
-    shape of Ally evidence lands pending, and positive comment evidence is
-    inert entirely. This is the machine-checkable form of the sole-authority
-    invariant this change claims."""
+    """Round 2 of this PR's review, updated for BLO-25488: `success` has
+    exactly TWO producers -- the formal exact-head App-seat APPROVED review,
+    and a distinct, permission-trusted, non-Ally login's exact-head-attested
+    APPROVED on a self-review PR. Every OTHER positive-looking shape of
+    evidence still lands pending -- including an approval from either Ally
+    identity -- and positive comment evidence is inert entirely. This is the
+    machine-checkable form of this change's net-positive-authority table."""
 
-    def test_only_a_formal_app_seat_approval_returns_success(self):
+    def test_only_two_intentional_producers_return_success(self):
         cases = [
             ("formal-app-seat-approved",
              dict(reviews=[review("APPROVED")]), "success"),
@@ -1851,7 +1858,12 @@ class TestSuccessExclusivity(unittest.TestCase):
              "pending"),
             ("trusted-distinct-approval-on-app-authored-pr",
              dict(reviews=[review("APPROVED", login=HUMAN, utype="User")],
-                  author="app/allyblockcast", trusted={HUMAN}), "pending"),
+                  author="app/allyblockcast", trusted={HUMAN}), "success"),
+            ("ally-user-hat-distinct-approval-on-app-authored-pr",
+             dict(reviews=[review("APPROVED", login="allyblockcast",
+                                  utype="User")],
+                  author="app/allyblockcast", trusted={"allyblockcast"}),
+             "pending"),
         ]
         for name, kwargs, expected in cases:
             state, _ = decide(**kwargs)
@@ -2328,6 +2340,83 @@ class TestSeatAwareReduction(unittest.TestCase):
             ]
         )
         self.assertEqual(state, "failure")
+
+
+class TestBLO25488PositiveAuthorityRestored(unittest.TestCase):
+    """BLO-25488: round 3 (multicast:1081-1084 / frr#47) adopted the reduced
+    distinct-reviewer signal only when it was `failure`, so on an
+    Ally-authored PR no identity in existence -- not even a trusted human --
+    could ever turn this gate green; admin bypass was the only relief
+    (evidenced by multicast#413, kkroo's attested APPROVED never clearing).
+    This suite pins the net semantics table from the issue: App seat and
+    Ally User hat both stay excluded from greening, but a distinct
+    write-access human now can, and every existing fail-closed property
+    (Ally blocking findings, a distinct CHANGES_REQUESTED) still holds.
+    """
+
+    APP_AUTHOR = "app/allyblockcast"
+
+    def test_non_ally_human_approved_and_attested_sets_success(self):
+        state, desc = decide(
+            reviews=[review("APPROVED", login=HUMAN, utype="User",
+                            assoc="MEMBER", at="2026-07-27T11:00:00Z")],
+            author=self.APP_AUTHOR,
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "success")
+        self.assertIn(HUMAN, desc)
+        self.assertIn("approved head", desc)
+
+    def test_app_bot_seat_approval_of_own_pr_does_not_set_success(self):
+        # GitHub structurally forbids an App from approving its own PR, but
+        # even a synthetic APPROVED row from the App's own login is demoted
+        # to the self-review placeholder, never success.
+        state, _ = decide(
+            reviews=[review("APPROVED", login="allyblockcast[bot]", utype="Bot")],
+            author=self.APP_AUTHOR,
+        )
+        self.assertNotEqual(state, "success")
+
+    def test_ally_user_hat_approval_does_not_set_success(self):
+        state, _ = decide(
+            reviews=[review("APPROVED", login="allyblockcast", utype="User",
+                            at="2026-07-27T11:00:00Z")],
+            author=self.APP_AUTHOR,
+            trusted={"allyblockcast"},
+        )
+        self.assertNotEqual(state, "success")
+
+    def test_outstanding_ally_blocking_finding_outranks_a_human_approval(self):
+        body = CONSOLIDATED + "### Critical Issues (1)\n"
+        state, _ = decide(
+            reviews=[
+                review("COMMENTED", login="allyblockcast[bot]", body=body,
+                       at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login=HUMAN, utype="User", assoc="MEMBER",
+                       at="2026-07-27T12:00:00Z"),
+            ],
+            author=self.APP_AUTHOR,
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "failure")
+
+    def test_distinct_human_changes_requested_still_fails_closed(self):
+        state, _ = decide(
+            reviews=[review("CHANGES_REQUESTED", login=HUMAN, utype="User",
+                            assoc="MEMBER", at="2026-07-27T11:00:00Z")],
+            author=self.APP_AUTHOR,
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "failure")
+
+    def test_self_review_description_no_longer_suggests_rehoming(self):
+        # BLO-24721: "reopen it under an independent author" was 0-for-4 and
+        # generated stale re-home tickets. The description now names the
+        # path that actually works.
+        state, desc = decide(reviews=[review("APPROVED")], author=self.APP_AUTHOR)
+        self.assertEqual(state, "pending")
+        self.assertNotIn("independent author", desc)
+        self.assertIn("write-access human", desc)
 
 
 class _FakeResponse:

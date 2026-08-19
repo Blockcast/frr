@@ -345,20 +345,24 @@ def is_issue_link_ally_comment_for_head(body, head_sha):
 
 def self_review_signal(at, author, head_sha, seat):
     """A clean self-review (the PR was authored by an Ally identity, and Ally
-    is reviewing its own PR) is not authoritative, and since round 3 of the
-    multicast vendoring review no substitute exists: the only identity that
-    may authorize this context is the App seat, which cannot approve its own
-    PR. App-authored heads stay pending until reopened under an independent
-    author. Machine-readable blocking findings are classified before reaching
-    here and still fail closed.
+    is reviewing its own PR) is not authoritative: neither Ally identity --
+    the App seat, which structurally cannot approve its own PR, nor the
+    shared `allyblockcast` User seat (BLO-24056: that account supplied 661
+    App-authored approvals org-wide and is Ally's second hat, not an
+    independent reviewer) -- may authorize this context. The positive path
+    (BLO-25488) is a distinct, permission-trusted, non-Ally login's
+    exact-head-attested APPROVED review, adopted in decide() from
+    distinct_signals. Machine-readable blocking findings are classified
+    before reaching here and still fail closed.
     """
     return {
         "at": str(at or ""),
         "author": author,
         "seat": seat,
         "description": (
-            "Ally-authored PR: head %s cannot be App-self-approved; "
-            "reopen it under an independent author." % short_sha(head_sha)
+            "Ally-authored PR: head %s cannot be App-self-approved; needs an "
+            "approving review from a write-access human at this head."
+            % short_sha(head_sha)
         ),
         "kind": "self-review",
         "status": "pending",
@@ -1031,7 +1035,8 @@ def decide(
     # trusted as implying resolved. Keeps the authoritative-lookup rule correct
     # even if a caller supplies only the trusted set.
     permission_resolved_logins = (permission_resolved_logins or set()) | permission_trusted_logins
-    is_self_review = isinstance(pr_author_login, str) and pr_author_login in set(ally_logins)
+    ally = set(ally_logins)
+    is_self_review = isinstance(pr_author_login, str) and pr_author_login in ally
 
     ally_signals = review_signals_for_head(
         reviews, head_sha, ally_logins, is_self_review
@@ -1070,27 +1075,43 @@ def decide(
     else:
         signal = latest_signal(ally_current)
 
-    # Distinct-reviewer evidence contributes ONLY blocking signals (round 3
-    # of the multicast vendoring review): this context's sole positive
-    # authority is the Ally App seat, and an App-authored PR cannot receive
-    # App approval -- it stays pending until reopened under an independent
-    # author. A trusted distinct reviewer's CHANGES_REQUESTED still fails
-    # closed (dropping it would be fail-open), and inside the per-reviewer
-    # reduction a reviewer's later approval still withdraws THEIR OWN earlier
-    # change request -- but a surviving approval maps to no signal, never
-    # success. Ally's own OUTSTANDING blocking findings outrank everything.
+    # Distinct-reviewer evidence contributes success as well as blocking
+    # signals here (BLO-25488, fixing the round-3 regression where success
+    # was dropped and no identity -- not even a trusted human -- could ever
+    # green a self-review PR). This context's positive authority is now
+    # EITHER Ally's own App-seat APPROVED (handled above via ally_successes)
+    # OR a distinct, permission-trusted, NON-ALLY login's exact-head-attested
+    # APPROVED. The Ally User seat structurally still qualifies as a
+    # "distinct" participant here (case (b) of
+    # distinct_reviewer_signals_for_head's is_distinct, needed so its own
+    # CHANGES_REQUESTED keeps binding), but BLO-24056 found it supplying 661
+    # App-authored approvals org-wide -- it is Ally's second hat, not an
+    # independent reviewer, so it must never be the identity that turns this
+    # green. Adopting `reduced` unconditionally on failure (as before) keeps
+    # a trusted distinct reviewer's CHANGES_REQUESTED fail-closed regardless
+    # of identity; adopting success only requires a SEPARATE reduction
+    # restricted to non-Ally authors, so a chronologically-later Ally-seat
+    # success cannot shadow an earlier, still-current non-Ally approval. A
+    # reviewer's later approval still withdraws THEIR OWN earlier change
+    # request inside the per-reviewer reduction. Ally's own OUTSTANDING
+    # blocking findings outrank everything.
     if is_self_review and distinct_signals and not ally_blocking:
         reduced = reduce_distinct_reviewer_signals(distinct_signals)
         if reduced is not None and reduced["status"] == "failure":
             signal = reduced
+        elif reduced is not None and reduced["status"] == "success":
+            non_ally_signals = [s for s in distinct_signals if s["author"] not in ally]
+            reduced_non_ally = reduce_distinct_reviewer_signals(non_ally_signals)
+            if reduced_non_ally is not None and reduced_non_ally["status"] == "success":
+                signal = reduced_non_ally
 
     # There is deliberately NO maintainer override on this context (round 3
     # of the multicast vendoring review): a head-bound label+comment override
-    # was a second path where a permission-trusted User could green a context
-    # whose sole positive authority is the App seat. Deadlock relief for a
-    # reviewer that never ran is an administrative action outside this
-    # context (branch-protection admin bypass), not a state this script will
-    # ever report as success.
+    # was a second, unchecked-identity path to the same authority the
+    # distinct-reviewer reduction above already grants under a permission AND
+    # identity check. Deadlock relief for a reviewer that never ran is an
+    # administrative action outside this context (branch-protection admin
+    # bypass), not a state this script will ever report as success.
 
     if signal is None:
         return "pending", "Waiting for Ally review of head %s." % short_sha(head_sha)
