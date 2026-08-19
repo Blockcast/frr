@@ -48,27 +48,51 @@ def require_strace(router):
         )
 
 
-# Nine of these tests execute for the first time now that strace is installed
-# and require_strace() fails hard instead of skipping -- and nine of them fail.
-# Both causes are zebra defects, not test defects:
+# Nine of these tests executed for the first time once strace was installed and
+# require_strace() started failing hard instead of skipping -- and nine failed.
+# An earlier revision of this comment attributed all nine to two zebra defects.
+# Artifact data from run 32166794496 says otherwise, and the correction matters
+# because it moves seven tests out of a zebra blocker's blast radius:
 #
-#   BLO-28405  A DIMT create whose netlink sendmsg fails is still reported
-#              result=0, and the GRE link the kernel already created is
-#              leaked. test_address_failure_cleans_up_and_allows_tunnel_id_reuse
-#              asserts exactly that and is the direct victim. The leaked
-#              dimt-00000004 then wedges every later create in this module with
-#              EEXIST, which is why seven further tests fail on their setup
-#              add() rather than on the behaviour they were written to check.
-#              Those seven are cascade failures of the one root cause and will
-#              stop failing together when it is fixed.
+#   BLO-28405  Still open, and still a zebra question, but a narrower one than
+#              this file claimed. The injection genuinely fires -- r1/zebra.out
+#              carries `netlink_send_msg error: Input/output error` exactly once,
+#              inside this test's TEST-START/TEST-END -- so the open question is
+#              only whether result=0 is correct for a create whose second
+#              sendmsg was injected. That is what
+#              test_address_failure_cleans_up_and_allows_tunnel_id_reuse still
+#              asserts, and why it keeps its marker.
+#
+#              What was NOT a zebra defect is the leak. dimt-00000004 survived
+#              because the test never deleted it: the `result == 1` assertion
+#              raises above the `del`, which is a test-cleanup bug and needs no
+#              zebra change to explain. The seven cascade failures followed from
+#              that leak, not from BLO-28405, so their markers came off here
+#              rather than in the BLO-28405 fix PR.
+#
+#              The cascade mechanism was also not name collision, which the link
+#              names invite you to assume: those seven create ids 5, 6, 9, 10,
+#              11 and 12, every one a different name from dimt-00000004, and all
+#              still died at their setup add() with `File exists`. It is a GRE
+#              tuple collision on the shared 192.0.2.1 -> 192.0.2.2 endpoints.
+#              (A real name collision does occur in this file, deliberately and
+#              benignly: test_create_failure_reports_fail_install_without_kernel_state
+#              creates dimt-00000004 as a dummy on purpose and removes it on its
+#              last line. Do not read that early EEXIST as the leak.)
+#
 #   BLO-28406  Reconciliation of the surviving link after a lost create ack.
+#              Unchanged, still open, still one test.
 #
-# These are marked xfail rather than skipped so the harness fix can land now
-# instead of waiting on two multi-day zebra fixes -- a skip would recreate the
-# very blind spot BLO-28043 exists to close. strict=True is load-bearing: the
-# build FAILS the moment a defect is fixed and its test starts passing, which
-# forces the marker off in the same PR that fixes it. Remove each marker in its
-# blocker's fix PR, never in a separate cleanup change.
+# These are marked xfail rather than skipped so the harness fix could land
+# without waiting on the zebra work -- a skip would recreate the very blind spot
+# BLO-28043 exists to close. strict=True is load-bearing: the build FAILS the
+# moment a defect is fixed and its test starts passing, which forces the marker
+# off in the same PR that fixes it. That is also why the seven markers could not
+# be removed in a follow-up: the reaper below unwedges those tests immediately,
+# so leaving the markers on would turn seven passes into strict-XPASS failures.
+# The fixture and the marker removal have to be one commit.
+#
+# Remove each REMAINING marker in its blocker's fix PR, never in a cleanup.
 XFAIL_BLO_28405 = pytest.mark.xfail(
     strict=True,
     reason=(
@@ -106,6 +130,55 @@ def setup_module(mod):
 
 def teardown_module(_mod):
     get_topogen().stop_topology()
+
+
+@pytest.fixture(autouse=True)
+def reap_stray_dimt_links():
+    """Delete leftover dimt-* links around every test.
+
+    Without this, ONE test that leaks a link wedges every later create -- and
+    not by name collision, which is the reading the link names invite.  The
+    cascade tests create ids 5, 6, 9, 10, 11 and 12, all different names from
+    the leaked dimt-00000004, and every one still died at its setup add() with
+    `File exists`.  The collision is on the GRE tuple: every tunnel in this file
+    uses the same 192.0.2.1 -> 192.0.2.2 endpoints, so a single surviving link
+    makes the kernel refuse the next create whatever it is called.
+
+    That is why this reaps by prefix rather than by the id under test, and why
+    it runs before as well as after: a link surviving from a previous MODULE, or
+    from an interrupted run, wedges the first test just as effectively.
+
+    Teardown never raises.  A cleanup failure must not convert a passing test
+    into an error, and must not mask the real failure of a failing one.
+    """
+    _reap_dimt_links()
+    yield
+    _reap_dimt_links()
+
+
+def _reap_dimt_links():
+    tgen = get_topogen()
+    if tgen is None:
+        return
+    router = tgen.gears.get("r1")
+    if router is None:
+        return
+    try:
+        out = router.run("ip -o link show 2>/dev/null")
+    except Exception:
+        return
+    for line in out.splitlines():
+        # `N: name@parent: <FLAGS> ...` -- the parent suffix is present on GRE
+        # links, so strip it before matching.
+        parts = line.split(":", 2)
+        if len(parts) < 2:
+            continue
+        name = parts[1].strip().split("@", 1)[0]
+        if name.startswith("dimt-"):
+            try:
+                router.run("ip link del {}".format(name))
+            except Exception:
+                pass
 
 
 def request(action, tunnel_id, encap="gre"):
@@ -369,6 +442,11 @@ def test_address_failure_cleans_up_and_allows_tunnel_id_reuse():
         failed = request("add", 4)
     finally:
         stop_tracer(tracer)
+    # Only the TRACER used to be protected, so when this assertion fired -- as
+    # it does today, see the marker above -- the `del` at the end of the test
+    # never ran and dimt-00000004 survived.  The autouse reaper now covers that
+    # regardless, but the assertion still belongs after the tracer stop and
+    # before anything that depends on the create having failed.
     assert failed["result"] == 1, failed
     _, link = topotest.run_and_expect(
         lambda: router.run("ip link show dimt-00000004 2>/dev/null"),
@@ -383,7 +461,6 @@ def test_address_failure_cleans_up_and_allows_tunnel_id_reuse():
     assert request("del", 4)["result"] == 2
 
 
-@XFAIL_BLO_28405
 def test_delete_failure_retains_ownership_for_retry_and_reuse():
     router = get_topogen().gears["r1"]
     installed = request("add", 5)
@@ -414,7 +491,6 @@ def zebra_ifindex(router, name):
     return entry.get("index") if entry else None
 
 
-@XFAIL_BLO_28405
 def test_queued_delete_does_not_remove_reused_ifindex():
     router = get_topogen().gears["r1"]
     installed = request("add", 6)
@@ -453,7 +529,6 @@ def test_queued_delete_does_not_remove_reused_ifindex():
     router.run("ip link del dimt-00000006")
 
 
-@XFAIL_BLO_28405
 def test_add_during_inflight_delete_is_rejected():
     router = get_topogen().gears["r1"]
     installed = request("add", 9)
@@ -523,7 +598,6 @@ def test_uncertain_create_result_reconciles_surviving_link():
     assert request("del", 8)["result"] == 2
 
 
-@XFAIL_BLO_28405
 def test_delete_encoded_before_replacement_binds_to_ifindex():
     router = get_topogen().gears["r1"]
     installed = request("add", 10)
@@ -567,7 +641,6 @@ def test_delete_encoded_before_replacement_binds_to_ifindex():
     router.run("ip link del dimt-0000000a")
 
 
-@XFAIL_BLO_28405
 def test_lost_delete_ack_reconciles_instead_of_resurrecting():
     router = get_topogen().gears["r1"]
     installed = request("add", 11)
@@ -604,7 +677,6 @@ def test_lost_delete_ack_reconciles_instead_of_resurrecting():
     assert request("del", 11)["result"] == 2
 
 
-@XFAIL_BLO_28405
 def test_skipped_delete_result_survives_mixed_batch():
     router = get_topogen().gears["r1"]
     replaced = request("add", 12)
@@ -656,7 +728,6 @@ def test_skipped_delete_result_survives_mixed_batch():
     router.run("ip link del dimt-0000000c")
 
 
-@XFAIL_BLO_28405
 def test_zebra_restart_adopts_surviving_tunnel():
     tgen = get_topogen()
     router = tgen.gears["r1"]
