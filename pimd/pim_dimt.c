@@ -213,18 +213,44 @@ static const char *const pim_dimt_pin_source_str[] = {
 };
 
 /*
- * The table is indexed by pin.source directly, unbounded, at three call
- * sites.  Adding an enum source without a string would make that an
- * out-of-bounds read rather than a build error, so tie the two together.
+ * This assert pins the table's EXTENT, and only that.
  *
  * The check has to be against the sentinel, not against
  * PIM_DIMT_PIN_TUNNEL_FAILED + 1: appending a source below FAILED changes
  * neither FAILED's value nor -- absent a new entry -- array_size(), so that
  * form would still compile and still read past the end.  PIM_DIMT_PIN_MAX
  * is the only expression here that grows with the enum.
+ *
+ * What it does NOT catch is an INSERTED source.  array_size() of a
+ * designated-initializer array is (highest designated index + 1), so it
+ * tracks the largest initialised index, not the count of non-NULL entries.
+ * Put a new tunnel state between TUNNEL_PENDING and TUNNEL_FAILED -- the
+ * obvious home, since the enum groups the tunnel states together -- and
+ * FAILED shifts up, array_size() and PIM_DIMT_PIN_MAX both grow, the assert
+ * still passes, and the vacated index is an implicit NULL hole.  Designated
+ * initializers make holes legal, so no warning fires either.
+ *
+ * A NULL there is worse than an out-of-bounds read on one path:
+ * json_object_string_add() hands the value to json_object_new_string(),
+ * which takes strlen() of it with no NULL guard, so `show ip pim dimt umh
+ * json` would fault rather than misprint.  Hence the accessor below: the
+ * assert keeps the build-time half, and every read goes through the check
+ * that covers the half the assert cannot see.
  */
 static_assert(array_size(pim_dimt_pin_source_str) == PIM_DIMT_PIN_MAX,
 	      "pim_dimt_pin_source_str is missing an entry for a pin source");
+
+/* The only legal way to read the table.  Never index it directly. */
+static const char *pim_dimt_pin_source_name(enum pim_dimt_pin_source source)
+{
+	/* Cast for the bound check so it holds whichever signedness the
+	 * compiler picks for the enum, without a tautological comparison
+	 * warning on the unsigned choice. */
+	if ((unsigned int)source >= PIM_DIMT_PIN_MAX ||
+	    !pim_dimt_pin_source_str[source])
+		return "unknown";
+	return pim_dimt_pin_source_str[source];
+}
 
 struct pim_dimt_pin {
 	struct interface *ifp; /* pin target, NULL when unresolved */
@@ -332,7 +358,7 @@ static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
 	if (PIM_DEBUG_PIM_TRACE && pin.shadowed)
 		zlog_debug("DIMT: UMH %pPAs pin resolves to %s (%s); covering interface %s does not carry it",
 			   &umh_addr, pin.ifp ? pin.ifp->name : "nothing",
-			   pim_dimt_pin_source_str[pin.source],
+			   pim_dimt_pin_source_name(pin.source),
 			   pin.shadowed->name);
 	else if (PIM_DEBUG_PIM_TRACE &&
 		 pin.source == PIM_DIMT_PIN_TUNNEL_PENDING)
@@ -713,7 +739,7 @@ void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json)
 			json_object_string_add(jumh, "interface",
 					       ifp ? ifp->name : "none");
 			json_object_string_add(jumh, "pinSource",
-					       pim_dimt_pin_source_str[pin.source]);
+					       pim_dimt_pin_source_name(pin.source));
 			/* Present only when a covering interface actually lost,
 			 * so its mere presence is the ambiguity signal. */
 			if (pin.shadowed)
@@ -725,7 +751,7 @@ void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json)
 				"%-22pFX %-16pPAs %-10s %-4u %-16s %-14s %s\n",
 				&umh->prefix, &umh->umh, type,
 				umh->preference, ifp ? ifp->name : "none",
-				pim_dimt_pin_source_str[pin.source],
+				pim_dimt_pin_source_name(pin.source),
 				pin.shadowed ? pin.shadowed->name : "-");
 		}
 	}
