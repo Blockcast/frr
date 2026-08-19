@@ -88,19 +88,24 @@ def require_strace(router):
 #              creates dimt-00000004 as a dummy on purpose and removes it on its
 #              last line. Do not read that early EEXIST as the leak.)
 #
-#   BLO-28406  UNVERIFIED, not "unchanged". Reconciliation of the surviving
-#              link after a lost create ack -- but every observation behind
-#              this marker ran with the leaked dimt-00000004 present, and the
-#              reasoning that dissolved the seven applies here too. With a
-#              stray link, `add 8` fails with `File exists`, which satisfies
-#              this test's result==1 assertion, its empty-link assertion (the
-#              link was never created) and its retry-returns-1 assertion -- the
-#              whole pre-failure sequence, with no zebra defect. The reaper
-#              makes this the first run under clean state. assert_injection_
-#              fired() now demands positive proof the recv injection happened,
-#              because a SUCCESSFUL lost-ack injection writes nothing to
-#              zebra.out (EAGAIN is the normal batch terminator), so silence
-#              there is not evidence of anything.
+#   BLO-28406  VERIFIED under clean state. Reconciliation of the surviving
+#              link after a lost create ack. Every observation before the
+#              reaper ran with the leaked dimt-00000004 present, and with a
+#              stray link `add 8` fails with `File exists`, satisfying this
+#              test's entire pre-failure sequence with no zebra defect -- so
+#              the marker rested on nothing. assert_injection_fired() now
+#              demands positive proof the injection happened, because a
+#              SUCCESSFUL lost-ack injection writes nothing to zebra.out
+#              (EAGAIN is the normal batch terminator), so silence there was
+#              never evidence. It raises Failed, not AssertionError, so an
+#              uninjected run ESCAPES this marker instead of being absorbed:
+#              the test reporting xfail is itself the proof it fired.
+#
+#   BLO-29000  zebra accepts an ADD issued while a DELETE for the same tunnel
+#              id is still in flight -- the readd returns result=0 with a live
+#              ifindex where the test requires rejection (result=1). Surfaced
+#              by removing the seven BLO-28405 markers that had absorbed it;
+#              it is neither BLO-28405 nor BLO-28406.
 #
 # These are marked xfail rather than skipped so the harness fix could land
 # without waiting on the zebra work -- a skip would recreate the very blind spot
@@ -130,12 +135,24 @@ XFAIL_BLO_28406 = pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
     reason=(
-        "BLO-28406: UNVERIFIED -- zebra may not reconcile the surviving link "
-        "after a lost create ack. Every observation behind this marker ran "
-        "with the leaked dimt-00000004 present, which satisfies all three of "
-        "this test's pre-failure assertions with no zebra defect at all. "
-        "Remove this marker in the BLO-28406 fix PR, or when a clean run "
-        "shows it passing."
+        "BLO-28406: zebra does not reconcile the surviving link after a "
+        "lost create ack (recvmsg EAGAIN at when=1). VERIFIED under a clean "
+        "kernel: assert_injection_fired() raises Failed rather than "
+        "AssertionError, so this xfail is only reachable if the injection "
+        "actually fired -- an uninjected run would surface as a hard failure "
+        "instead. Remove this marker in the BLO-28406 fix PR."
+    ),
+)
+
+
+XFAIL_BLO_29000 = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason=(
+        "BLO-29000: zebra accepts an ADD issued while a DELETE for the same "
+        "tunnel id is in flight -- the readd returns result=0 with a live "
+        "ifindex instead of being rejected with result=1. Remove this marker "
+        "in the BLO-29000 fix PR."
     ),
 )
 
@@ -169,9 +186,16 @@ def reap_stray_dimt_links():
     not by name collision, which is the reading the link names invite.  The
     cascade tests create ids 5, 6, 9, 10, 11 and 12, all different names from
     the leaked dimt-00000004, and every one still died at its setup add() with
-    `File exists`.  The collision is on the GRE tuple: every tunnel in this file
-    uses the same 192.0.2.1 -> 192.0.2.2 endpoints, so a single surviving link
-    makes the kernel refuse the next create whatever it is called.
+    `File exists`.  The collision is on the GRE tuple, not the name: tunnels
+    here share the 192.0.2.1 -> 192.0.2.2 endpoints, so a single surviving link
+    makes the kernel refuse the next create whatever it is called.  Measured
+    directly -- a second `ip link add ... type gre local 192.0.2.1 remote
+    192.0.2.2` is refused with `File exists` whether or not the first is up.
+
+    Tunnel 13 is the one deliberate exception (BLO-29009): it is the only test
+    needing two DIMT tunnels alive at once, so it carries its own outer remote.
+    That is a property of that test, not a weakening of this reaping -- this
+    reaps by the dimt- prefix, so it collects every id regardless of endpoints.
 
     That is why this reaps by prefix rather than by the id under test, and why
     it runs before as well as after: a link surviving from a previous MODULE, or
@@ -186,7 +210,15 @@ def reap_stray_dimt_links():
     layer down, unlogged, is how it gets misread as a zebra defect twice.
     """
     _reap_dimt_links()
-    stray = _dimt_links()
+    try:
+        stray = _dimt_links()
+    except LinkTableUnreadable as exc:
+        pytest.fail(
+            "cannot establish the clean-kernel precondition: {}. Refusing to "
+            "run: an unreadable link table is indistinguishable from a clean "
+            "one, and telling those apart is the entire job of this "
+            "fixture.".format(exc)
+        )
     if stray:
         pytest.fail(
             "stray DIMT links survived the pre-test reap: {}. Every tunnel in "
@@ -199,18 +231,61 @@ def reap_stray_dimt_links():
     _reap_dimt_links()
 
 
+class LinkTableUnreadable(RuntimeError):
+    """r1's link table could not be read -- distinct from it being empty."""
+
+
+_RC_MARKER = "__DIMT_LINK_RC__"
+
+
+def _split_rc(out):
+    """Split trailing `__DIMT_LINK_RC__=N` off command output.
+
+    Returns (output_without_marker, rc).  A missing marker means the command
+    did not run to completion, which is itself unreadable, so it is reported
+    as a non-zero rc rather than silently treated as success.
+    """
+    lines = _text(out).splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        stripped = lines[i].strip()
+        if stripped.startswith(_RC_MARKER + "="):
+            del lines[i]
+            try:
+                return "\n".join(lines), int(stripped.split("=", 1)[1])
+            except ValueError:
+                break
+    return "\n".join(lines), -1
+
+
 def _dimt_links():
-    """Names of the dimt-* links present, or [] if they cannot be read."""
+    """Names of the dimt-* links present on r1.
+
+    Raises LinkTableUnreadable if the table cannot be read, and deliberately
+    does NOT fall back to [].  "Could not read the link table" and "the link
+    table is clean" are different answers, and collapsing them into [] makes
+    the setup postcondition pass vacuously -- a guard that runs and reports
+    success without having established anything, which is the same shape as
+    the cascade this fixture exists to erase, one layer down.
+
+    stderr is captured rather than discarded so the caller that cares can
+    print the reason.  The two callers choose their own tolerance: teardown
+    swallows this, setup does not.
+    """
     tgen = get_topogen()
     if tgen is None:
-        return []
+        raise LinkTableUnreadable("no topology is running")
     router = tgen.gears.get("r1")
     if router is None:
-        return []
+        raise LinkTableUnreadable("router r1 is not in the topology")
     try:
-        out = router.run("ip -o link show 2>/dev/null")
-    except Exception:
-        return []
+        out = router.run("ip -o link show 2>&1; echo {}=$?".format(_RC_MARKER))
+    except Exception as exc:
+        raise LinkTableUnreadable("`ip -o link show` raised: {}".format(exc))
+    out, rc = _split_rc(out)
+    if rc != 0:
+        raise LinkTableUnreadable(
+            "`ip -o link show` exited {}: {}".format(rc, out.strip() or "(no output)")
+        )
     names = []
     for line in out.splitlines():
         # `N: name@parent: <FLAGS> ...` -- the parent suffix is present on GRE
@@ -231,18 +306,37 @@ def _reap_dimt_links():
     router = tgen.gears.get("r1")
     if router is None:
         return
-    for name in _dimt_links():
+    try:
+        names = _dimt_links()
+    except LinkTableUnreadable:
+        # Reaping is best-effort by design; the strict read lives in setup.
+        return
+    for name in names:
         try:
             router.run("ip link del {}".format(name))
         except Exception:
             pass
 
 
-def request(action, tunnel_id, encap="gre"):
+# Unused in the topology (r1 is 192.0.2.1, h1 is 192.0.2.2), so it gives
+# tunnel 13 a GRE identity distinct from every other tunnel here.  It never
+# has to be reachable: the kernel does not validate the remote at create time
+# and this test asserts only on ZAPI results, never on traffic.
+TUNNEL_13_OUTER_REMOTE = "192.0.2.3"
+
+
+def request(action, tunnel_id, encap="gre", outer_remote=None):
+    """Drive one DIMT ZAPI add/del against r1.
+
+    outer_remote overrides the GRE tunnel's remote endpoint.  It is only
+    needed by a test that must hold two DIMT tunnels up at the same time --
+    see TUNNEL_13_OUTER_REMOTE.  del carries no endpoints, so it is add-only.
+    """
     client = os.path.join(CWD, "dimt_zapi_client.py")
-    output = get_topogen().gears["r1"].run(
-        "python3 {} {} {} --encap {}".format(client, action, tunnel_id, encap)
-    )
+    command = "python3 {} {} {} --encap {}".format(client, action, tunnel_id, encap)
+    if outer_remote is not None:
+        command += " --outer-remote {}".format(outer_remote)
+    output = get_topogen().gears["r1"].run(command)
     return json.loads(output)
 
 
@@ -278,6 +372,14 @@ def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
         pytest.fail(
             "strace attach failed: {}".format(_text(stderr).strip())
         )
+    # Derived from the same arguments that built the strace command, so the
+    # diagnostic cannot drift from the injection.  It drifted once: the recv
+    # site said EIO while inject_netlink_recv_failure() deliberately injects
+    # EAGAIN, pointing a triager at the exact errno that helper exists to
+    # keep out (EIO on the recv side takes zebra's fatal path).
+    tracer.injection_label = "{} {} injection at when={}".format(
+        syscall, errno_name, when
+    )
     return tracer
 
 
@@ -543,7 +645,7 @@ def test_address_failure_cleans_up_and_allows_tunnel_id_reuse():
         failed = request("add", 4)
     finally:
         trace = stop_tracer(tracer)
-    assert_injection_fired(trace, "send-side EIO injection at when=2")
+    assert_injection_fired(trace, tracer.injection_label)
     # Only the TRACER used to be protected, so when this assertion fired -- as
     # it does today, see the marker above -- the `del` at the end of the test
     # never ran and dimt-00000004 survived.  The autouse reaper now covers that
@@ -631,6 +733,7 @@ def test_queued_delete_does_not_remove_reused_ifindex():
     router.run("ip link del dimt-00000006")
 
 
+@XFAIL_BLO_29000
 def test_add_during_inflight_delete_is_rejected():
     router = get_topogen().gears["r1"]
     installed = request("add", 9)
@@ -678,14 +781,16 @@ def test_uncertain_create_result_reconciles_surviving_link():
         failed = request("add", 8)
     finally:
         trace = stop_tracer(tracer)
-    # This assertion is the whole reason BLO-28406's marker is now labelled
-    # UNVERIFIED. Every prior observation ran with the leaked dimt-00000004
-    # present, and under that condition `add 8` fails with `File exists` from
-    # the shared-tuple collision -- which satisfies the result==1 check below,
-    # the empty-link check after it (nothing was ever created), and the retry
-    # returning 1 twice, all with zero zebra involvement. Proving the recv
-    # injection fired is what separates the defect from that phantom.
-    assert_injection_fired(trace, "recv-side EIO injection at when=1")
+    # This assertion is what converted BLO-28406 from asserted to verified.
+    # Every earlier observation ran with the leaked dimt-00000004 present, and
+    # under that condition `add 8` fails with `File exists` from the shared-
+    # tuple collision -- which satisfies the result==1 check below, the empty-
+    # link check after it (nothing was ever created), and the retry returning 1
+    # twice, all with zero zebra involvement. Proving the recv injection fired
+    # is what separates the defect from that phantom, and it now does: under
+    # the reaper this test reports xfail, which pytest.fail() could not have
+    # produced.
+    assert_injection_fired(trace, tracer.injection_label)
     assert failed["result"] == 1, failed
     # Zebra must adopt the surviving link and tear it down instead of
     # leaving it unmanaged to collide with a later ADD.
@@ -791,7 +896,16 @@ def test_skipped_delete_result_survives_mixed_batch():
     router = get_topogen().gears["r1"]
     replaced = request("add", 12)
     assert replaced["result"] == 0, replaced
-    normal = request("add", 13)
+    # BLO-29009: this is the ONLY test in the module needing two DIMT GRE
+    # tunnels alive at once, so tunnel 13 must not share tunnel 12's outer
+    # (local, remote) tuple -- that pair is the tunnel's kernel identity, and
+    # a second create on it is refused with EEXIST whatever the link is named
+    # and whether or not the first is up.  Measured: `ip link add ... local
+    # 192.0.2.1 remote 192.0.2.2` twice -> `RTNETLINK answers: File exists`;
+    # varying the remote alone -> both create and both come up.  Without this
+    # the test dies at its own setup and never reaches the mixed batch it
+    # exists to exercise, which reads as a zebra defect and was filed as one.
+    normal = request("add", 13, outer_remote=TUNNEL_13_OUTER_REMOTE)
     assert normal["result"] == 0, normal
 
     # Queue the REAL delete first and the skipped one second: the
