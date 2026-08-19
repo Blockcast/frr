@@ -276,7 +276,7 @@ def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
     if tracer.poll() is not None:
         _stdout, stderr = tracer.communicate()
         pytest.fail(
-            "strace attach failed: {}".format(stderr.decode().strip())
+            "strace attach failed: {}".format(_text(stderr).strip())
         )
     return tracer
 
@@ -363,9 +363,20 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
     if tracer.poll() is not None:
         _stdout, stderr = tracer.communicate()
         pytest.fail(
-            "strace attach failed: {}".format(stderr.decode().strip())
+            "strace attach failed: {}".format(_text(stderr).strip())
         )
     return tracer
+
+
+def _text(data):
+    """popen output is str under some topotest/python combinations and bytes
+    under others.  Four tests died on AttributeError: 'str' object has no
+    attribute 'decode' -- a harness bug that had been sitting under an
+    XFAIL_BLO_28405 marker, attributed to zebra.
+    """
+    if data is None:
+        return ""
+    return data if isinstance(data, str) else data.decode("utf-8", "replace")
 
 
 def stop_tracer(tracer):
@@ -614,8 +625,8 @@ def test_queued_delete_does_not_remove_reused_ifindex():
     finally:
         stop_tracer(tracer)
     stdout, stderr = pending.communicate(timeout=10)
-    assert pending.returncode == 0, stderr.decode()
-    assert json.loads(stdout.decode())["result"] == 2
+    assert pending.returncode == 0, _text(stderr)
+    assert json.loads(_text(stdout))["result"] == 2
     assert "dummy" in router.run("ip -d link show dimt-00000006")
     router.run("ip link del dimt-00000006")
 
@@ -642,8 +653,8 @@ def test_add_during_inflight_delete_is_rejected():
     finally:
         stop_tracer(tracer)
     stdout, stderr = pending.communicate(timeout=10)
-    assert pending.returncode == 0, stderr.decode()
-    assert json.loads(stdout.decode())["result"] == 2
+    assert pending.returncode == 0, _text(stderr)
+    assert json.loads(_text(stdout))["result"] == 2
     _, link = topotest.run_and_expect(
         lambda: router.run("ip link show dimt-00000009 2>/dev/null"),
         "",
@@ -730,11 +741,11 @@ def test_delete_encoded_before_replacement_binds_to_ifindex():
     finally:
         stop_tracer(tracer)
     stdout, stderr = pending.communicate(timeout=15)
-    assert pending.returncode == 0, stderr.decode()
+    assert pending.returncode == 0, _text(stderr)
     # The encode happened before the replacement (proven by the sendmsg
     # sync), so the pre-encode skip path is unreachable: the delete must
     # fail on the stale index and the replacement must survive.
-    assert json.loads(stdout.decode())["result"] == 3, stdout
+    assert json.loads(_text(stdout))["result"] == 3, stdout
     assert "dummy" in router.run("ip -d link show dimt-0000000a")
     assert request("del", 10)["result"] == 2
     router.run("ip link del dimt-0000000a")
@@ -817,12 +828,12 @@ def test_skipped_delete_result_survives_mixed_batch():
         stop_tracer(tracer)
     out13, err13 = pending13.communicate(timeout=10)
     out12, err12 = pending12.communicate(timeout=10)
-    assert pending13.returncode == 0, err13.decode()
-    assert pending12.returncode == 0, err12.decode()
-    assert json.loads(out13.decode())["result"] == 2, out13
+    assert pending13.returncode == 0, _text(err13)
+    assert pending12.returncode == 0, _text(err12)
+    assert json.loads(_text(out13))["result"] == 2, out13
     # The skipped delete must report REMOVED even though it shared the
     # batch with a real delete whose ack is the only response.
-    assert json.loads(out12.decode())["result"] == 2, out12
+    assert json.loads(_text(out12))["result"] == 2, out12
     assert "dummy" in router.run("ip -d link show dimt-0000000c")
     router.run("ip link del dimt-0000000c")
 
