@@ -50,21 +50,32 @@ def require_strace(router):
 
 # Nine of these tests execute for the first time now that strace is installed
 # and require_strace() fails hard instead of skipping -- and nine of them fail.
-# Both causes are zebra defects, not test defects:
+# The causes are NOT all zebra defects; an earlier revision of this comment
+# asserted that they were, and it was wrong:
 #
-#   BLO-28405  A DIMT create whose netlink sendmsg fails is still reported
-#              result=0, and the GRE link the kernel already created is
-#              leaked. test_address_failure_cleans_up_and_allows_tunnel_id_reuse
-#              asserts exactly that and is the direct victim. The leaked
-#              dimt-00000004 then wedges every later create in this module with
-#              EEXIST, which is why seven further tests fail on their setup
-#              add() rather than on the behaviour they were written to check.
-#              Those seven are cascade failures of the one root cause and will
-#              stop failing together when it is fixed.
+#   BLO-28405  test_address_failure_cleans_up_and_allows_tunnel_id_reuse
+#              injects EIO on the 2nd sendmsg of a create and expects
+#              result=1; zebra answers result=0 with a live ifindex. Whether
+#              that is a zebra defect is UNPROVEN. result=0 is only reachable
+#              from the phase==ADDRESS success branch of
+#              zebra_dimt_tunnel_dplane_result(), so the address-add sendmsg
+#              must have succeeded -- meaning the injected EIO may have landed
+#              on a syscall outside the create transaction, in which case
+#              result=0 is correct and the injection index is the bug. The
+#              strace trace file now recorded by inject_netlink_syscall_failure
+#              is what settles it; read the evidence in the assert message
+#              before removing this marker.
+#
+#              The cascade of seven further failures was NOT caused by zebra.
+#              This test's own tunnel cleanup was a trailing statement after
+#              the asserts, so a failed assert skipped it and leaked
+#              dimt-00000004, which then collided -- on the (local, remote,
+#              key) tuple, not the name -- with every later create. That is
+#              fixed here: cleanup moved into the finally block.
 #   BLO-28406  Reconciliation of the surviving link after a lost create ack.
 #
 # These are marked xfail rather than skipped so the harness fix can land now
-# instead of waiting on two multi-day zebra fixes -- a skip would recreate the
+# instead of waiting on the zebra questions -- a skip would recreate the
 # very blind spot BLO-28043 exists to close. strict=True is load-bearing: the
 # build FAILS the moment a defect is fixed and its test starts passing, which
 # forces the marker off in the same PR that fixes it. Remove each marker in its
@@ -72,9 +83,11 @@ def require_strace(router):
 XFAIL_BLO_28405 = pytest.mark.xfail(
     strict=True,
     reason=(
-        "BLO-28405: zebra reports result=0 for a DIMT create whose netlink "
-        "sendmsg failed and leaks the GRE link, wedging every later create "
-        "with EEXIST. Remove this marker in the BLO-28405 fix PR."
+        "BLO-28405: a DIMT create with EIO injected on the 2nd sendmsg is "
+        "answered result=0 rather than result=1. Under investigation -- the "
+        "injected errno may be landing outside the create transaction, which "
+        "would make result=0 correct. Remove this marker in the BLO-28405 "
+        "resolution PR."
     ),
 )
 XFAIL_BLO_28406 = pytest.mark.xfail(
@@ -116,6 +129,19 @@ def request(action, tunnel_id, encap="gre"):
     return json.loads(output)
 
 
+def trace_path(label):
+    """Path for a strace log, inside the collected per-router log directory.
+
+    topogen bind-mounts <logdir>/<router> at /tmp/gearlogdir, and that
+    directory is what CI archives as the r1/ tree next to zebra.out. Writing
+    the trace there means the syscall-level evidence for a failure-injection
+    test survives in the job artifact instead of dying with the container.
+    """
+    current = os.environ.get("PYTEST_CURRENT_TEST", "unknown")
+    test = current.split("::")[-1].split(" ")[0]
+    return "/tmp/gearlogdir/strace-{}-{}.log".format(test, label)
+
+
 def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
     require_strace(router)
     zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
@@ -128,10 +154,22 @@ def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
         tracing_unavailable(
             "zebra_dplane worker not found -- netlink failure injection cannot run"
         )
+    # -o is not optional. strace writes its per-syscall trace to stderr, and
+    # nothing here reads that pipe until stop_tracer() terminates the process,
+    # so a trace larger than the 64 KiB pipe buffer would block strace mid-write
+    # while the dplane worker stays ptrace-stopped -- a hung test, not a failing
+    # one. Routing the trace to a file keeps stderr down to attach diagnostics.
+    # It is also the only record of WHICH syscall took the injected error, which
+    # is what distinguishes "the transaction under test failed" from "the
+    # injection landed on an unrelated syscall" (BLO-28405).
+    trace_file = trace_path("inject-{}-when{}".format(syscall, when))
+    router.run("rm -f {}".format(trace_file))
     tracer = router.popen(
         [
             "strace",
             "-qq",
+            "-o",
+            trace_file,
             "-e",
             "trace={}".format(syscall),
             "-e",
@@ -148,7 +186,26 @@ def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
         tracing_unavailable(
             "strace attach failed: {}".format(stderr.decode().strip())
         )
-    return tracer
+    return tracer, trace_file
+
+
+def syscall_trace(router, trace_file):
+    """Return the recorded syscalls, one per line, oldest first."""
+    text = router.run("cat {} 2>/dev/null".format(trace_file))
+    return [line for line in text.splitlines() if line.strip()]
+
+
+def injected_call_index(router, trace_file, errno_name):
+    """1-based index of the traced call that returned the injected errno.
+
+    Returns (index, calls). index is None when the errno never appears, which
+    means the injection did not fire on this thread at all.
+    """
+    calls = syscall_trace(router, trace_file)
+    for position, line in enumerate(calls, start=1):
+        if errno_name in line:
+            return position, calls
+    return None, calls
 
 
 def inject_netlink_send_failure(router, when):
@@ -184,7 +241,10 @@ def hold_dplane_worker(router, delay_usecs=6000000):
     already handed to the dataplane provably stays queued until the tracer
     detaches.
     """
-    return _hold_dplane_syscalls(router, "ppoll,poll", "delay_exit", delay_usecs)
+    tracer, _trace_file = _hold_dplane_syscalls(
+        router, "ppoll,poll", "delay_exit", delay_usecs
+    )
+    return tracer
 
 
 def hold_dplane_sendmsg(router, delay_usecs=6000000):
@@ -196,29 +256,30 @@ def hold_dplane_sendmsg(router, delay_usecs=6000000):
     records each sendmsg entry, so callers can positively synchronize on
     the syscall having been entered instead of guessing with sleeps.
     """
-    trace_file = "/tmp/dimt-sendmsg-trace-{}.log".format(os.getpid())
-    router.run("rm -f {}".format(trace_file))
-    tracer = _hold_dplane_syscalls(
-        router, "sendmsg", "delay_enter", delay_usecs, trace_file
-    )
-    return tracer, trace_file
+    return _hold_dplane_syscalls(router, "sendmsg", "delay_enter", delay_usecs)
 
 
 def sendmsg_entered(router, trace_file):
     return "sendmsg(" in router.run("cat {} 2>/dev/null".format(trace_file))
 
 
-def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
-                          trace_file=None):
+def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs):
     require_strace(router)
     worker = dplane_tid(router)
     if not worker:
         tracing_unavailable(
             "zebra_dplane worker not found -- cannot hold the dplane worker"
         )
+    # Always -o: tracing ppoll/poll on an event loop is high volume, and an
+    # unread stderr pipe would deadlock strace (and so wedge the held dplane
+    # worker) once the trace exceeded 64 KiB. See inject_netlink_syscall_failure.
+    trace_file = trace_path("hold-{}".format(syscalls.replace(",", "-")))
+    router.run("rm -f {}".format(trace_file))
     cmd = [
         "strace",
         "-qq",
+        "-o",
+        trace_file,
         "-e",
         "trace={}".format(syscalls),
         "-e",
@@ -226,8 +287,6 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
         "-p",
         worker,
     ]
-    if trace_file:
-        cmd[1:1] = ["-o", trace_file]
     tracer = router.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     time.sleep(0.3)
     if tracer.poll() is not None:
@@ -235,7 +294,7 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
         tracing_unavailable(
             "strace attach failed: {}".format(stderr.decode().strip())
         )
-    return tracer
+    return tracer, trace_file
 
 
 def stop_tracer(tracer):
@@ -364,12 +423,26 @@ def test_external_delete_does_not_reuse_stale_ifindex():
 @XFAIL_BLO_28405
 def test_address_failure_cleans_up_and_allows_tunnel_id_reuse():
     router = get_topogen().gears["r1"]
-    tracer = inject_netlink_send_failure(router, 2)
+    tracer, trace_file = inject_netlink_send_failure(router, 2)
     try:
         failed = request("add", 4)
     finally:
+        # Read the trace before detaching: it names the syscall that actually
+        # took the EIO, which is what separates "zebra swallowed a failed
+        # create" from "the injection landed outside the create transaction".
+        index, calls = injected_call_index(router, trace_file, "EIO")
         stop_tracer(tracer)
-    assert failed["result"] == 1, failed
+        # The tunnel is torn down here rather than after the asserts below.
+        # A failed assert raises, so a trailing cleanup line would never run,
+        # and the surviving dimt-00000004 would collide -- on the (local,
+        # remote, key) tuple, not the name -- with every later create in this
+        # module, turning one red into eight.
+        request("del", 4)
+
+    evidence = "injected EIO hit sendmsg #{} of {}: {}".format(
+        index, len(calls), calls
+    )
+    assert failed["result"] == 1, (failed, evidence)
     _, link = topotest.run_and_expect(
         lambda: router.run("ip link show dimt-00000004 2>/dev/null"),
         "",
@@ -389,12 +462,17 @@ def test_delete_failure_retains_ownership_for_retry_and_reuse():
     installed = request("add", 5)
     assert installed["result"] == 0, installed
 
-    tracer = inject_netlink_send_failure(router, 1)
+    tracer, trace_file = inject_netlink_send_failure(router, 1)
     try:
         failed = request("del", 5)
     finally:
+        index, calls = injected_call_index(router, trace_file, "EIO")
         stop_tracer(tracer)
-    assert failed["result"] == 3, failed
+
+    evidence = "injected EIO hit sendmsg #{} of {}: {}".format(
+        index, len(calls), calls
+    )
+    assert failed["result"] == 3, (failed, evidence)
     assert "dimt-00000005" in router.run("ip link show dimt-00000005")
 
     assert request("del", 5)["result"] == 2
@@ -496,7 +574,7 @@ def test_uncertain_create_result_reconciles_surviving_link():
     router = get_topogen().gears["r1"]
     # Fail the response read: the RTM_NEWLINK reaches the kernel but its
     # ack is lost, so the reported failure is not an authoritative verdict.
-    tracer = inject_netlink_recv_failure(router, 1)
+    tracer, _trace_file = inject_netlink_recv_failure(router, 1)
     try:
         failed = request("add", 8)
     finally:
@@ -577,7 +655,7 @@ def test_lost_delete_ack_reconciles_instead_of_resurrecting():
     # converge on reconciled interface state -- REMOVED now, or
     # REMOVE_FAIL then REMOVED on retry -- and never report INSTALLED for
     # a link that no longer exists.
-    tracer = inject_netlink_recv_failure(router, 1)
+    tracer, _trace_file = inject_netlink_recv_failure(router, 1)
     try:
         removed = request("del", 11)
     finally:
