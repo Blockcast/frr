@@ -34,7 +34,15 @@ ALLOW_MISSING_STRACE = os.environ.get("TOPOTESTS_ALLOW_MISSING_STRACE") == "1"
 
 
 def tracing_unavailable(reason):
-    """Fail by default; skip only under the explicit local opt-out."""
+    """Skip only under the explicit local opt-out, and only for strace itself.
+
+    Call this from require_strace() and nowhere else.  A missing zebra_dplane
+    worker and a failed strace attach are not "strace is unavailable" -- the
+    first is a zebra defect and the second usually is too -- and routing them
+    through here let TOPOTESTS_ALLOW_MISSING_STRACE convert a real defect into
+    a skip on any developer host that lacks strace.  The env var name already
+    promises the narrower contract; those sites call pytest.fail directly.
+    """
     if ALLOW_MISSING_STRACE:
         pytest.skip(reason)
     pytest.fail(reason)
@@ -80,8 +88,19 @@ def require_strace(router):
 #              creates dimt-00000004 as a dummy on purpose and removes it on its
 #              last line. Do not read that early EEXIST as the leak.)
 #
-#   BLO-28406  Reconciliation of the surviving link after a lost create ack.
-#              Unchanged, still open, still one test.
+#   BLO-28406  UNVERIFIED, not "unchanged". Reconciliation of the surviving
+#              link after a lost create ack -- but every observation behind
+#              this marker ran with the leaked dimt-00000004 present, and the
+#              reasoning that dissolved the seven applies here too. With a
+#              stray link, `add 8` fails with `File exists`, which satisfies
+#              this test's result==1 assertion, its empty-link assertion (the
+#              link was never created) and its retry-returns-1 assertion -- the
+#              whole pre-failure sequence, with no zebra defect. The reaper
+#              makes this the first run under clean state. assert_injection_
+#              fired() now demands positive proof the recv injection happened,
+#              because a SUCCESSFUL lost-ack injection writes nothing to
+#              zebra.out (EAGAIN is the normal batch terminator), so silence
+#              there is not evidence of anything.
 #
 # These are marked xfail rather than skipped so the harness fix could land
 # without waiting on the zebra work -- a skip would recreate the very blind spot
@@ -93,20 +112,30 @@ def require_strace(router):
 # The fixture and the marker removal have to be one commit.
 #
 # Remove each REMAINING marker in its blocker's fix PR, never in a cleanup.
+# raises= narrows each marker to the failure it actually predicts, so an
+# unrelated topology error or a no-op injection surfaces as a hard failure
+# instead of being absorbed as expected.  pytest.fail() raises Failed, not
+# AssertionError, which is what makes assert_injection_fired() below able to
+# break out of an xfail rather than be swallowed by it.
 XFAIL_BLO_28405 = pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason=(
         "BLO-28405: zebra reports result=0 for a DIMT create whose netlink "
-        "sendmsg failed and leaks the GRE link, wedging every later create "
-        "with EEXIST. Remove this marker in the BLO-28405 fix PR."
+        "sendmsg was injected with EIO. Remove this marker in the BLO-28405 "
+        "fix PR."
     ),
 )
 XFAIL_BLO_28406 = pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason=(
-        "BLO-28406: zebra does not reconcile the surviving link after a lost "
-        "create ack, so the retry cannot adopt it. Remove this marker in the "
-        "BLO-28406 fix PR."
+        "BLO-28406: UNVERIFIED -- zebra may not reconcile the surviving link "
+        "after a lost create ack. Every observation behind this marker ran "
+        "with the leaked dimt-00000004 present, which satisfies all three of "
+        "this test's pre-failure assertions with no zebra defect at all. "
+        "Remove this marker in the BLO-28406 fix PR, or when a clean run "
+        "shows it passing."
     ),
 )
 
@@ -148,12 +177,51 @@ def reap_stray_dimt_links():
     it runs before as well as after: a link surviving from a previous MODULE, or
     from an interrupted run, wedges the first test just as effectively.
 
-    Teardown never raises.  A cleanup failure must not convert a passing test
-    into an error, and must not mask the real failure of a failing one.
+    The two call sites are NOT symmetric.  Teardown never raises: a cleanup
+    failure must not convert a passing test into an error, nor mask the real
+    failure of a failing one.  Setup is a PRECONDITION, so it asserts its
+    postcondition -- a silent no-op there hands the test a dirty kernel, it
+    dies at its setup add() with `File exists`, and that is precisely the
+    cascade signature this fixture exists to erase.  Reintroducing it one
+    layer down, unlogged, is how it gets misread as a zebra defect twice.
     """
     _reap_dimt_links()
+    stray = _dimt_links()
+    if stray:
+        pytest.fail(
+            "stray DIMT links survived the pre-test reap: {}. Every tunnel in "
+            "this module shares the 192.0.2.1 -> 192.0.2.2 endpoints, so the "
+            "next create would fail with `File exists` for a reason that has "
+            "nothing to do with the behaviour under test.".format(
+                ", ".join(stray))
+        )
     yield
     _reap_dimt_links()
+
+
+def _dimt_links():
+    """Names of the dimt-* links present, or [] if they cannot be read."""
+    tgen = get_topogen()
+    if tgen is None:
+        return []
+    router = tgen.gears.get("r1")
+    if router is None:
+        return []
+    try:
+        out = router.run("ip -o link show 2>/dev/null")
+    except Exception:
+        return []
+    names = []
+    for line in out.splitlines():
+        # `N: name@parent: <FLAGS> ...` -- the parent suffix is present on GRE
+        # links, so strip it before matching.
+        parts = line.split(":", 2)
+        if len(parts) < 2:
+            continue
+        name = parts[1].strip().split("@", 1)[0]
+        if name.startswith("dimt-"):
+            names.append(name)
+    return names
 
 
 def _reap_dimt_links():
@@ -163,22 +231,11 @@ def _reap_dimt_links():
     router = tgen.gears.get("r1")
     if router is None:
         return
-    try:
-        out = router.run("ip -o link show 2>/dev/null")
-    except Exception:
-        return
-    for line in out.splitlines():
-        # `N: name@parent: <FLAGS> ...` -- the parent suffix is present on GRE
-        # links, so strip it before matching.
-        parts = line.split(":", 2)
-        if len(parts) < 2:
-            continue
-        name = parts[1].strip().split("@", 1)[0]
-        if name.startswith("dimt-"):
-            try:
-                router.run("ip link del {}".format(name))
-            except Exception:
-                pass
+    for name in _dimt_links():
+        try:
+            router.run("ip link del {}".format(name))
+        except Exception:
+            pass
 
 
 def request(action, tunnel_id, encap="gre"):
@@ -198,7 +255,7 @@ def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
         "done"
     ).strip()
     if not dplane_tid:
-        tracing_unavailable(
+        pytest.fail(
             "zebra_dplane worker not found -- netlink failure injection cannot run"
         )
     tracer = router.popen(
@@ -218,7 +275,7 @@ def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
     time.sleep(0.2)
     if tracer.poll() is not None:
         _stdout, stderr = tracer.communicate()
-        tracing_unavailable(
+        pytest.fail(
             "strace attach failed: {}".format(stderr.decode().strip())
         )
     return tracer
@@ -286,7 +343,7 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
     require_strace(router)
     worker = dplane_tid(router)
     if not worker:
-        tracing_unavailable(
+        pytest.fail(
             "zebra_dplane worker not found -- cannot hold the dplane worker"
         )
     cmd = [
@@ -305,19 +362,52 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
     time.sleep(0.3)
     if tracer.poll() is not None:
         _stdout, stderr = tracer.communicate()
-        tracing_unavailable(
+        pytest.fail(
             "strace attach failed: {}".format(stderr.decode().strip())
         )
     return tracer
 
 
 def stop_tracer(tracer):
+    """Stop the tracer and return what strace wrote to stderr.
+
+    The stderr pipe was opened and never read, which is why a no-op injection
+    was indistinguishable from a fired one.  That matters most on the RECV
+    side: EAGAIN is the normal batch terminator, so a SUCCESSFUL lost-ack
+    injection writes nothing to zebra.out at all -- it is invisible by
+    construction, and there has never been positive proof it fired.  strace
+    tags injected calls `(INJECTED)`, so its own output is the only evidence
+    available.  Reading it also removes a latent deadlock: wait() on a process
+    with a full stderr pipe blocks forever.
+    """
     tracer.terminate()
     try:
-        tracer.wait(timeout=2)
+        err = tracer.communicate(timeout=2)[1]
     except subprocess.TimeoutExpired:
         tracer.kill()
-        tracer.wait(timeout=2)
+        err = tracer.communicate(timeout=2)[1]
+    if not err:
+        return ""
+    return err if isinstance(err, str) else err.decode("utf-8", "replace")
+
+
+def assert_injection_fired(trace_output, what):
+    """Refuse to assert on a run whose injection may never have happened.
+
+    Deliberately pytest.fail() rather than assert: it raises Failed, not
+    AssertionError, so it escapes the raises=AssertionError xfail markers
+    instead of being absorbed by them as an expected failure.  A marker that
+    swallows "the injection did not fire" is exactly how a test can appear to
+    confirm a defect it never exercised.
+    """
+    if "(INJECTED)" not in trace_output:
+        pytest.fail(
+            "{}: strace reported no injected syscall, so anything asserted "
+            "below would describe an UNINJECTED run. Treat this as the test "
+            "not having executed, not as evidence about zebra.\n"
+            "strace stderr was:\n{}".format(
+                what, trace_output.strip() or "(empty)")
+        )
 
 
 def dplane_tid(router):
@@ -441,7 +531,8 @@ def test_address_failure_cleans_up_and_allows_tunnel_id_reuse():
     try:
         failed = request("add", 4)
     finally:
-        stop_tracer(tracer)
+        trace = stop_tracer(tracer)
+    assert_injection_fired(trace, "send-side EIO injection at when=2")
     # Only the TRACER used to be protected, so when this assertion fired -- as
     # it does today, see the marker above -- the `del` at the end of the test
     # never ran and dimt-00000004 survived.  The autouse reaper now covers that
@@ -575,7 +666,15 @@ def test_uncertain_create_result_reconciles_surviving_link():
     try:
         failed = request("add", 8)
     finally:
-        stop_tracer(tracer)
+        trace = stop_tracer(tracer)
+    # This assertion is the whole reason BLO-28406's marker is now labelled
+    # UNVERIFIED. Every prior observation ran with the leaked dimt-00000004
+    # present, and under that condition `add 8` fails with `File exists` from
+    # the shared-tuple collision -- which satisfies the result==1 check below,
+    # the empty-link check after it (nothing was ever created), and the retry
+    # returning 1 twice, all with zero zebra involvement. Proving the recv
+    # injection fired is what separates the defect from that phantom.
+    assert_injection_fired(trace, "recv-side EIO injection at when=1")
     assert failed["result"] == 1, failed
     # Zebra must adopt the surviving link and tear it down instead of
     # leaving it unmanaged to collide with a later ADD.

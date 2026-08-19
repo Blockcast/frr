@@ -53,10 +53,6 @@ RUN for i in $(seq 1 ${APT_RETRIES}); do \
             texinfo \
             tmux \
             iptables \
-    # strace drives the zebra_dimt_tunnel netlink failure-injection and
-    # dplane-hold topotests (strace -e inject=). Without it those tests
-    # skip, and a skipped failure-injection test reads as green.
-            strace \
     && \
     # Protobuf build requirements
     apt-get install -y \
@@ -93,6 +89,10 @@ RUN for i in $(seq 1 ${APT_RETRIES}); do \
         snmp-mibs-downloader \
         snmpd \
         ssmping \
+        # strace drives the zebra_dimt_tunnel netlink failure-injection and
+        # dplane-hold topotests (strace -e inject=). Without it those tests
+        # skip, and a skipped failure-injection test reads as green.
+        strace \
         sudo \
         time \
         tshark \
