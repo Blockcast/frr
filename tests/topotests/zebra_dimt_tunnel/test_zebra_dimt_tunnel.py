@@ -58,73 +58,61 @@ def require_strace(router):
 
 # Nine of these tests executed for the first time once strace was installed and
 # require_strace() started failing hard instead of skipping -- and nine failed.
-# An earlier revision of this comment attributed all nine to two zebra defects.
-# Artifact data from run 32166794496 says otherwise, and the correction matters
-# because it moves seven tests out of a zebra blocker's blast radius:
+# Seven were one leaked link; three tickets remain, and only two of those are
+# zebra questions. (The reasoning that reclassified them is in the commit log,
+# not here.)
 #
-#   BLO-28405  Still open, and still a zebra question, but a narrower one than
-#              this file claimed. The injection genuinely fires -- r1/zebra.out
-#              carries `netlink_send_msg error: Input/output error` exactly once,
-#              inside this test's TEST-START/TEST-END -- so the open question is
-#              only whether result=0 is correct for a create whose second
-#              sendmsg was injected. That is what
-#              test_address_failure_cleans_up_and_allows_tunnel_id_reuse still
-#              asserts, and why it keeps its marker.
+#   BLO-28405  zebra. The injection genuinely fires -- r1/zebra.out carries
+#              `netlink_send_msg error: Input/output error` exactly once, inside
+#              this test's TEST-START/TEST-END -- so the live question is only
+#              whether result=0 is correct for a create whose second sendmsg was
+#              injected. test_address_failure_cleans_up_and_allows_tunnel_id_reuse
+#              asserts that, and keeps its marker.
 #
-#              What was NOT a zebra defect is the leak. dimt-00000004 survived
-#              because the test never deleted it: the `result == 1` assertion
-#              raises above the `del`, which is a test-cleanup bug and needs no
-#              zebra change to explain. The seven cascade failures followed from
-#              that leak, not from BLO-28405, so their markers came off here
-#              rather than in the BLO-28405 fix PR.
+#   BLO-28406  zebra. Reconciliation of the surviving link after a lost create
+#              ack. assert_injection_fired() demands positive proof the
+#              injection happened, because a SUCCESSFUL lost-ack injection
+#              writes nothing to zebra.out (EAGAIN is the normal batch
+#              terminator) -- silence there is not evidence. It raises Failed,
+#              not AssertionError, so an uninjected run ESCAPES this marker
+#              instead of being absorbed: the test reporting xfail is itself
+#              the proof it fired.
 #
-#              The cascade mechanism was also not name collision, which the link
-#              names invite you to assume: those seven create ids 5, 6, 9, 10,
-#              11 and 12, every one a different name from dimt-00000004, and all
-#              still died at their setup add() with `File exists`. It is a GRE
-#              tuple collision on the shared 192.0.2.1 -> 192.0.2.2 endpoints.
-#              (A real name collision does occur in this file, deliberately and
-#              benignly: test_create_failure_reports_fail_install_without_kernel_state
-#              creates dimt-00000004 as a dummy on purpose and removes it on its
-#              last line. Do not read that early EEXIST as the leak.)
+#   BLO-29000  HARNESS, not zebra. hold_dplane_worker() does not hold the
+#              `del 9` client: it exits with result=2 (REMOVED) before the readd
+#              runs, so the test has never opened the window it is named for.
+#              The zebra defect first filed here -- "readd returns result=0" --
+#              was a phantom: a post-delete ADD succeeding is correct, and this
+#              test's own tail asserts exactly that. The two observables are
+#              bit-for-bit identical, which is why the precondition guard is the
+#              only thing that can tell them apart.
 #
-#   BLO-28406  VERIFIED under clean state. Reconciliation of the surviving
-#              link after a lost create ack. Every observation before the
-#              reaper ran with the leaked dimt-00000004 present, and with a
-#              stray link `add 8` fails with `File exists`, satisfying this
-#              test's entire pre-failure sequence with no zebra defect -- so
-#              the marker rested on nothing. assert_injection_fired() now
-#              demands positive proof the injection happened, because a
-#              SUCCESSFUL lost-ack injection writes nothing to zebra.out
-#              (EAGAIN is the normal batch terminator), so silence there was
-#              never evidence. It raises Failed, not AssertionError, so an
-#              uninjected run ESCAPES this marker instead of being absorbed:
-#              the test reporting xfail is itself the proof it fired.
-#
-#   BLO-29000  a HARNESS defect, not a zebra one. hold_dplane_worker() does
-#              not hold the `del 9` client: it exits with result=2 (REMOVED)
-#              before the readd runs, so the test has never opened the window
-#              it is named for. The zebra defect first filed here -- "readd
-#              returns result=0" -- was a phantom: a post-delete ADD succeeding
-#              is correct, and this test's own tail asserts exactly that. The
-#              two observables are bit-for-bit identical, which is why the
-#              precondition guard is the only thing that could tell them apart.
+# Why reap_stray_dimt_links() exists: the seven cascade failures were a GRE
+# TUPLE collision on the shared 192.0.2.1 -> 192.0.2.2 endpoints, not a name
+# collision -- those seven create ids 5, 6, 9, 10, 11 and 12, every one a
+# different name from the leaked dimt-00000004, and all still died at their
+# setup add() with `File exists`. A real name collision does occur here,
+# deliberately and benignly:
+# test_create_failure_reports_fail_install_without_kernel_state creates
+# dimt-00000004 as a dummy on purpose and removes it on its last line. Do not
+# read that early EEXIST as a leak.
 #
 # These are marked xfail rather than skipped so the harness fix could land
 # without waiting on the zebra work -- a skip would recreate the very blind spot
 # BLO-28043 exists to close. strict=True is load-bearing: the build FAILS the
 # moment a defect is fixed and its test starts passing, which forces the marker
-# off in the same PR that fixes it. That is also why the seven markers could not
-# be removed in a follow-up: the reaper below unwedges those tests immediately,
-# so leaving the markers on would turn seven passes into strict-XPASS failures.
-# The fixture and the marker removal have to be one commit.
+# off in the same PR that fixes it. Corollary worth keeping: anything that
+# unwedges a marked test -- a fixture like the reaper below, as much as a zebra
+# fix -- must remove that test's marker in the SAME commit, or strict turns the
+# new pass into an XPASS failure.
 #
 # Remove each REMAINING marker in its blocker's fix PR, never in a cleanup.
 # raises= narrows each marker to the failure it actually predicts, so an
 # unrelated topology error or a no-op injection surfaces as a hard failure
-# instead of being absorbed as expected.  pytest.fail() raises Failed, not
-# AssertionError, which is what makes assert_injection_fired() below able to
-# break out of an xfail rather than be swallowed by it.
+# instead of being absorbed as expected. Neither pytest.fail()'s Failed nor
+# WindowNeverOpened is an AssertionError, which is what lets
+# assert_injection_fired() and the precondition guard break out of an xfail
+# rather than be swallowed by it.
 XFAIL_BLO_28405 = pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
@@ -420,6 +408,7 @@ def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
     tracer.injection_label = "{} {} injection at when={}".format(
         syscall, errno_name, when
     )
+    tracer.injection_tag = "(INJECTED)"
     return tracer
 
 
@@ -515,6 +504,21 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
     tracer.injection_label = "{} {}={} hold".format(
         syscalls, inject_kind, delay_usecs
     )
+    # NOT "(INJECTED)" -- strace tags a delay "(DELAYED)". See
+    # assert_injection_fired() for the measurement.
+    #
+    # Published so a hold site CAN adopt assert_injection_fired(), but the hold
+    # sites deliberately do not yet: unlike an error injection, strace emits the
+    # line when the delayed syscall RETURNS, so whether "(DELAYED)" is already
+    # in stderr when the test terminates the tracer is a timing property that
+    # was NOT confirmed. It could not be measured outside CI -- attaching with
+    # -p needs root or ptrace_scope=0, and the dev host has ptrace_scope=1, so
+    # the attempt produced an empty trace that proves nothing either way.
+    # Asserting on an unconfirmed tag would trade a silent pass for a flake.
+    # The hold sites synchronize on observable effects instead
+    # (sendmsg_entered() reading the -o trace file, and "zebra did not process
+    # the replacement link").
+    tracer.injection_tag = "(DELAYED)"
     return tracer
 
 
@@ -552,7 +556,7 @@ def stop_tracer(tracer):
     return err if isinstance(err, str) else err.decode("utf-8", "replace")
 
 
-def assert_injection_fired(trace_output, what):
+def assert_injection_fired(trace_output, what, tag="(INJECTED)"):
     """Refuse to assert on a run whose injection may never have happened.
 
     Deliberately pytest.fail() rather than assert: it raises Failed, not
@@ -560,14 +564,24 @@ def assert_injection_fired(trace_output, what):
     instead of being absorbed by them as an expected failure.  A marker that
     swallows "the injection did not fire" is exactly how a test can appear to
     confirm a defect it never exercised.
+
+    `tag` is which strace annotation counts as proof, because strace does NOT
+    use one word for both injection kinds -- measured on strace 6.8:
+
+        -e inject=write:error=EIO       -> "= -1 EIO (...) (INJECTED)"
+        -e inject=write:delay_enter=N   -> "= 6 (DELAYED)"
+
+    So an error injection is proved by "(INJECTED)" and a delay/hold by
+    "(DELAYED)". Pass tracer.injection_tag rather than hardcoding either;
+    both tracer-returning helpers set it beside injection_label.
     """
-    if "(INJECTED)" not in trace_output:
+    if tag not in trace_output:
         pytest.fail(
-            "{}: strace reported no injected syscall, so anything asserted "
+            "{}: strace reported no {} syscall, so anything asserted "
             "below would describe an UNINJECTED run. Treat this as the test "
             "not having executed, not as evidence about zebra.\n"
             "strace stderr was:\n{}".format(
-                what, trace_output.strip() or "(empty)")
+                what, tag, trace_output.strip() or "(empty)")
         )
 
 
@@ -722,7 +736,12 @@ def test_delete_failure_retains_ownership_for_retry_and_reuse():
     try:
         failed = request("del", 5)
     finally:
-        stop_tracer(tracer)
+        trace = stop_tracer(tracer)
+    # Same reasoning as the recv sites: under a no-op injection the delete
+    # simply succeeds, and while the result assertion below would then fail, it
+    # fails as "expected 3, got 2" -- which reads as a zebra defect. This says
+    # "the injection never fired" instead, which is what actually happened.
+    assert_injection_fired(trace, tracer.injection_label, tracer.injection_tag)
     assert failed["result"] == 3, failed
     assert "dimt-00000005" in router.run("ip link show dimt-00000005")
 
