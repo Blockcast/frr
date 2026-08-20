@@ -476,6 +476,7 @@ static void pim_zebra_mvpn_sg_send(struct pim_upstream *up, uint8_t role, bool a
 {
 	struct zapi_mvpn_sg sg = {};
 	struct stream *s;
+	struct pim_dimt_fwd_detail detail;
 
 	if (!pim_zclient || pim_zclient->sock < 0)
 		return;
@@ -495,13 +496,22 @@ static void pim_zebra_mvpn_sg_send(struct pim_upstream *up, uint8_t role, bool a
 	/* Proven-forwarding state travels on the same message as the role:
 	 * pimd is the only daemon that observes all three preconditions, and
 	 * riding the existing message makes restart replay correct for free.
-	 * PENDING is the fail-closed value for anything not DIMT-steered. */
-	sg.forwarding = pim_dimt_forwarding_state(up->pim, up);
+	 * PENDING is the fail-closed value for anything not DIMT-steered.
+	 *
+	 * The cause and the proven oif ride alongside it: the aggregated state
+	 * byte cannot carry which precondition failed, and bgpd has to name a
+	 * reason in `forwarding_lost` and an oif in `forwarding_ready`. */
+	sg.forwarding = pim_dimt_forwarding_state(up->pim, up, &detail);
+	sg.fwd_reason = detail.reason;
+	sg.fwd_ifindex = detail.ifindex;
+	strlcpy(sg.fwd_oif, detail.oif, sizeof(sg.fwd_oif));
 	up->gtm_forwarding = sg.forwarding;
 
 	if (PIM_DEBUG_ZEBRA)
-		zlog_debug("MVPN_SG %s %pSG role=%u fwd=%u to zebra",
-			   add ? "ADD" : "DEL", &up->sg, role, sg.forwarding);
+		zlog_debug("MVPN_SG %s %pSG role=%u fwd=%u reason=%u oif=%s to zebra",
+			   add ? "ADD" : "DEL", &up->sg, role, sg.forwarding,
+			   sg.fwd_reason,
+			   sg.fwd_oif[0] ? sg.fwd_oif : "-");
 
 	s = pim_zclient->obuf;
 	zapi_mvpn_sg_encode(s, add ? ZEBRA_MVPN_SG_ADD : ZEBRA_MVPN_SG_DEL,
@@ -574,7 +584,11 @@ void pim_gtm_forwarding_update(struct pim_instance *pim,
 	if (!pim->gtm_enable || !up->gtm_announced)
 		return;
 
-	forwarding = pim_dimt_forwarding_state(pim, up);
+	/* NULL reason: this is an edge detector on the state byte only.  The
+	 * cause is (re)computed authoritatively inside pim_zebra_mvpn_sg_send()
+	 * below, which is also what sets up->gtm_forwarding, so the two bytes
+	 * on the wire always come from one evaluation. */
+	forwarding = pim_dimt_forwarding_state(pim, up, NULL);
 	if (forwarding == up->gtm_forwarding)
 		return;
 

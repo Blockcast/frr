@@ -150,19 +150,81 @@ rejoins later gets a strictly higher `route_version`, not a restart from 1.
 | `leaf_install` | A Type-4 (Leaf A-D) route learned from a peer appears for a `(source, group)`, naming one receiving PE in `leaf`. Under ingress replication a root emits one of these per leaf, and settlement bills each separately. |
 | `leaf_withdraw` | A previously emitted `(source, group, leaf)` Type-4 is no longer present in the MVPN RIB. |
 | `origin_change` | An already-installed join's resolved `(source_as, upstream_peer)` changes -- typically because the unicast route toward C-S changed (a new best path, a new/changed route-import RT or UMH large community, and so on). No withdraw/re-join occurs on the wire; the Type-7 route is re-originated in place. |
+| `forwarding_ready` | pimd reported `FWD_READY` for an installed `(source, group)` -- tunnel netlink ack **and** RPF pinned onto that netdev **and** the kernel admitted the MFC entry with the DIMT vif. Additive; **never independently payable**. |
+| `forwarding_lost` | A path that had reported `forwarding_ready` left that state, or its readiness interval is being closed because the entitlement interval containing it is ending. Carries `forwarding.reason`. Additive; **never independently payable**. |
 
 A redundant re-resolution that produces the *same* `(source_as,
 upstream_peer)` as last emitted (for example, an unrelated unicast churn
 that re-triggers `bgp_mvpn_reresolve_joins_for_route` without actually
 changing this join's resolved values) emits nothing.
 
+### Proven-forwarding events
+
+`forwarding_ready` / `forwarding_lost` report whether DIMT forwarding is
+actually proven for a join. They are **additive** and **annotate** an
+entitlement interval rather than delimiting one:
+
+- They reuse the record envelope and route identity of the interval that
+  contains them -- including the **same `route_version`**, deliberately not a
+  new generation. That is what makes a readiness record joinable to its
+  entitlement interval by `(source, group, route_version)`. A readiness
+  transition is not a producer lifecycle transition, and bumping `generation`
+  would tell every consumer the entitlement window closed and reopened.
+- `install`, `withdraw` and `origin_change` keep their timing, trigger and
+  shape **unchanged and ungated**. A forwarding failure does **not** close the
+  entitlement interval; readiness is reported, never enforced.
+- Neither event is payable on its own. Payability is fenced by the
+  independently attested witness slices `W`, not by these records.
+
+Cardinality and ordering:
+
+- Exactly one `forwarding_ready` per readiness interval. pimd re-announces on
+  every event that could have moved readiness, so emission is edge-triggered:
+  a re-announce of a still-ready `(S,G)` emits nothing.
+- `forwarding_lost` is emitted **if and only if** a `forwarding_ready` was
+  emitted for the current route-state interval. A path that never reported
+  ready has no interval to close, and no `forwarding_lost` is emitted for it.
+- `forwarding_lost` is ordered **before** the `withdraw` or `origin_change`
+  it accompanies, so a readiness interval always closes inside the entitlement
+  interval that contained it. Readiness intervals never straddle a
+  `route_version` change.
+- Forwarding state is **not** part of the snapshot. A restarted `bgpd` has no
+  readiness state and emits no `forwarding_ready` until pimd re-reports;
+  "installed, no readiness yet" is the correct post-restart reading.
+
+The `forwarding` object:
+
+| Key | Present on | Meaning |
+| --- | --- | --- |
+| `state` | both | `"ready"` or `"lost"`. |
+| `oif` | `forwarding_ready` | The DIMT netdev carrying the traffic, as named by pimd. Omitted when the reporting pimd predates the field. |
+| `ifindex` | `forwarding_ready` | Kernel ifindex of `oif`. Present exactly when `oif` is. |
+| `tunnel_ack` | `forwarding_ready` | Always `"netlink"`. Names *which* proof was required, not a fresh observation. |
+| `mfc_ack` | `forwarding_ready` | Always `"MRT_ADD_MFC"`. Same. |
+| `reason` | `forwarding_lost` | Stable enum, see below. |
+
+`forwarding.reason` is a **stable, append-only enum**. Renaming or repurposing
+a value is a breaking change; adding one is not.
+
+| `reason` | Meaning |
+| --- | --- |
+| `tunnel_fail_install` | Tunnel install was refused or errored. Includes zebra's anti-recursion refusal, which surfaces to pimd only as a failed tunnel. |
+| `tunnel_removed` | The tunnel is gone or tearing down: no mapping, no tunnel object, or a state other than installed/failed. |
+| `mfc_evicted` | The kernel MFC entry is absent, or its incoming vif is no longer the DIMT vif -- kernel acceptance withdrawn. |
+| `rpf_unpinned` | RPF is no longer pinned onto the tunnel netdev. |
+| `anti_recursion_refused` | Reserved for a distinguishable anti-recursion refusal. Not currently emitted: pimd cannot separate it from `tunnel_fail_install` on tunnel state alone. |
+| `withdraw` | The readiness interval is being closed because the join is being withdrawn. Set by `bgpd`. |
+| `origin_change` | Closed because the upstream origin changed; the readiness proof was established against the old path. Set by `bgpd`. |
+| `unknown` | The reporting pimd did not supply a cause -- a mixed-version deployment predating the cause field. Emitted rather than guessing a specific step: a wrong-but-plausible reason in a settlement record is worse than an honest `unknown`. |
+
+
 ## Fields
 
 | Field | Type | Present on | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | int | all output records | `1`. Bump on any breaking wire-format change. |
+| `schema_version` | int | all output records | `1`. Bump on any breaking wire-format change. Adding an `event_type` is **not** breaking -- see "Forward compatibility" below -- so additive event types do not bump this. |
 | `type` | string | `snapshot_end` only | `snapshot_end`; distinguishes the framing record from lifecycle-shaped snapshot installs. |
-| `event_type` | string | live lifecycle and snapshot install records | `install` \| `withdraw` \| `origin_change`. Snapshot records are always `install`. |
+| `event_type` | string | live lifecycle and snapshot install records | `install` \| `withdraw` \| `origin_change` \| `leaf_install` \| `leaf_withdraw` \| `forwarding_ready` \| `forwarding_lost`. Snapshot records are always `install` or `leaf_install`. This list is **not** closed: consumers MUST tolerate unrecognised values per "Forward compatibility" below. |
 | `boot_epoch` | int | all output records | See "Durable cursor" above. |
 | `seq` | int | all output records | Live lifecycle sequence, starting at 1. Snapshot records and `snapshot_end` retain the current baseline, which may be 0 before the first live event. Use the `(boot_epoch, seq)` pair, not `seq` alone, for gap detection. |
 | `snapshot` | bool | snapshot install records only | `true`; identifies a private point-in-time install rather than a live lifecycle transition. |
@@ -180,7 +242,39 @@ changing this join's resolved values) emits nothing.
 | `upstream_peer` | string | when an upstream PE was resolved | The resolved upstream PE's IPv4 address (the RFC 7716 upstream-node-identifying Route Target's Global Administrator, or the large-community UMH when `bgp mvpn umh-large-community` is configured). **This is the UMH -- the next hop toward the source. It is NOT a leaf and must not be used as a subscriber identity.** Earlier revisions of this table called it the "peer/leaf next-hop … for counter identity"; that was wrong, and a consumer that billed it attributed every leaf behind a route reflector to the reflector. Per-leaf identity is the `leaf` field on `leaf_install` / `leaf_withdraw`. |
 | `leaf` | string | `leaf_install` / `leaf_withdraw` only | The Type-4 (Leaf A-D) route's leaf originator: the receiving PE's router-id, canonical text. This is the per-PE subscriber identity for settlement. Note the granularity: one Type-4 covers a whole PE, so every receiver behind that PE aggregates into this one identity. BGP carries nothing finer at any layer. |
 | `ipmsi_label` | int | live lifecycle and snapshot install records | This bgp instance's configured `bgp mvpn ipmsi-label` (0 = unlabeled GTM tunnel, RFC 6514 Section 5). The "MPLS label" BLO-17650's counter-identity key refers to. |
+| `forwarding` | object | `forwarding_ready` / `forwarding_lost` only | Proven-forwarding detail. See "Proven-forwarding events" above. |
 | `vrf` | string | live lifecycle and snapshot install records | The bgp instance name, or `default`. |
+
+## Forward compatibility
+
+**A consumer MUST ignore `event_type` values it does not recognise, MUST NOT
+quarantine on them, and MUST advance its persisted `(boot_epoch, seq)` cursor
+across them exactly as it would for a recognised record.**
+
+Ignoring alone is **not** sufficient, and getting this wrong converts an
+additive event into a settlement outage. `seq` is present on every output
+record and is drawn from one counter shared by all event types. A consumer
+that skips an unrecognised record *without advancing its cursor* computes
+`seq > last_seq + 1` at the next record it does recognise, concludes there is
+a genuine gap, and quarantines -- an interval-wide billing stall caused by an
+event it was entitled to ignore.
+
+Concretely, a consumer that recognises only the three original v1 event types,
+reading a stream carrying `forwarding_*`, must:
+
+- advance `last_seq` for every record it reads, recognised or not;
+- report `cursor_status` contiguous;
+- never quarantine on an unrecognised `event_type` alone.
+
+This is the reading `schema_version` `1` depends on: adding an event type is
+additive precisely *because* this rule holds. Note the rule is about
+unrecognised **`event_type`** values only -- it does not weaken the mandatory
+quarantine on a real `gap` or `rollback` in the `(boot_epoch, seq)` cursor
+itself, nor the requirement to reject an unrecognised `schema_version`.
+
+Ordering between an `install` and a later `forwarding_ready` for the same
+`(source, group)` and `route_version` is guaranteed by `seq`; no consumer
+needs to infer it from arrival adjacency.
 
 ## Example
 
