@@ -116,12 +116,34 @@ static struct pim_dimt_umh *pim_dimt_umh_lookup(struct pim_instance *pim,
 	return best;
 }
 
-/* The light interface facing a UMH: pim and pim-light enabled and a
- * connected (or ptp peer) subnet containing the UMH address.  Requiring
- * pim_enable filters out interfaces that cannot send joins and interfaces
- * mid-teardown by `no ip pim`. */
-static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
-					      pim_addr umh_addr)
+static struct pim_dimt_tunnel *pim_dimt_tunnel_find(struct pim_instance *pim,
+						    pim_addr umh);
+
+/* Is this interface usable as an RPF pin target?  pim_enable filters out
+ * interfaces that cannot send joins and interfaces mid-teardown by
+ * `no ip pim`; pim_light_enable is what makes a neighborless pin legal. */
+static bool pim_dimt_iface_pinnable(struct interface *ifp)
+{
+	struct pim_interface *pim_ifp;
+
+	if (!ifp)
+		return false;
+
+	pim_ifp = ifp->info;
+
+	return pim_ifp && pim_ifp->pim_enable && pim_ifp->pim_light_enable &&
+	       if_is_operative(ifp);
+}
+
+/* First pinnable, *non-tunnel* light interface whose connected subnet (or ptp
+ * peer) covers the UMH.  This is the Phase-B resolver, and it is retained
+ * verbatim for the no-tunnel case -- but it is order-dependent by nature
+ * (FOR_ALL_INTERFACES has no defined order w.r.t. netdev creation), so it is
+ * never allowed to answer for a UMH that has a tunnel.  `skip` excludes the
+ * DIMT netdev so the result is a genuine second candidate. */
+static struct interface *pim_dimt_covering_iface(struct pim_instance *pim,
+						 pim_addr umh_addr,
+						 const struct interface *skip)
 {
 	struct interface *ifp;
 	struct prefix pumh;
@@ -129,11 +151,9 @@ static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
 	pim_addr_to_prefix(&pumh, umh_addr);
 
 	FOR_ALL_INTERFACES (pim->vrf, ifp) {
-		struct pim_interface *pim_ifp = ifp->info;
 		struct connected *c;
 
-		if (!pim_ifp || !pim_ifp->pim_enable ||
-		    !pim_ifp->pim_light_enable || !if_is_operative(ifp))
+		if (ifp == skip || !pim_dimt_iface_pinnable(ifp))
 			continue;
 
 		frr_each (if_connected, ifp->connected, c) {
@@ -148,6 +168,208 @@ static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
 	}
 
 	return NULL;
+}
+
+/* How a UMH's RPF pin resolved.  Recorded so the choice is observable:
+ * the failure this exists to kill was silent precisely because a wrong
+ * answer and a right answer were indistinguishable from the box. */
+enum pim_dimt_pin_source {
+	/* nothing resolves; no pin */
+	PIM_DIMT_PIN_NONE = 0,
+	/* the DIMT netdev serving this UMH */
+	PIM_DIMT_PIN_TUNNEL,
+	/* a configured pim-light interface covering the UMH (no tunnel) */
+	PIM_DIMT_PIN_LIGHT,
+	/* a tunnel is demanded but its netdev is not pinnable yet */
+	PIM_DIMT_PIN_TUNNEL_PENDING,
+	/*
+	 * The tunnel for this UMH is in state `failed`, so nothing will
+	 * become pinnable without a new demand edge.
+	 *
+	 * Distinct from TUNNEL_PENDING because the two need opposite
+	 * responses and only differ by a field an operator cannot see from
+	 * this command: a FAILED row keeps its place in dimt_tunnel_list with
+	 * ifindex 0, so it is not-pinnable forever.  Reporting that as
+	 * "pending" tells the operator to wait for something that will never
+	 * arrive -- zebra's anti-recursion refusal lands here and never
+	 * self-heals.  pim_dimt_forwarding_state() already separates them.
+	 */
+	PIM_DIMT_PIN_TUNNEL_FAILED,
+
+	/* Sentinel, so the string table below can be size-checked.  Keep it
+	 * last and add new sources above it. */
+	PIM_DIMT_PIN_MAX,
+};
+
+/* Which resolver answered.  Not cosmetic: "tunnel-pending" and
+ * "tunnel-failed" are the states that used to be indistinguishable from a
+ * healthy pin, and from each other. */
+static const char *const pim_dimt_pin_source_str[] = {
+	[PIM_DIMT_PIN_NONE] = "none",
+	[PIM_DIMT_PIN_TUNNEL] = "tunnel",
+	[PIM_DIMT_PIN_LIGHT] = "light",
+	[PIM_DIMT_PIN_TUNNEL_PENDING] = "tunnel-pending",
+	[PIM_DIMT_PIN_TUNNEL_FAILED] = "tunnel-failed",
+};
+
+/*
+ * This assert pins the table's EXTENT, and only that.
+ *
+ * The check has to be against the sentinel, not against
+ * PIM_DIMT_PIN_TUNNEL_FAILED + 1: appending a source below FAILED changes
+ * neither FAILED's value nor -- absent a new entry -- array_size(), so that
+ * form would still compile and still read past the end.  PIM_DIMT_PIN_MAX
+ * is the only expression here that grows with the enum.
+ *
+ * What it does NOT catch is an INSERTED source.  array_size() of a
+ * designated-initializer array is (highest designated index + 1), so it
+ * tracks the largest initialised index, not the count of non-NULL entries.
+ * Put a new tunnel state between TUNNEL_PENDING and TUNNEL_FAILED -- the
+ * obvious home, since the enum groups the tunnel states together -- and
+ * FAILED shifts up, array_size() and PIM_DIMT_PIN_MAX both grow, the assert
+ * still passes, and the vacated index is an implicit NULL hole.  Designated
+ * initializers make holes legal, so no warning fires either.
+ *
+ * A NULL there is worse than an out-of-bounds read on one path:
+ * json_object_string_add() hands the value to json_object_new_string(),
+ * which takes strlen() of it with no NULL guard, so `show ip pim dimt umh
+ * json` would fault rather than misprint.  Hence the accessor below: the
+ * assert keeps the build-time half, and every read goes through the check
+ * that covers the half the assert cannot see.
+ */
+static_assert(array_size(pim_dimt_pin_source_str) == PIM_DIMT_PIN_MAX,
+	      "pim_dimt_pin_source_str is missing an entry for a pin source");
+
+/* The only legal way to read the table.  Never index it directly. */
+static const char *pim_dimt_pin_source_name(enum pim_dimt_pin_source source)
+{
+	/* Cast for the bound check so it holds whichever signedness the
+	 * compiler picks for the enum, without a tautological comparison
+	 * warning on the unsigned choice. */
+	if ((unsigned int)source >= PIM_DIMT_PIN_MAX ||
+	    !pim_dimt_pin_source_str[source])
+		return "unknown";
+	return pim_dimt_pin_source_str[source];
+}
+
+struct pim_dimt_pin {
+	struct interface *ifp; /* pin target, NULL when unresolved */
+	enum pim_dimt_pin_source source;
+	/* A covering non-tunnel interface that did NOT get the pin.  Only the
+	 * tunnel cases can shadow, and reporting it is the whole point: an
+	 * operator can see which interface lost. */
+	struct interface *shadowed;
+};
+
+/* Resolve the RPF pin for a UMH, deterministically.
+ *
+ * The rule: if a DIMT tunnel exists for this UMH, that tunnel's netdev is the
+ * ONLY legal pin target.  Otherwise fall back to the Phase-B covering-subnet
+ * search.
+ *
+ * Why the tunnel wins outright rather than merely being preferred: the old
+ * resolver matched per-interface with no tunnel preference, so a `/24` underlay
+ * covering the UMH was exactly as good a match as the tunnel's own `/32` ptp
+ * peer, and FOR_ALL_INTERFACES order decided which won.  When the underlay won,
+ * readiness conjunct (2) in pim_dimt_forwarding_state() -- rpf interface ==
+ * tunnel ifindex -- could never hold, so the tunnel installed clean and never
+ * forwarded, with no error and no log.  Preferring the ptp match would only
+ * narrow that race (any other ptp link toward the UMH re-opens it); resolving
+ * from the tunnel list closes it.
+ *
+ * Fail-closed while the tunnel is pending: no pin at all, rather than a
+ * transient pin onto the underlay.  A pin the tunnel does not own can never
+ * satisfy conjunct (2), so it buys no forwarding -- it only reintroduces the
+ * ambiguity.  pim_dimt_ifp_adopt() -> pim_dimt_iface_up() re-resolves every
+ * upstream the moment the netdev appears, which is what makes waiting safe.
+ *
+ * `want_shadowed` gates the second, purely diagnostic search.  It is the
+ * expensive half: with no competing interface pim_dimt_covering_iface()
+ * cannot short-circuit, so it walks every interface and every connected
+ * address before returning NULL -- once per upstream, on a path that
+ * pim_dimt_iface_up() drives across the whole upstream tree on every
+ * connected-address change.  Nothing in the forwarding path reads it. */
+static void pim_dimt_resolve_pin(struct pim_instance *pim, pim_addr umh_addr,
+				 struct pim_dimt_pin *pin, bool want_shadowed)
+{
+	struct pim_dimt_tunnel *tun;
+	struct interface *tun_ifp = NULL;
+	struct interface *own_ifp;
+
+	memset(pin, 0, sizeof(*pin));
+
+	tun = pim_dimt_tunnel_find(pim, umh_addr);
+	if (!tun) {
+		pin->ifp = pim_dimt_covering_iface(pim, umh_addr, NULL);
+		pin->source = pin->ifp ? PIM_DIMT_PIN_LIGHT : PIM_DIMT_PIN_NONE;
+		return;
+	}
+
+	/* ifindex is 0 until the INSTALLED notify lands, and is reset to 0 on
+	 * FAIL_INSTALL and REMOVED -- so a non-zero ifindex is exactly "zebra
+	 * has acked a netdev for this tunnel". */
+	if (tun->ifindex)
+		tun_ifp = if_lookup_by_index(tun->ifindex, pim->vrf->vrf_id);
+
+	if (pim_dimt_iface_pinnable(tun_ifp)) {
+		pin->ifp = tun_ifp;
+		pin->source = PIM_DIMT_PIN_TUNNEL;
+	} else if (tun->state == PIM_DIMT_TUNNEL_FAILED) {
+		/* Terminal until demand changes -- do not report it as a wait. */
+		pin->source = PIM_DIMT_PIN_TUNNEL_FAILED;
+	} else {
+		/* Deliberately no fallback: see the comment above. */
+		pin->source = PIM_DIMT_PIN_TUNNEL_PENDING;
+	}
+
+	if (!want_shadowed)
+		return;
+
+	/*
+	 * Exclude the tunnel's own netdev by NAME, not by the pointer the
+	 * ifindex resolved to -- that pointer is NULL exactly when the netdev
+	 * is most likely to still be present.
+	 *
+	 * pim_dimt_tunnel_session_reset() zeroes ifindex while deliberately
+	 * leaving the netdev built: it survives a zebra restart with pim-light
+	 * still set from the earlier adopt and the UMH still its ptp peer, so
+	 * it covers the UMH and matches itself.  Skipping on the
+	 * ifindex-derived pointer would skip nothing there and name the tunnel
+	 * as the interface that shadowed its own pin -- for the whole reconnect
+	 * window, which is precisely when an operator reads this.  The name is
+	 * stable across all of it.
+	 */
+	own_ifp = tun_ifp ? tun_ifp
+			  : if_lookup_by_name(tun->ifname, pim->vrf->vrf_id);
+
+	pin->shadowed = pim_dimt_covering_iface(pim, umh_addr, own_ifp);
+}
+
+/* The interface a UMH's RPF pin belongs on, or NULL. */
+static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
+					      pim_addr umh_addr)
+{
+	struct pim_dimt_pin pin;
+
+	/* The shadowed search is diagnostic only; skip it unless something
+	 * will actually read the answer. */
+	pim_dimt_resolve_pin(pim, umh_addr, &pin, PIM_DEBUG_PIM_TRACE);
+
+	if (PIM_DEBUG_PIM_TRACE && pin.shadowed)
+		zlog_debug("DIMT: UMH %pPAs pin resolves to %s (%s); covering interface %s does not carry it",
+			   &umh_addr, pin.ifp ? pin.ifp->name : "nothing",
+			   pim_dimt_pin_source_name(pin.source),
+			   pin.shadowed->name);
+	else if (PIM_DEBUG_PIM_TRACE &&
+		 pin.source == PIM_DIMT_PIN_TUNNEL_PENDING)
+		zlog_debug("DIMT: UMH %pPAs has a tunnel but its netdev is not pinnable yet; not pinning",
+			   &umh_addr);
+	else if (PIM_DEBUG_PIM_TRACE &&
+		 pin.source == PIM_DIMT_PIN_TUNNEL_FAILED)
+		zlog_debug("DIMT: UMH %pPAs has a failed tunnel; not pinning until demand changes",
+			   &umh_addr);
+
+	return pin.ifp;
 }
 
 /* Pin an upstream's RPF onto the light interface facing its UMH.
@@ -484,17 +706,22 @@ void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json)
 	if (json)
 		jobj = json_object_new_object();
 	else
-		vty_out(vty, "%-22s %-16s %-10s %-4s %s\n", "Prefix", "UMH",
-			"Type", "Pref", "Interface");
+		vty_out(vty, "%-22s %-16s %-10s %-4s %-16s %-14s %s\n", "Prefix",
+			"UMH", "Type", "Pref", "Interface", "PinSource",
+			"Shadowed");
 
 	for (ALL_LIST_ELEMENTS_RO(pim->dimt_umh_list, node, umh)) {
-		struct interface *ifp = pim_dimt_light_iface(pim, umh->umh);
+		struct pim_dimt_pin pin;
+		struct interface *ifp;
 		const char *type = umh->umh_type == ZAPI_UMH_TYPE_PIM
 					   ? "pim"
 					   : (umh->umh_type ==
 						      ZAPI_UMH_TYPE_AMT_RELAY
 						      ? "amt-relay"
 						      : "unknown");
+
+		pim_dimt_resolve_pin(pim, umh->umh, &pin, true);
+		ifp = pin.ifp;
 
 		if (jobj) {
 			json_object *jumh = json_object_new_object();
@@ -511,11 +738,21 @@ void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json)
 					    umh->preference);
 			json_object_string_add(jumh, "interface",
 					       ifp ? ifp->name : "none");
+			json_object_string_add(jumh, "pinSource",
+					       pim_dimt_pin_source_name(pin.source));
+			/* Present only when a covering interface actually lost,
+			 * so its mere presence is the ambiguity signal. */
+			if (pin.shadowed)
+				json_object_string_add(jumh, "shadowedInterface",
+						       pin.shadowed->name);
 			json_object_object_add(jobj, pfx_str, jumh);
 		} else {
-			vty_out(vty, "%-22pFX %-16pPAs %-10s %-4u %s\n",
+			vty_out(vty,
+				"%-22pFX %-16pPAs %-10s %-4u %-16s %-14s %s\n",
 				&umh->prefix, &umh->umh, type,
-				umh->preference, ifp ? ifp->name : "none");
+				umh->preference, ifp ? ifp->name : "none",
+				pim_dimt_pin_source_name(pin.source),
+				pin.shadowed ? pin.shadowed->name : "-");
 		}
 	}
 

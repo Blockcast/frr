@@ -26,26 +26,32 @@ using s1 (10.0.0.0/24) as the outer underlay.
 
 WHY THE UMH IS A LOOPBACK, AND WHY r2-eth0 IS NOT `ip pim light`
 ----------------------------------------------------------------
-`pim_dimt_light_iface()` walks FOR_ALL_INTERFACES and returns the FIRST
-pim-light interface with a connected address, or point-to-point destination,
-that prefix-matches the UMH.  Readiness conjunct (2) then demands that the
-pinned RPF interface be the tunnel itself.
+`pim_dimt_light_iface()` resolves the pin from the DIMT tunnel list when a
+tunnel exists for the UMH, and only falls back to a covering-subnet search
+over pim-light interfaces when one does not.  Readiness conjunct (2) then
+demands that the pinned RPF interface be the tunnel itself.
 
 zebra addresses the DIMT netdev point-to-point -- `IFA_LOCAL` = inner-local,
 `IFA_ADDRESS` = the inner peer = the UMH, /32 (`zebra/if_netlink.c`, the
 ZEBRA_DIMT_TUNNEL_ADDRESS phase) -- so the tunnel's `destination` is exactly
-the UMH and it matches.  But so would any *other* pim-light interface whose
-subnet happens to cover the UMH, and whichever one iteration reaches first
-wins.  Had the UMH been r1's s1 address (10.0.0.1) with r2-eth0 pim-light,
-r2-eth0's 10.0.0.2/24 would cover it and could shadow the tunnel: the pin
-lands on the wrong interface, conjunct (2) never holds, and readiness sits
-at `pending` forever with no error anywhere.
+the UMH.
 
-Putting the UMH on a loopback r2 has no route to, and leaving the underlay
-out of pim-light, makes the tunnel the only candidate -- so this suite tests
-the state machine rather than an interface-ordering coin flip.  The
-shadowing hazard itself is real but out of scope here; it is filed
-separately rather than papered over with a topology that hides it.
+The stages below keep the UMH on a loopback r2 has no route to, and leave the
+underlay out of pim-light, so that the tunnel is the *only* candidate and each
+stage tests the state machine rather than pin resolution.  The shadowing case
+-- where a second, covering pim-light interface competes with the tunnel -- is
+covered deliberately and last, by
+test_covering_light_interface_does_not_shadow_the_tunnel, which constructs the
+ambiguity on purpose.
+
+Historically that resolver returned the FIRST pim-light interface whose
+connected address or point-to-point destination prefix-matched the UMH, with no
+preference for the tunnel, so a `/24` covering the UMH was exactly as good a
+match as the tunnel's own `/32` peer and FOR_ALL_INTERFACES order decided which
+won.  That order is by interface NAME -- `RB_FOREACH (ifp, if_name_head,
+&vrf->ifaces_by_name)` in `lib/if.h` -- not by ifindex and not by the order
+things were configured.  When a covering interface sorted before `dimt-%08x`
+and won, the tunnel installed clean and never forwarded, silently (BLO-27869).
 
 WHAT IS EVIDENCE HERE
 ---------------------
@@ -65,6 +71,9 @@ D6 BOUNDARY COVERAGE
   4 leave ........................ test_leave_removes_mfc_and_tunnel
   5 restart re-derivation ........ test_pimd_restart_rederives_readiness_from_kernel_state
   6 anti-recursion ............... NOT covered end-to-end here.
+
+Pin determinism against a competing covering interface is not a D6 boundary; it
+is the BLO-27869 regression guard, covered by the final stage.
 
 Boundary 6 is deliberately left to `zebra_dimt_tunnel/
 test_outer_remote_via_dimt_is_rejected`, which proves the refusal where it
@@ -119,6 +128,19 @@ NEW_OUTER_REMOTE = "10.0.0.9"
 SECOND_SOURCE = "10.10.10.11"
 SECOND_GROUP = "232.1.1.11"
 SECOND_SG = "(10.10.10.11,232.1.1.11)"
+
+# BLO-27869: a covering interface used to build the shadowing case on purpose.
+# 10.99.0.3/24 covers the UMH 10.99.0.1 exactly the way a directly-connected UMH
+# segment would.
+#
+# The NAME matters and is the whole point.  FOR_ALL_INTERFACES walks
+# vrf->ifaces_by_name (lib/if.h), so the pre-fix resolver picked the
+# alphabetically first covering interface.  `aaa0` sorts before `dimt-%08x`;
+# `r2-eth0` does not, so using an existing interface here would let the tunnel
+# win by luck and the stage would prove nothing.  Created as a dummy by the
+# stage itself.
+COVERING_ADDR = "10.99.0.3/24"
+COVERING_IFACE = "aaa0"
 
 
 def build_topo(tgen):
@@ -187,6 +209,32 @@ def umh_entry(router):
     """
     output = json.loads(router.vtysh_cmd("show ip pim dimt umh json"))
     return output.get(SRC_PREFIX)
+
+
+def check_pin(router, interface, source, shadowed=None):
+    """The resolved RPF pin for the UMH: target, which resolver won, who lost.
+
+    `shadowed` is compared against `.get()`, so the default None asserts the
+    key is ABSENT -- pim_dimt_show_umh() emits shadowedInterface only when a
+    covering interface actually lost the pin, so its presence is itself the
+    ambiguity signal.
+    """
+    entry = umh_entry(router)
+    if entry is None:
+        return "pimd holds no UMH mapping for {}".format(SRC_PREFIX)
+    if entry.get("interface") != interface:
+        return "pin interface is {}, expected {}: {}".format(
+            entry.get("interface"), interface, entry
+        )
+    if entry.get("pinSource") != source:
+        return "pinSource is {}, expected {}: {}".format(
+            entry.get("pinSource"), source, entry
+        )
+    if entry.get("shadowedInterface") != shadowed:
+        return "shadowedInterface is {}, expected {}: {}".format(
+            entry.get("shadowedInterface"), shadowed, entry
+        )
+    return None
 
 
 def check_tunnel_state(router, state):
@@ -798,6 +846,114 @@ def test_zebra_reconnect_holds_demand_while_bgpd_is_away():
            count=60)
     expect(lambda: check_tunnel_state(r2, "installed"), count=60)
     expect(lambda: check_forwarding(r2, "ready"), count=60)
+
+
+# --- BLO-27869: a covering pim-light interface must not shadow the tunnel ---
+
+
+def test_covering_light_interface_does_not_shadow_the_tunnel():
+    """A pim-light interface whose subnet covers the UMH must lose to the tunnel.
+
+    This is the case the rest of the suite deliberately avoids by putting the
+    UMH on a loopback (see the module docstring).  Here it is constructed on
+    purpose: a dummy netdev gets 10.99.0.3/24 -- which covers the UMH 10.99.0.1
+    -- plus `ip pim light`, so BOTH the DIMT netdev's /32 point-to-point peer
+    and the dummy's /24 connected subnet prefix-match the UMH.
+
+    ORDERING IS THE POINT, AND THE ORDER IS BY NAME.  `FOR_ALL_INTERFACES` is
+    `RB_FOREACH (ifp, if_name_head, &vrf->ifaces_by_name)` (`lib/if.h`), so the
+    old resolver -- which had no preference for the tunnel and returned the
+    FIRST covering match it reached -- was decided by interface *name*, not by
+    ifindex and not by configuration order.
+
+    Hence the dummy is named `aaa0`: it sorts before `dimt-%08x`, so the old
+    resolver reaches it first and pins there.  Readiness conjunct (2) (rpf
+    interface == tunnel ifindex) can then never hold, and forwarding sits at
+    `pending` forever with no error and no log.  A covering interface named
+    `r2-eth0` would NOT reproduce this -- `dimt-` sorts before `r2-`, so the
+    tunnel would win by luck and the stage would pass against the unfixed
+    resolver for the wrong reason.
+
+    Step 2 asserts the covering interface genuinely resolves while no tunnel
+    exists.  That keeps the test honest twice over: it proves the shadow
+    candidate is real (so step 5 is not vacuous), and it proves the no-tunnel
+    fallback still behaves as it did in Phase B.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    r2 = tgen.gears["r2"]
+
+    # 1. Drop demand so the tunnel row is released entirely, whatever state the
+    #    preceding stage left it in (it is `installed` after the endpoint
+    #    re-point stage, and was `failed` before that stage existed -- releasing
+    #    demand reaches a known-empty state from either).
+    r2.vtysh_cmd(
+        "conf t\ninterface r2-eth1\nno ip igmp static-group {} {}".format(
+            GROUP, SOURCE
+        )
+    )
+    expect(lambda: check_no_tunnel(r2))
+
+    # 2. Build the ambiguity while no tunnel exists, and prove the covering
+    #    interface really does resolve the pin on its own.  A dummy rather than
+    #    an existing interface, because the name is what decides the old
+    #    resolver and no interface in this topology sorts before `dimt-`.
+    r2.run("ip link add {} type dummy".format(COVERING_IFACE))
+    r2.run("ip link set {} up".format(COVERING_IFACE))
+    r2.vtysh_cmd(
+        "conf t\ninterface {}\nip address {}\nip pim\nip pim light".format(
+            COVERING_IFACE, COVERING_ADDR
+        )
+    )
+    expect(lambda: check_pin(r2, COVERING_IFACE, "light"))
+
+    # 3. Now bring the tunnel back.  Its netdev is created *after* the covering
+    #    interface is already a candidate, and sorts after it by name.
+    r2.vtysh_cmd(
+        "conf t\ninterface r2-eth1\nip igmp static-group {} {}".format(
+            GROUP, SOURCE
+        )
+    )
+    expect(lambda: check_tunnel_state(r2, "installed"))
+    ifname = tunnel_ifname(r2)
+
+    # 4. The netdev still carries the UMH as its ptp peer, so the tunnel and
+    #    the covering interface are both genuine prefix matches -- the
+    #    ambiguity is real.
+    address = r2.run("ip -o address show dev {}".format(ifname))
+    assert "{} peer {}/32".format(INNER_LOCAL, UMH) in address, address
+
+    # 5. The pin lands on the tunnel, and the covering interface is reported as
+    #    the one that lost it -- the ambiguity is observable, not silent.
+    expect(lambda: check_pin(r2, ifname, "tunnel", shadowed=COVERING_IFACE))
+
+    # 6. Readiness follows, corroborated kernel-side: the admitted incoming vif
+    #    must be the DIMT vif, not the covering interface's.  Per G10 the kernel
+    #    is the evidence; the JSON above is only pimd's aggregation of it.
+    def kernel_admitted():
+        vif, error = resolve_mr_vif(r2, ifname)
+        if error:
+            return error
+        return check_ip_mr_cache_iif(r2, SOURCE, GROUP, vif)
+
+    expect(kernel_admitted)
+    expect(lambda: check_forwarding(r2, "ready"))
+    assert (
+        json.loads(r2.vtysh_cmd("show ip pim dimt forwarding json"))[SG][
+            "interface"
+        ]
+        == ifname
+    )
+
+    # 7. Put the ambiguity away.  This is the last stage today, but leaving a
+    #    covering pim-light interface behind would silently change the premise
+    #    of anything appended after it -- and the name was chosen to win the
+    #    resolver, so it would win in stages that do not expect a competitor.
+    r2.vtysh_cmd("conf t\nno interface {}".format(COVERING_IFACE))
+    r2.run("ip link del {}".format(COVERING_IFACE))
+    expect(lambda: check_pin(r2, ifname, "tunnel"))
+    expect(lambda: check_forwarding(r2, "ready"))
 
 
 if __name__ == "__main__":
