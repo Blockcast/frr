@@ -634,7 +634,10 @@ def test_acknowledged_gre_lifecycle_and_owner_reconnect():
     removed = request("del", 1)
     assert removed["result"] == 2, removed
     _, result = topotest.run_and_expect(
-        lambda: router.run("ip link show dimt-00000001 2>/dev/null"), "", count=10, wait=0.2
+        lambda: router.run("ip link show dimt-00000001 2>/dev/null"),
+        "",
+        count=10,
+        wait=0.2,
     )
     assert result == "", result
 
