@@ -148,15 +148,43 @@ XFAIL_BLO_28406 = pytest.mark.xfail(
 )
 
 
-# raises=pytest.fail.Exception, NOT AssertionError: the expected failure here is
-# the precondition guard, which deliberately uses pytest.fail() so it can escape
-# a raises=AssertionError marker. Narrowing to Failed keeps that property -- the
-# behavioural assertion below it is an AssertionError and would NOT be absorbed,
-# so if the hold ever starts working and zebra then misbehaves, that surfaces as
-# a hard failure rather than hiding under this marker.
+class WindowNeverOpened(Exception):
+    """A test's precondition never held, so its window was never exercised.
+
+    Deliberately a bespoke type rather than pytest.fail()'s Failed. EVERY
+    pytest.fail() in this module raises Failed -- the tracing_unavailable()
+    funnel, both reap_stray_dimt_links() precondition failures, both
+    inject_netlink_syscall_failure() setup paths, both _hold_dplane_syscalls()
+    paths ("zebra_dplane worker not found", "strace attach failed") and
+    assert_injection_fired() -- so a marker written raises=pytest.fail.Exception
+    absorbs all of them as a green xfail, a *setup-time* fixture failure
+    included. Only this class can reach XFAIL_BLO_29000, so a missing strace, a
+    dirty kernel, a missing dplane worker or a failed attach still fails the job
+    loudly instead of reading as "expected failure, blocker still open".
+
+    It keeps the property that made pytest.fail() right in the first place: it
+    is NOT an AssertionError, so a raises=AssertionError marker cannot swallow
+    it either. Same escape reasoning as assert_injection_fired(), narrower
+    blast radius.
+
+    One asymmetry to know before wrapping a guard site in a handler: Failed
+    derives from BaseException, not Exception, so `except Exception` does not
+    catch it -- this class it would. Verified at the time of writing that the
+    only try enclosing the guard is a bare try/finally with no handlers, so
+    nothing swallows it today. Keep it that way, or re-narrow the handler.
+    """
+
+
+# raises=WindowNeverOpened -- NOT AssertionError, and deliberately NOT
+# pytest.fail.Exception: the expected failure here is the precondition guard,
+# and exactly one site raises that type, so nothing else can be absorbed. The
+# behavioural assertion below the guard is an AssertionError and is NOT
+# absorbed, so if the hold ever starts working and zebra then misbehaves, that
+# surfaces as a hard failure rather than hiding under this marker. See
+# WindowNeverOpened for why Failed was too wide.
 XFAIL_BLO_29000 = pytest.mark.xfail(
     strict=True,
-    raises=pytest.fail.Exception,
+    raises=WindowNeverOpened,
     reason=(
         "BLO-29000: this test does not currently exercise its own window -- "
         "hold_dplane_worker() does not hold the `del 9` client, which exits "
@@ -479,6 +507,14 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
         pytest.fail(
             "strace attach failed: {}".format(_text(stderr).strip())
         )
+    # Same contract as inject_netlink_syscall_failure() above, and derived from
+    # the same arguments that built the command for the same anti-drift reason.
+    # Without it, any hold site that adopts assert_injection_fired() -- the
+    # natural next step, since strace tags delay injections (INJECTED) too --
+    # gets AttributeError instead of a diagnostic.
+    tracer.injection_label = "{} {}={} hold".format(
+        syscalls, inject_kind, delay_usecs
+    )
     return tracer
 
 
@@ -768,12 +804,14 @@ def test_add_during_inflight_delete_is_rejected():
         # raises=AssertionError would absorb it into a green xfail. So establish
         # the precondition before asserting on it.
         #
-        # pytest.fail(), not assert: Failed escapes raises=AssertionError, an
-        # AssertionError here would be swallowed by the very marker this guard
-        # exists to keep honest. Same reasoning as assert_injection_fired().
+        # raise WindowNeverOpened, not assert and not pytest.fail(): it is not
+        # an AssertionError, so the marker this guard exists to keep honest
+        # cannot swallow it; and unlike Failed exactly this one site raises it,
+        # so XFAIL_BLO_29000 cannot absorb a missing strace, a dirty kernel, a
+        # missing dplane worker or a failed attach.
         if pending.poll() is not None:
             out, err = pending.communicate(timeout=5)
-            pytest.fail(
+            raise WindowNeverOpened(
                 "the `del 9` client already exited (rc={}), so nothing was in "
                 "flight when the readd below ran. The dplane worker hold did "
                 "not take, and anything asserted past this point describes an "
