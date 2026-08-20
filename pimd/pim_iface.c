@@ -851,12 +851,16 @@ void pim_if_addr_del(struct connected *ifc, int force_prim_as_any)
 	 * it; without a re-apply here a pin can strand on an interface that no
 	 * longer faces the UMH.  pim_dimt_iface_up() re-resolves every upstream
 	 * and unpins any whose light interface no longer covers its UMH -- the
-	 * delete-side counterpart of the same call in pim_if_addr_add(). */
+	 * delete-side counterpart of the same call in pim_if_addr_add().
+	 *
+	 * Named apart from the `pim_ifp` that exists in this function only
+	 * under PIM_IPV == 6: sharing the name builds clean for pimd and
+	 * -Wshadow for pim6d. */
 	{
-		struct pim_interface *pim_ifp = ifp->info;
+		struct pim_interface *dimt_ifp = ifp->info;
 
-		if (pim_ifp)
-			pim_dimt_iface_up(pim_ifp->pim, ifp);
+		if (dimt_ifp)
+			pim_dimt_iface_up(dimt_ifp->pim, ifp);
 	}
 }
 
@@ -2061,6 +2065,25 @@ static int pim_ifp_create(struct interface *ifp)
 		 */
 		if (pim_ifp)
 			pim_ifp->pim = pim;
+
+		/*
+		 * DIMT: a netdev pimd asked zebra to build may reach us here
+		 * rather than on the INSTALLED notify.  The notify and this
+		 * hook are produced by two independent asynchronous paths --
+		 * the dplane result and the netlink listener -- so their
+		 * arrival order is not guaranteed.  When the notify wins,
+		 * its if_lookup_by_index() finds nothing and adoption is
+		 * simply skipped; nothing retries it, so the interface never
+		 * becomes PIM Light, never becomes a multicast vif, and
+		 * readiness for every (S,G) riding that tunnel stays PENDING
+		 * forever.  Adopting from both arrival orders closes that.
+		 * It is idempotent and a no-op for any interface we did not
+		 * request, and it runs before pim_if_addr_add_all() below so
+		 * the addresses land on an interface already light-enabled.
+		 */
+		if (pim)
+			pim_dimt_ifp_adopt(pim, ifp);
+
 		pim_if_addr_add_all(ifp);
 
 		/*
@@ -2172,6 +2195,27 @@ static int pim_ifp_up(struct interface *ifp)
 		return 0;
 
 	pim_ifp = ifp->info;
+
+	/*
+	 * DIMT: the adoption hook in pim_ifp_create() sits inside that
+	 * function's if_is_operative(ifp) block, so it is skipped whenever the
+	 * interface-add arrives before the link is up.  That ordering is the
+	 * normal one for a netdev pimd just asked zebra to build: a freshly
+	 * created GRE link has IFF_UP clear on its first RTM_NEWLINK, and
+	 * zebra brings it up as a second, separate netlink operation.  Without
+	 * a second adoption point nothing would ever set pim_light_enable for
+	 * that interface, pim_dimt_light_iface() would keep rejecting it, and
+	 * readiness for every (S,G) riding the tunnel would stay PENDING
+	 * forever -- the same failure the create-path hook was added to close,
+	 * reached from the other arrival order.
+	 *
+	 * This must run before the double-activation guard below, which
+	 * returns early for any interface that already has a vif and would
+	 * otherwise skip adoption on exactly the interfaces that need it.
+	 * pim_dimt_ifp_adopt() is idempotent and a no-op for any interface
+	 * pimd did not request, so the extra call is harmless.
+	 */
+	pim_dimt_ifp_adopt(pim, ifp);
 
 	/* Avoid enabling the same interface twice */
 	if (pim_ifp && pim_ifp->mroute_vif_index != -1)

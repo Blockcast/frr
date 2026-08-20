@@ -270,6 +270,27 @@ jobs:
                 echo "ERROR: make check did not produce tests/tests.xml" >&2
                 exit 125
               fi
+              # tests/topotests/lib/ is collected by NEITHER pytest runner:
+              # tests/pytest.ini sets norecursedirs=topotests, which hides it
+              # from the "make check" run above, and tests/topotests/pytest.ini
+              # lists lib in norecursedirs, which hides it from the topotest
+              # job.  Unit tests living there therefore run nowhere unless the
+              # path is named explicitly -- norecursedirs governs directory
+              # recursion, not an explicit file argument -- so without this
+              # step the file reads as coverage while providing none.
+              # --noconftest keeps the munet/topogen machinery in
+              # tests/topotests/conftest.py out of a pure unit test that needs
+              # neither it nor root.
+              PYTHONPATH=~/frr/tests/topotests \
+                python3 -m pytest -q --noconftest -p no:cacheprovider \
+                  tests/topotests/lib/test_kernel_state.py
+              lib_status=$?
+              # Exit 5 ("no tests collected") also lands here, so a future
+              # change that stops collecting the file fails this job rather
+              # than passing silently.
+              if [ "${status}" -eq 0 ]; then
+                status="${lib_status}"
+              fi
               touch /tmp/frr-unit-test-report-ready
               exit "${status}"
             '

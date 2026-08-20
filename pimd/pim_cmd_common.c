@@ -25,6 +25,7 @@
 #include "pimd.h"
 #include "pim_instance.h"
 #include "pim_vty.h"
+#include "pim_dimt.h"
 #include "lib/northbound_cli.h"
 #include "pim_errors.h"
 #include "pim_nb.h"
@@ -6035,6 +6036,28 @@ int pim_router_config_write(struct vty *vty)
 
 		if (!pim)
 			continue;
+
+		/* DIMT endpoint rows are written OUTSIDE the `router pim`
+		 * frame, at column 0, because that is the node the command is
+		 * installed at (CONFIG_NODE).  Writing them inside the frame
+		 * did not merely look wrong: on reload the line fails to match
+		 * at PIM_NODE, command_config_read_one_line() retries at
+		 * successive parents, and reaching CONFIG_NODE pops the vty
+		 * out of `router pim` as a side effect -- so every following
+		 * line in that block parses at the wrong node.  Worse, the
+		 * handler's PIM_DECLVAR_CONTEXT_VRF resolves CONFIG_NODE to
+		 * VRF_DEFAULT, so a row written under `router pim vrf red`
+		 * came back on reload applied to the DEFAULT vrf, silently.
+		 *
+		 * Only the default VRF is written, matching the CONFIG_NODE-
+		 * only installation: the grammar carries no `vrf NAME` token,
+		 * so a non-default row has no representation that could round-
+		 * trip.  (pim_dimt_tunnel_send() now addresses the instance
+		 * VRF rather than hardcoding VRF_DEFAULT, so the transport is
+		 * no longer the limiting factor -- the missing grammar token
+		 * is, and it is sufficient on its own.) */
+		if (vrf->vrf_id == VRF_DEFAULT)
+			writes += pim_dimt_endpoint_config_write(pim, vty);
 
 		snprintfrr(framestr, sizeof(framestr), "router %s",
 			   PIM_AF_ROUTER);

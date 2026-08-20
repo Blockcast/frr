@@ -4201,6 +4201,7 @@ int zapi_mvpn_sg_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
 	stream_put_ipaddr(s, &sg->src);
 	stream_put_ipaddr(s, &sg->grp);
 	stream_putc(s, sg->role);
+	stream_putc(s, sg->forwarding);
 
 	/* Put length at the first point of the stream. */
 	stream_putw_at(s, 0, stream_get_endp(s));
@@ -4215,6 +4216,26 @@ int zapi_mvpn_sg_decode(struct stream *s, struct zapi_mvpn_sg *sg)
 	STREAM_GET_IPADDR(s, &sg->src);
 	STREAM_GET_IPADDR(s, &sg->grp);
 	STREAM_GETC(s, sg->role);
+
+	/*
+	 * `forwarding` is additive.  A peer built before it simply stops the
+	 * message after `role`; memset() above already left the field at
+	 * ZAPI_MVPN_SG_FWD_PENDING, which is the fail-closed reading.
+	 */
+	if (STREAM_READABLE(s) >= 1)
+		STREAM_GETC(s, sg->forwarding);
+
+	/*
+	 * An unrecognised value is clamped to the same fail-closed reading as
+	 * an absent byte rather than rejected.  Returning -1 here would fail
+	 * the whole decode and discard src/grp/role too, so the day a fourth
+	 * enum zapi_mvpn_sg_forwarding member is added, every older peer would
+	 * stop processing MVPN SG messages entirely -- a strictly worse
+	 * outcome than the mixed-version case this additive framing exists to
+	 * survive.
+	 */
+	if (sg->forwarding > ZAPI_MVPN_SG_FWD_FAILED)
+		sg->forwarding = ZAPI_MVPN_SG_FWD_PENDING;
 
 	return 0;
 

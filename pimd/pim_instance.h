@@ -174,6 +174,16 @@ struct pim_instance {
 
 	/* DIMT: bgpd-learned UMH mappings (struct pim_dimt_umh) */
 	struct list *dimt_umh_list;
+	/* DIMT: explicitly configured tunnel endpoints, one row per UMH
+	 * (struct pim_dimt_endpoint).  There is deliberately no default and
+	 * no derivation: a UMH with no row gets no tunnel. */
+	struct list *dimt_endpoint_list;
+	/* DIMT: live tunnel request/ack state, one per UMH under demand
+	 * (struct pim_dimt_tunnel) */
+	struct list *dimt_tunnel_list;
+	/* DIMT: bounds how long a zebra reconnect holds unreplayed mappings
+	 * before declaring them gone (pim_dimt_umh_resync_begin()) */
+	struct event *dimt_umh_resync_timer;
 	pim_addr ssmpingd_group_addr;
 
 	unsigned int gm_socket_if_count;

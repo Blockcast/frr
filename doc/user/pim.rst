@@ -345,6 +345,39 @@ VRF where indicated), instead of under the 'router pim' submode.
    groups. The ``no`` form of the command disables the warning generation.
    This command is VRF-aware.
 
+.. clicmd:: dimt tunnel-endpoint A.B.C.D inner-local A.B.C.D outer-local <A.B.C.D|X:X::X:X> outer <A.B.C.D|X:X::X:X> encap <gre|gre-in-fou> [dport (1-65535)] [key (0-4294967295)] [mtu (68-65535)]
+
+   Configure the tunnel used to reach one DIMT Upstream Multicast Hop (UMH),
+   for dynamic multicast tunneling
+   (draft-zzhang-mboned-dynamic-internet-mcast-tunnel). The leading
+   ``A.B.C.D`` is the UMH: it is simultaneously the key of this mapping, the
+   inner tunnel peer, and the settlement identity. ``inner-local`` is the
+   local inner address; ``outer-local`` and ``outer`` are the local and
+   remote underlay addresses; ``encap`` selects plain GRE or GRE-in-UDP
+   (FOU). ``key`` sets the GRE key and ``mtu`` the tunnel MTU; when either is
+   omitted it is left unset and the tunnel provider's default applies.
+
+   Two constraints are enforced, and violating either rejects the command
+   with ``% Invalid DIMT tunnel endpoint``:
+
+   - ``outer-local`` and ``outer`` must be of the same address family, and
+   - ``dport`` is required when ``encap`` is ``gre-in-fou``.
+
+   Every value is stated explicitly. There is deliberately no wildcard form,
+   no default and no derived variant: in particular the outer address is
+   *not* computed from the UMH, because such arithmetic is not injective,
+   cannot express an IPv6 outer, and would couple the settlement identity to
+   subnet arithmetic.
+
+   This command exists only at the top level of the configuration, so it
+   always applies to the default VRF. The ``no`` form removes the mapping;
+   the full command line is still parsed, but only the UMH is significant.
+
+   See :clicmd:`show ip pim [vrf NAME] dimt tunnel [json]` for the resulting
+   request/acknowledgement state, and
+   :clicmd:`show ip pim [vrf NAME] dimt forwarding [json]` for the per-(S,G)
+   readiness it feeds.
+
 .. _pim-multicast-rib:
 
 Multicast RIB Commands
@@ -552,15 +585,68 @@ keyword at the end.
    address.  Cannot be combined with ``ip pim passive``.  Instead of a
    static route, the RPF may be steered by a BGP-learned Upstream Multicast
    Hop mapping (``set extcommunity umh`` in bgpd); see
-   :clicmd:`show ip pim dimt umh [json]`.
+   :clicmd:`show ip pim [vrf NAME] dimt umh [json]`.
 
-.. clicmd:: show ip pim dimt umh [json]
+.. clicmd:: show ip pim [vrf NAME] dimt umh [json]
 
    Display the bgpd-learned DIMT Upstream Multicast Hop mappings: for each
    source prefix, the UMH address joins are sent toward, its type
    (``pim`` / ``amt-relay``), preference, and the resolved PIM Light
    interface.  Only ``pim``-type mappings steer RPF; ``amt-relay`` mappings
    are recorded and displayed but not acted on.
+
+.. clicmd:: show ip pim [vrf NAME] dimt tunnel [json]
+
+   Display the DIMT tunnel request/acknowledgement state, one row per UMH:
+   the tunnel id, the tunnel interface name, the state, how many upstreams
+   currently reference it (``Refcount``), and the interface index. The state
+   is one of ``idle``, ``requested``, ``installed``, ``failed`` or
+   ``removing``.
+
+   In JSON output the object is keyed by UMH address, and each value carries
+   ``tunnelId``, ``interface``, ``state``, ``refcount`` and ``ifindex``.
+
+   The endpoints themselves are configured with the
+   ``dimt tunnel-endpoint`` command.
+
+.. clicmd:: show ip pim [vrf NAME] dimt forwarding [json]
+
+   Display the per-(S,G) DIMT forwarding readiness aggregation: the channel,
+   the verdict, the RPF interface, and the UMH. The verdict is one of
+   ``pending``, ``ready`` or ``failed``. Only DIMT-steered channels are
+   listed -- a channel this router does not tunnel is absent rather than
+   reported as ``pending``.
+
+   ``ready`` requires all three of the following, and the verdict stays
+   ``pending`` until every one of them holds:
+
+   - the tunnel for the UMH is in state ``installed``, that is, the tunnel
+     provider returned a positive acknowledgement for the netdev;
+   - the RPF for the channel is pinned onto that netdev. The interface being
+     up is explicitly *not* sufficient, since a GRE link is up whether or
+     not the peer is reachable; and
+   - the kernel accepted the multicast forwarding entry *and* admitted the
+     DIMT interface as that entry's incoming interface.
+
+   The verdict is ``failed`` when the tunnel itself is in state ``failed``.
+   It is recomputed on every read rather than cached, so it cannot report a
+   stale edge.
+
+   In JSON output the object is keyed by the ``(S,G)`` string, and each value
+   carries ``forwarding``, ``interface``, ``umh``, ``mfcInstalled``,
+   ``announced`` and ``announcedForwarding``.
+
+   ``mfcInstalled`` reports only that the kernel accepted the forwarding
+   entry, which is the first half of the third condition above. The
+   incoming-interface half is not exposed separately, so when
+   ``mfcInstalled`` is true a ``pending`` verdict may still originate from
+   that half and cannot be attributed to one conjunct on its own.
+
+   ``announced`` and ``announcedForwarding`` report what bgpd was last told,
+   as against ``forwarding``, which is recomputed on read. The two agree only
+   while every readiness edge is actually announced, so a verdict that is
+   correct when an operator asks but stale on the wire appears here as a
+   disagreement between them.
 
 .. clicmd:: ip igmp
 

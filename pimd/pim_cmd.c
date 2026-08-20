@@ -2681,6 +2681,140 @@ DEFPY (show_ip_pim_dimt_umh,
 	return CMD_SUCCESS;
 }
 
+DEFPY (show_ip_pim_dimt_tunnel,
+       show_ip_pim_dimt_tunnel_cmd,
+       "show ip pim [vrf NAME] dimt tunnel [json$json]",
+       SHOW_STR
+       IP_STR
+       PIM_STR
+       VRF_CMD_HELP_STR
+       "DIMT dynamic multicast tunneling\n"
+       "Native tunnel request/acknowledgement state\n"
+       JSON_STR)
+{
+	struct vrf *v;
+
+	v = vrf_lookup_by_name(vrf ? vrf : VRF_DEFAULT_NAME);
+	if (!v || !v->info)
+		return CMD_WARNING;
+
+	pim_dimt_show_tunnel(v->info, vty, !!json);
+
+	return CMD_SUCCESS;
+}
+
+DEFPY (show_ip_pim_dimt_forwarding,
+       show_ip_pim_dimt_forwarding_cmd,
+       "show ip pim [vrf NAME] dimt forwarding [json$json]",
+       SHOW_STR
+       IP_STR
+       PIM_STR
+       VRF_CMD_HELP_STR
+       "DIMT dynamic multicast tunneling\n"
+       "Per-(S,G) forwarding readiness aggregation\n"
+       JSON_STR)
+{
+	struct vrf *v;
+
+	v = vrf_lookup_by_name(vrf ? vrf : VRF_DEFAULT_NAME);
+	if (!v || !v->info)
+		return CMD_WARNING;
+
+	pim_dimt_show_forwarding(v->info, vty, !!json);
+
+	return CMD_SUCCESS;
+}
+
+/*
+ * Explicit per-UMH tunnel endpoint (contract D2).
+ *
+ * One row per mapping, every value stated.  There is deliberately no
+ * wildcard form, no default and no derived variant: the Phase-A
+ * `10.99.X.Y <-> 100.64.X.Y` arithmetic is refused by D2 because it is not
+ * injective, cannot express an IPv6 outer, and couples the settlement
+ * identity to subnet arithmetic.
+ */
+DEFPY (pim_dimt_tunnel_endpoint,
+       pim_dimt_tunnel_endpoint_cmd,
+       "[no] dimt tunnel-endpoint A.B.C.D$umh inner-local A.B.C.D$inner_local outer-local <A.B.C.D|X:X::X:X>$outer_local outer <A.B.C.D|X:X::X:X>$outer_remote encap <gre|gre-in-fou>$encap [dport (1-65535)$dport] [key (0-4294967295)$key] [mtu (68-65535)$mtu]",
+       NO_STR
+       "DIMT dynamic multicast tunneling\n"
+       "Explicit tunnel endpoint for one Upstream Multicast Hop\n"
+       "The UMH address; also the inner peer and the settlement identity\n"
+       "Local inner address of the tunnel\n"
+       "Local inner address\n"
+       "Local outer (underlay) address\n"
+       "Local outer address\n"
+       "Local outer address\n"
+       "Remote outer (underlay) address\n"
+       "Remote outer address\n"
+       "Remote outer address\n"
+       "Encapsulation\n"
+       "Plain GRE\n"
+       "GRE in UDP (FOU)\n"
+       "UDP destination port (required for gre-in-fou)\n"
+       "Port number\n"
+       "GRE key\n"
+       "Key value\n"
+       "Tunnel MTU\n"
+       "MTU value\n")
+{
+	struct pim_dimt_endpoint ep = {};
+
+	PIM_DECLVAR_CONTEXT_VRF(vrf, pim);
+
+	ep.umh = umh;
+
+	if (no) {
+		pim_dimt_endpoint_unset(pim, ep.umh);
+		return CMD_SUCCESS;
+	}
+
+	ep.inner_local.ipa_type = IPADDR_V4;
+	ep.inner_local.ipaddr_v4 = inner_local;
+
+	/* A <A.B.C.D|X:X::X:X>$name token merges to clippy's IPGenHandler, so
+	 * the generated argument is a "const union sockunion *" -- there is no
+	 * $name_v4 / $name_v6 pair.  Take the family from the sockunion clippy
+	 * already parsed rather than re-sniffing $name_str for a ':'. */
+	if (outer_local->sa.sa_family == AF_INET6) {
+		ep.outer_local.ipa_type = IPADDR_V6;
+		ep.outer_local.ipaddr_v6 = outer_local->sin6.sin6_addr;
+	} else {
+		ep.outer_local.ipa_type = IPADDR_V4;
+		ep.outer_local.ipaddr_v4 = outer_local->sin.sin_addr;
+	}
+
+	if (outer_remote->sa.sa_family == AF_INET6) {
+		ep.outer_remote.ipa_type = IPADDR_V6;
+		ep.outer_remote.ipaddr_v6 = outer_remote->sin6.sin6_addr;
+	} else {
+		ep.outer_remote.ipa_type = IPADDR_V4;
+		ep.outer_remote.ipaddr_v4 = outer_remote->sin.sin_addr;
+	}
+
+	ep.encap = strmatch(encap, "gre-in-fou")
+			   ? ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU
+			   : ZAPI_DIMT_TUNNEL_ENCAP_GRE;
+	if (dport_str)
+		ep.dport = dport;
+	if (key_str) {
+		ep.key = key;
+		ep.key_set = true;
+	}
+	if (mtu_str) {
+		ep.mtu = mtu;
+		ep.mtu_set = true;
+	}
+
+	if (!pim_dimt_endpoint_set(pim, &ep)) {
+		vty_out(vty, "%% Invalid DIMT tunnel endpoint: outer addresses must share a family, and gre-in-fou requires a dport\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	return CMD_SUCCESS;
+}
+
 DEFPY (show_ip_pim_channel,
        show_ip_pim_channel_cmd,
        "show ip pim [vrf NAME] channel [json$json]",
@@ -9571,6 +9705,8 @@ void pim_cmd_init(void)
 	install_element(VIEW_NODE, &show_ip_pim_upstream_vrf_all_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_channel_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_dimt_umh_cmd);
+	install_element(VIEW_NODE, &show_ip_pim_dimt_tunnel_cmd);
+	install_element(VIEW_NODE, &show_ip_pim_dimt_forwarding_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_join_desired_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_rpf_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_rp_cmd);
@@ -9730,6 +9866,26 @@ void pim_cmd_init(void)
 	install_element(VRF_NODE, &ip_igmp_group_watermark_cmd);
 	install_element(CONFIG_NODE, &no_ip_igmp_group_watermark_cmd);
 	install_element(VRF_NODE, &no_ip_igmp_group_watermark_cmd);
+
+	/* DIMT explicit tunnel endpoints (contract D2).
+	 *
+	 * CONFIG_NODE only, and deliberately NOT VRF_NODE.  The handler uses
+	 * PIM_DECLVAR_CONTEXT_VRF, whose CONFIG_NODE arm resolves to
+	 * VRF_DEFAULT -- and the request this row produces is sent with a
+	 * hardcoded VRF_DEFAULT in pim_dimt_tunnel_send(), so a row entered
+	 * under `vrf red` would be stored on red's instance, requested as
+	 * default, and never correlated with its own ack.  Installing at
+	 * VRF_NODE would therefore accept configuration that structurally
+	 * cannot work.  DIMT is default-VRF-only until that is addressed.
+	 *
+	 * Not PIM_NODE either: `router pim` pushes an XPATH context
+	 * (VTY_PUSH_XPATH), so VTY_GET_CONTEXT(vrf) has nothing to return
+	 * there.  Reaching PIM_NODE means converting this command to
+	 * northbound, which is a YANG change, not a registration change.
+	 * pim_dimt_endpoint_config_write() writes the row at top level to
+	 * match this, so it round-trips.
+	 */
+	install_element(CONFIG_NODE, &pim_dimt_tunnel_endpoint_cmd);
 
 	pim_install_deprecated();
 }
