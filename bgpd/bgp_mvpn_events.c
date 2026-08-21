@@ -1179,8 +1179,10 @@ static struct json_object *bgp_mvpn_event_forwarding_new(struct bgp_mvpn_event_s
  * current route-state interval -- D3 "Failed": a path that never reported
  * ready has no readiness interval to close, and emitting an unpaired
  * forwarding_lost would invent one.  That guard is also what makes the
- * "exactly one forwarding_lost" cardinality hold: the latch is cleared here,
- * so a second call is a no-op.
+ * "exactly one forwarding_lost" cardinality hold: the latch is cleared before
+ * the record is built, so a second call after a successful emit is a no-op.
+ * A call that fails to build the record restores the latch instead, leaving the
+ * interval closable by a later trigger -- still at most one emitted close.
  *
  * Never emits during snapshot replay: forwarding state is not part of the
  * snapshot (D4 restart matrix), and a replay must not fabricate a readiness
@@ -1195,22 +1197,41 @@ static void bgp_mvpn_event_forwarding_lost(struct bgp_mvpn_event_sink *sink,
 	if (!join->forwarding_ready || sink->snapshot_replay_active)
 		return;
 
-	/* Clear the latch before the fallible allocation below.  If the record
-	 * is lost, the reserved cursor gap is the signal; what must not happen
-	 * is the latch staying set and a second forwarding_lost being emitted
-	 * later for the same interval. */
+	/* Cleared before the fallible allocations below, so a failure can never
+	 * leave the latch set and let a later trigger emit a SECOND
+	 * forwarding_lost for the same interval.  Restored on each failure path
+	 * so the interval stays closable by a later withdraw/origin_change
+	 * instead of being silently abandoned open: exactly one of these
+	 * attempts can reach the broadcast, so restoring cannot duplicate. */
 	join->forwarding_ready = false;
 
 	jo = bgp_mvpn_event_forwarding_new(sink, join, "forwarding_lost");
-	if (!jo)
+	if (!jo) {
+		join->forwarding_ready = true;
 		return;
-
-	jfwd = json_object_new_object();
-	if (jfwd) {
-		json_object_string_add(jfwd, "state", "lost");
-		json_object_string_add(jfwd, "reason", reason);
-		json_object_object_add(jo, "forwarding", jfwd);
 	}
+
+	/* `reason` is a mandatory stable enum (D4), and it lives in this object.
+	 * A forwarding_lost without it is not a lossy close record, it is an
+	 * unattributable one -- so treat the failure as an event-construction
+	 * failure and discard the envelope rather than broadcasting a partial.
+	 * jo is owned by bgp_mvpn_event_broadcast() once passed, so free it here.
+	 * bgp_mvpn_event_new() already reserved the seq, so the discard leaves
+	 * the same fail-closed cursor gap it reserves for its own failure. */
+	jfwd = json_object_new_object();
+	if (!jfwd) {
+		flog_err(EC_LIB_SYSTEM_CALL,
+			 "MVPN events: json allocation failed, dropping forwarding_lost event at seq %" PRIu64
+			 " (cursor gap reserved)",
+			 sink->seq);
+		json_object_free(jo);
+		join->forwarding_ready = true;
+		return;
+	}
+
+	json_object_string_add(jfwd, "state", "lost");
+	json_object_string_add(jfwd, "reason", reason);
+	json_object_object_add(jo, "forwarding", jfwd);
 
 	bgp_mvpn_event_broadcast(sink, jo);
 }
@@ -1255,30 +1276,54 @@ void bgp_mvpn_event_forwarding_update(struct bgp *bgp, const struct ipaddr *src,
 	if (join->forwarding_ready)
 		return;
 
-	join->forwarding_ready = true;
-
 	jo = bgp_mvpn_event_forwarding_new(sink, join, "forwarding_ready");
 	if (!jo)
 		return;
 
+	/* The forwarding object is not decoration on a readiness record: it IS
+	 * the readiness proof, and D4 fixes its shape.  A forwarding_ready
+	 * without it is not a weaker proof, it is an uninterpretable one, so
+	 * failing to build it is a construction failure for the whole event
+	 * rather than a reason to broadcast a partial record.  jo is owned by
+	 * bgp_mvpn_event_broadcast() once passed, so discard it here instead.
+	 * bgp_mvpn_event_new() already reserved the seq, so the discard leaves
+	 * the same fail-closed cursor gap it reserves for its own failure. */
 	jfwd = json_object_new_object();
-	if (jfwd) {
-		json_object_string_add(jfwd, "state", "ready");
-		/* The proven oif, resolved by pimd -- bgpd has no view of the
-		 * DIMT netdev.  Emitted only when pimd actually named one, so
-		 * a mixed-version peer that predates the field produces a
-		 * record without it rather than a record claiming ifindex 0. */
-		if (fwd_oif && fwd_oif[0]) {
-			json_object_string_add(jfwd, "oif", fwd_oif);
-			json_object_int_add(jfwd, "ifindex", (int64_t)fwd_ifindex);
-		}
-		/* The two ack names are constants, not observations: READY is
-		 * defined as both acks having happened, so naming them records
-		 * WHICH proof was required rather than re-asserting it. */
-		json_object_string_add(jfwd, "tunnel_ack", "netlink");
-		json_object_string_add(jfwd, "mfc_ack", "MRT_ADD_MFC");
-		json_object_object_add(jo, "forwarding", jfwd);
+	if (!jfwd) {
+		flog_err(EC_LIB_SYSTEM_CALL,
+			 "MVPN events: json allocation failed, dropping forwarding_ready event at seq %" PRIu64
+			 " (cursor gap reserved)",
+			 sink->seq);
+		json_object_free(jo);
+		return;
 	}
+
+	json_object_string_add(jfwd, "state", "ready");
+	/* The proven oif, resolved by pimd -- bgpd has no view of the
+	 * DIMT netdev.  Emitted only when pimd actually named one, so
+	 * a mixed-version peer that predates the field produces a
+	 * record without it rather than a record claiming ifindex 0. */
+	if (fwd_oif && fwd_oif[0]) {
+		json_object_string_add(jfwd, "oif", fwd_oif);
+		json_object_int_add(jfwd, "ifindex", (int64_t)fwd_ifindex);
+	}
+	/* The two ack names are constants, not observations: READY is
+	 * defined as both acks having happened, so naming them records
+	 * WHICH proof was required rather than re-asserting it. */
+	json_object_string_add(jfwd, "tunnel_ack", "netlink");
+	json_object_string_add(jfwd, "mfc_ack", "MRT_ADD_MFC");
+	json_object_object_add(jo, "forwarding", jfwd);
+
+	/* Latched only once the record is fully built and about to be emitted.
+	 * Latching ahead of the fallible allocations above would, on failure,
+	 * leave the latch set with nothing emitted -- and the latch is read two
+	 * ways, so that strands both of them: the edge-trigger check above
+	 * would suppress every later re-announce, and the guard in
+	 * bgp_mvpn_event_forwarding_lost() would let a subsequent withdraw or
+	 * origin_change close a readiness interval that was never opened,
+	 * breaking D3's "if and only if forwarding_ready was previously
+	 * emitted". */
+	join->forwarding_ready = true;
 
 	bgp_mvpn_event_broadcast(sink, jo);
 }
