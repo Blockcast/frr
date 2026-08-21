@@ -59,6 +59,13 @@ def main():
     parser.add_argument("tunnel_id", type=int)
     parser.add_argument("--encap", choices=("gre", "fou"), default="gre")
     parser.add_argument("--socket", default="/var/run/frr/zserv.api")
+    # The OUTER endpoints are the GRE tunnel's kernel identity. Two links
+    # sharing a (local, remote) tuple cannot coexist -- the second create is
+    # refused with EEXIST whatever the link is named and whether or not the
+    # first is up -- so a test needing two DIMT tunnels alive at once must
+    # vary one of them. Defaults match every other test in the module.
+    parser.add_argument("--outer-local", default="192.0.2.1")
+    parser.add_argument("--outer-remote", default="192.0.2.2")
     args = parser.parse_args()
 
     session_id = 0xD1000000 | (os.getpid() & 0xFFFF)
@@ -73,7 +80,7 @@ def main():
             dport = 5555 if args.encap == "fou" else 0
             payload = struct.pack("!I", args.tunnel_id)
             payload += ipaddr("10.200.0.1") + ipaddr("10.200.0.2")
-            payload += ipaddr("192.0.2.1") + ipaddr("192.0.2.2")
+            payload += ipaddr(args.outer_local) + ipaddr(args.outer_remote)
             payload += struct.pack("!BHB", encap, dport, 0)
             command = ZEBRA_DIMT_TUNNEL_ADD
         else:
