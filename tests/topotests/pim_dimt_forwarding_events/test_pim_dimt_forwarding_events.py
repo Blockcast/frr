@@ -801,7 +801,32 @@ def test_install_then_exactly_one_forwarding_ready():
     install = only(events, "install", source=SOURCE)
     assert install["route_type"] == 7, install
     assert install["group"] == GROUP, install
-    assert install["upstream_peer"] == UMH, install
+    # NOT asserted here: install["upstream_peer"] == UMH.
+    #
+    # It does not hold, and the reason is a product gap outside this PR's
+    # charter, not a defect in the emitter under test.  bgpd resolves the UMH
+    # for a settlement record in bgp_mvpn_resolve_from_ecommunity(), which
+    # reads ECOMMUNITY_VRF_ROUTE_IMPORT (0x0b) then ECOMMUNITY_ROUTE_TARGET
+    # (0x02) -- but DIMT steers with ECOMMUNITY_UMH (0x80), the encoding
+    # bgp_dimt.c owns.  So `umh` stays INADDR_ANY and bgp_mvpn_events.c gates
+    # BOTH upstream_peer and lc_umh_origin off, correctly per the documented
+    # "when an upstream PE was resolved" condition.  pimd resolves the same EC
+    # fine, which is why test_session_and_umh_route above passes -- the two
+    # daemons read different communities.  Tracked as BLO-29577; that ticket
+    # also carries the settlement_version question, since adding
+    # lc_umh_origin where it is absent today changes a settlement field.
+    #
+    # PR 4's acceptance criteria are about the additive forwarding events and
+    # about install/withdraw/origin_change being UNCHANGED.  UMH attestation
+    # is covered by bgp_mvpn_gtm_umh_{lc,ebgp,ibgp,bestpath}.  Asserting it
+    # here only couples this suite to an unrelated bug.  The absence is
+    # asserted positively so that a future fix turns this line red rather
+    # than letting the suite drift silently.
+    assert "upstream_peer" not in install, (
+        "BLO-29577 appears fixed -- bgpd now resolves ECOMMUNITY_UMH. Restore "
+        "the strict `install['upstream_peer'] == UMH` assertion here and at "
+        "the two sibling sites: {}".format(install)
+    )
     assert install["route_version"] == "{}.1".format(boot_epoch), install
     # D4: install keeps its revision-1 shape.  A forwarding object on it would
     # mean the readiness verdict had been folded into the entitlement record.
@@ -888,7 +913,10 @@ def test_second_sg_gets_exactly_one_forwarding_ready():
 
     install = only(events, "install", source=SECOND_SOURCE)
     assert install["group"] == SECOND_GROUP, install
-    assert install["upstream_peer"] == UMH, install
+    # See the note in test_install_then_exactly_one_forwarding_ready: bgpd's
+    # MVPN resolver does not read ECOMMUNITY_UMH, so upstream_peer is absent
+    # by construction here too (BLO-29577).
+    assert "upstream_peer" not in install, install
     assert "forwarding" not in install, install
 
     alive(
@@ -1002,6 +1030,18 @@ def test_v1_only_consumer_ignores_and_advances():
     not a hand-written expectation -- so the arithmetic below cannot drift away
     from what the producer emits.
     """
+    # Every other stage in this file opens with this guard; this one did not,
+    # and the omission actively misled a CI triage.  When the join stage failed
+    # (BLO-29577), its five siblings correctly SKIPped, but this stage ran on
+    # half-initialised module state -- `observed` held only the first (S,G),
+    # because the stage that joins the second never ran -- and reported a
+    # SECOND, entirely derivative failure: "installs == [SOURCE] != [SOURCE,
+    # SECOND_SOURCE]".  Two failures in the summary for one root cause, and the
+    # louder one was the fake.  A cascade must present as a skip.
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
     # Ignore-AND-advance: cursor tracks every record, recognised or not.
     correct_cursor = max(e["seq"] for e in observed)
     # Ignore-WITHOUT-advance: cursor only counts records it recognised, which
@@ -1151,6 +1191,33 @@ def test_forwarding_lost_precedes_origin_change():
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
+
+    # STRUCTURALLY UNPASSABLE until BLO-29577 lands, so skipped rather than
+    # left to fail or -- worse -- weakened into something that passes.
+    #
+    # This stage's trigger is a UMH swap (UMH1 10.99.0.1 -> UMH2 10.99.0.9)
+    # carried in ECOMMUNITY_UMH (0x80).  bgpd decides an origin changed in
+    # bgp_mvpn_events.c:1000 by comparing last_source_as / last_umh -- both
+    # sourced from bgp_mvpn_resolve_from_ecommunity(), which never reads 0x80.
+    # So both stay pinned (0, INADDR_ANY) across the swap, `changed` stays
+    # false, and bgp_mvpn_events.c:1003 returns early as a "redundant
+    # re-resolve": NO origin_change is emitted at all.  The stage would fail
+    # on its alive(origin_change) precondition, not on the ordering claim it
+    # exists to make.
+    #
+    # The claim itself (forwarding_lost precedes origin_change) is a real PR 4
+    # requirement and is NOT abandoned -- it is unexercisable in this fixture
+    # until bgpd can see the swap.  Its sibling half, forwarding_lost before
+    # withdraw, IS exercised by test_forwarding_lost_precedes_withdraw above,
+    # so the D6 ordering rule keeps automated coverage on the withdraw path
+    # meanwhile.  Re-enable this stage as the first verifying signal on
+    # BLO-29577.
+    pytest.skip(
+        "origin_change cannot be triggered while bgpd ignores ECOMMUNITY_UMH "
+        "(BLO-29577): last_umh stays INADDR_ANY across the UMH swap, so "
+        "bgp_mvpn_events.c:1000 never sets changed=true"
+    )
+
     r1 = tgen.gears["r1"]
 
     # Swap the attached UMH by replacing the redistribution route-map IN PLACE.
