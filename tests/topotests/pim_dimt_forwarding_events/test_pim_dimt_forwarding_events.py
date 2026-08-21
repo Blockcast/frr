@@ -42,11 +42,16 @@ Topology -- same shape as pim_dimt_tunnel/, plus the event socket on r2:
 
 r2 is the receiver PoP: the membership lives there, so r2 is the PE that
 locally originates the Type-7 and therefore the PE that runs the event socket.
-r1 advertises 10.10.10.0/24 with `set extcommunity umh 10.99.0.1 pim`, where
-10.99.0.1 is r1's *loopback* and r2 has no route to it -- so the DIMT netdev
-is the only interface that can carry the pin.  The full reasoning for the
-loopback UMH is in pim_dimt_tunnel/test_pim_dimt_tunnel.py; it is reproduced
-in r1/zebra.conf and not re-argued here.
+r1 advertises 10.10.10.0/24 carrying the same upstream under TWO encodings --
+`set extcommunity umh 10.99.0.1 pim` (ECOMMUNITY_UMH 0x80, which only pimd
+reads, and which does the RPF steering) and `set extcommunity rt 10.99.0.1:0`
+(the RFC 7716 upstream-node RT, which only bgpd reads, and which is what puts
+`upstream_peer` / `lc_umh_origin` on the emitted records).  Neither daemon
+reads the other's encoding; see r1/bgpd.conf and BLO-29577.  10.99.0.1 is r1's
+*loopback* and r2 has no route to it -- so the DIMT netdev is the only
+interface that can carry the pin.  The full reasoning for the loopback UMH is
+in pim_dimt_tunnel/test_pim_dimt_tunnel.py; it is reproduced in r1/zebra.conf
+and not re-argued here.
 
 WHAT IS EVIDENCE HERE
 ---------------------
@@ -801,32 +806,16 @@ def test_install_then_exactly_one_forwarding_ready():
     install = only(events, "install", source=SOURCE)
     assert install["route_type"] == 7, install
     assert install["group"] == GROUP, install
-    # NOT asserted here: install["upstream_peer"] == UMH.
-    #
-    # It does not hold, and the reason is a product gap outside this PR's
-    # charter, not a defect in the emitter under test.  bgpd resolves the UMH
-    # for a settlement record in bgp_mvpn_resolve_from_ecommunity(), which
-    # reads ECOMMUNITY_VRF_ROUTE_IMPORT (0x0b) then ECOMMUNITY_ROUTE_TARGET
-    # (0x02) -- but DIMT steers with ECOMMUNITY_UMH (0x80), the encoding
-    # bgp_dimt.c owns.  So `umh` stays INADDR_ANY and bgp_mvpn_events.c gates
-    # BOTH upstream_peer and lc_umh_origin off, correctly per the documented
-    # "when an upstream PE was resolved" condition.  pimd resolves the same EC
-    # fine, which is why test_session_and_umh_route above passes -- the two
-    # daemons read different communities.  Tracked as BLO-29577; that ticket
-    # also carries the settlement_version question, since adding
-    # lc_umh_origin where it is absent today changes a settlement field.
-    #
-    # PR 4's acceptance criteria are about the additive forwarding events and
-    # about install/withdraw/origin_change being UNCHANGED.  UMH attestation
-    # is covered by bgp_mvpn_gtm_umh_{lc,ebgp,ibgp,bestpath}.  Asserting it
-    # here only couples this suite to an unrelated bug.  The absence is
-    # asserted positively so that a future fix turns this line red rather
-    # than letting the suite drift silently.
-    assert "upstream_peer" not in install, (
-        "BLO-29577 appears fixed -- bgpd now resolves ECOMMUNITY_UMH. Restore "
-        "the strict `install['upstream_peer'] == UMH` assertion here and at "
-        "the two sibling sites: {}".format(install)
-    )
+    # Asserted strictly, and it holds because r1/bgpd.conf attaches the RFC
+    # 7716 upstream-node RT (ROUTE_TARGET 0x02) alongside the DIMT steering EC
+    # (ECOMMUNITY_UMH 0x80).  bgpd's resolver reads only the former; pimd only
+    # the latter.  BLO-29577 tracks whether bgpd SHOULD also read 0x80 -- that
+    # is a settlement-field question (it would add lc_umh_origin where it is
+    # absent today) and deliberately not decided by this suite.  The RT is not
+    # a workaround for it: without a resolvable upstream the origin-change
+    # stage cannot run at all, because `changed` in bgp_mvpn_events.c:1000
+    # compares last_umh against umh and both would be INADDR_ANY.
+    assert install["upstream_peer"] == UMH, install
     assert install["route_version"] == "{}.1".format(boot_epoch), install
     # D4: install keeps its revision-1 shape.  A forwarding object on it would
     # mean the readiness verdict had been folded into the entitlement record.
@@ -913,10 +902,10 @@ def test_second_sg_gets_exactly_one_forwarding_ready():
 
     install = only(events, "install", source=SECOND_SOURCE)
     assert install["group"] == SECOND_GROUP, install
-    # See the note in test_install_then_exactly_one_forwarding_ready: bgpd's
-    # MVPN resolver does not read ECOMMUNITY_UMH, so upstream_peer is absent
-    # by construction here too (BLO-29577).
-    assert "upstream_peer" not in install, install
+    # Same upstream as the first (S,G): both sources sit inside the one
+    # advertised 10.10.10.0/24, so they resolve off the SAME path and the same
+    # RT.  A divergence here would mean per-(S,G) resolution drift.
+    assert install["upstream_peer"] == UMH, install
     assert "forwarding" not in install, install
 
     alive(
