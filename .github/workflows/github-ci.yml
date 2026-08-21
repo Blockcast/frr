@@ -401,23 +401,29 @@ jobs:
           if [ -f test-results-${{ matrix.cfg.platform }}/topotests.xml ]; then
             ./tests/topotests/analyze.py -r test-results-${{ matrix.cfg.platform }}
             ls -l test-results-${{ matrix.cfg.platform }}/topotests.xml
-            run_tests=$(./tests/topotests/analyze.py -r test-results-${{ matrix.cfg.platform }}| cut -f1 -d: | sort -u)
+            run_tests_raw=$(./tests/topotests/analyze.py -r test-results-${{ matrix.cfg.platform }}| cut -f1 -d: | sort -u)
+            mapfile -t run_tests < <(printf '%s' "${run_tests_raw}")
           else
             echo "No test results dir"
-            run_tests=""
+            run_tests=()
           fi
           rm -rf test-results-${{ matrix.cfg.platform }}* /tmp/topotests
 
-          echo RUN_TESTS: $run_tests
+          echo "RUN_TESTS: ${run_tests[*]}"
           [[ "${TOPOTEST_WORKERS}" =~ ^[1-9][0-9]*$ ]]
           # As in the serial rerun below, the selected tests go through "$@"
           # rather than being glued onto the `bash -c` string: appending an
           # unquoted list there delivers only its first word to pytest and
           # turns the rest into positional parameters of the -c script, which
           # would silently narrow a targeted rerun to a single file.
+          # The list is carried in a mapfile array so that one array element is
+          # exactly one analyze.py record; expanding a scalar unquoted would
+          # re-split those records on spaces and glob them, which the full node
+          # IDs below make reachable.  An empty array expands to zero words, so
+          # the ordinary "no prior results" path still runs the whole tree.
           if docker run --init -i --privileged --name frr-${{ matrix.cfg.platform }}-cont ${ADD_DOCKER_ENV} \
             -e TOPOTEST_WORKERS="${TOPOTEST_WORKERS}" -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
-            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest -n"${TOPOTEST_WORKERS}" --dist=loadfile "$@"' pytest-run $run_tests; then
+            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest -n"${TOPOTEST_WORKERS}" --dist=loadfile "$@"' pytest-run "${run_tests[@]}"; then
             echo "All tests passed."
             exit 0
           fi
@@ -445,14 +451,24 @@ jobs:
           # `cut -f1 -d:` truncated them to bare file paths, discarding the only
           # information that makes it possible to check afterwards that the
           # rerun re-ran the tests that actually failed.
-          rerun_tests=$(./tests/topotests/analyze.py -r test-results-${{ matrix.cfg.platform }} | sort -u)
-          if [ -z "$rerun_tests" ]; then
+          #
+          # Read them into an array rather than a scalar: analyze.py emits one
+          # node ID per line, and only an array preserves that framing.  A
+          # scalar expanded unquoted re-splits on spaces and is glob-expanded,
+          # so a parametrized ID -- `test_x[a b]`, which `cut` used to strip --
+          # would arrive at pytest as two unknown IDs instead of one real one.
+          # The capture stays a command substitution so that `set -e` still
+          # aborts the step when analyze.py fails; feeding mapfile directly
+          # from a process substitution would silently drop that.
+          rerun_tests_raw=$(./tests/topotests/analyze.py -r test-results-${{ matrix.cfg.platform }} | sort -u)
+          mapfile -t rerun_tests < <(printf '%s' "${rerun_tests_raw}")
+          if [ ${#rerun_tests[@]} -eq 0 ]; then
             echo "ERROR: Parallel pytest run failed but no failures found in topotests.xml." >&2
             exit 1
           fi
 
           echo "ERROR: Some tests failed during parallel run, rerunning serially." >&2
-          echo RERUN_TESTS: $rerun_tests >&2
+          echo "RERUN_TESTS: ${rerun_tests[*]}" >&2
           docker stop frr-${{ matrix.cfg.platform }}-cont
           docker rm frr-${{ matrix.cfg.platform }}-cont
 
@@ -468,14 +484,14 @@ jobs:
           # reported success over three real failures.
           rerun_rc=0
           docker run --init -i --privileged --name frr-${{ matrix.cfg.platform }}-cont ${ADD_DOCKER_ENV} -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
-            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest "$@"' pytest-rerun $rerun_tests || rerun_rc=$?
+            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest "$@"' pytest-rerun "${rerun_tests[@]}" || rerun_rc=$?
 
           # pytest's exit code only claims "everything I collected passed",
           # which is strictly weaker than "every test we named passed".  A
           # target that collects nothing -- renamed, uncollectable, or never
           # delivered to pytest at all -- yields 0 items and exit 0.  Verify
           # coverage against the harvested IDs before believing that 0.
-          printf '%s\n' "$rerun_tests" > /tmp/rerun-expected.txt
+          printf '%s\n' "${rerun_tests[@]}" > /tmp/rerun-expected.txt
           rerun_xml=/tmp/rerun-results.xml
           rm -f "${rerun_xml}"
           if ! docker cp frr-${{ matrix.cfg.platform }}-cont:/tmp/topotests/topotests.xml "${rerun_xml}"; then

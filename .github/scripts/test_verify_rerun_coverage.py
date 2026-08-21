@@ -242,10 +242,12 @@ class TestWorkflowWiring(unittest.TestCase):
             )
 
     def test_rerun_harvest_keeps_full_node_ids(self):
+        # Matches the harvest whatever the variable is called, so renaming it
+        # cannot silently retire this assertion.
         harvest = [
             line
             for line in self.workflow.splitlines()
-            if "rerun_tests=$(" in line
+            if re.search(r"\brerun_tests(_raw)?=\$\(", line)
         ]
         self.assertTrue(harvest, "expected to find the rerun harvest line")
         for line in harvest:
@@ -255,6 +257,46 @@ class TestWorkflowWiring(unittest.TestCase):
                 "harvest truncates file.py::test_name to file.py, discarding "
                 "the IDs the coverage check needs: " + line.strip(),
             )
+
+    def test_rerun_list_is_passed_as_an_array_not_a_split_scalar(self):
+        """Full node IDs make word-splitting reachable; an array prevents it.
+
+        Dropping `cut -f1 -d:` means the list now carries `file.py::test_name`
+        rather than bare paths, and a parametrized ID can contain spaces and
+        glob metacharacters (`test_x[a b]`).  Expanding that unquoted would
+        re-split one real ID into two bogus ones, so the list has to reach
+        pytest as a quoted array expansion.
+        """
+        invocations = re.findall(r"sudo -E pytest[^\n]*", self.workflow)
+        self.assertTrue(invocations, "expected to find the pytest invocations")
+        for inv in invocations:
+            self.assertNotRegex(
+                inv,
+                r"\$(run_tests|rerun_tests)\b",
+                "test list expanded as an unquoted scalar, which re-splits "
+                "node IDs on spaces and globs them: " + inv.strip(),
+            )
+        for name in ("run_tests", "rerun_tests"):
+            self.assertIn(
+                '"${%s[@]}"' % name,
+                self.workflow,
+                "%s must reach pytest as a quoted array expansion" % name,
+            )
+
+    def test_rerun_harvest_still_aborts_when_analyze_fails(self):
+        """`set -e` coverage must survive the move to an array.
+
+        The harvest is a command substitution precisely so that a failing
+        analyze.py still aborts the step.  Feeding mapfile straight from a
+        process substitution silently drops that, because a process
+        substitution is not a pipeline component `set -e` inspects.
+        """
+        self.assertNotRegex(
+            self.workflow,
+            r"mapfile[^\n]*<\s*<\([^\n]*analyze\.py",
+            "mapfile reads analyze.py through a process substitution, so a "
+            "failure there no longer aborts the step under set -e",
+        )
 
     def test_rerun_result_is_gated_on_the_coverage_check(self):
         self.assertIn("verify_rerun_coverage.py", self.workflow)
