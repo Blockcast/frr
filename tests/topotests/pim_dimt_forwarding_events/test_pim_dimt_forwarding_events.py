@@ -25,7 +25,7 @@ Two reasons, and both are about what counts as evidence.
 
 2. An event stream is not re-readable.  A reader only sees what is emitted
    after it connects, so the join has to happen after the reader attaches --
-   which is why r2/pimd.conf here carries no `ip igmp static-group` and
+   which is why r2/pimd.conf here carries no startup membership and
    pim_dimt_tunnel/r2/pimd.conf does.  Retrofitting that into a suite whose
    twelve stages are explicitly order-dependent, and whose earlier stages have
    already joined and left several times, would mean the reader could only
@@ -82,9 +82,11 @@ append-only enum and does not pin which cause an origin change must report.
 Pinning one value here would produce a test that fails on a correct
 implementation roughly whenever the scheduler ran differently, so the
 cardinality and ordering claims -- which are NOT race-dependent -- carry the
-weight instead.  Raised as an open contract question on BLO-27739 rather than
-papered over: if D4 is later tightened to mandate a specific reason on these
-two paths, tighten FWD_LOST_REASONS_* below to match.
+weight instead.  This was raised as a contract question on BLO-27739 and has
+since been ANSWERED: D4 does not pin it -- §D4 constrains enum membership and
+stability only, and §D3/§D6 constrain ordering only.  If D4 is later tightened
+to mandate a specific reason on these two paths, tighten FWD_LOST_REASONS_*
+below to match.
 
 D6 VERIFYING-SIGNAL COVERAGE (contract D6, quoted in BLO-27739)
 ---------------------------------------------------------------
@@ -183,8 +185,23 @@ FWD_LOST_REASONS = frozenset(
         "anti_recursion_refused",
         "withdraw",
         "origin_change",
+        "unknown",
     ]
 )
+
+# `unknown` is the mixed-version rendering: bgpd emits it
+# (bgp_mvpn_events.c, for ZAPI_MVPN_SG_FWD_REASON_UNSPECIFIED) when a pimd
+# predating the cause field supplies no cause, and doc/mvpn-events-schema.md
+# documents it as such.  A same-version pimd cannot produce it -- every
+# non-READY return in pim_dimt_forwarding_state() sets a specific cause -- so
+# it is unreachable in this suite and is admitted for forward-compatibility,
+# not because a stage here expects it.
+#
+# It is unioned in at the GATE rather than added to each per-path subset
+# below, because a mixed-version producer can omit the cause on ANY path;
+# threading it through every subset would also mean N edits for the next
+# added value instead of one.
+FWD_LOST_REASON_VERSION_DEPENDENT = frozenset(["unknown"])
 
 # The subsets reachable on the two racing paths -- see the header.  Narrower
 # than the full enum, so a reason from an unrelated cause still fails.
@@ -435,9 +452,35 @@ def record(events):
 # --- helpers --------------------------------------------------------------
 
 
-def _static_group(source, group, negate=False):
+def _membership(source, group, negate=False):
+    """Join/leave (S,G) on the receiver stub, at runtime.
+
+    Deliberately `join-group` and NOT `static-group`, even though the sibling
+    DIMT suites all use `static-group`: those configure it in r2/pimd.conf at
+    startup, and this one cannot (see the header note -- the reader has to be
+    attached before the join).  That difference matters, because the two
+    commands are only equivalent at startup:
+
+      `static-group` -> pim_if_static_group_add() -> static_group_join(),
+      which returns SILENTLY when the VIF is not ready
+      (pim_iface.c:1484) or when tib_sg_gm_join() refuses
+      (pim_iface.c:1491), leaving the membership to be picked up later by
+      pim_if_static_group_replay().  That replay only runs from
+      interface-up / neighbor-add / delete-on-noinfo -- never from a
+      runtime config change.  So a runtime `static-group` that misses on
+      its single attempt is a permanent no-op that reports success: config
+      accepted, no membership, no upstream, no Type-7, empty event stream.
+
+      `join-group` -> pim_if_gm_join_add() (pim_iface.c:1603) issues the
+      kernel socket join immediately, has no VIF-readiness deferral and no
+      DR check, and fails LOUDLY via ferr_cfg_invalid() rather than
+      deferring to a replay that will not come.
+
+    bgp_mvpn_gtm_events is the one sibling that also joins at runtime, and it
+    uses `join-group` for this reason.
+    """
     get_topogen().gears["r2"].vtysh_cmd(
-        "conf t\ninterface r2-eth1\n{}ip igmp static-group {} {}".format(
+        "conf t\ninterface r2-eth1\n{}ip igmp join-group {} {}".format(
             "no " if negate else "", group, source
         )
     )
@@ -612,8 +655,9 @@ def assert_lost_shape(event, allowed_reasons):
             reason, sorted(FWD_LOST_REASONS)
         )
     )
-    assert reason in allowed_reasons, "reason is {}, expected one of {}: {}".format(
-        reason, sorted(allowed_reasons), fwd
+    allowed = frozenset(allowed_reasons) | FWD_LOST_REASON_VERSION_DEPENDENT
+    assert reason in allowed, "reason is {}, expected one of {}: {}".format(
+        reason, sorted(allowed), fwd
     )
     # A lost record names no oif: there is no proven forwarding path to name.
     assert "oif" not in fwd, fwd
@@ -735,9 +779,9 @@ def test_install_then_exactly_one_forwarding_ready():
 
     reader = EventReader(EVENT_SOCK)
     snapshot, snapshot_end = reader.read_snapshot()
-    # Nothing has joined yet -- r2/pimd.conf deliberately carries no static
-    # group -- so an empty snapshot is the precondition for reading the whole
-    # lifecycle off the live stream.
+    # Nothing has joined yet -- r2/pimd.conf deliberately carries no startup
+    # membership -- so an empty snapshot is the precondition for reading the
+    # whole lifecycle off the live stream.
     assert snapshot == [], "expected a quiet baseline, got {}".format(
         _summary(snapshot)
     )
@@ -746,7 +790,7 @@ def test_install_then_exactly_one_forwarding_ready():
     reader.acknowledge_snapshot(snapshot_end)
     boot_epoch = snapshot_end["boot_epoch"]
 
-    _static_group(SOURCE, GROUP)
+    _membership(SOURCE, GROUP)
 
     events = record(
         reader.collect(
@@ -832,7 +876,7 @@ def test_second_sg_gets_exactly_one_forwarding_ready():
         pytest.skip(tgen.errors)
     r2 = tgen.gears["r2"]
 
-    _static_group(SECOND_SOURCE, SECOND_GROUP)
+    _membership(SECOND_SOURCE, SECOND_GROUP)
 
     events = record(
         reader.collect(
@@ -1037,7 +1081,7 @@ def test_forwarding_lost_precedes_withdraw():
         pytest.skip(tgen.errors)
     r2 = tgen.gears["r2"]
 
-    _static_group(SECOND_SOURCE, SECOND_GROUP, negate=True)
+    _membership(SECOND_SOURCE, SECOND_GROUP, negate=True)
 
     events = record(
         reader.collect(
