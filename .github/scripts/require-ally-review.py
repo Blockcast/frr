@@ -461,7 +461,31 @@ def finding_heading_pattern(label):
 # Anchored at the start only. A SHA appearing mid-prose is content, and in these
 # repos two findings can legitimately differ by nothing but a SHA they quote, so
 # a global strip would be a widening rather than a normalization.
-FINDING_METADATA_BRACKET_PATTERN = re.compile(r"^\*\*\[[^\]]*\].*?\*\*[ \t]*")
+#
+# THE CLOSING `**` MUST FOLLOW THE `]` IMMEDIATELY. The reference lineage writes
+# this as `^\*\*\[[^\]]*\].*?\*\*[ \t]*`, whose non-greedy `.*?` runs to the
+# FIRST `**` after the bracket -- so on a bullet whose bold span closes after the
+# TITLE rather than after the bracket, the strip eats the whole title as if it
+# were metadata. That is a CONFIRMED content-id collision, demonstrated
+# end-to-end against this gate (BLO-27578 adversarial pass): given
+#
+#     - **[HIGH] Unbounded read in the HTTP client** `client.go:88`
+#     - **[HIGH] Missing authorization check on admin config writes** `client.go:12`
+#
+# both normalize to `` `client.go:#` `` and hash identically, so an admin's
+# legitimate deferral of the first silently covered the second -- a brand-new,
+# semantically unrelated finding -- and the gate went green. It violates both
+# "a deferral covers only the finding it names" and "a later finding re-reds the
+# check", and the admin cannot notice because they copy the digest the gate
+# prints.
+#
+# Requiring `\]\*\*` fixes it in the fail-safe direction: on Ally's real renderer
+# the bracket IS the whole bold run (verified against the live bodies on
+# trafficcontrol PR #1278), so nothing legitimate stops being stripped; and if
+# Ally ever does emit `**[x] title**`, the bracket is simply NOT stripped, the
+# title stays in the digest, identity becomes MORE specific, and the failure mode
+# is a deferral ceasing to apply -- never one applying where it should not.
+FINDING_METADATA_BRACKET_PATTERN = re.compile(r"^\*\*\[[^\]]*\]\*\*[ \t]*")
 FINDING_CARRY_FORWARD_TOKEN_PATTERN = re.compile(
     r"^(?:origin|prior)[: ]+[0-9a-f]{7,40}[ :]+(?:critical|important)[ :]+\d+[ \t]*",
     re.IGNORECASE,

@@ -3441,3 +3441,108 @@ class TestParseListFailsClosed(unittest.TestCase):
 
     def test_a_real_value_is_still_honoured(self):
         self.assertEqual(gate.parse_list("x, y ,", ["a"]), ["x", "y"])
+
+
+class TestFindingIdentityCollisions(unittest.TestCase):
+    """Content-id collisions are the whole attack surface of a content-bound
+    deferral: a collision means one admin's ruling silently covers a DIFFERENT
+    finding, violating both "covers only what it names" and "a later finding
+    re-reds". These are regressions, each from a demonstrated bypass or a pinned
+    residual -- not speculative hardening.
+    """
+
+    def _cid(self, line, label="important"):
+        return gate.finding_content_id(line.split("\n"), label)
+
+    def test_a_title_inside_the_bold_run_is_not_eaten_as_metadata(self):
+        """CONFIRMED BYPASS, closed (BLO-27578 adversarial pass).
+
+        The reference lineage's bracket pattern ends `\\].*?\\*\\*`, whose
+        non-greedy run reaches the FIRST `**` after the bracket -- so a bullet
+        whose bold span closes after the TITLE had its entire title stripped as
+        if it were metadata. These two findings are semantically unrelated, live
+        in the same file, and hashed identically: an admin's legitimate deferral
+        of the first went green over the second.
+        """
+        a = "- **[HIGH] Unbounded read in the HTTP client** `client.go:88`"
+        b = "- **[HIGH] Missing authorization check on admin config writes** `client.go:12`"
+        self.assertNotEqual(self._cid(a), self._cid(b))
+
+    def test_allys_real_bracket_is_still_stripped_so_carry_forward_holds(self):
+        """The control for the fix above, taken from the live bodies on
+        trafficcontrol PR #1278: a semicolon-separated `prior:` chain plus the
+        tool list, closed by `]**`. Stripping this is what lets one ruling
+        survive Ally re-rendering the citation and the line number, so a
+        narrower pattern must not stop stripping it."""
+        early = (
+            "- **[pr-review-toolkit + gstack/review + native-codex]** "
+            "`traffic_ops/cdni/mvpn_witness.go:196` — Route-version verification is wrong."
+        )
+        later = (
+            "- **[prior:1eafba4 important 1; prior:bec0d4e important 2; "
+            "pr-review-toolkit + gstack/review + native-codex]** "
+            "`traffic_ops/cdni/mvpn_witness.go:282` — Route-version verification is wrong."
+        )
+        self.assertEqual(self._cid(early), self._cid(later))
+
+    def test_PINS_THE_RESIDUAL_two_findings_differing_only_inside_the_bracket(self):
+        """Deliberate, and load-bearing in BOTH directions.
+
+        Excluding the bracket from identity is what makes a ruling survive Ally
+        re-rendering its `prior:`/tool attribution; without it carry-forward
+        breaks and the never-green loop comes straight back. The cost is that two
+        findings differing ONLY inside the bracket share an id.
+
+        That is safe while the discriminating detail (`file:line`) lives in the
+        BODY, as it does in every shape observed on trafficcontrol PR #1278. If
+        Ally ever moves the location into the bracket, THIS test is the one to
+        re-argue -- it will still pass, so treat it as a contract on Ally's
+        renderer, not as proof of safety.
+        """
+        a = "- **[auth/session.go:88]** Token compared with non-constant-time equality."
+        b = "- **[admin/keys.go:12]** Token compared with non-constant-time equality."
+        self.assertEqual(self._cid(a), self._cid(b))
+        # ...whereas with the location in the BODY, which is the real shape,
+        # the same two findings are correctly distinct.
+        real_a = "- **[pr-review-toolkit]** `auth/session.go:88` — Non-constant-time compare."
+        real_b = "- **[pr-review-toolkit]** `admin/keys.go:12` — Non-constant-time compare."
+        self.assertNotEqual(self._cid(real_a), self._cid(real_b))
+
+    def test_PINS_THE_RESIDUAL_a_reworded_finding_is_a_new_finding(self):
+        """MEASURED AGAINST LIVE DATA, and the single biggest limitation of a
+        content-bound deferral -- recorded here so the suite states what is true
+        rather than implying carry-forward always works.
+
+        On trafficcontrol PR #1278 Ally REWORDS the same finding on every head
+        while linking it with its own `prior:` citation. Measured 2026-08-22:
+        head afa3c88 Important #1 carries `prior:f15a05a important 2`, i.e. Ally
+        asserts they are the same finding -- and their content ids differ
+        (3a3c9f94... vs a70fafc9...), because the summary was rewritten.
+
+        Consequence: a deferral must be RE-ISSUED whenever Ally rewords. That is
+        fail-closed, but it is a manual step per push, so it only partly retires
+        the never-green loop. It is inherited from the reference lineage, not
+        introduced here -- `canonicalDeferralToken` there accepts content ids
+        only, so a positional `prior:` token cannot authorize a deferral in
+        either lineage.
+
+        The durable fix is a renderer contract (Ally emitting a finding id it
+        keeps stable across rewords), NOT loosening identity here: resolving the
+        `prior:` chain inside the gate would let anyone who can influence Ally's
+        bracket inherit an existing ruling onto a new finding.
+        """
+        f15a05a_important_2 = (
+            "- **[gstack/review + native-codex]** `traffic_ops/cdni/mvpn_witness.go:301` — "
+            "The historical route-version window is still resolved through mutable, "
+            "unversioned configuration."
+        )
+        afa3c88_important_1 = (
+            "- **[prior:f15a05a important 2; pr-review-toolkit + gstack/review + native-codex]** "
+            "`traffic_ops/cdni/mvpn_witness.go:315` — A historical signed route version can "
+            "still credit the replacement delivery service after the former mapping is removed."
+        )
+        self.assertNotEqual(
+            self._cid(f15a05a_important_2),
+            self._cid(afa3c88_important_1),
+            "a reworded finding sharing an id would mean identity is too loose",
+        )
