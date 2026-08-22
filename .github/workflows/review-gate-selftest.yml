@@ -1,11 +1,18 @@
 name: review-gate-selftest
 
-# The review gate is a merge control that was hand-ported from JavaScript, so
-# its decision logic is unit-tested. These tests run in their OWN workflow,
-# separate from review-gate.yml, for a reason learned the hard way: when the
-# self-test ran as a step inside the gate job, a self-test failure aborted the
-# job before any commit status was posted -- and a gate that posts nothing on
-# failure recreates the silent hole it exists to close.
+# Decision-logic unit tests for the pure-Python helpers in .github/scripts/.
+# The step below runs `unittest discover` over that whole directory, so every
+# `test_*.py` there is covered; the path triggers just decide when to bother.
+# Currently: the review gate (a merge control hand-ported from JavaScript, so
+# its logic is pinned against translation slips) and the buildcache freshness
+# gate (whose bug mode is reporting a stale cache as fresh, which reinstates the
+# silent failure it exists to catch).
+#
+# These tests run in their OWN workflow, separate from review-gate.yml, for a
+# reason learned the hard way: when the self-test ran as a step inside the gate
+# job, a self-test failure aborted the job before any commit status was posted
+# -- and a gate that posts nothing on failure recreates the silent hole it
+# exists to close.
 #
 # Unlike the gate, this runs from the PULL REQUEST's code, because the point is
 # to validate the proposed change to the checker. It is a plain `pull_request`
@@ -17,6 +24,8 @@ on:
     paths:
       - '.github/scripts/require-ally-review.py'
       - '.github/scripts/test_require_ally_review.py'
+      - '.github/scripts/buildcache_freshness.py'
+      - '.github/scripts/test_buildcache_freshness.py'
       - '.github/workflows/review-gate.yml'
       - '.github/workflows/review-gate-selftest.yml'
   push:
@@ -29,6 +38,8 @@ on:
     paths:
       - '.github/scripts/require-ally-review.py'
       - '.github/scripts/test_require_ally_review.py'
+      - '.github/scripts/buildcache_freshness.py'
+      - '.github/scripts/test_buildcache_freshness.py'
 
 permissions:
   contents: read

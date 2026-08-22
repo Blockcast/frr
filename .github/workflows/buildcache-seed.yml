@@ -1,0 +1,233 @@
+name: buildcache-seed
+
+# Sole writer of the frr CI buildcache.
+#
+# Why this is a separate workflow instead of a `cache-to` inside github-ci.yml
+# ---------------------------------------------------------------------------
+# github-ci.yml sets `cancel-in-progress: true` on a group keyed only on
+# `github.ref`, so every master push shares one lane and supersedes the previous
+# master run. When `cache-to` lived in that workflow, master runs were the only
+# cache writers *and* the most cancellable ones: measured over 44 master push
+# runs (2026-07-02 -> 2026-08-21), 23 were cancelled and 16 of those were
+# provably killed by the next master push, several within 2 seconds. A cancelled
+# run publishes no cache, so the tags went unwritten for stretches of 8-18 days
+# and every PR built cold. The busier master got, the more reliably the cache
+# stayed stale -- a self-sustaining trap, and a silent one, because a cancelled
+# run is not a red check.
+#
+# The obvious one-line fix -- exempting master from cancellation -- was
+# measured and rejected: a full master github-ci run takes 6-11 hours wall
+# clock (the arc-e2e topotest lane dominates), and Build jobs already queue up
+# to 2.5 hours under pool contention. Making those uncancellable would let a
+# burst of back-to-back merges (3 pushes in 41s on 2026-08-10) pin three
+# multi-hour runs onto a capacity-capped pool at once -- the exact
+# oversubscription shape BLO-21606 moved this lane off arc-default to avoid.
+#
+# So instead: decouple cache freshness from push cadence entirely. This
+# workflow runs *only* the three Build legs (~12-28 min each, no unit tests, no
+# topotests, no arc-e2e) and is the one place `cache-to` lives. github-ci.yml
+# keeps `cancel-in-progress: true` for every ref and its runner savings, and
+# nothing it does can leave the cache stale.
+#
+# `cancel-in-progress: false` here is the load-bearing line: a cache writer
+# must never be cancelled by a newer one. GitHub keeps at most one run queued
+# per group, so a merge burst collapses to "current run finishes, newest queued
+# run follows" rather than a pile-up.
+
+on:
+  schedule:
+    # Twice daily. Against the 72h freshness budget asserted below, that
+    # tolerates ~5 consecutive missed cycles before the gate goes red -- enough
+    # slack to absorb the ARC runner kills tracked on BLO-20922 without the
+    # signal crying wolf. Off :00 to avoid the cluster-wide cron herd.
+    - cron: '23 2,14 * * *'
+  workflow_dispatch:
+  push:
+    branches:
+      - 'master'
+    paths:
+      # A change to the image definition invalidates the shared layers, so the
+      # cache is cold from that commit onward. Seed promptly rather than
+      # leaving every PR cold until the next scheduled run. This is a
+      # Build-only run, so leaving it uncancellable is cheap.
+      - 'docker/ubuntu-ci/**'
+      - '.github/workflows/buildcache-seed.yml'
+      - '.github/scripts/buildcache_freshness.py'
+
+concurrency:
+  group: buildcache-seed
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CACHE_REPO: registry.blockcast.net/cache/frr-ci
+  # If the cache has not been rewritten inside this window, the next PR build
+  # will be cold and slow and someone must reseed. That is the decision this
+  # threshold informs. Sized from measurement: over the 49-day sample the
+  # median gap between successful cache writes was 25h, so 72h is ~3x the
+  # normal cadence -- loose enough not to fire on ordinary quiet weekends,
+  # tight enough that all four observed multi-day outages (192h, 215h, 222h,
+  # 442h) would have fired.
+  MAX_CACHE_AGE_HOURS: '72'
+
+jobs:
+  probe-before:
+    # Records the pre-seed push timestamps so the seeding run can prove the
+    # tags actually advanced, and warns if the cache had already gone stale --
+    # i.e. tells us this guard was load-bearing on this cycle.
+    if: github.repository == 'Blockcast/frr'
+    runs-on: default
+    name: Probe buildcache age (before)
+    timeout-minutes: 10
+    outputs:
+      baseline: ${{ steps.probe.outputs.baseline }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Read current buildcache push timestamps
+        id: probe
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/buildcache_freshness.py \
+            --tag amd64_u22-buildcache \
+            --tag amd64_u24-buildcache \
+            --tag amd64_u24_lttng-buildcache \
+            --max-age-hours "${MAX_CACHE_AGE_HOURS}" \
+            --json-out /tmp/buildcache-before.json \
+            --report-only
+          # Single-line JSON so it survives GITHUB_OUTPUT.
+          printf 'baseline=%s\n' "$(tr -d '\n ' < /tmp/buildcache-before.json)" \
+            >> "$GITHUB_OUTPUT"
+
+  seed:
+    needs: probe-before
+    runs-on: default
+    name: Seed ${{ matrix.cfg.name }}
+    # Cold-build headroom. A cold u22 build measured ~30 min; 90 leaves room
+    # for a slow apt mirror without a timeout becoming the reason the cache
+    # goes unwritten -- the same deadlock github-ci.yml's timeout comment
+    # already guards against.
+    timeout-minutes: 90
+    strategy:
+      # Never let one platform's failure stop the others from being seeded: a
+      # partially fresh cache still saves the other legs from building cold.
+      fail-fast: false
+      matrix:
+        # Must stay in lockstep with github-ci.yml's Build matrix. The cache is
+        # keyed on `platform`, which is the full build identity (distro +
+        # LTTng); a platform present there but missing here builds cold forever
+        # with nothing to say so.
+        cfg:
+        -  { rel: '22.04', name: 'Ubuntu 22.04 amd64', platform: 'amd64_u22' }
+        -  { rel: '24.04', name: 'Ubuntu 24.04 amd64', platform: 'amd64_u24' }
+        -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 LTTng', platform: 'amd64_u24_lttng', lttng: 'true' }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Ensure local MIB cache directory exists
+        run: mkdir -p docker/ubuntu-ci/mib-cache
+      - name: Restore cached MIB files
+        # Opportunistic: restore-only so this never fights github-ci.yml's
+        # Prepare-MIB-Cache for the cache entry. On a miss the Dockerfile's
+        # fetch_mib() falls back to fetching upstream, so a cold MIB cache
+        # slows this job but cannot fail it.
+        if: ${{ matrix.cfg.rel == '24.04' }}
+        continue-on-error: true
+        uses: actions/cache/restore@v5
+        with:
+          path: docker/ubuntu-ci/mib-cache
+          key: mib-cache-v1-ubuntu24
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: registry.blockcast.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Build and publish buildcache
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_SUMMARY: true
+        with:
+          context: .
+          file: docker/ubuntu-ci/Dockerfile
+          build-args: |
+            UBUNTU_VERSION=${{ matrix.cfg.rel }}
+            ENABLE_LTTNG=${{ matrix.cfg.lttng || 'false' }}
+            FRR_SOURCE_REV=${{ github.sha }}
+          # No image is needed from this run -- only the cache export. Skipping
+          # the tar keeps the job off the node's image filesystem, which is
+          # under eviction pressure.
+          outputs: type=cacheonly
+          cache-from: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.platform }}-buildcache
+          cache-to: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.platform }}-buildcache,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=3
+
+  verify:
+    needs: [probe-before, seed]
+    # Runs even when a seed leg failed, so the summary names exactly which
+    # platform's cache did not advance instead of leaving that to log
+    # archaeology.
+    if: ${{ !cancelled() }}
+    runs-on: default
+    name: Verify buildcache advanced
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Restore pre-seed timestamps
+        run: |
+          set -euo pipefail
+          printf '%s' '${{ needs.probe-before.outputs.baseline }}' \
+            > /tmp/buildcache-before.json
+          cat /tmp/buildcache-before.json
+      - name: Assert every tag's push timestamp advanced
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/buildcache_freshness.py \
+            --tag amd64_u22-buildcache \
+            --tag amd64_u24-buildcache \
+            --tag amd64_u24_lttng-buildcache \
+            --max-age-hours "${MAX_CACHE_AGE_HOURS}" \
+            --baseline /tmp/buildcache-before.json
+
+  freshness-gate:
+    needs: verify
+    # The standing signal, independent of whether this cycle seeded anything:
+    # is the cache within its freshness budget right now? This is what goes red
+    # when the seeding path has quietly stopped working. Kept as its own job so
+    # a red gate is legible in the run list without opening logs.
+    if: ${{ !cancelled() }}
+    runs-on: default
+    name: Buildcache freshness gate (${{ github.event_name }})
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Fail if any buildcache tag is older than the budget
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/buildcache_freshness.py \
+            --tag amd64_u22-buildcache \
+            --tag amd64_u24-buildcache \
+            --tag amd64_u24_lttng-buildcache \
+            --max-age-hours "${MAX_CACHE_AGE_HOURS}"
