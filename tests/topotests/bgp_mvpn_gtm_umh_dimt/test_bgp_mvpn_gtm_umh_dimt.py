@@ -83,6 +83,7 @@ EVENT_SOCK = "/tmp/bgp_mvpn_gtm_umh_dimt-r1-{}.sock".format(os.getpid())
 
 reader = None
 attested_install_umh = None
+rt_only_install = None
 
 
 def _ip4_to_int(addr):
@@ -388,15 +389,19 @@ def test_type7_rt_is_unaffected_by_umh_ec():
     Type-7 whose RT is byte-identical and derived from the RT lane alone
     (10.0.0.2), never from the DIMT endpoint (10.99.0.1). If this ever fails,
     the change has silently retargeted which PE imports the join."""
+    global rt_only_install
     tgen = get_topogen()
 
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
     _join(P2_SRC, P2_GRP)
-    # Drain p2's install so later tests read from a known point.
+    # Drain p2's install so later tests read from a known point. This is also
+    # the ONLY install p2 ever emits -- see test_rt_only_join_is_unchanged --
+    # so keep it for that test to assert the RT-lane attestation on.
     ev = reader.read_event_for(P2_SRC, P2_GRP)
     assert ev["event_type"] == "install", ev
+    rt_only_install = ev
 
     expected_rt = "RT:{}:0".format(RT_UMH)
 
@@ -422,10 +427,18 @@ def test_type7_rt_is_unaffected_by_umh_ec():
 
 
 def test_rt_only_join_is_unchanged():
-    """The control: a join with no 0x80 EC must attest exactly what it
+    """AC 2 control: a join with no 0x80 EC must attest exactly what it
     attested before this change -- the RT lane's value. The attestation lane
     falls back rather than overriding, so events that are correct today do
-    not move."""
+    not move.
+
+    Asserted on p2's `install` rather than by forcing a re-announce, because
+    an unchanged re-resolve emits NOTHING by design: bgp_mvpn_events.c:975-979
+    returns early when neither source_as nor umh moved ("redundant re-resolve:
+    same origin as last emitted"). That suppression is the guard that stops a
+    plain route refresh from minting a spurious billing-window split, so a
+    test that waited for a second event here would be asserting against a
+    deliberate contract-P4 invariant -- and would hang for its full timeout."""
     tgen = get_topogen()
 
     if tgen.routers_have_failure():
@@ -438,12 +451,12 @@ def test_rt_only_join_is_unchanged():
         r.get("routeType") == 7 and r.get("source") == P2_SRC for r in routes
     ), routes
 
-    # Re-emit the live joins and read p2's record back off the socket: its
-    # attested origin must still be the RT lane's PE.
-    tgen.gears["r1"].vtysh_cmd("clear bgp 10.0.0.2 soft out")
-    ev = reader.read_event_for(P2_SRC, P2_GRP)
+    assert rt_only_install is not None, "RT-only install was never captured"
+    ev = rt_only_install
     assert ev["upstream_peer"] == RT_UMH, ev
     assert ev["lc_umh_origin"] == _origin(RT_UMH), ev
+    # The 0x80 endpoint on the OTHER prefix must not have bled across.
+    assert ev["upstream_peer"] != DIMT_UMH, ev
 
 
 def test_gaining_an_origin_emits_origin_change():
