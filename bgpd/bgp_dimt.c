@@ -52,10 +52,14 @@ static struct route_table *dimt_sent[AFI_MAX];
  * communities. The IPv4 UMH rides the 8-byte ecommunity list (type 0x01,
  * Local Admin at byte 7); the IPv6 UMH rides the 20-byte ipv6_ecommunity list
  * (type 0x00, Local Admin at byte 19). Returns true and fills a family-tagged
- * umh/umh_type/preference on match. */
-static bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
-				   struct ipaddr *umh, uint8_t *umh_type,
-				   uint8_t *preference)
+ * umh/umh_type/preference on match.
+ *
+ * Exported (see bgp_dimt.h): bgp_mvpn.c's settlement-event attestation lane
+ * decodes 0x80 through this function rather than duplicating the layout.
+ */
+bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
+			    struct ipaddr *umh, uint8_t *umh_type,
+			    uint8_t *preference)
 {
 	const struct ecommunity *ecom;
 	bool is_v6 = (afi == AFI_IP6);
