@@ -28,6 +28,11 @@ on:
       - '.github/scripts/test_buildcache_freshness.py'
       - '.github/workflows/review-gate.yml'
       - '.github/workflows/review-gate-selftest.yml'
+      # The buildcache tests assert the seeder's build matrix stays in lockstep
+      # with github-ci.yml's. A drift PR may touch ONLY these two workflows, so
+      # without them here the assertion that guards them never runs.
+      - '.github/workflows/buildcache-seed.yml'
+      - '.github/workflows/github-ci.yml'
   push:
     branches:
       # Both fleet default branches: frr uses master, but this file is
@@ -40,6 +45,8 @@ on:
       - '.github/scripts/test_require_ally_review.py'
       - '.github/scripts/buildcache_freshness.py'
       - '.github/scripts/test_buildcache_freshness.py'
+      - '.github/workflows/buildcache-seed.yml'
+      - '.github/workflows/github-ci.yml'
 
 permissions:
   contents: read

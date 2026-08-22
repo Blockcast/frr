@@ -57,23 +57,36 @@ def parse_push_time(raw: str) -> dt.datetime:
     Harbor emits nanosecond precision (`...:05.123456789Z`), which
     `datetime.fromisoformat` rejects on Python < 3.11 and accepts only up to
     microseconds later.  Truncate the fractional part to 6 digits.
+
+    Raises ProbeError -- never ValueError/AttributeError -- on anything it
+    cannot parse.  This is load-bearing for the exit-code contract above: a
+    leaked exception terminates the process with status 1, which is
+    indistinguishable from EXIT_STALE, so corrupt Harbor data would be reported
+    as a stale cache and send someone to reseed a cache that is fine.
     """
-    text = raw.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    if "." in text:
-        head, _, tail = text.partition(".")
-        digits = ""
-        for ch in tail:
-            if ch.isdigit():
-                digits += ch
+    if not isinstance(raw, str):
+        raise ProbeError(
+            f"push_time is {type(raw).__name__}, expected string: {raw!r}"
+        )
+    try:
+        text = raw.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        if "." in text:
+            head, _, tail = text.partition(".")
+            digits = ""
+            for ch in tail:
+                if ch.isdigit():
+                    digits += ch
+                else:
+                    tail = tail[len(digits):]
+                    break
             else:
-                tail = tail[len(digits):]
-                break
-        else:
-            tail = ""
-        text = f"{head}.{digits[:6]:0<6}{tail}"
-    parsed = dt.datetime.fromisoformat(text)
+                tail = ""
+            text = f"{head}.{digits[:6]:0<6}{tail}"
+        parsed = dt.datetime.fromisoformat(text)
+    except (ValueError, TypeError) as exc:
+        raise ProbeError(f"unparseable push_time {raw!r}: {exc}") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed.astimezone(dt.timezone.utc)
@@ -193,7 +206,13 @@ def fetch_push_times(
         if not payload:
             observed[tag] = None
             continue
-        push_time = payload[0].get("push_time")
+        artifact = payload[0]
+        if not isinstance(artifact, dict):
+            raise ProbeError(
+                f"artifact record for {tag} is {type(artifact).__name__}, "
+                f"expected object: {artifact!r}"
+            )
+        push_time = artifact.get("push_time")
         if not push_time:
             raise ProbeError(f"artifact for {tag} has no push_time field")
         observed[tag] = parse_push_time(push_time)
@@ -243,12 +262,19 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with open(args.baseline, encoding="utf-8") as fh:
                 raw = json.load(fh)
+            if not isinstance(raw, dict):
+                raise ProbeError(
+                    f"baseline is {type(raw).__name__}, expected object"
+                )
             baseline = {
                 tag: parse_push_time(value)
                 for tag, value in raw.items()
                 if value is not None
             }
-        except (OSError, ValueError) as exc:
+        # ProbeError is included deliberately: parse_push_time raises it for a
+        # corrupt baseline value, and letting that escape would exit 1 --
+        # reporting "cache did not advance" for a seed that in fact succeeded.
+        except (OSError, ValueError, ProbeError) as exc:
             print(f"ERROR: cannot read baseline {args.baseline}: {exc}", file=sys.stderr)
             return EXIT_PROBE_ERROR
 

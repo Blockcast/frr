@@ -14,7 +14,10 @@ Run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 
 import datetime as dt
 import importlib.util
+import json
 import os
+import re
+import tempfile
 import unittest
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -183,6 +186,255 @@ class TestRenderSummary(unittest.TestCase):
     def test_missing_tag_renders_without_crashing(self):
         results = bcf.evaluate({"gone": None}, NOW, 72.0)
         self.assertIn("—", bcf.render_summary(results, 72.0))
+
+
+class TestCorruptHarborDataIsAProbeError(unittest.TestCase):
+    """Bad Harbor data must exit 2, never 1.
+
+    Exit 1 means "the cache is stale"; exit 2 means "the probe could not tell".
+    An uncaught ValueError/AttributeError terminates Python with status 1, so a
+    leaked exception here does not merely crash -- it actively *misdiagnoses*
+    corrupt Harbor data as a stale cache and sends someone to reseed a cache
+    that was never stale. Each case below leaked before this class existed.
+    """
+
+    def test_unparseable_timestamp_string(self):
+        with self.assertRaises(bcf.ProbeError):
+            bcf.parse_push_time("not-a-date")
+
+    def test_out_of_range_timestamp(self):
+        with self.assertRaises(bcf.ProbeError):
+            bcf.parse_push_time("2026-13-45T99:99:99Z")
+
+    def test_non_string_push_time(self):
+        # Harbor returning a numeric epoch instead of RFC3339.
+        for value in (1787412231, None, {"nested": 1}, ["list"]):
+            with self.subTest(value=value):
+                with self.assertRaises(bcf.ProbeError):
+                    bcf.parse_push_time(value)
+
+    def test_probe_error_message_names_the_offending_value(self):
+        # The operator reading CI logs needs to see *what* was malformed.
+        with self.assertRaises(bcf.ProbeError) as ctx:
+            bcf.parse_push_time("not-a-date")
+        self.assertIn("not-a-date", str(ctx.exception))
+
+    def test_empty_string_push_time(self):
+        with self.assertRaises(bcf.ProbeError):
+            bcf.parse_push_time("")
+
+    def test_valid_timestamps_still_parse(self):
+        # Guard against the hardening swallowing the happy path.
+        self.assertEqual(
+            bcf.parse_push_time("2026-08-22T11:00:00Z"),
+            dt.datetime(2026, 8, 22, 11, 0, 0, tzinfo=UTC),
+        )
+        self.assertEqual(
+            bcf.parse_push_time("2026-08-22T11:00:00.123456789Z"),
+            dt.datetime(2026, 8, 22, 11, 0, 0, 123456, tzinfo=UTC),
+        )
+
+
+class TestFetchPushTimesRejectsMalformedPayloads(unittest.TestCase):
+    """The artifacts response is attacker-adjacent data: validate its shape."""
+
+    def _fetch(self, payload):
+        original = bcf._request_json
+        bcf._request_json = lambda url, headers, timeout: payload
+        try:
+            return bcf.fetch_push_times(
+                "reg", "cache", "frr-ci", ["amd64_u22-buildcache"], "u", "p"
+            )
+        finally:
+            bcf._request_json = original
+
+    def test_artifact_record_that_is_not_an_object(self):
+        with self.assertRaises(bcf.ProbeError):
+            self._fetch(["just-a-string"])
+
+    def test_artifact_with_malformed_push_time(self):
+        with self.assertRaises(bcf.ProbeError):
+            self._fetch([{"push_time": "not-a-date"}])
+
+    def test_artifact_with_numeric_push_time(self):
+        with self.assertRaises(bcf.ProbeError):
+            self._fetch([{"push_time": 1787412231}])
+
+    def test_empty_payload_means_missing_not_error(self):
+        # A tag that genuinely does not exist is a *stale* verdict (exit 1),
+        # not a probe error -- this distinction is the whole point.
+        self.assertEqual(self._fetch([]), {"amd64_u22-buildcache": None})
+
+    def test_well_formed_payload_parses(self):
+        observed = self._fetch([{"push_time": "2026-08-21T06:41:00Z"}])
+        self.assertEqual(
+            observed["amd64_u22-buildcache"],
+            dt.datetime(2026, 8, 21, 6, 41, 0, tzinfo=UTC),
+        )
+
+
+class TestMainExitCodes(unittest.TestCase):
+    """End-to-end: the exit code is the contract the workflow branches on."""
+
+    def setUp(self):
+        self._original = bcf._request_json
+        os.environ["HARBOR_USERNAME"] = "u"
+        os.environ["HARBOR_PASSWORD"] = "p"
+
+    def tearDown(self):
+        bcf._request_json = self._original
+
+    def _main(self, payload, extra_argv=()):
+        bcf._request_json = lambda url, headers, timeout: payload
+        return bcf.main(["--tag", "amd64_u22-buildcache", *extra_argv])
+
+    def test_corrupt_push_time_exits_probe_error_not_stale(self):
+        self.assertEqual(
+            self._main([{"push_time": "not-a-date"}]), bcf.EXIT_PROBE_ERROR
+        )
+
+    def test_non_string_push_time_exits_probe_error_not_stale(self):
+        self.assertEqual(
+            self._main([{"push_time": 1787412231}]), bcf.EXIT_PROBE_ERROR
+        )
+
+    def test_non_object_artifact_exits_probe_error_not_stale(self):
+        self.assertEqual(self._main(["oops"]), bcf.EXIT_PROBE_ERROR)
+
+    def test_missing_tag_exits_stale_not_probe_error(self):
+        self.assertEqual(self._main([]), bcf.EXIT_STALE)
+
+    def test_corrupt_baseline_exits_probe_error_not_stale(self):
+        # Regression: the baseline path is the post-seed "did it advance"
+        # assertion. Leaking here reports a *successful* seed as a failure.
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as fh:
+            json.dump({"amd64_u22-buildcache": 1787412231}, fh)
+            path = fh.name
+        self.addCleanup(os.unlink, path)
+        self.assertEqual(
+            self._main(
+                [{"push_time": "2026-08-21T06:41:00Z"}], ("--baseline", path)
+            ),
+            bcf.EXIT_PROBE_ERROR,
+        )
+
+    def test_baseline_that_is_not_an_object_exits_probe_error(self):
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as fh:
+            json.dump(["not", "a", "dict"], fh)
+            path = fh.name
+        self.addCleanup(os.unlink, path)
+        self.assertEqual(
+            self._main(
+                [{"push_time": "2026-08-21T06:41:00Z"}], ("--baseline", path)
+            ),
+            bcf.EXIT_PROBE_ERROR,
+        )
+
+    def test_missing_credentials_exits_probe_error(self):
+        os.environ["HARBOR_USERNAME"] = ""
+        self.assertEqual(
+            self._main([{"push_time": "2026-08-21T06:41:00Z"}]),
+            bcf.EXIT_PROBE_ERROR,
+        )
+
+
+class TestSeederMatrixMatchesCI(unittest.TestCase):
+    """The seeder must build every platform github-ci.yml consumes.
+
+    `buildcache-seed.yml` is the *sole* writer of the buildcache; `github-ci.yml`
+    is read-only against it. So a platform added to the CI Build matrix but not
+    to the seeder matrix builds cold on every PR, forever, with nothing to say
+    so -- green checks, just slower. That is precisely the silent failure mode
+    this whole gate exists to close, reintroduced one matrix entry at a time.
+
+    Both files carry a comment saying the matrices must stay in lockstep. A
+    comment is not a check, so this asserts it. Stdlib only (no PyYAML in CI):
+    the matrix entries are single-line flow mappings, parsed by regex below.
+    """
+
+    WORKFLOWS = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "workflows"
+    )
+
+    # -  { rel: '22.04', name: 'Ubuntu 22.04 amd64', platform: 'amd64_u22' }
+    _ENTRY = re.compile(r"^\s*-\s*\{.*\}\s*$")
+    _FIELD = re.compile(r"(\w+)\s*:\s*'([^']*)'")
+
+    def _job_block(self, filename, job_id):
+        """Lines belonging to one top-level job (2-space indented key)."""
+        path = os.path.join(self.WORKFLOWS, filename)
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        start = None
+        for i, line in enumerate(lines):
+            if line == f"  {job_id}:":
+                start = i + 1
+                break
+        self.assertIsNotNone(start, f"job '{job_id}' not found in {filename}")
+        block = []
+        for line in lines[start:]:
+            # Next top-level job key ends the block.
+            if re.match(r"^  [A-Za-z0-9_-]+:\s*$", line):
+                break
+            block.append(line)
+        return block
+
+    def _matrix_platforms(self, filename, job_id):
+        """{platform: lttng_flag} for the job's matrix cfg entries."""
+        entries = {}
+        for line in self._job_block(filename, job_id):
+            if not self._ENTRY.match(line):
+                continue
+            fields = dict(self._FIELD.findall(line))
+            if "platform" not in fields:
+                continue
+            entries[fields["platform"]] = fields.get("lttng", "")
+        self.assertTrue(
+            entries, f"no matrix platforms parsed from {filename}:{job_id}"
+        )
+        return entries
+
+    def test_platform_sets_are_identical(self):
+        ci = self._matrix_platforms("github-ci.yml", "Build")
+        seed = self._matrix_platforms("buildcache-seed.yml", "seed")
+        unseeded = set(ci) - set(seed)
+        self.assertFalse(
+            unseeded,
+            f"platform(s) built by github-ci.yml but never seeded: "
+            f"{sorted(unseeded)} -- these will build cold on every PR with no "
+            f"signal. Add them to buildcache-seed.yml's matrix.",
+        )
+        orphaned = set(seed) - set(ci)
+        self.assertFalse(
+            orphaned,
+            f"platform(s) seeded but no longer built by github-ci.yml: "
+            f"{sorted(orphaned)} -- wasted runner time. Remove from the seeder.",
+        )
+
+    def test_lttng_flag_matches_per_platform(self):
+        # `platform` is the cache key, but LTTng changes the build content. A
+        # mismatch would seed a cache the CI build cannot use.
+        ci = self._matrix_platforms("github-ci.yml", "Build")
+        seed = self._matrix_platforms("buildcache-seed.yml", "seed")
+        for platform in sorted(set(ci) & set(seed)):
+            with self.subTest(platform=platform):
+                self.assertEqual(
+                    ci[platform],
+                    seed[platform],
+                    f"lttng flag differs for {platform}",
+                )
+
+    def test_parser_actually_found_the_expected_platforms(self):
+        # Guard against the regex silently matching nothing and the drift
+        # assertions above passing vacuously on two empty sets.
+        ci = self._matrix_platforms("github-ci.yml", "Build")
+        self.assertIn("amd64_u22", ci)
+        self.assertIn("amd64_u24", ci)
+        self.assertGreaterEqual(len(ci), 3)
 
 
 if __name__ == "__main__":
