@@ -80,7 +80,7 @@ def override_body(sha):
 
 
 def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=None,
-           resolved=None):
+           resolved=None, deferrals=None):
     return gate.decide(
         reviews=list(reviews),
         comments=list(comments),
@@ -91,6 +91,7 @@ def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=
         override_label=OVERRIDE,
         permission_trusted_logins=trusted or set(),
         permission_resolved_logins=resolved or set(),
+        deferrals=dict(deferrals or {}),
     )
 
 
@@ -2810,3 +2811,633 @@ class TestExhaustedRetryFailsClosed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- Per-finding deferral (BLO-22676, ported under BLO-27578) ---------------
+
+APP_AUTHOR = "app/allyblockcast"
+ADMIN = "repo-admin"
+
+# The real shape from trafficcontrol PR #1278: a top-level bullet carrying
+# Ally's own per-head metadata bracket, plus an indented continuation line.
+FINDING_A = (
+    "- **[origin:79eb590 important 1]** Unbounded `response.read()` in `client.go:88`.\n"
+    "  A hostile peer trickling bytes holds the worker past its deadline."
+)
+# The SAME finding as Ally re-renders it at a later head: the bracket has moved
+# on (new origin, a prior: chain) and the citation's line number has drifted.
+# Both are per-head metadata, so identity must survive them.
+FINDING_A_CARRIED = (
+    "- **[origin:5b91d52 important 1; prior:79eb590 important 1]** "
+    "Unbounded `response.read()` in `client.go:141`.\n"
+    "  A hostile peer trickling bytes holds the worker past its deadline."
+)
+FINDING_B = (
+    "- **[origin:5b91d52 important 1]** Missing authorization check in `admin.go:12`.\n"
+    "  Any authenticated caller can write another tenant's config."
+)
+
+
+def finding_body(head, findings, label="Important", critical=0, extra=""):
+    """An Ally consolidated body enumerating `findings` under `label`."""
+    counts = "### Critical Issues (%d)\n\n" % critical if label != "Critical" else ""
+    return attest(
+        head,
+        "%s### %s Issues (%d)\n\n%s\n%s"
+        % (counts, label, len(findings), "\n".join(findings), extra),
+    )
+
+
+def content_id(finding, label="important"):
+    """The id the gate itself computes -- never hand-written in a fixture.
+
+    A fixture carrying a hard-coded digest would pass while the production hint
+    printed something else, which is the one failure that silently makes every
+    real deferral miss.
+    """
+    return gate.finding_content_id(finding.split("\n"), label)
+
+
+def defer_comment(finding_or_id, issue="BLO-18949", login=ADMIN, at="2026-07-27T11:00:00Z",
+                  updated=None, label="important"):
+    token = (
+        finding_or_id
+        if str(finding_or_id).startswith("content:")
+        else content_id(finding_or_id, label)
+    )
+    return {
+        "body": "Accepted; booked to %s.\n\nreview-gate-defer: %s issue:%s\n"
+        % (issue, token, issue),
+        "user": {"login": login, "type": "User"},
+        "created_at": at,
+        "updated_at": updated or at,
+        "id": 4242,
+    }
+
+
+class TestDeferralThreeCases(unittest.TestCase):
+    """The three cases BLO-27578's verifying signal names, on the shape that
+    actually produced the loop: an agent-authored PR where a human's attested
+    APPROVED is the positive authority and Ally's residual finding outranks it.
+
+    This is `TestBLO25488PositiveAuthorityRestored.
+    test_outstanding_ally_blocking_finding_outranks_a_human_approval` -- correct,
+    and the exact 7-cycle never-green loop BLO-22676 was filed about once the
+    finding is one the maintainers have READ and ACCEPTED.
+    """
+
+    def _reviews(self, head, findings):
+        return [
+            review("COMMENTED", commit=head, body=finding_body(head, findings),
+                   at="2026-07-27T09:00:00Z"),
+            review("APPROVED", commit=head, login=HUMAN, utype="User", assoc="MEMBER",
+                   at="2026-07-27T12:00:00Z"),
+        ]
+
+    def test_a_outstanding_finding_with_no_deferral_fails(self):
+        state, _ = decide(
+            reviews=self._reviews(HEAD, [FINDING_A]), author=APP_AUTHOR, trusted={HUMAN}
+        )
+        self.assertEqual(state, "failure")
+
+    def test_b_same_finding_with_a_valid_deferral_passes(self):
+        state, desc = decide(
+            reviews=self._reviews(HEAD, [FINDING_A]),
+            author=APP_AUTHOR,
+            trusted={HUMAN},
+            deferrals={content_id(FINDING_A): "BLO-18949"},
+        )
+        self.assertEqual(state, "success")
+        # The audit trail lives in the description, so a green here structurally
+        # names the issue the residual risk was booked to.
+        self.assertIn("BLO-18949", desc)
+        self.assertIn("deferred", desc)
+        self.assertIn("not fixed", desc)
+        # And it must never claim the code was reviewed clean. The 08-15 bypass
+        # in the reference lineage wrote `success` with "Ally approved head
+        # 35c24be" over a live finding; the state was not the danger, the
+        # unmade attestation was.
+        self.assertNotIn("clean", desc.lower())
+        self.assertNotIn("approved", desc.lower())
+
+    def test_c_a_new_finding_at_a_later_head_re_reds_the_check(self):
+        """The old deferral is still present and still trusted; it simply does
+        not name this finding, because identity is the finding's CONTENT."""
+        state, _ = decide(
+            reviews=self._reviews(OTHER, [FINDING_B]),
+            head=OTHER,
+            author=APP_AUTHOR,
+            trusted={HUMAN},
+            deferrals={content_id(FINDING_A): "BLO-18949"},
+        )
+        self.assertEqual(state, "failure")
+
+    def test_the_same_finding_carried_forward_stays_covered(self):
+        """The counterpart the three cases do not state, and the whole reason
+        the mechanism is worth having: one ruling must survive Ally re-rendering
+        the SAME finding at a later head, with a new origin bracket, a prior:
+        chain, and a drifted line number. Without this the deferral evaporates
+        on every push and the maintainer reaches for the blanket override."""
+        self.assertEqual(content_id(FINDING_A), content_id(FINDING_A_CARRIED))
+        state, desc = decide(
+            reviews=self._reviews(OTHER, [FINDING_A_CARRIED]),
+            head=OTHER,
+            author=APP_AUTHOR,
+            trusted={HUMAN},
+            deferrals={content_id(FINDING_A): "BLO-18949"},
+        )
+        self.assertEqual(state, "success")
+        self.assertIn("BLO-18949", desc)
+
+    def test_a_new_finding_beside_a_deferred_one_still_fails(self):
+        """Partial coverage is not coverage."""
+        state, _ = decide(
+            reviews=self._reviews(HEAD, [FINDING_A, FINDING_B]),
+            author=APP_AUTHOR,
+            trusted={HUMAN},
+            deferrals={content_id(FINDING_A): "BLO-18949"},
+        )
+        self.assertEqual(state, "failure")
+
+
+class TestDeferralNeutralizesOnlyCountDerivedBlocking(unittest.TestCase):
+    """BLO-27578's explicit scope note: this Python lineage carries evaluators
+    the .mjs reference lacks, and a deferral must neutralize only the
+    COUNT-derived blocking, never the PROSE-derived kind."""
+
+    def _decide(self, extra, deferrals=True, findings=(FINDING_A,)):
+        body = finding_body(HEAD, list(findings), extra=extra)
+        return decide(
+            reviews=[
+                review("COMMENTED", body=body, at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login=HUMAN, utype="User", assoc="MEMBER",
+                       at="2026-07-27T12:00:00Z"),
+            ],
+            author=APP_AUTHOR,
+            trusted={HUMAN},
+            deferrals={content_id(FINDING_A): "BLO-18949"} if deferrals else None,
+        )
+
+    def test_surviving_action_required_prose_still_fails(self):
+        state, _ = self._decide("\nAction required: rotate the leaked key.\n")
+        self.assertEqual(state, "failure")
+
+    def test_explicit_changes_requested_verdict_still_fails(self):
+        state, _ = self._decide("\nAlly-Verdict: changes-requested\n")
+        self.assertEqual(state, "failure")
+
+    def test_recommended_action_request_changes_still_fails(self):
+        state, _ = self._decide("\n### Recommended Action\n\nRequest changes\n")
+        self.assertEqual(state, "failure")
+
+    def test_a_negated_all_clear_beside_full_coverage_still_passes(self):
+        """The control for the three above: with the prose scan finding nothing
+        affirmative, full coverage does reach success -- so the failures above
+        are the prose, not the deferral path being inert."""
+        state, _ = self._decide("\nNo action required elsewhere.\n")
+        self.assertEqual(state, "success")
+
+    def test_the_count_heading_itself_does_not_re_block_through_the_prose_scan(self):
+        """ACTION_REQUIRED_COMMENT_PATTERN carries `important issues? \\([1-9]\\d*\\)`
+        as its OWN alternative, a verbatim duplicate of the heading text. Without
+        strip_finding_count_headings a fully-deferred body would still fail
+        through that redundant path -- the count-derived blocking surviving the
+        deferral under a different name."""
+        state, _ = self._decide("")
+        self.assertEqual(state, "success")
+
+    def test_an_inline_count_disagreeing_with_the_heading_fails_closed(self):
+        """extract_issue_count reads the MAXIMUM across every occurrence while
+        enumeration binds to the anchored heading. When they disagree the
+        reconciliation must refuse rather than strip -- otherwise the strip
+        would blank a count the gate never enumerated."""
+        state, _ = self._decide("\nSee also Important Issues (5) in the recap.\n")
+        self.assertEqual(state, "failure")
+
+
+class TestDeferralEnumerationFailsClosed(unittest.TestCase):
+    """A deferral must never widen coverage past what the script can positively
+    enumerate. Every parse mismatch falls back to raw-count blocking."""
+
+    def _decide(self, body, deferrals):
+        return decide(
+            reviews=[
+                review("COMMENTED", body=body, at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login=HUMAN, utype="User", assoc="MEMBER",
+                       at="2026-07-27T12:00:00Z"),
+            ],
+            author=APP_AUTHOR,
+            trusted={HUMAN},
+            deferrals=deferrals,
+        )
+
+    def test_declared_count_disagreeing_with_bullet_count_fails(self):
+        body = attest(
+            HEAD,
+            "### Critical Issues (0)\n\n### Important Issues (2)\n\n%s\n" % FINDING_A,
+        )
+        state, _ = self._decide(body, {content_id(FINDING_A): "BLO-18949"})
+        self.assertEqual(state, "failure")
+
+    def test_a_recap_section_that_enumerates_bullets_is_ambiguous_and_fails(self):
+        """Ally bodies legitimately repeat these headings for a "Prior Findings
+        Dispositioned" recap. Selecting the first occurrence while
+        extract_issue_count takes the maximum let a maintainer defer the
+        ALREADY-DISPOSITIONED bullets and clear the section while a live finding
+        stood. Two bullet-bearing occurrences now fail closed."""
+        body = attest(
+            HEAD,
+            "### Critical Issues (0)\n\n"
+            "### Important Issues (1)\n\n%s\n\n"
+            "### Important Issues (1)\n\n%s\n" % (FINDING_B, FINDING_A),
+        )
+        state, _ = self._decide(body, {content_id(FINDING_A): "BLO-18949"})
+        self.assertEqual(state, "failure")
+
+    def test_a_zero_count_recap_heading_is_unaffected(self):
+        """The control: the REAL recap shape carries `(0)` with no bullets, so
+        the guard above must not red an ordinary body."""
+        body = attest(
+            HEAD,
+            "### Critical Issues (0)\n\n"
+            "### Important Issues (0)\n\n_None carried forward._\n\n"
+            "### Important Issues (1)\n\n%s\n" % FINDING_A,
+        )
+        state, _ = self._decide(body, {content_id(FINDING_A): "BLO-18949"})
+        self.assertEqual(state, "success")
+
+    def test_two_same_head_reports_that_disagree_make_the_severity_ambiguous(self):
+        body_a = finding_body(HEAD, [FINDING_A])
+        body_b = finding_body(HEAD, [FINDING_B])
+        state, _ = decide(
+            reviews=[
+                review("COMMENTED", body=body_a, at="2026-07-27T09:00:00Z"),
+                review("COMMENTED", body=body_b, at="2026-07-27T09:30:00Z"),
+                review("APPROVED", login=HUMAN, utype="User", assoc="MEMBER",
+                       at="2026-07-27T12:00:00Z"),
+            ],
+            author=APP_AUTHOR,
+            trusted={HUMAN},
+            deferrals={
+                content_id(FINDING_A): "BLO-18949",
+                content_id(FINDING_B): "BLO-18950",
+            },
+        )
+        self.assertEqual(state, "failure")
+
+    def test_severity_reclassification_re_reds(self):
+        """Identity is scoped by severity. A ruling granted while Ally classed a
+        finding Important must not silently silence it once reclassified
+        Critical: LLM severity is unstable run to run and an author can
+        influence it by moving code onto a more sensitive path."""
+        self.assertNotEqual(
+            content_id(FINDING_A, "important"), content_id(FINDING_A, "critical")
+        )
+        body = attest(
+            HEAD,
+            "### Important Issues (0)\n\n### Critical Issues (1)\n\n%s\n" % FINDING_A,
+        )
+        state, _ = self._decide(body, {content_id(FINDING_A, "important"): "BLO-18949"})
+        self.assertEqual(state, "failure")
+
+    def test_a_review_selected_on_commit_id_alone_cannot_reach_the_deferral_path(self):
+        """`commit_id` is GitHub-managed and Update branch can rewrite it after
+        the review was posted. Only the body's own `Reviewed head:` line is
+        trustworthy provenance for whether it is safe to clear THIS body's
+        findings on a live-head ruling."""
+        body = finding_body(OTHER, [FINDING_A])  # attests OTHER, selected for HEAD
+        state, _ = self._decide(body, {content_id(FINDING_A): "BLO-18949"})
+        self.assertEqual(state, "failure")
+
+
+class TestDeferralStatusRefusesToGoGreenUnaudited(unittest.TestCase):
+    """On this path the description IS the audit trail, so `success` must
+    structurally imply a named issue."""
+
+    def _reviews(self, findings=(FINDING_A,)):
+        return [
+            review("COMMENTED", body=finding_body(HEAD, list(findings)),
+                   at="2026-07-27T09:00:00Z"),
+            review("APPROVED", login=HUMAN, utype="User", assoc="MEMBER",
+                   at="2026-07-27T12:00:00Z"),
+        ]
+
+    def test_a_ruling_that_cannot_be_named_is_not_green(self):
+        """The counterfactual scan found the finding, but the map's ref cannot
+        be rendered inside GitHub's 140 characters. "Cannot be enumerated" and
+        "cannot be named in this status" are the same failure for this path, so
+        they get the same answer: pending, not a green attesting to a ruling it
+        cannot identify."""
+        long_refs = {
+            content_id(FINDING_A): "B" + "0" * 200 + "-1",
+        }
+        with mock.patch.object(gate, "deferral_success_description", return_value=None):
+            state, desc = decide(
+                reviews=self._reviews(), author=APP_AUTHOR, trusted={HUMAN},
+                deferrals=long_refs,
+            )
+        self.assertEqual(state, "pending")
+        self.assertIn("not green", desc)
+
+    def test_every_authored_deferral_description_fits_the_status_limit(self):
+        for count, refs in (
+            (1, ["BLO-18949"]),
+            (3, ["BLO-18949", "BLO-22676", "BLO-27578"]),
+            (12, ["BLO-%d" % (10000 + n) for n in range(9)]),
+            (40, ["BLO-%d" % (10000 + n) for n in range(40)]),
+        ):
+            desc = gate.deferral_success_description(HEAD, count, refs)
+            self.assertIsNotNone(desc)
+            self.assertLessEqual(len(desc), gate.STATUS_DESCRIPTION_LIMIT)
+
+    def test_the_overflow_tail_counts_issues_not_findings(self):
+        desc = gate.deferral_success_description(
+            HEAD, 12, ["BLO-%d" % (10000 + n) for n in range(9)]
+        )
+        self.assertIn("more issue", desc)
+
+    def test_a_clean_commented_deferred_head_is_not_described_as_clean(self):
+        """The comment-channel outcome: coverage folds a would-be failure into
+        the clean-commented placeholder, which returns BEFORE the success
+        capping. Without its own branch this posted "no blocking findings" with
+        a real outstanding finding on the head."""
+        body = finding_body(
+            HEAD, [FINDING_A], extra="\n### Recommended Action\n\nMerge.\n"
+        )
+        state, desc = decide(
+            reviews=[review("COMMENTED", body=body)],
+            deferrals={content_id(FINDING_A): "BLO-18949"},
+        )
+        self.assertEqual(state, "pending")
+        self.assertNotIn("no blocking findings", desc)
+        self.assertIn("deferred", desc)
+
+    def test_a_deferral_is_not_a_machine_readable_all_clear(self):
+        """AUTHORIZATION INVERSION (review round 5) must survive the deferral.
+
+        A clean COMMENTED review authorizes only on an explicit pass verdict or
+        BOTH zero-count sections -- and `has_zero_counts` deliberately reads the
+        RAW body, never the count-stripped one. A fully-deferred finding set is
+        "we accepted this risk", not "Ally found nothing": synthesising an
+        all-clear out of the strip would be exactly the 08-15 failure shape in
+        the reference lineage, a state paired with an attestation nobody made.
+
+        So a deferred body with no pass verdict yields NO positive signal at
+        all, and the gate holds at the no-signal pending. Fail-closed.
+        """
+        state, desc = decide(
+            reviews=[review("COMMENTED", body=finding_body(HEAD, [FINDING_A]))],
+            deferrals={content_id(FINDING_A): "BLO-18949"},
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("Waiting for Ally review", desc)
+
+    def test_a_genuinely_clean_head_keeps_its_original_description(self):
+        state, desc = decide(
+            reviews=[review("COMMENTED", body=CLEAN)],
+            deferrals={content_id(FINDING_A): "BLO-18949"},
+        )
+        self.assertEqual(state, "pending")
+        self.assertIn("no blocking findings", desc)
+
+
+class TestDeferralAuthorization(unittest.TestCase):
+    """trusted_deferrals is where a shape-valid line becomes an authorization.
+    Each condition below independently drops the record."""
+
+    def _visibility(self, findings=(FINDING_A,), at="2026-07-27T10:00:00Z"):
+        return gate.finding_id_visibility(
+            [review("COMMENTED", body=finding_body(HEAD, list(findings)), at=at)], [], ALLY
+        )
+
+    def _trusted(self, comments, permissions=None, author=APP_AUTHOR, visibility=None):
+        return gate.trusted_deferrals(
+            comments,
+            ally_logins=ALLY,
+            collaborator_permissions=permissions if permissions is not None else {ADMIN: "admin"},
+            finding_visibility=self._visibility() if visibility is None else visibility,
+            pr_author_login=author,
+        )
+
+    def test_an_admin_non_author_deferral_is_accepted(self):
+        got = self._trusted([defer_comment(FINDING_A)])
+        self.assertEqual(got, {content_id(FINDING_A): "BLO-18949"})
+
+    def test_write_permission_is_not_enough(self):
+        """One tier above the write/maintain/admin every other trust decision in
+        this file accepts: deferral is the only lever that converts an
+        outstanding finding into a green REQUIRED status."""
+        for tier in ("write", "maintain", "triage", "read"):
+            with self.subTest(tier=tier):
+                self.assertEqual(self._trusted([defer_comment(FINDING_A)], {ADMIN: tier}), {})
+
+    def test_a_non_collaborator_is_refused(self):
+        self.assertEqual(self._trusted([defer_comment(FINDING_A)], {}), {})
+
+    def test_the_refusal_names_the_tier_held_and_required(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self._trusted([defer_comment(FINDING_A)], {ADMIN: "write"})
+        out = buf.getvalue()
+        self.assertIn("REFUSED", out)
+        self.assertIn("admin", out)
+        self.assertIn("write", out)
+        self.assertIn("stays outstanding", out)
+
+    def test_the_pr_author_may_never_defer_findings_against_their_own_pr(self):
+        """Deferral is the only lever here that moves red toward green, so it is
+        the one that most needs the separation of duties. Holding admin makes
+        someone the accountable owner of the repo; it does not make them
+        independent of their own change."""
+        self.assertEqual(
+            self._trusted(
+                [defer_comment(FINDING_A, login=ADMIN)], {ADMIN: "admin"}, author=ADMIN
+            ),
+            {},
+        )
+
+    def test_no_ally_seat_may_author_a_deferral_across_spelling_variants(self):
+        for seat in ("allyblockcast", "allyblockcast[bot]", "app/allyblockcast",
+                     "AllyBlockcast", "ALLYBLOCKCAST[BOT]"):
+            with self.subTest(seat=seat):
+                self.assertEqual(
+                    self._trusted(
+                        [defer_comment(FINDING_A, login=seat)], {seat: "admin"}
+                    ),
+                    {},
+                    "%s authored its own deferral" % seat,
+                )
+
+    def test_an_edited_comment_cannot_authorize(self):
+        """GitHub's write role can edit anyone else's comments, and REST exposes
+        only the ORIGINAL author -- edit provenance is GraphQL-only. So a PR
+        author holding write could append a defer line to an innocent
+        maintainer's comment and the gate would attribute the ruling to them,
+        walking around the self-deferral prohibition."""
+        self.assertEqual(
+            self._trusted(
+                [defer_comment(FINDING_A, at="2026-07-27T11:00:00Z",
+                               updated="2026-07-27T13:00:00Z")]
+            ),
+            {},
+        )
+
+    def test_a_comment_with_no_edit_timestamp_cannot_authorize(self):
+        row = defer_comment(FINDING_A)
+        del row["updated_at"]
+        self.assertEqual(self._trusted([row]), {})
+
+    def test_a_deferral_predating_the_finding_cannot_pre_clear_it(self):
+        """Authorization to defer is not authorization to defer something that
+        does not exist yet. Without the visibility anchor a trusted admin could
+        post defer lines for guessable boilerplate findings BEFORE Ally reviewed
+        and pre-clear whatever it then found -- a blanket escape for FUTURE
+        findings, which this feature's acceptance criteria forbid."""
+        self.assertEqual(
+            self._trusted([defer_comment(FINDING_A, at="2026-07-27T08:00:00Z")]), {}
+        )
+
+    def test_a_deferral_in_the_same_second_as_the_artifact_is_accepted(self):
+        """GitHub timestamps are second-granularity, so same-second is far more
+        likely a prompt response than an attacker who guessed the exact second
+        Ally would publish."""
+        self.assertNotEqual(
+            self._trusted([defer_comment(FINDING_A, at="2026-07-27T10:00:00Z")]), {}
+        )
+
+    def test_a_finding_no_artifact_ever_enumerated_cannot_be_deferred(self):
+        self.assertEqual(self._trusted([defer_comment(FINDING_B)]), {})
+
+    def test_first_writer_wins_when_two_admins_defer_to_different_issues(self):
+        """The status names the earlier ruling rather than silently re-pointing
+        the audit trail at whichever comment sorted last."""
+        got = self._trusted(
+            [
+                defer_comment(FINDING_A, issue="BLO-11111", at="2026-07-27T11:00:00Z"),
+                defer_comment(FINDING_A, issue="BLO-22222", at="2026-07-27T12:00:00Z"),
+            ]
+        )
+        self.assertEqual(got, {content_id(FINDING_A): "BLO-11111"})
+
+
+class TestDeferralLineShape(unittest.TestCase):
+    """What does and does not parse as a deferral at all."""
+
+    def test_a_positional_token_does_not_parse(self):
+        """A positional id names a SLOT, not a finding: a brand-new unrelated
+        finding landing at the same severity and ordinal, at a head the author
+        controls, was covered by the old deferral every time. Three hardening
+        rounds in the reference lineage failed to fix the head half before the
+        slot itself was retired, so this lineage never accepted one."""
+        for token in (
+            "origin:79eb590:important:1",
+            "origin:%s:important:1" % HEAD,
+            "prior:79eb590 important 1",
+        ):
+            with self.subTest(token=token):
+                body = "review-gate-defer: %s issue:BLO-18949\n" % token
+                self.assertEqual(
+                    gate.deferral_records_from_comments(
+                        [{"body": body, "user": {"login": ADMIN},
+                          "created_at": "2026-07-27T11:00:00Z",
+                          "updated_at": "2026-07-27T11:00:00Z"}]
+                    ),
+                    [],
+                )
+
+    def test_an_opaque_issue_ref_does_not_parse(self):
+        for ref in ("not-a-real-ticket", "https://untracked.example", "1234", ""):
+            with self.subTest(ref=ref):
+                body = "review-gate-defer: %s issue:%s\n" % (content_id(FINDING_A), ref)
+                self.assertEqual(
+                    gate.deferral_records_from_comments(
+                        [{"body": body, "user": {"login": ADMIN},
+                          "created_at": "2026-07-27T11:00:00Z",
+                          "updated_at": "2026-07-27T11:00:00Z"}]
+                    ),
+                    [],
+                )
+
+    def test_a_lowercase_issue_ref_is_refused_LOUDLY(self):
+        """A malformed finding id is almost always a copy-paste of the wrong
+        thing, but a malformed issue ref is a maintainer who wrote a real
+        ruling. Dropping that silently is what pushes them to the blanket
+        override this per-finding lever exists to avoid."""
+        body = "review-gate-defer: %s issue:blo-18949\n" % content_id(FINDING_A)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = gate.deferral_records_from_comments(
+                [{"body": body, "user": {"login": ADMIN},
+                  "created_at": "2026-07-27T11:00:00Z",
+                  "updated_at": "2026-07-27T11:00:00Z"}]
+            )
+        self.assertEqual(got, [])
+        self.assertIn("REFUSED", buf.getvalue())
+        self.assertIn("UPPERCASE", buf.getvalue())
+
+    def test_the_line_must_stand_alone(self):
+        for body in (
+            "prose review-gate-defer: %s issue:BLO-1\n" % content_id(FINDING_A),
+            "review-gate-defer: %s issue:BLO-1 and more\n" % content_id(FINDING_A),
+            "`review-gate-defer: %s issue:BLO-1`\n" % content_id(FINDING_A),
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    gate.deferral_records_from_comments(
+                        [{"body": body, "user": {"login": ADMIN},
+                          "created_at": "2026-07-27T11:00:00Z",
+                          "updated_at": "2026-07-27T11:00:00Z"}]
+                    ),
+                    [],
+                )
+
+    def test_a_finding_with_no_hashable_content_can_never_be_deferred(self):
+        self.assertIsNone(gate.finding_content_id(["-   "], "important"))
+        self.assertIsNone(gate.finding_content_id([""], "important"))
+
+
+class TestDeferralHints(unittest.TestCase):
+    """The gate computes the digest and prints it precisely so that nobody ever
+    hand-computes one."""
+
+    def test_the_hint_names_the_id_the_matcher_will_accept(self):
+        """If the hint drifted from the enumerated id, every deferral a
+        maintainer copy-pasted would silently miss."""
+        hints = gate.outstanding_finding_hints(
+            [review("COMMENTED", body=finding_body(HEAD, [FINDING_A]))], [], HEAD, ALLY, {}
+        )
+        self.assertEqual([h["content_id"] for h in hints], [content_id(FINDING_A)])
+
+    def test_already_deferred_findings_are_omitted(self):
+        hints = gate.outstanding_finding_hints(
+            [review("COMMENTED", body=finding_body(HEAD, [FINDING_A, FINDING_B]))],
+            [], HEAD, ALLY, {content_id(FINDING_A): "BLO-18949"},
+        )
+        self.assertEqual([h["content_id"] for h in hints], [content_id(FINDING_B)])
+
+    def test_load_bearing_deferrals_names_only_suppressing_rulings(self):
+        count, refs = gate.load_bearing_deferrals(
+            [review("COMMENTED", body=finding_body(HEAD, [FINDING_A]))],
+            [], HEAD, ALLY,
+            {content_id(FINDING_A): "BLO-18949", content_id(FINDING_B): "BLO-99999"},
+        )
+        self.assertEqual((count, refs), (1, ["BLO-18949"]))
+
+
+class TestParseListFailsClosed(unittest.TestCase):
+    """An all-separator operator value parses to [] and must fall back.
+
+    Fail-OPEN, not merely wrong: an empty ally-login set makes every withholding
+    check in trusted_deferrals return False, and the `allyblockcast` seat -- the
+    identity that RAISED the findings -- becomes eligible to author deferrals
+    against them. A workflow composing this from two empty expressions yields
+    exactly `,`.
+    """
+
+    def test_an_all_separator_value_falls_back(self):
+        for raw in ("", ",", " , ", ",,", None):
+            with self.subTest(raw=raw):
+                self.assertEqual(gate.parse_list(raw, DEFAULT := ["a", "b"]), DEFAULT)
+
+    def test_a_real_value_is_still_honoured(self):
+        self.assertEqual(gate.parse_list("x, y ,", ["a"]), ["x", "y"])
