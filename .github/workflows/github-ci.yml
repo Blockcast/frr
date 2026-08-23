@@ -551,11 +551,18 @@ jobs:
           cap="${TOPOTEST_JOB_CAP_MIN}"
 
           # Keep the mirrored cap honest against the real `timeout-minutes`.
-          # Advisory only: a formatting change to the workflow must not be able
-          # to fail the topotest lane.
-          configured=$(awk '/^  Test:/{f=1} f && /^    timeout-minutes:/{print $2; exit}' \
-                         .github/workflows/github-ci.yml 2>/dev/null || true)
-          if [ -n "${configured}" ] && [ "${configured}" != "${cap}" ]; then
+          # Scoped to the `Test:` job's own block: latch on the job key, and
+          # bail at the next key at that indent so a later job's cap can never
+          # be read as this one's.  Advisory only -- a formatting change to the
+          # workflow must not be able to fail the topotest lane.
+          configured=$(awk '
+            /^  Test:$/       { f=1; next }
+            f && /^  [^ #]/   { exit }
+            f && /^    timeout-minutes:/ { print $2; exit }
+          ' .github/workflows/github-ci.yml 2>/dev/null || true)
+          if [ -z "${configured}" ]; then
+            echo "::warning title=BLO-29817 cap mirror uncheckable::could not read timeout-minutes out of the Test job; headroom below assumes TOPOTEST_JOB_CAP_MIN=${cap}"
+          elif [ "${configured}" != "${cap}" ]; then
             echo "::error title=BLO-29817 cap mirror drift::TOPOTEST_JOB_CAP_MIN=${cap} but timeout-minutes=${configured}; headroom figures below are unreliable until they match"
             cap="${configured}"
           fi
@@ -567,8 +574,10 @@ jobs:
           elapsed=$(( ( $(date +%s) - TOPOTEST_LANE_START_EPOCH ) / 60 ))
           headroom=$(( cap - elapsed ))
 
-          # Within this margin of the cap, a `cancelled` is the cap firing
-          # rather than anything a human or the concurrency group did.
+          # How close to the cap a *cancelled* job must land before the cap --
+          # rather than a human or the concurrency group -- is the explanation.
+          # The three observed kills overshot by 1.0/1.0/2.2 min, so 5 covers
+          # them with margin; it is not applied to jobs that were not cancelled.
           near=5
 
           {
@@ -584,7 +593,21 @@ jobs:
             echo
           } >> "${summary}"
 
-          if [ "${headroom}" -le "${near}" ]; then
+          # Cancellation is the necessary condition, headroom only the
+          # discriminator.  A cap kill and an external cancel are BOTH stamped
+          # `cancelled` by GitHub and are told apart by how close to the cap
+          # they landed -- but a job that reached a conclusion of its own was by
+          # definition not killed, however little headroom it had left.  Gating
+          # on JOB_STATUS first is what stops a merely-slow *successful* leg
+          # (one landing inside `near` on its own steam -- 176/180 min has
+          # already happened once) from being reported as a timeout kill.
+          if [ "${JOB_STATUS}" = "cancelled" ]; then
+            if [ "${headroom}" -gt "${near}" ]; then
+              # Far from the cap, so this really was external.
+              echo "Cancelled externally (human or \`cancel-in-progress\`) at ${elapsed} min, ${headroom} min clear of the ${cap}-minute cap — **not** a timeout." >> "${summary}"
+              echo "::notice title=External cancel::Cancelled at ${elapsed}/${cap} min with ${headroom} min of headroom — not a timeout."
+              exit 0
+            fi
             case "${SUITE_CONCLUSION}" in
               success|failure)
                 # The false-cancel case this ticket exists for: the tests
@@ -604,15 +627,13 @@ jobs:
             exit 0
           fi
 
-          if [ "${JOB_STATUS}" = "cancelled" ]; then
-            # Far from the cap, so this really was external.
-            echo "Cancelled externally (human or \`cancel-in-progress\`) at ${elapsed} min, ${headroom} min clear of the ${cap}-minute cap — **not** a timeout." >> "${summary}"
-            echo "::notice title=External cancel::Cancelled at ${elapsed}/${cap} min with ${headroom} min of headroom — not a timeout."
-            exit 0
-          fi
-
-          # Healthy run: leave the headroom on the record so the cap can be
-          # re-derived from ordinary runs instead of only from failures.
-          if [ "${headroom}" -le 20 ]; then
+          # Reached its own conclusion.  Leave the headroom on the record so the
+          # cap can be re-derived from ordinary runs instead of only from
+          # failures -- and shout when a leg only just cleared the cap, because
+          # that is the signal that the derivation is going stale.
+          if [ "${headroom}" -le "${near}" ]; then
+            echo "**:warning: Finished \`${JOB_STATUS}\` with only ${headroom} min to spare** — this leg came within ${near} min of the ${cap}-minute cap without being killed. Not a timeout, but the next one may be. Re-derive the cap (BLO-29817)." >> "${summary}"
+            echo "::warning title=Topotest lane nearly hit the cap::Finished ${JOB_STATUS} at ${elapsed}/${cap} min — ${headroom} min spare. NOT a timeout kill, but re-derive the cap (BLO-29817)."
+          elif [ "${headroom}" -le 20 ]; then
             echo "::warning title=Low topotest headroom::Finished at ${elapsed}/${cap} min — only ${headroom} min spare. Re-check the cap derivation (BLO-29817)."
           fi
