@@ -32,6 +32,7 @@
 #include "bgpd/bgp_mvpn.h"
 #include "bgpd/bgp_mvpn_events.h"
 #include "bgpd/bgp_zebra.h"
+#include "bgpd/bgp_dimt.h"
 
 /* Bit-length key covering the whole mvpn_addr (route_type, C-S, C-G). Padding
  * inside the struct is memset-zeroed on build, so the radix key is stable.
@@ -1208,6 +1209,61 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 }
 
 /*
+ * Attestation-only UMH resolver: the DIMT Upstream Multicast Hop carried by
+ * ECOMMUNITY_UMH (0x80) on the selected source route, IPv4 only.
+ *
+ * This is deliberately NOT folded into bgp_mvpn_resolve_from_ecommunity(),
+ * whose value becomes the RFC 7716 upstream-node-identifying Route Target via
+ * bgp_mvpn_attach_ip_rt() and therefore decides which PE imports the
+ * C-multicast join. 0x0b names an MVPN PE identity; 0x80 names a
+ * PIM-Light/AMT-relay tunnel endpoint (bgp_dimt.c). They are different objects
+ * and in our own topotest fixture they hold different addresses, so feeding
+ * 0x80 to the RT would retarget the join. The two lanes stay separate: the RT
+ * lane is untouched, and only the settlement event's attested origin moves.
+ *
+ * The contrast with bgp_mvpn_resolve_from_lcommunity(), which DOES override the
+ * RT, is not a precedent for sharing: that large community re-encodes the same
+ * object (its data2 is "the upstream PE's IPv4 address"), so overriding keeps
+ * the RT naming the same thing. 0x80 does not.
+ *
+ * Selection differs too: 0x80 is chosen by highest la_pref (a preference the
+ * DIMT encoding defines), while the RT lane's ecommunity_lookup() is a
+ * first-match with no preference notion -- another reason one function cannot
+ * serve both.
+ *
+ * IPv4 only, per the BLO-29578 Q4 ruling: SessionLease.lc_umh_origin is
+ * "<sourceAS>:1:<UMH-u32>", a u32, so a 16-byte UMH has no representation in
+ * the settlement contract. IPv6 attestation is tracked separately (BLO-29651).
+ * AFI_IP here selects the 8-byte EC list, independent of the C-S family -- a v6
+ * C-S route may still carry an IPv4 UMH.
+ *
+ * *attested is overwritten only when a valid tuple is present; otherwise it is
+ * left untouched, so the caller's RT-lane value stands as the fallback and
+ * events that are correct today do not change.
+ */
+static void bgp_mvpn_resolve_attested_umh(struct bgp_path_info *pi, struct in_addr *attested)
+{
+	struct ipaddr umh = {};
+	uint8_t umh_type;
+	uint8_t preference;
+
+	if (!bgp_dimt_umh_from_path(pi, AFI_IP, &umh, &umh_type, &preference))
+		return;
+
+	/* AFI_IP always tags v4; reject anything else rather than trusting a
+	 * future change to that contract to keep a 16-byte value out of a u32. */
+	if (!IS_IPADDR_V4(&umh))
+		return;
+
+	if (BGP_DEBUG(zebra, ZEBRA) && attested->s_addr != INADDR_ANY &&
+	    attested->s_addr != umh.ipaddr_v4.s_addr)
+		zlog_debug("MVPN UMH attestation (0x80 %pI4, type %u pref %u) disagrees with the RFC 7716 RT lane (%pI4); RT unchanged, event reports the attested origin",
+			   &umh.ipaddr_v4, umh_type, preference, attested);
+
+	*attested = umh.ipaddr_v4;
+}
+
+/*
  * Resolve the RFC 6514 Section 5 communities (Source AS, upstream PE) for a
  * pimd-driven Type-7 from the unicast route toward C-S, in one longest-match
  * lookup, reading the selected (best) path only.
@@ -1224,14 +1280,28 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
  * With "bgp mvpn umh-large-community" configured the UMH large community is
  * tried first; the extended communities are the fallback whenever no valid
  * tuple is present (and the only encoding when the knob is unset).
+ *
+ * *attested (optional) receives the settlement attestation lane's UMH off that
+ * same selected path -- the DIMT 0x80 EC when present, otherwise whatever the
+ * RT lane resolved. Taking it from the same path preserves the one-path
+ * invariant above. Pass NULL when only the RT lane is wanted.
  */
-static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipaddr *src,
-					       uint32_t *source_as, struct in_addr *upstream)
+/*
+ * The selected (best) BGP path of the unicast route toward C-S, by longest
+ * match. On a hit the returned dest is LOCKED and the caller must
+ * bgp_dest_unlock_node() it; on a miss *dest_out is NULL and there is nothing
+ * to unlock.
+ */
+static struct bgp_path_info *bgp_mvpn_source_route_best_path(struct bgp *bgp,
+							     const struct ipaddr *src,
+							     struct bgp_dest **dest_out)
 {
 	struct prefix psrc = {};
 	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
+
+	*dest_out = NULL;
 
 	if (IS_IPADDR_V6(src)) {
 		psrc.family = AF_INET6;
@@ -1245,13 +1315,46 @@ static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipa
 
 	dest = bgp_node_match(bgp->rib[afi][SAFI_UNICAST], &psrc);
 	if (!dest)
-		return;
+		return NULL;
+
+	*dest_out = dest;
 
 	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
 		if (CHECK_FLAG(pi->flags, BGP_PATH_SELECTED))
 			break;
 
-	if (pi && pi->type == ZEBRA_ROUTE_BGP) {
+	return (pi && pi->type == ZEBRA_ROUTE_BGP) ? pi : NULL;
+}
+
+/*
+ * Overwrite *attested with the DIMT 0x80 UMH from the unicast route toward
+ * C-S, if that route's selected path carries one.
+ *
+ * *attested is NEVER cleared: when no 0x80 tuple is present the caller's value
+ * stands untouched. Each caller therefore owns its own fallback -- the join
+ * origination path seeds the RT-lane value, the re-emit path seeds the
+ * installed Type-7's RT -- and neither can silently acquire the other's.
+ */
+static void bgp_mvpn_attest_umh_from_source_route(struct bgp *bgp, const struct ipaddr *src,
+						  struct in_addr *attested)
+{
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi = bgp_mvpn_source_route_best_path(bgp, src, &dest);
+
+	if (pi)
+		bgp_mvpn_resolve_attested_umh(pi, attested);
+
+	if (dest)
+		bgp_dest_unlock_node(dest);
+}
+
+static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipaddr *src,
+					       uint32_t *source_as, struct in_addr *upstream)
+{
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi = bgp_mvpn_source_route_best_path(bgp, src, &dest);
+
+	if (pi) {
 		uint32_t ec_as = 0;
 		struct in_addr ec_umh = { .s_addr = INADDR_ANY };
 
@@ -1269,7 +1372,8 @@ static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipa
 		}
 	}
 
-	bgp_dest_unlock_node(dest);
+	if (dest)
+		bgp_dest_unlock_node(dest);
 }
 
 /*
@@ -1768,6 +1872,10 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 	struct attr attr;
 	uint32_t source_as = 0;
 	struct in_addr umh = { .s_addr = INADDR_ANY };
+	/* Settlement attestation lane. Assigned from the RT lane's final value
+	 * below, then moved only by a DIMT 0x80 EC; deliberately kept out of the
+	 * RT computation. See bgp_mvpn_resolve_attested_umh(). */
+	struct in_addr attested_umh = { .s_addr = INADDR_ANY };
 
 	if (negate) {
 		/* Withdraw removes by (C-S, C-G) ignoring the Source AS.  It is
@@ -1826,12 +1934,21 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 		zlog_debug("MVPN Type-7 (%pIA, %pIA): no upstream PE resolved; originating without upstream RT",
 			   src, grp);
 
+	/* The attestation lane starts from the RT lane's final value -- including
+	 * the Source Active next-hop arm above and the "no source route at all"
+	 * case -- and only a 0x80 EC moves it. An event that carries an origin
+	 * today therefore carries the same one after this change; only a
+	 * DIMT-steered join sees a different value, which is the defect being
+	 * fixed. */
+	attested_umh = umh;
+	bgp_mvpn_attest_umh_from_source_route(bgp, src, &attested_umh);
+
 	bgp_mvpn_route_install(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p), &p, &attr,
 			       BGP_ROUTE_STATIC);
 	bgp_mvpn_selective_join_set(bgp, src, grp, false);
 	/* Settlement consumers must never observe an install/origin change before
 	 * the corresponding Type-7 and selective-route RIB mutations are visible. */
-	bgp_mvpn_event_join_resolved(bgp, src, grp, source_as, umh);
+	bgp_mvpn_event_join_resolved(bgp, src, grp, source_as, attested_umh);
 
 	bgp_attr_flush(&attr);
 	aspath_unintern(&attr.aspath);
@@ -1854,6 +1971,7 @@ void bgp_mvpn_reemit_local_joins(struct bgp *bgp)
 				(const struct prefix_mvpn *)bgp_dest_get_prefix(dest);
 			struct bgp_path_info *pi;
 			struct in_addr umh = { .s_addr = INADDR_ANY };
+			struct in_addr attested_umh = { .s_addr = INADDR_ANY };
 			uint32_t ignored_source_as = 0;
 
 			if (p->family != AF_MVPN ||
@@ -1871,8 +1989,21 @@ void bgp_mvpn_reemit_local_joins(struct bgp *bgp)
 			/* The installed Type-7's upstream-node RT is the event's UMH.
 			 * Source AS comes from the NLRI key, not from an optional EC. */
 			bgp_mvpn_resolve_from_ecommunity(pi, &ignored_source_as, &umh);
+
+			/* Attestation lane: bgp_mvpn_attach_ip_rt() replaced the
+			 * Type-7's entire EC set with the RT, so the 0x80 EC is
+			 * not on THIS path -- it lives on the unicast route
+			 * toward C-S. Re-resolve from there so a re-emit reports
+			 * the same attested origin the original install did,
+			 * rather than silently downgrading to the RT. Seeded
+			 * with the installed Type-7's own RT, so a source route
+			 * that is gone or carries no 0x80 keeps today's value. */
+			attested_umh = umh;
+			bgp_mvpn_attest_umh_from_source_route(bgp, &p->prefix.src,
+							      &attested_umh);
+
 			bgp_mvpn_event_join_resolved(bgp, &p->prefix.src, &p->prefix.grp,
-						     p->prefix.source_as, umh);
+						     p->prefix.source_as, attested_umh);
 		}
 	}
 }
