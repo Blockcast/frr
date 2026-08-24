@@ -52,6 +52,9 @@
 #include "vrf.h"
 #include "libfrr.h"
 #include "json.h"
+/* enum zapi_mvpn_sg_forwarding / zapi_mvpn_sg_fwd_reason: the readiness state
+ * and cause that the forwarding_* events report. */
+#include "zclient.h"
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_table.h"
@@ -98,6 +101,21 @@ struct bgp_mvpn_event_join {
 	bool installed;
 	uint32_t last_source_as;
 	struct in_addr last_umh;
+	/*
+	 * Whether a "forwarding_ready" has been emitted for the CURRENT
+	 * route-state interval, i.e. the open readiness interval.
+	 *
+	 * This is the exactly-once latch for both edges: it gates
+	 * "forwarding_lost" (D3 "Failed": never emit one for a path that never
+	 * reported ready) and it suppresses duplicate "forwarding_ready" when
+	 * pimd re-ADDs a still-READY (S,G).
+	 *
+	 * Cleared on withdraw and on origin_change, so a readiness interval
+	 * never straddles a route_version change (D3 "Origin change").  NOT
+	 * carried in the snapshot: a restarted bgpd has no readiness state and
+	 * emits nothing until pimd re-reports (D4 restart matrix).
+	 */
+	bool forwarding_ready;
 };
 
 struct bgp_mvpn_event_sink {
@@ -952,6 +970,13 @@ static struct json_object *bgp_mvpn_event_new(struct bgp_mvpn_event_sink *sink,
 	return jo;
 }
 
+/* Defined below with the rest of the forwarding-event code; declared here
+ * because both lifecycle emitters must close an open readiness interval
+ * BEFORE their own record reaches the stream (D3 "Remove" / "Origin
+ * change"). */
+static void bgp_mvpn_event_forwarding_lost(struct bgp_mvpn_event_sink *sink,
+					   struct bgp_mvpn_event_join *join, const char *reason);
+
 void bgp_mvpn_event_join_resolved(struct bgp *bgp, const struct ipaddr *src,
 				  const struct ipaddr *grp, uint32_t source_as,
 				  struct in_addr umh)
@@ -981,6 +1006,23 @@ void bgp_mvpn_event_join_resolved(struct bgp *bgp, const struct ipaddr *src,
 	if (!is_new)
 		bgp_mvpn_event_route_version(prior_route_version, sizeof(prior_route_version),
 					     sink->boot_epoch, join->generation);
+
+	/* An origin change invalidates the readiness proof: it was established
+	 * against the OLD upstream path.  Close the interval before the
+	 * origin_change record so a readiness interval never straddles a
+	 * route_version change (D3 "Origin change"), and so it closes inside
+	 * the entitlement interval that contained it.
+	 *
+	 * This is ordering only -- it neither gates nor reshapes the
+	 * origin_change record that follows.  Emitted before the generation is
+	 * bumped below, so the forwarding_lost carries the route_version of the
+	 * interval it is closing rather than the new one.
+	 *
+	 * `changed` is false during snapshot replay for an unchanged join, and
+	 * bgp_mvpn_event_forwarding_lost() ignores replay outright, so a
+	 * snapshot cannot synthesise this. */
+	if (changed)
+		bgp_mvpn_event_forwarding_lost(sink, join, "origin_change");
 
 	/* A snapshot describes current state to one subscriber; it is not a
 	 * producer lifecycle transition and must not mint a new route_version. */
@@ -1036,6 +1078,13 @@ void bgp_mvpn_event_withdrawn(struct bgp *bgp, const struct ipaddr *src,
 	if (!join || !join->installed)
 		return; /* never observed installed by this sink: no window to close */
 
+	/* If forwarding was ready, the readiness interval must close BEFORE the
+	 * withdraw, so it always closes inside the entitlement interval that
+	 * contained it (D3 "Remove").  Ordering only: the withdraw record's
+	 * trigger, timing and shape are untouched, and this is a no-op when no
+	 * readiness was ever reported. */
+	bgp_mvpn_event_forwarding_lost(sink, join, "withdraw");
+
 	next_generation = join->generation + 1;
 	bgp_mvpn_event_route_version(route_version, sizeof(route_version), sink->boot_epoch,
 				     next_generation);
@@ -1049,6 +1098,234 @@ void bgp_mvpn_event_withdrawn(struct bgp *bgp, const struct ipaddr *src,
 
 	if (jo)
 		bgp_mvpn_event_broadcast(sink, jo);
+}
+
+/*
+ * Map pimd's cause byte onto the contract's stable reason enum.
+ *
+ * The mapping is 1:1 and total.  bgpd never invents a cause: an unspecified
+ * byte -- which is what an old pimd, or one that predates the cause field,
+ * sends -- renders as "unknown" rather than guessing a specific step.  A
+ * wrong-but-plausible reason in a settlement record is worse than an honest
+ * "unknown", because a reason string is what a dispute reads.
+ */
+static const char *bgp_mvpn_event_fwd_reason_str(uint8_t fwd_reason)
+{
+	switch (fwd_reason) {
+	case ZAPI_MVPN_SG_FWD_REASON_TUNNEL_FAIL_INSTALL:
+		return "tunnel_fail_install";
+	case ZAPI_MVPN_SG_FWD_REASON_TUNNEL_REMOVED:
+		return "tunnel_removed";
+	case ZAPI_MVPN_SG_FWD_REASON_MFC_EVICTED:
+		return "mfc_evicted";
+	case ZAPI_MVPN_SG_FWD_REASON_RPF_UNPINNED:
+		return "rpf_unpinned";
+	case ZAPI_MVPN_SG_FWD_REASON_ANTI_RECURSION_REFUSED:
+		return "anti_recursion_refused";
+	case ZAPI_MVPN_SG_FWD_REASON_UNSPECIFIED:
+	default:
+		return "unknown";
+	}
+}
+
+/*
+ * Build the shared part of a forwarding record.
+ *
+ * The record deliberately reuses the CURRENT route_version rather than
+ * minting a new generation: a readiness record is not a producer lifecycle
+ * transition, it annotates the entitlement interval that contains it, and it
+ * must be joinable to that interval by (source, group, route_version).
+ * Bumping the generation here would tell every settlement consumer that the
+ * entitlement window closed and reopened, which is exactly the over-claim /
+ * under-claim hazard D4 exists to avoid.
+ *
+ * It does advance `seq`, because it is a real record on the stream and the
+ * consumer cursor must stay contiguous across it -- that contiguity is what
+ * the ignore-and-advance rule in doc/mvpn-events-schema.md depends on.
+ */
+static struct json_object *bgp_mvpn_event_forwarding_new(struct bgp_mvpn_event_sink *sink,
+							 struct bgp_mvpn_event_join *join,
+							 const char *event_type)
+{
+	struct json_object *jo;
+	char route_version[32], lc_umh_origin[48];
+
+	bgp_mvpn_event_route_version(route_version, sizeof(route_version), sink->boot_epoch,
+				     join->generation);
+	bgp_mvpn_event_lc_umh_origin(lc_umh_origin, sizeof(lc_umh_origin), join->last_source_as,
+				     join->last_umh);
+
+	jo = bgp_mvpn_event_new(sink, event_type, &join->src, &join->grp, join->last_source_as,
+				route_version);
+	if (!jo)
+		return NULL;
+
+	if (lc_umh_origin[0])
+		json_object_string_add(jo, "lc_umh_origin", lc_umh_origin);
+	if (join->last_umh.s_addr != INADDR_ANY) {
+		char umhbuf[INET_ADDRSTRLEN];
+
+		json_object_string_add(jo, "upstream_peer",
+				       inet_ntop(AF_INET, &join->last_umh, umhbuf, sizeof(umhbuf)));
+	}
+
+	return jo;
+}
+
+/*
+ * Close the open readiness interval for `join`, if there is one.
+ *
+ * Returns without emitting when no forwarding_ready was emitted for the
+ * current route-state interval -- D3 "Failed": a path that never reported
+ * ready has no readiness interval to close, and emitting an unpaired
+ * forwarding_lost would invent one.  That guard is also what makes the
+ * "exactly one forwarding_lost" cardinality hold: the latch is cleared before
+ * the record is built, so a second call after a successful emit is a no-op.
+ * A call that fails to build the record restores the latch instead, leaving the
+ * interval closable by a later trigger -- still at most one emitted close.
+ *
+ * Never emits during snapshot replay: forwarding state is not part of the
+ * snapshot (D4 restart matrix), and a replay must not fabricate a readiness
+ * transition that did not happen.
+ */
+static void bgp_mvpn_event_forwarding_lost(struct bgp_mvpn_event_sink *sink,
+					   struct bgp_mvpn_event_join *join, const char *reason)
+{
+	struct json_object *jo;
+	struct json_object *jfwd;
+
+	if (!join->forwarding_ready || sink->snapshot_replay_active)
+		return;
+
+	/* Cleared before the fallible allocations below, so a failure can never
+	 * leave the latch set and let a later trigger emit a SECOND
+	 * forwarding_lost for the same interval.  Restored on each failure path
+	 * so the interval stays closable by a later withdraw/origin_change
+	 * instead of being silently abandoned open: exactly one of these
+	 * attempts can reach the broadcast, so restoring cannot duplicate. */
+	join->forwarding_ready = false;
+
+	jo = bgp_mvpn_event_forwarding_new(sink, join, "forwarding_lost");
+	if (!jo) {
+		join->forwarding_ready = true;
+		return;
+	}
+
+	/* `reason` is a mandatory stable enum (D4), and it lives in this object.
+	 * A forwarding_lost without it is not a lossy close record, it is an
+	 * unattributable one -- so treat the failure as an event-construction
+	 * failure and discard the envelope rather than broadcasting a partial.
+	 * jo is owned by bgp_mvpn_event_broadcast() once passed, so free it here.
+	 * bgp_mvpn_event_new() already reserved the seq, so the discard leaves
+	 * the same fail-closed cursor gap it reserves for its own failure. */
+	jfwd = json_object_new_object();
+	if (!jfwd) {
+		flog_err(EC_LIB_SYSTEM_CALL,
+			 "MVPN events: json allocation failed, dropping forwarding_lost event at seq %" PRIu64
+			 " (cursor gap reserved)",
+			 sink->seq);
+		json_object_free(jo);
+		join->forwarding_ready = true;
+		return;
+	}
+
+	json_object_string_add(jfwd, "state", "lost");
+	json_object_string_add(jfwd, "reason", reason);
+	json_object_object_add(jo, "forwarding", jfwd);
+
+	bgp_mvpn_event_broadcast(sink, jo);
+}
+
+void bgp_mvpn_event_forwarding_update(struct bgp *bgp, const struct ipaddr *src,
+				      const struct ipaddr *grp, uint8_t forwarding,
+				      uint8_t fwd_reason, ifindex_t fwd_ifindex,
+				      const char *fwd_oif)
+{
+	struct bgp_mvpn_event_sink *sink = bgp->mvpn_event_sink;
+	struct bgp_mvpn_event_join *join;
+	struct json_object *jo;
+	struct json_object *jfwd;
+	bool ready = forwarding == ZAPI_MVPN_SG_FWD_READY;
+
+	if (!sink)
+		return;
+	/* Forwarding state is not in the snapshot; a replay never synthesises
+	 * a readiness edge. */
+	if (sink->snapshot_replay_active)
+		return;
+
+	/* Only a join this sink has seen installed can carry readiness: the
+	 * readiness interval lives inside an entitlement interval, so with no
+	 * open entitlement there is nothing to annotate.  Note this uses
+	 * _find, not _get: readiness for an (S,G) we never installed must not
+	 * conjure join state. */
+	join = bgp_mvpn_event_join_find(sink, src, grp);
+	if (!join || !join->installed)
+		return;
+
+	if (!ready) {
+		bgp_mvpn_event_forwarding_lost(sink, join,
+					       bgp_mvpn_event_fwd_reason_str(fwd_reason));
+		return;
+	}
+
+	/* Edge-triggered: pimd re-ADDs on every event that could plausibly
+	 * have moved readiness, so a level-triggered emitter would emit a
+	 * duplicate forwarding_ready per redundant re-announce and break the
+	 * contract's exactly-once cardinality. */
+	if (join->forwarding_ready)
+		return;
+
+	jo = bgp_mvpn_event_forwarding_new(sink, join, "forwarding_ready");
+	if (!jo)
+		return;
+
+	/* The forwarding object is not decoration on a readiness record: it IS
+	 * the readiness proof, and D4 fixes its shape.  A forwarding_ready
+	 * without it is not a weaker proof, it is an uninterpretable one, so
+	 * failing to build it is a construction failure for the whole event
+	 * rather than a reason to broadcast a partial record.  jo is owned by
+	 * bgp_mvpn_event_broadcast() once passed, so discard it here instead.
+	 * bgp_mvpn_event_new() already reserved the seq, so the discard leaves
+	 * the same fail-closed cursor gap it reserves for its own failure. */
+	jfwd = json_object_new_object();
+	if (!jfwd) {
+		flog_err(EC_LIB_SYSTEM_CALL,
+			 "MVPN events: json allocation failed, dropping forwarding_ready event at seq %" PRIu64
+			 " (cursor gap reserved)",
+			 sink->seq);
+		json_object_free(jo);
+		return;
+	}
+
+	json_object_string_add(jfwd, "state", "ready");
+	/* The proven oif, resolved by pimd -- bgpd has no view of the
+	 * DIMT netdev.  Emitted only when pimd actually named one, so
+	 * a mixed-version peer that predates the field produces a
+	 * record without it rather than a record claiming ifindex 0. */
+	if (fwd_oif && fwd_oif[0]) {
+		json_object_string_add(jfwd, "oif", fwd_oif);
+		json_object_int_add(jfwd, "ifindex", (int64_t)fwd_ifindex);
+	}
+	/* The two ack names are constants, not observations: READY is
+	 * defined as both acks having happened, so naming them records
+	 * WHICH proof was required rather than re-asserting it. */
+	json_object_string_add(jfwd, "tunnel_ack", "netlink");
+	json_object_string_add(jfwd, "mfc_ack", "MRT_ADD_MFC");
+	json_object_object_add(jo, "forwarding", jfwd);
+
+	/* Latched only once the record is fully built and about to be emitted.
+	 * Latching ahead of the fallible allocations above would, on failure,
+	 * leave the latch set with nothing emitted -- and the latch is read two
+	 * ways, so that strands both of them: the edge-trigger check above
+	 * would suppress every later re-announce, and the guard in
+	 * bgp_mvpn_event_forwarding_lost() would let a subsequent withdraw or
+	 * origin_change close a readiness interval that was never opened,
+	 * breaking D3's "if and only if forwarding_ready was previously
+	 * emitted". */
+	join->forwarding_ready = true;
+
+	bgp_mvpn_event_broadcast(sink, jo);
 }
 
 static struct bgp_mvpn_event_leaf *bgp_mvpn_event_leaf_find(struct bgp_mvpn_event_sink *sink,

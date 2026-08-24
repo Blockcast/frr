@@ -198,10 +198,32 @@ void pim_dimt_reconcile(struct pim_instance *pim);
  * netdev; kernel netdevs survive on purpose and zebra MUST NOT sweep them. */
 void pim_dimt_tunnel_session_reset(struct pim_instance *pim);
 
+/*
+ * What pimd knows about a forwarding verdict that the aggregated state byte
+ * cannot carry.
+ *
+ * `reason` is the specific cause of any non-READY verdict: five distinct
+ * contract causes collapse into FWD_PENDING/FWD_FAILED on the wire, and bgpd
+ * has to name one in `forwarding_lost`.
+ *
+ * `ifindex` / `oif` identify the DIMT netdev that carries the traffic, which
+ * the contract's `forwarding_ready` shape requires and which only pimd
+ * resolves.  Both are set only on a READY verdict; a non-READY verdict has no
+ * proven oif to name.
+ */
+struct pim_dimt_fwd_detail {
+	enum zapi_mvpn_sg_fwd_reason reason;
+	ifindex_t ifindex;
+	char oif[IFNAMSIZ];
+};
+
 /* True once zebra has positively acked the netdev backing this upstream's
- * UMH.  Readiness proper additionally requires the kernel MFC check. */
+ * UMH.  Readiness proper additionally requires the kernel MFC check.
+ *
+ * `detail` is optional and may be NULL; when given it is fully overwritten. */
 enum zapi_mvpn_sg_forwarding
-pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up);
+pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up,
+			  struct pim_dimt_fwd_detail *detail);
 
 /* Re-evaluate readiness for every upstream and relay any edge to bgpd.
  * Cheap and idempotent: only a changed state produces a message. */

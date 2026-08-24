@@ -1419,13 +1419,25 @@ void pim_dimt_tunnel_session_reset(struct pim_instance *pim)
  */
 
 enum zapi_mvpn_sg_forwarding
-pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up)
+pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up,
+			  struct pim_dimt_fwd_detail *detail)
 {
 	struct pim_dimt_umh *umh;
 	struct pim_dimt_tunnel *tun;
 	struct pim_interface *pim_ifp;
 	struct channel_oil *c_oil;
 	struct interface *ifp;
+	struct pim_dimt_fwd_detail local_detail;
+
+	/* Every non-READY return below must set a cause: bgpd emits
+	 * `forwarding_lost` with a stable enum reason and has no way to
+	 * re-derive which of these branches fired from the state byte alone.
+	 * Writing through a local when the caller passed NULL keeps that
+	 * total, so a later branch cannot forget to set one. */
+	if (!detail)
+		detail = &local_detail;
+	memset(detail, 0, sizeof(*detail));
+	detail->reason = ZAPI_MVPN_SG_FWD_REASON_UNSPECIFIED;
 
 	/* Not DIMT-steered: this contract proves DIMT forwarding and has
 	 * nothing to say about a path it does not own.  PENDING is the
@@ -1435,24 +1447,39 @@ pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up)
 	 * Keyed on the mapping, NOT on PIM_UPSTREAM_FLAG_SRC_DIMT: the flag
 	 * means "already pinned", so reading it here would collapse "the
 	 * tunnel failed" into "not ours" and lose FWD_FAILED entirely. */
-	if (!pim_dimt_upstream_steered(pim, up, &umh))
+	if (!pim_dimt_upstream_steered(pim, up, &umh)) {
+		detail->reason = ZAPI_MVPN_SG_FWD_REASON_TUNNEL_REMOVED;
 		return ZAPI_MVPN_SG_FWD_PENDING;
+	}
 
 	tun = pim_dimt_tunnel_find(pim, umh->umh);
-	if (!tun)
+	if (!tun) {
+		detail->reason = ZAPI_MVPN_SG_FWD_REASON_TUNNEL_REMOVED;
 		return ZAPI_MVPN_SG_FWD_PENDING;
-	if (tun->state == PIM_DIMT_TUNNEL_FAILED)
+	}
+	if (tun->state == PIM_DIMT_TUNNEL_FAILED) {
+		/* Includes zebra's anti-recursion refusal, which lands in
+		 * FAILED (see pim_dimt.c tunnel-ack handling).  pimd cannot
+		 * tell the two apart from tunnel state alone, so this reports
+		 * the install failure it can actually attest rather than
+		 * claiming the more specific anti-recursion cause. */
+		detail->reason = ZAPI_MVPN_SG_FWD_REASON_TUNNEL_FAIL_INSTALL;
 		return ZAPI_MVPN_SG_FWD_FAILED;
+	}
 	/* (1) positive netlink ack for the netdev. */
-	if (tun->state != PIM_DIMT_TUNNEL_INSTALLED)
+	if (tun->state != PIM_DIMT_TUNNEL_INSTALLED) {
+		detail->reason = ZAPI_MVPN_SG_FWD_REASON_TUNNEL_REMOVED;
 		return ZAPI_MVPN_SG_FWD_PENDING;
+	}
 
 	/* (2) RPF actually pinned onto that netdev.  Interface-UP alone is
 	 * explicitly insufficient (D8.3): a GRE link is admin-up regardless
 	 * of whether the peer is reachable, so "up" proves nothing. */
 	ifp = up->rpf.source_nexthop.interface;
-	if (!ifp || ifp->ifindex != tun->ifindex)
+	if (!ifp || ifp->ifindex != tun->ifindex) {
+		detail->reason = ZAPI_MVPN_SG_FWD_REASON_RPF_UNPINNED;
 		return ZAPI_MVPN_SG_FWD_PENDING;
+	}
 
 	/* (3) MRT_ADD_MFC returned 0 AND the DIMT vif is the admitted
 	 * incoming vif of that entry.  c_oil->installed is set only from the
@@ -1479,19 +1506,30 @@ pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up)
 	 * incoming-vif check is the stronger of the two readings, so it is
 	 * safe to land ahead of that. */
 	c_oil = up->channel_oil;
-	if (!c_oil || !c_oil->installed)
+	if (!c_oil || !c_oil->installed) {
+		detail->reason = ZAPI_MVPN_SG_FWD_REASON_MFC_EVICTED;
 		return ZAPI_MVPN_SG_FWD_PENDING;
+	}
 
 	pim_ifp = ifp->info;
-	if (!pim_ifp || pim_ifp->mroute_vif_index < 0)
+	if (!pim_ifp || pim_ifp->mroute_vif_index < 0) {
+		detail->reason = ZAPI_MVPN_SG_FWD_REASON_MFC_EVICTED;
 		return ZAPI_MVPN_SG_FWD_PENDING;
+	}
 	/* Compare through int: this file is in pim_common, so it is compiled
 	 * for pim6d as well, where oil_incoming_vif() returns mifi_t rather
 	 * than vifi_t (and vifi_t is an IPv4-only mroute type). int is wide
 	 * enough for both and keeps the comparison free of -Wsign-compare. */
-	if ((int)*oil_incoming_vif(c_oil) != (int)pim_ifp->mroute_vif_index)
+	if ((int)*oil_incoming_vif(c_oil) != (int)pim_ifp->mroute_vif_index) {
+		detail->reason = ZAPI_MVPN_SG_FWD_REASON_MFC_EVICTED;
 		return ZAPI_MVPN_SG_FWD_PENDING;
+	}
 
+	/* READY: name the netdev that actually carries the traffic.  Only
+	 * meaningful here -- a non-READY verdict has no proven oif. */
+	detail->reason = ZAPI_MVPN_SG_FWD_REASON_UNSPECIFIED;
+	detail->ifindex = ifp->ifindex;
+	strlcpy(detail->oif, ifp->name, sizeof(detail->oif));
 	return ZAPI_MVPN_SG_FWD_READY;
 }
 
@@ -1606,7 +1644,7 @@ void pim_dimt_show_forwarding(struct pim_instance *pim, struct vty *vty,
 		if (!pim_dimt_upstream_steered(pim, up, &umh))
 			continue;
 
-		state = pim_dimt_forwarding_state(pim, up);
+		state = pim_dimt_forwarding_state(pim, up, NULL);
 		ifp = up->rpf.source_nexthop.interface;
 		ifname = ifp ? ifp->name : "-";
 
