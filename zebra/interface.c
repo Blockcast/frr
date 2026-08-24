@@ -2162,7 +2162,6 @@ static void zebra_if_dplane_ifp_handling(struct zebra_dplane_ctx *ctx)
 
 			/* Inform clients, install any configured addresses. */
 			if_add_update(ifp);
-			zebra_dimt_tunnel_if_update(ifp);
 
 			/*
 			 * Extract and save L2 interface information, take
@@ -2170,6 +2169,15 @@ static void zebra_if_dplane_ifp_handling(struct zebra_dplane_ctx *ctx)
 			 */
 			interface_update_l2info(ctx, ifp, zif_type, 1,
 						link_nsid);
+			/*
+			 * Must run after interface_update_l2info(): DIMT
+			 * identity matching reads zif->l2info.gre, and this is
+			 * the first sighting of the link, so that struct is
+			 * still zeroed until the call above memcpys it in.
+			 * Adopting a tunnel that survived an unacknowledged
+			 * create depends on that comparison succeeding.
+			 */
+			zebra_dimt_tunnel_if_update(ifp);
 			if (IS_ZEBRA_IF_BOND(ifp))
 				zebra_l2if_update_bond(ifp, true);
 			if (IS_ZEBRA_IF_BRIDGE_SLAVE(ifp))

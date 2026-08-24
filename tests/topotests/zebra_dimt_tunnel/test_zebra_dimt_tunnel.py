@@ -69,14 +69,18 @@ def require_strace(router):
 #              injected. test_address_failure_cleans_up_and_allows_tunnel_id_reuse
 #              asserts that, and keeps its marker.
 #
-#   BLO-28406  zebra. Reconciliation of the surviving link after a lost create
-#              ack. assert_injection_fired() demands positive proof the
-#              injection happened, because a SUCCESSFUL lost-ack injection
-#              writes nothing to zebra.out (EAGAIN is the normal batch
-#              terminator) -- silence there is not evidence. It raises Failed,
-#              not AssertionError, so an uninjected run ESCAPES this marker
-#              instead of being absorbed: the test reporting xfail is itself
-#              the proof it fired.
+#   BLO-29583  zebra. FIXED -- marker removed, the test now asserts the real
+#              behaviour. Reconciliation of the surviving link after a lost
+#              create ack. Root cause was ordering in zebra/interface.c:
+#              zebra_dimt_tunnel_if_update() ran BEFORE
+#              interface_update_l2info() populated zif->l2info.gre, so the
+#              zebra_dimt_if_matches() identity guard in the CLEANUP-tombstone
+#              adoption branch compared against a zeroed struct and never
+#              adopted the link. assert_injection_fired() stays: a SUCCESSFUL
+#              lost-ack injection writes nothing to zebra.out (EAGAIN is the
+#              normal batch terminator), so silence there is not evidence. It
+#              raises Failed, not AssertionError, so an uninjected run fails
+#              hard rather than passing for the wrong reason.
 #
 #   BLO-29000  HARNESS, not zebra. hold_dplane_worker() does not hold the
 #              `del 9` client: it exits with result=2 (REMOVED) before the readd
@@ -120,18 +124,6 @@ XFAIL_BLO_28405 = pytest.mark.xfail(
         "BLO-28405: zebra reports result=0 for a DIMT create whose netlink "
         "sendmsg was injected with EIO. Remove this marker in the BLO-28405 "
         "fix PR."
-    ),
-)
-XFAIL_BLO_28406 = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "BLO-28406: zebra does not reconcile the surviving link after a "
-        "lost create ack (recvmsg EAGAIN at when=1). VERIFIED under a clean "
-        "kernel: assert_injection_fired() raises Failed rather than "
-        "AssertionError, so this xfail is only reachable if the injection "
-        "actually fired -- an uninjected run would surface as a hard failure "
-        "instead. Remove this marker in the BLO-28406 fix PR."
     ),
 )
 
@@ -865,7 +857,6 @@ def test_add_during_inflight_delete_is_rejected():
     assert request("del", 9)["result"] == 2
 
 
-@XFAIL_BLO_28406
 def test_uncertain_create_result_reconciles_surviving_link():
     router = get_topogen().gears["r1"]
     # Fail the response read: the RTM_NEWLINK reaches the kernel but its
@@ -875,15 +866,15 @@ def test_uncertain_create_result_reconciles_surviving_link():
         failed = request("add", 8)
     finally:
         trace = stop_tracer(tracer)
-    # This assertion is what converted BLO-28406 from asserted to verified.
-    # Every earlier observation ran with the leaked dimt-00000004 present, and
-    # under that condition `add 8` fails with `File exists` from the shared-
-    # tuple collision -- which satisfies the result==1 check below, the empty-
-    # link check after it (nothing was ever created), and the retry returning 1
-    # twice, all with zero zebra involvement. Proving the recv injection fired
-    # is what separates the defect from that phantom, and it now does: under
-    # the reaper this test reports xfail, which pytest.fail() could not have
-    # produced.
+    # This assertion is what kept BLO-29583 honest. Every early observation ran
+    # with the leaked dimt-00000004 present, and under that condition `add 8`
+    # fails with `File exists` from the shared-tuple collision -- which
+    # satisfies the result==1 check below, the empty-link check after it
+    # (nothing was ever created), and the retry returning 1 twice, all with zero
+    # zebra involvement. Proving the recv injection fired is what separates the
+    # defect from that phantom. Keep it: without it this test would pass for the
+    # wrong reason the moment the injection stopped perturbing anything, which
+    # is the silent-skip regression BLO-28043 exists to kill.
     assert_injection_fired(trace, tracer.injection_label)
     assert failed["result"] == 1, failed
     # Zebra must adopt the surviving link and tear it down instead of
