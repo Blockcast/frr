@@ -330,7 +330,38 @@ jobs:
     needs: Build
     name: ${{ matrix.cfg.name }}
     # Topotest runs can be long; still cap runtime for stuck jobs.
-    timeout-minutes: 180
+    #
+    # BLO-29817: this was 180, which sat *inside* the lane's own distribution
+    # rather than outside it, so the cap fired on runs whose tests had already
+    # finished.  Measured over 28 matrix legs across 20 `github-ci` runs
+    # (2026-08-19 .. 2026-08-22):
+    #
+    #   suite ("Run topotests" step), n=24  min 127.6  median 143.4  p100 174.5
+    #   job overhead (total - suite),  n=24  min   4.3  median   9.3  p100  21.9
+    #
+    # Overhead is dominated by "Fetch docker image artifact", which alone
+    # ranged 1.3 .. 19.5 min -- variance that has nothing to do with the tests.
+    # Those two p100s compose to 174.5 + 21.9 = 196.4 min, i.e. the old 180
+    # cap was 16.4 min BELOW the worst case it had to survive.  Three legs were
+    # duly killed at 181.0/181.0/182.2 min; in two of them the suite had
+    # already PASSED and the cap landed in the artifact-upload tail.
+    #
+    # The suite p100 above is uncensored: all 24 observed "Run topotests" steps
+    # reached a natural conclusion, so 174.5 is a real maximum and not a
+    # cap-truncated one.
+    #
+    # 240 is therefore the composed p100 (196.4) plus 43.6 min, i.e. 1.22x,
+    # which leaves 65.5 min for overhead == 3.0x the worst tail ever recorded.
+    # Not chosen for roundness: 200 (1.02x) would be re-tripped by a single slow
+    # artifact fetch, and 210 (1.6x overhead budget) still leaves under one
+    # spare fetch.  Not larger, because a genuinely wedged job must not hold a
+    # capacity-capped arc-e2e slot for longer than necessary -- 240 keeps that
+    # bound at 4h while clearing the measured distribution.
+    #
+    # Re-derive with:
+    #   gh api "repos/Blockcast/frr/actions/runs/$RID/jobs?per_page=100" | jq -r \
+    #     '.jobs[]|select(.name|test("amd64 Test"))|"\(.name) \(.conclusion) \(((.completed_at|fromdate)-(.started_at|fromdate))/60|floor)min"'
+    timeout-minutes: 240
     env:
       # arc-e2e's DinD sidecar is capped at 2 CPUs. Nested Docker containers
       # still see all 48 host CPUs, so nproc-based sizing launched 120 pytest
@@ -338,6 +369,11 @@ jobs:
       # legs. Preserve the intended 2.5x oversubscription against the real
       # cgroup budget instead.
       TOPOTEST_WORKERS: "5"
+      # BLO-29817: must mirror `timeout-minutes` above (a job cannot read its
+      # own cap at runtime).  Used only to report headroom and to attribute a
+      # cap kill in the job summary; if the two drift the summary says so
+      # instead of silently misreporting.
+      TOPOTEST_JOB_CAP_MIN: "240"
     strategy:
       # Keep running remaining platforms when one leg fails.
       fail-fast: false
@@ -350,6 +386,12 @@ jobs:
         -  { rel: '22.04', name: 'Ubuntu 22.04 amd64 Test', platform: 'amd64_u22' }
         -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 Test', platform: 'amd64_u24' }
     steps:
+      - name: Record lane start
+        # BLO-29817: the runtime-vs-cap report at the end of this job needs a
+        # start reference, and no context exposes the job's own start time.
+        # First step in the job, so this trails "Set up job"/"Set up runner" by
+        # only a few seconds.
+        run: echo "TOPOTEST_LANE_START_EPOCH=$(date +%s)" >> "${GITHUB_ENV}"
       - name: Checkout
         uses: actions/checkout@v5
         with:
@@ -372,6 +414,10 @@ jobs:
           name: test-results-${{ matrix.cfg.platform }}
           path: test-results-${{ matrix.cfg.platform }}
       - name: Run topotests
+        # BLO-29817: `id` lets the runtime report below distinguish "the cap
+        # killed the suite mid-run" from "the suite finished and the cap killed
+        # the artifact tail".
+        id: topotests
         run: |
           # Fail fast on command errors, undefined vars, and pipeline failures.
           set -euo pipefail
@@ -535,3 +581,113 @@ jobs:
           rm -rf test-results-${{ matrix.cfg.platform }}* /tmp/frr-${{ matrix.cfg.platform }}.tar
           docker stop frr-${{ matrix.cfg.platform }}-cont || true
           docker rm frr-${{ matrix.cfg.platform }}-cont || true
+      - name: Report lane runtime and attribute any cap kill
+        # BLO-29817: a `timeout-minutes` kill is reported by GitHub as
+        # `cancelled`, which is indistinguishable from a human pressing cancel
+        # or a `cancel-in-progress` concurrency eviction -- both routine here.
+        # Three separate investigations on BLO-29523 read that `cancelled` and
+        # did not recognise it as a timeout.  So say it explicitly.
+        #
+        # This step runs LAST on purpose: in two of the three observed kills the
+        # suite had already finished and the cap landed during "Upload test
+        # results", so a report placed before the upload would have seen healthy
+        # headroom and missed the kill entirely.  Cancellation still lets
+        # `always()` steps run -- in all three kills the upload, cleanup and
+        # post steps completed after the cap fired -- and this step is pure
+        # bash, so it lands inside that grace window.
+        if: ${{ always() }}
+        env:
+          SUITE_CONCLUSION: ${{ steps.topotests.conclusion }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -uo pipefail
+          summary="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+          cap="${TOPOTEST_JOB_CAP_MIN}"
+
+          # Keep the mirrored cap honest against the real `timeout-minutes`.
+          # Scoped to the `Test:` job's own block: latch on the job key, and
+          # bail at the next key at that indent so a later job's cap can never
+          # be read as this one's.  Advisory only -- a formatting change to the
+          # workflow must not be able to fail the topotest lane.
+          configured=$(awk '
+            /^  Test:$/       { f=1; next }
+            f && /^  [^ #]/   { exit }
+            f && /^    timeout-minutes:/ { print $2; exit }
+          ' .github/workflows/github-ci.yml 2>/dev/null || true)
+          if [ -z "${configured}" ]; then
+            echo "::warning title=BLO-29817 cap mirror uncheckable::could not read timeout-minutes out of the Test job; headroom below assumes TOPOTEST_JOB_CAP_MIN=${cap}"
+          elif [ "${configured}" != "${cap}" ]; then
+            echo "::error title=BLO-29817 cap mirror drift::TOPOTEST_JOB_CAP_MIN=${cap} but timeout-minutes=${configured}; headroom figures below are unreliable until they match"
+            cap="${configured}"
+          fi
+
+          if [ -z "${TOPOTEST_LANE_START_EPOCH:-}" ]; then
+            echo "::warning title=BLO-29817::lane start was never recorded; cannot attribute runtime"
+            exit 0
+          fi
+          elapsed=$(( ( $(date +%s) - TOPOTEST_LANE_START_EPOCH ) / 60 ))
+          headroom=$(( cap - elapsed ))
+
+          # How close to the cap a *cancelled* job must land before the cap --
+          # rather than a human or the concurrency group -- is the explanation.
+          # The three observed kills overshot by 1.0/1.0/2.2 min, so 5 covers
+          # them with margin; it is not applied to jobs that were not cancelled.
+          near=5
+
+          {
+            echo "### ${{ matrix.cfg.name }} — lane runtime"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| elapsed | **${elapsed} min** |"
+            echo "| cap (\`timeout-minutes\`) | ${cap} min |"
+            echo "| headroom | **${headroom} min** |"
+            echo "| suite step | \`${SUITE_CONCLUSION:-not-reached}\` |"
+            echo "| job status | \`${JOB_STATUS}\` |"
+            echo
+          } >> "${summary}"
+
+          # Cancellation is the necessary condition, headroom only the
+          # discriminator.  A cap kill and an external cancel are BOTH stamped
+          # `cancelled` by GitHub and are told apart by how close to the cap
+          # they landed -- but a job that reached a conclusion of its own was by
+          # definition not killed, however little headroom it had left.  Gating
+          # on JOB_STATUS first is what stops a merely-slow *successful* leg
+          # (one landing inside `near` on its own steam -- 176/180 min has
+          # already happened once) from being reported as a timeout kill.
+          if [ "${JOB_STATUS}" = "cancelled" ]; then
+            if [ "${headroom}" -gt "${near}" ]; then
+              # Far from the cap, so this really was external.
+              echo "Cancelled externally (human or \`cancel-in-progress\`) at ${elapsed} min, ${headroom} min clear of the ${cap}-minute cap — **not** a timeout." >> "${summary}"
+              echo "::notice title=External cancel::Cancelled at ${elapsed}/${cap} min with ${headroom} min of headroom — not a timeout."
+              exit 0
+            fi
+            case "${SUITE_CONCLUSION}" in
+              success|failure)
+                # The false-cancel case this ticket exists for: the tests
+                # finished and reported, then the cap killed the tail.
+                echo "**:stopwatch: KILLED BY THE JOB TIMEOUT — and the tests had already finished (\`${SUITE_CONCLUSION}\`).**" >> "${summary}"
+                echo "" >> "${summary}"
+                echo "This job was **not** cancelled by a person and **not** evicted by concurrency. The suite ran to completion; the ${cap}-minute cap fired during the artifact/cleanup tail, so GitHub stamped the job \`cancelled\` and the rollup went red over a result that was actually \`${SUITE_CONCLUSION}\`. Raise \`timeout-minutes\` (see the derivation above it) rather than re-running. Ref BLO-29817." >> "${summary}"
+                echo "::error title=Job timeout (tests already ${SUITE_CONCLUSION})::Cap kill at ${elapsed}/${cap} min during the post-suite tail — NOT a human cancel or concurrency eviction. Tests concluded ${SUITE_CONCLUSION}. See BLO-29817."
+                ;;
+              *)
+                echo "**:stopwatch: KILLED BY THE JOB TIMEOUT while the suite was still running.**" >> "${summary}"
+                echo "" >> "${summary}"
+                echo "Not a human cancel and not a concurrency eviction: elapsed ${elapsed} min against a ${cap}-minute cap. Either the suite genuinely regressed past its measured p100 or it is wedged. Ref BLO-29817." >> "${summary}"
+                echo "::error title=Job timeout (suite incomplete)::Cap kill at ${elapsed}/${cap} min with the suite in state '${SUITE_CONCLUSION:-not-reached}' — NOT a human cancel or concurrency eviction. See BLO-29817."
+                ;;
+            esac
+            exit 0
+          fi
+
+          # Reached its own conclusion.  Leave the headroom on the record so the
+          # cap can be re-derived from ordinary runs instead of only from
+          # failures -- and shout when a leg only just cleared the cap, because
+          # that is the signal that the derivation is going stale.
+          if [ "${headroom}" -le "${near}" ]; then
+            echo "**:warning: Finished \`${JOB_STATUS}\` with only ${headroom} min to spare** — this leg came within ${near} min of the ${cap}-minute cap without being killed. Not a timeout, but the next one may be. Re-derive the cap (BLO-29817)." >> "${summary}"
+            echo "::warning title=Topotest lane nearly hit the cap::Finished ${JOB_STATUS} at ${elapsed}/${cap} min — ${headroom} min spare. NOT a timeout kill, but re-derive the cap (BLO-29817)."
+          elif [ "${headroom}" -le 20 ]; then
+            echo "::warning title=Low topotest headroom::Finished at ${elapsed}/${cap} min — only ${headroom} min spare. Re-check the cap derivation (BLO-29817)."
+          fi
