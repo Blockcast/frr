@@ -69,7 +69,7 @@ env:
   # median gap between successful cache writes was 25h, so 72h is ~3x the
   # normal cadence -- loose enough not to fire on ordinary quiet weekends,
   # tight enough that all four observed multi-day outages (192h, 215h, 222h,
-  # 442h) would have fired.
+  442h) would have fired.
   MAX_CACHE_AGE_HOURS: '72'
 
 jobs:
@@ -110,20 +110,11 @@ jobs:
     needs: probe-before
     runs-on: default
     name: Seed ${{ matrix.cfg.name }}
-    # Cold-build headroom. A cold u22 build measured ~30 min; 90 leaves room
-    # for a slow apt mirror without a timeout becoming the reason the cache
-    # goes unwritten -- the same deadlock github-ci.yml's timeout comment
-    # already guards against.
     timeout-minutes: 90
     strategy:
-      # Never let one platform's failure stop the others from being seeded: a
-      # partially fresh cache still saves the other legs from building cold.
       fail-fast: false
       matrix:
-        # Must stay in lockstep with github-ci.yml's Build matrix. The cache is
-        # keyed on `platform`, which is the full build identity (distro +
-        # LTTng); a platform present there but missing here builds cold forever
-        # with nothing to say so.
+        # Must stay in lockstep with github-ci.yml's Build matrix.
         cfg:
         -  { rel: '22.04', name: 'Ubuntu 22.04 amd64', platform: 'amd64_u22' }
         -  { rel: '24.04', name: 'Ubuntu 24.04 amd64', platform: 'amd64_u24' }
@@ -136,10 +127,6 @@ jobs:
       - name: Ensure local MIB cache directory exists
         run: mkdir -p docker/ubuntu-ci/mib-cache
       - name: Restore cached MIB files
-        # Opportunistic: restore-only so this never fights github-ci.yml's
-        # Prepare-MIB-Cache for the cache entry. On a miss the Dockerfile's
-        # fetch_mib() falls back to fetching upstream, so a cold MIB cache
-        # slows this job but cannot fail it.
         if: ${{ matrix.cfg.rel == '24.04' }}
         continue-on-error: true
         uses: actions/cache/restore@v5
@@ -165,19 +152,15 @@ jobs:
             UBUNTU_VERSION=${{ matrix.cfg.rel }}
             ENABLE_LTTNG=${{ matrix.cfg.lttng || 'false' }}
             FRR_SOURCE_REV=${{ github.sha }}
-          # No image is needed from this run -- only the cache export. Skipping
-          # the tar keeps the job off the node's image filesystem, which is
-          # under eviction pressure.
           outputs: type=cacheonly
           cache-from: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.platform }}-buildcache
           cache-to: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.platform }}-buildcache,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=3
 
   verify:
     needs: [probe-before, seed]
-    # Runs even when a seed leg failed, so the summary names exactly which
-    # platform's cache did not advance instead of leaving that to log
-    # archaeology.
-    if: ${{ !cancelled() }}
+    # `needs` jobs default to success(); always() is required to report which
+    # seed leg failed instead of silently skipping verification and its gate.
+    if: ${{ always() && !cancelled() }}
     runs-on: default
     name: Verify buildcache advanced
     timeout-minutes: 10
@@ -207,11 +190,9 @@ jobs:
 
   freshness-gate:
     needs: verify
-    # The standing signal, independent of whether this cycle seeded anything:
-    # is the cache within its freshness budget right now? This is what goes red
-    # when the seeding path has quietly stopped working. Kept as its own job so
-    # a red gate is legible in the run list without opening logs.
-    if: ${{ !cancelled() }}
+    # This also needs always(): otherwise a failed verification is converted
+    # into a skipped freshness signal rather than a visible failure state.
+    if: ${{ always() && !cancelled() }}
     runs-on: default
     name: Buildcache freshness gate (${{ github.event_name }})
     timeout-minutes: 10
