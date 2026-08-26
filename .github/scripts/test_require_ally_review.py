@@ -2920,6 +2920,28 @@ class TestDeferralThreeCases(unittest.TestCase):
         self.assertNotIn("clean", desc.lower())
         self.assertNotIn("approved", desc.lower())
 
+    def test_an_app_approved_finding_can_be_deferred_after_it_is_visible(self):
+        """Finding-bearing App approvals are visibility anchors too.
+
+        The blocking path evaluates findings before the APPROVED state can
+        authorize success, so omitting this artifact from visibility would
+        make a valid admin deferral fail closed forever.
+        """
+        state, desc = decide(
+            reviews=[
+                review(
+                    "APPROVED",
+                    commit=HEAD,
+                    body=finding_body(HEAD, [FINDING_A]),
+                    at="2026-07-27T09:00:00Z",
+                ),
+            ],
+            author=HUMAN,
+            deferrals={content_id(FINDING_A): "BLO-18949"},
+        )
+        self.assertEqual(state, "success")
+        self.assertIn("BLO-18949", desc)
+
     def test_c_a_new_finding_at_a_later_head_re_reds_the_check(self):
         """The old deferral is still present and still trusted; it simply does
         not name this finding, because identity is the finding's CONTENT."""

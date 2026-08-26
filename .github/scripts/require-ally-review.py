@@ -860,7 +860,11 @@ def ally_finding_artifacts(reviews, comments, ally_logins):
         if (
             isinstance(login, str)
             and login in ally
-            and review.get("state") == "COMMENTED"
+            # An APPROVED artifact can still carry blocking findings; the
+            # review signal path fails closed on those findings before it
+            # considers the approval state. It must therefore mint the same
+            # visibility anchor as a COMMENTED artifact.
+            and review.get("state") in ("COMMENTED", "APPROVED")
             and attested is not None
         ):
             artifacts.append((body, attested, item_visible_at_ms(review)))
@@ -1152,7 +1156,10 @@ def qualifying_ally_bodies_for_head(reviews, comments, head_sha, ally_logins):
         if (
             isinstance(login, str)
             and login in ally
-            and review.get("state") == "COMMENTED"
+            # Keep this in lockstep with ally_finding_artifacts(): a finding
+            # on an APPROVED review is still blocking evidence and may be the
+            # finding a load-bearing deferral needs to name in its audit trail.
+            and review.get("state") in ("COMMENTED", "APPROVED")
             and parse_reviewed_head(body) == normalized
         ):
             bodies.append(body)
