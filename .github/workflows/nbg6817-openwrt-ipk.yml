@@ -41,9 +41,18 @@ on:
         required: true
         default: "4"
   # Bootstrap trigger: workflow_dispatch only becomes selectable once this file
-  # is on the default branch, so BLO-31631's pre-merge evidence run comes from a
-  # push to the feature branch. Remove that branch from this list on merge;
-  # master is kept so a later change to the build definition re-proves itself.
+  # is on the default branch, so BLO-31631's pre-merge evidence run has to come
+  # from a push to the feature branch. master is kept so a later change to the
+  # build definition re-proves itself.
+  #
+  # ⚠ MERGE GATE, in this order and not the other one:
+  #   1. this branch produces ONE green run (as of head 5b414a13 there have been
+  #      five runs and zero green: 33884020708 cancelled, 33884148336 failure,
+  #      33891736212 failure, 33892673791 cancelled, 33900460174 failure);
+  #   2. THEN delete the feature-branch line below, leaving only master;
+  #   3. THEN merge.
+  # Deleting it before step 1 removes the only trigger that can produce that
+  # green run -- there is no dispatch path until this file is on master.
   push:
     branches:
       - master
@@ -107,6 +116,30 @@ jobs:
         run: |
           set -euo pipefail
           cd src/frr
+
+          # pkg_release is a free-form dispatch input that ends up interpolated
+          # into the copy-paste operator block at the end of this job, on the
+          # line immediately above an `ssh root@<nbg6817> "rm -rf $D ..."`.
+          # The person PASTING that block is not the person who dispatched it,
+          # so validate here rather than trusting the input: a value of
+          # `4; rm -rf ~` would render as `D=/tmp/frr-r4; rm -rf ~` and run on
+          # the operator's workstation the moment they paste it.
+          #
+          # Use bash's [[ =~ ]] and NOT `grep -qE`. grep is LINE-based, so it
+          # accepts a multi-line value whose FIRST line is numeric -- which is
+          # precisely the GITHUB_OUTPUT injection shape this check exists to
+          # stop ("4\nfrr_sha=<attacker>" passes grep and would forge the
+          # provenance fields the version-parity contract rests on). [[ =~ ]]
+          # anchors against the whole string, so it rejects that.
+          #
+          # ^[1-9][0-9]*$ rather than ^[0-9]+$: it also rejects "0" and a
+          # leading-zero "04", which would silently produce a package version
+          # that does not match the one recorded in the build-log row.
+          if [[ ! "$PKG_RELEASE" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::pkg_release must be a positive integer without leading zeros (got: '${PKG_RELEASE}')"
+            exit 1
+          fi
+          echo "OK: pkg_release=${PKG_RELEASE}"
 
           # Reject a branch or bare SHA masquerading as a tag. The parity
           # contract exists because an untagged build is neither reproducible
@@ -240,7 +273,8 @@ jobs:
             echo '```'
             echo '### Install (operator, on the router)'
             echo
-            echo 'Download the artifact from this run, then:'
+            echo 'Download the artifact from this run **into an empty directory**'
+            echo '(the scp below globs your LOCAL frr*.ipk), then:'
             echo
             echo '```sh'
             echo '# 0. CONFIRM the firmware matches what this .ipk was built against.'

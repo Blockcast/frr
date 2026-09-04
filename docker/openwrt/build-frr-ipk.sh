@@ -269,17 +269,70 @@ BASE=$(find /builder/artifacts -name 'frr_*.ipk' | head -1)
 # .ipk payload members may be listed with or without a leading "./" depending on
 # how the archive was rolled, so every match below is anchored on (^|/) rather
 # than assuming one form.
-ipk_files() { tar -xzOf "$1" ./data.tar.gz 2>/dev/null | tar -tzf - 2>/dev/null; }
-# Resolve a payload path suffix to the exact member name inside the archive.
-ipk_member() { ipk_files "$1" | grep -E "(^|/)${2}\$" | head -1; }
-# Stream one payload member out of an .ipk to stdout.
+#
+# Read the payload member list ONCE per archive, into a variable, and match
+# against that text. Do not re-derive it per check by piping tar into a
+# consumer, which is what this file used to do.
+#
+# Why: listing an .ipk means unwrapping two nested archives, and any consumer
+# that stops reading early -- `grep -q` on its first match, `head -1` on its
+# first line -- SIGPIPEs the upstream tar. Under this script's `set -o pipefail`
+# that turns a SUCCESSFUL match into a non-zero pipeline, so the status
+# inverts the answer.
+#
+# Run 33900460174 (head 5b414a13) failed exactly that way. It reported
+#   "FATAL: libmlag_pb.so missing from frr_10.8.0-r4_..."
+# against an .ipk whose payload provably contains usr/lib/libmlag_pb.so,
+# libmlag_pb.so.0 and libmlag_pb.so.0.0.0 -- verified by extracting the very
+# artifact that run uploaded, and corroborated by the build log, which shows
+# both the `cp` into the package dir and rstrip.sh processing the library.
+# The vtysh and pim6d checks passed in that same run only by accident: they
+# wrapped the pipeline in $( ) and tested the resulting STRING, so they never
+# looked at the status that was lying.
+#
+# Capture a payload listing once, and assert the archive was read COMPLETELY.
+#
+# An unreadable archive and an archive missing one member are different faults
+# with different owners, and only this assertion can tell them apart. Without
+# it, a bad archive surfaces at whichever member check runs first and reports
+# that member as missing -- diagnosing the wrong problem, which is how a
+# corrupt package would read as "zebra will not start".
+#
+# Non-empty alone is NOT sufficient: a truncated .ipk yields a PARTIAL member
+# list, which is worse than an empty one because it looks plausible while
+# silently lacking members. So the status of the read is checked too -- and
+# here, uniquely, that status is trustworthy, because the command substitution
+# consumes the stream to EOF, so nothing exits early and nothing is SIGPIPEd.
+# `pipefail` is re-stated inside to mark this as the one construction in this
+# file whose pipeline status means what it says.
+ipk_list() {
+  local list
+  if ! list=$(set -o pipefail; tar -xzOf "$1" ./data.tar.gz 2>/dev/null | tar -tzf - 2>/dev/null); then
+    echo "FATAL: cannot read the payload of $(basename "$1") -- truncated, corrupt," >&2
+    echo "       or not an .ipk. This is an ARCHIVE fault, not a missing file." >&2
+    return 1
+  fi
+  if [ -z "$list" ]; then
+    echo "FATAL: payload of $(basename "$1") lists no members. ARCHIVE fault, not" >&2
+    echo "       a missing file." >&2
+    return 1
+  fi
+  printf '%s\n' "$list"
+}
+
+# Stream one payload member out of an .ipk to stdout. The caller checks the
+# extracted bytes (`[ -s ]`), not this status, for the same reason as above.
 ipk_extract() { tar -xzOf "$1" ./data.tar.gz 2>/dev/null | tar -xzOf - "$2" 2>/dev/null; }
 
-if [ -n "$(ipk_member "$BASE" 'usr/bin/vtysh')" ]; then
+# Listed once here and reused by every base-package check below, so the
+# archive is opened one time and each check is a pure string match.
+BASE_FILES=$(ipk_list "$BASE") || exit 1
+
+if printf '%s\n' "$BASE_FILES" | grep -qE '(^|/)usr/bin/vtysh$'; then
   echo "OK: usr/bin/vtysh present in $(basename "$BASE")"
 else
   echo "WARN: could not confirm vtysh inside $(basename "$BASE")"
-  ipk_files "$BASE" | head -30 || true
+  printf '%s\n' "$BASE_FILES" | head -30
 fi
 
 # --- Artifact-level acceptance checks -------------------------------------
@@ -298,11 +351,12 @@ fail=0
 #    time, but assert it against the artifact too so the guarantee survives any
 #    future change to that check.
 echo "=== libmlag_pb.so in base frr package ==="
-if ipk_files "$BASE" | grep -qE '(^|/)usr/lib/libmlag_pb\.so'; then
+if printf '%s\n' "$BASE_FILES" | grep -qE '(^|/)usr/lib/libmlag_pb\.so'; then
   echo "OK: libmlag_pb.so* present in $(basename "$BASE")"
-  ipk_files "$BASE" | grep -E '(^|/)usr/lib/' | sort || true
+  printf '%s\n' "$BASE_FILES" | grep -E '(^|/)usr/lib/' | sort
 else
   echo "FATAL: libmlag_pb.so missing from $(basename "$BASE") -- zebra will not start" >&2
+  echo "       (the archive read completely, so this is a genuine absence)" >&2
   fail=1
 fi
 
@@ -312,7 +366,14 @@ fi
 #    end. BLO-22372's probe drives `ipv6 mld static-group`, which lives here.
 echo "=== pim6d binary in frr-pim6d package ==="
 P6=$(find /builder/artifacts -name 'frr-pim6d_*.ipk' | head -1)
-if [ -n "${P6:-}" ] && [ -n "$(ipk_member "$P6" 'usr/sbin/pim6d')" ]; then
+if [ -z "${P6:-}" ]; then
+  echo "FATAL: no frr-pim6d_*.ipk in the artifact set at all" >&2
+  fail=1
+elif ! P6_FILES=$(ipk_list "$P6"); then
+  # ipk_list already named the archive fault. Do not let it read as a missing
+  # daemon: "no pim6d" and "cannot read the package" need different fixes.
+  fail=1
+elif printf '%s\n' "$P6_FILES" | grep -qE '(^|/)usr/sbin/pim6d$'; then
   echo "OK: usr/sbin/pim6d present in $(basename "$P6")"
 else
   echo "FATAL: no usr/sbin/pim6d in frr-pim6d package -- the probe would originate no Type-7" >&2
@@ -337,28 +398,51 @@ fi
 SENTINEL='body does not match advertised length'
 echo "=== d3cfdeb8 sentinel in the compiled bgpd ==="
 BGPD_IPK=$(find /builder/artifacts -name 'frr-bgpd_*.ipk' | head -1)
-BGPD_MEMBER=$([ -n "${BGPD_IPK:-}" ] && ipk_member "$BGPD_IPK" 'usr/sbin/bgpd' || true)
-if [ -z "${BGPD_IPK:-}" ] || [ -z "${BGPD_MEMBER:-}" ]; then
-  echo "FATAL: no bgpd binary found to check" >&2
-  [ -n "${BGPD_IPK:-}" ] && ipk_files "$BGPD_IPK" | head -20 || true
+if [ -z "${BGPD_IPK:-}" ]; then
+  echo "FATAL: no frr-bgpd_*.ipk in the artifact set at all" >&2
+  fail=1
+elif ! BGPD_FILES=$(ipk_list "$BGPD_IPK"); then
+  # Archive fault already named. Critically, do NOT let it fall through to the
+  # sentinel branch: "cannot read the package" must never be reported as
+  # "the bytes do not carry the fix", which would read as a PRE-FIX verdict on
+  # the one check the PoP deploy decision actually rests on.
   fail=1
 else
-  ipk_extract "$BGPD_IPK" "$BGPD_MEMBER" > /tmp/bgpd.bin || true
-  if [ ! -s /tmp/bgpd.bin ]; then
-    echo "FATAL: could not extract ${BGPD_MEMBER} from $(basename "$BGPD_IPK")" >&2
+  BGPD_MEMBER=$(printf '%s\n' "$BGPD_FILES" | grep -E '(^|/)usr/sbin/bgpd$' | head -1)
+  if [ -z "${BGPD_MEMBER:-}" ]; then
+    echo "FATAL: no usr/sbin/bgpd member in $(basename "$BGPD_IPK")" >&2
+    printf '%s\n' "$BGPD_FILES" | head -20
     fail=1
-  elif grep -aqF "$SENTINEL" /tmp/bgpd.bin; then
-    echo "OK: post-fix sentinel present in bgpd -- the built binary contains d3cfdeb8"
-    echo "    ($(stat -c%s /tmp/bgpd.bin) bytes, member ${BGPD_MEMBER} of $(basename "$BGPD_IPK"))"
   else
-    echo "FATAL: sentinel '$SENTINEL' NOT found in the compiled bgpd." >&2
-    echo "       The tag's ancestry contains d3cfdeb8 but the bytes do not carry it." >&2
-    fail=1
+    ipk_extract "$BGPD_IPK" "$BGPD_MEMBER" > /tmp/bgpd.bin || true
+    if [ ! -s /tmp/bgpd.bin ]; then
+      echo "FATAL: could not extract ${BGPD_MEMBER} from $(basename "$BGPD_IPK")" >&2
+      fail=1
+    elif grep -aqF "$SENTINEL" /tmp/bgpd.bin; then
+      echo "OK: post-fix sentinel present in bgpd -- the built binary contains d3cfdeb8"
+      echo "    ($(stat -c%s /tmp/bgpd.bin) bytes, member ${BGPD_MEMBER} of $(basename "$BGPD_IPK"))"
+    else
+      echo "FATAL: sentinel '$SENTINEL' NOT found in the compiled bgpd." >&2
+      echo "       The tag's ancestry contains d3cfdeb8 but the bytes do not carry it." >&2
+      fail=1
+    fi
   fi
 fi
 
 [ "$fail" -eq 0 ] || { echo "FATAL: artifact acceptance checks failed" >&2; exit 1; }
 echo "OK: all artifact acceptance checks passed"
+
+# Read one field out of an .ipk's control file. Best-effort by construction:
+# the manifest is a record, not a gate, and it is written AFTER the acceptance
+# checks have already passed, so nothing here may fail a two-hour build. Every
+# failure path yields the literal "unknown" instead.
+ipk_control_field() {
+  local v
+  v=$(tar -xzOf "$1" ./control.tar.gz 2>/dev/null \
+      | tar -xzOf - ./control 2>/dev/null \
+      | sed -n "s/^${2}: *//p" | head -1) || true
+  [ -n "$v" ] && printf '%s\n' "$v" || printf 'unknown\n'
+}
 
 # The durable record that closes frr-openwrt-build.md's version-parity contract.
 {
@@ -378,6 +462,17 @@ echo "OK: all artifact acceptance checks passed"
   echo
   echo "## packages (sha256)"
   (cd /builder/artifacts && sha256sum ./*.ipk)
+  echo
+  # Each package's declared Depends, so the operator can diff the required set
+  # against `opkg list-installed` BEFORE opening the one-shot install window.
+  # This is the one thing about the artifact that cannot be derived on the
+  # router without committing to the install, and nbg6817 is reachable only by
+  # a human standing next to it -- so a failed dependency resolution there
+  # costs another physical visit, not a retry.
+  echo "## declared dependencies (verify against \`opkg list-installed\` first)"
+  for f in /builder/artifacts/*.ipk; do
+    echo "$(basename "$f"): $(ipk_control_field "$f" Depends)"
+  done
 } > /builder/artifacts/MANIFEST.txt
 
 echo "=== MANIFEST ==="
