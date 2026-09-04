@@ -112,6 +112,35 @@ subs = [
     # download actually extracts to.
     (r"(?m)^PKG_BUILD_DIR:=.*$",  "PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)"),
     (r"(?m)^HOST_BUILD_DIR:=.*$", "HOST_BUILD_DIR:=$(BUILD_DIR_HOST)/$(PKG_NAME)-$(PKG_VERSION)"),
+    # Ship libmlag_pb.so alongside the other FRR shared libs in the base
+    # package. The feed does not, and on FRR >= 10.3 that breaks the build:
+    #
+    #   Package frr-zebra is missing dependencies for the following libraries:
+    #   libmlag_pb.so.0
+    #
+    # mlag/subdir.am has always had `if HAVE_PROTOBUF3: lib_LTLIBRARIES +=
+    # mlag/libmlag_pb.la`, but in FRR 10.2.1 (the version this feed pins)
+    # PROTO3 was only ever set true under `if test "$enable_protobuf3" = yes`
+    # -- and no AC_ARG_ENABLE ever defined --enable-protobuf3, so the flag was
+    # unsettable and HAVE_PROTOBUF3 was permanently false. libmlag_pb was
+    # therefore never built as a shared library, zebra never linked it, and the
+    # feed had no reason to install it. FRR later fixed that dead flag: this
+    # tag's configure.ac sets PROTO3=true whenever protobuf is not disabled and
+    # libprotobuf-c >= 1.3.0 is present, which it is here (the feed itself
+    # depends on +libprotobuf-c). So the library is now built shared, installed
+    # to PKG_INSTALL_DIR, and linked by zebra -- while the feed's install list
+    # still reflects the 10.2.1 world. Upstream's master feed (10.6.1) has not
+    # caught up either, so this is not something to wait for.
+    #
+    # Shipping it is preferred over building with --disable-protobuf: it keeps
+    # this .ipk configured identically to the PE container image built from the
+    # same tag, which is the whole point of the version-parity contract. Guarded
+    # by $(wildcard) -- mirroring the feed's own $(if $(CONFIG_FRR_SNMP),...)
+    # idiom -- so this stays correct if a future build has protobuf off, in
+    # which case zebra will not link it and there is nothing to ship.
+    (r"(?m)^(\t\$\(CP\) \$\(PKG_INSTALL_DIR\)/usr/lib/libmgmt_be_nb\.so\* \$\(1\)/usr/lib/)$",
+     "\\1\n\t$(if $(wildcard $(PKG_INSTALL_DIR)/usr/lib/libmlag_pb.so*),"
+     "$(CP) $(PKG_INSTALL_DIR)/usr/lib/libmlag_pb.so* $(1)/usr/lib/,)"),
 ]
 for entry in subs:
     pat, repl = entry[0], entry[1]
@@ -187,12 +216,100 @@ echo "OK: all ${#FRR_PKGS[@]} expected packages produced"
 # Prove it from the artifact instead of asserting it in prose.
 echo "=== vtysh presence in base frr package ==="
 BASE=$(find /builder/artifacts -name 'frr_*.ipk' | head -1)
-if tar -xzOf "$BASE" ./data.tar.gz 2>/dev/null | tar -tzf - 2>/dev/null | grep -qE '\./usr/bin/vtysh$'; then
-  echo "OK: ./usr/bin/vtysh present in $(basename "$BASE")"
+
+# .ipk payload members may be listed with or without a leading "./" depending on
+# how the archive was rolled, so every match below is anchored on (^|/) rather
+# than assuming one form.
+ipk_files() { tar -xzOf "$1" ./data.tar.gz 2>/dev/null | tar -tzf - 2>/dev/null; }
+# Resolve a payload path suffix to the exact member name inside the archive.
+ipk_member() { ipk_files "$1" | grep -E "(^|/)${2}\$" | head -1; }
+# Stream one payload member out of an .ipk to stdout.
+ipk_extract() { tar -xzOf "$1" ./data.tar.gz 2>/dev/null | tar -xzOf - "$2" 2>/dev/null; }
+
+if [ -n "$(ipk_member "$BASE" 'usr/bin/vtysh')" ]; then
+  echo "OK: usr/bin/vtysh present in $(basename "$BASE")"
 else
   echo "WARN: could not confirm vtysh inside $(basename "$BASE")"
-  tar -xzOf "$BASE" ./data.tar.gz 2>/dev/null | tar -tzf - 2>/dev/null | head -30 || true
+  ipk_files "$BASE" | head -30 || true
 fi
+
+# --- Artifact-level acceptance checks -------------------------------------
+#
+# Everything above proves things about the build INPUTS (the tag, its ancestry,
+# the SDK release). These three prove things about the OUTPUT bytes the operator
+# will actually install, which is what the acceptance criteria ask for.
+
+fail=0
+
+# 1. libmlag_pb.so must be in the base package. zebra has a NEEDED entry for
+#    libmlag_pb.so.0 (see the feed patch above); without the library present
+#    zebra does not start -- it dies at load time with "cannot open shared
+#    object file", which on a remote router looks like a bad flash rather than
+#    a missing file. OpenWrt's own dependency check catches this at package
+#    time, but assert it against the artifact too so the guarantee survives any
+#    future change to that check.
+echo "=== libmlag_pb.so in base frr package ==="
+if ipk_files "$BASE" | grep -qE '(^|/)usr/lib/libmlag_pb\.so'; then
+  echo "OK: libmlag_pb.so* present in $(basename "$BASE")"
+  ipk_files "$BASE" | grep -E '(^|/)usr/lib/' | sort || true
+else
+  echo "FATAL: libmlag_pb.so missing from $(basename "$BASE") -- zebra will not start" >&2
+  fail=1
+fi
+
+# 2. frr-pim6d must contain a real pim6d binary. AC2 asks for the daemon to be
+#    evidenced from the produced packages rather than asserted, and a selected
+#    CONFIG_PACKAGE_frr-pim6d=y alone does not prove a binary came out the far
+#    end. BLO-22372's probe drives `ipv6 mld static-group`, which lives here.
+echo "=== pim6d binary in frr-pim6d package ==="
+P6=$(find /builder/artifacts -name 'frr-pim6d_*.ipk' | head -1)
+if [ -n "${P6:-}" ] && [ -n "$(ipk_member "$P6" 'usr/sbin/pim6d')" ]; then
+  echo "OK: usr/sbin/pim6d present in $(basename "$P6")"
+else
+  echo "FATAL: no usr/sbin/pim6d in frr-pim6d package -- the probe would originate no Type-7" >&2
+  fail=1
+fi
+
+# 3. The compiled bgpd must actually carry d3cfdeb8. Ancestry proves the SOURCE
+#    contained the fix; this proves the BYTES do, which is the claim the PoP
+#    deploy actually rests on.
+#
+#    The sentinel is the flog_err format string the fix introduces:
+#      bgpd/bgp_mvpn.c: "%s [Error] MVPN Type-%u body does not match advertised
+#                        length %u"
+#    Occurrences in bgp_mvpn.c: 0 at d3cfdeb8^, 1 at this tag. As a string
+#    literal it lands in .rodata and survives rstrip/sstrip.
+#
+#    Do NOT use BGP_MVPN_TYPE3_V6_V4_SPEC_LEN as the sentinel even though the
+#    fix introduces it. It is a #define used in an integer comparison
+#    (bgp_mvpn.c:197 `length == BGP_MVPN_TYPE3_V6_V4_SPEC_LEN`), so it compiles
+#    to a number and never appears in the binary -- grepping for it returns 0 on
+#    pre-fix AND post-fix builds, i.e. a silent false negative.
+SENTINEL='body does not match advertised length'
+echo "=== d3cfdeb8 sentinel in the compiled bgpd ==="
+BGPD_IPK=$(find /builder/artifacts -name 'frr-bgpd_*.ipk' | head -1)
+BGPD_MEMBER=$([ -n "${BGPD_IPK:-}" ] && ipk_member "$BGPD_IPK" 'usr/sbin/bgpd' || true)
+if [ -z "${BGPD_IPK:-}" ] || [ -z "${BGPD_MEMBER:-}" ]; then
+  echo "FATAL: no bgpd binary found to check" >&2
+  [ -n "${BGPD_IPK:-}" ] && ipk_files "$BGPD_IPK" | head -20 || true
+  fail=1
+else
+  ipk_extract "$BGPD_IPK" "$BGPD_MEMBER" > /tmp/bgpd.bin || true
+  if [ ! -s /tmp/bgpd.bin ]; then
+    echo "FATAL: could not extract ${BGPD_MEMBER} from $(basename "$BGPD_IPK")" >&2
+    fail=1
+  elif grep -aqF "$SENTINEL" /tmp/bgpd.bin; then
+    echo "OK: post-fix sentinel present in bgpd -- the built binary contains d3cfdeb8"
+    echo "    ($(stat -c%s /tmp/bgpd.bin) bytes, member ${BGPD_MEMBER} of $(basename "$BGPD_IPK"))"
+  else
+    echo "FATAL: sentinel '$SENTINEL' NOT found in the compiled bgpd." >&2
+    echo "       The tag's ancestry contains d3cfdeb8 but the bytes do not carry it." >&2
+    fail=1
+  fi
+fi
+
+[ "$fail" -eq 0 ] || { echo "FATAL: artifact acceptance checks failed" >&2; exit 1; }
+echo "OK: all artifact acceptance checks passed"
 
 # The durable record that closes frr-openwrt-build.md's version-parity contract.
 {

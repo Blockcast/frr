@@ -255,8 +255,21 @@ jobs:
             echo '#'
             echo '# 2. Confirm the fix is in the installed binary (BLO-22372 step 0).'
             echo '#    This is the positive confirmation that the PoP is post-fix.'
-            echo 'ssh root@<nbg6817> "strings /usr/sbin/bgpd | grep -c BGP_MVPN_TYPE3_V6_V4_SPEC_LEN || true"'
+            echo '#'
+            echo '#    The sentinel is the flog_err format string d3cfdeb8 adds to'
+            echo '#    bgpd/bgp_mvpn.c (0 occurrences at d3cfdeb8^, 1 at this tag).'
+            echo '#    Do NOT grep for BGP_MVPN_TYPE3_V6_V4_SPEC_LEN: it is a #define'
+            echo '#    used in an integer comparison, so it compiles to a number and'
+            echo '#    is absent from pre-fix AND post-fix binaries alike -- it reads'
+            echo '#    as a confident PRE-FIX no matter what the box is running.'
+            echo '#    The -f guard reports UNKNOWN rather than PRE-FIX when the'
+            echo '#    binary is missing, for the same reason.'
+            echo '#'
+            echo '#    `tr -c` is used instead of `strings` (binutils is not on the'
+            echo '#    router) and instead of `grep -a` (busybox grep has no -a).'
+            echo "ssh root@<nbg6817> 'B=/usr/sbin/bgpd; [ -f \"\$B\" ] || { echo UNKNOWN-no-binary; exit 2; }; tr -c \"[:print:]\" \"\\n\" < \"\$B\" | grep -qF \"body does not match advertised length\" && echo POST-FIX || echo PRE-FIX'"
             echo 'ssh root@<nbg6817> "/usr/sbin/bgpd --version; /usr/sbin/pim6d --version"'
+            echo 'ssh root@<nbg6817> "opkg list-installed | grep ^frr"   # for the build-log row'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
