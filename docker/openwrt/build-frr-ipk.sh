@@ -134,13 +134,28 @@ subs = [
     #
     # Shipping it is preferred over building with --disable-protobuf: it keeps
     # this .ipk configured identically to the PE container image built from the
-    # same tag, which is the whole point of the version-parity contract. Guarded
-    # by $(wildcard) -- mirroring the feed's own $(if $(CONFIG_FRR_SNMP),...)
-    # idiom -- so this stays correct if a future build has protobuf off, in
-    # which case zebra will not link it and there is nothing to ship.
+    # same tag, which is the whole point of the version-parity contract.
+    #
+    # Copied UNCONDITIONALLY, exactly as the feed copies libfrr.so* and
+    # libmgmt_be_nb.so* on the two lines above. An earlier revision guarded this
+    # with $(if $(wildcard $(PKG_INSTALL_DIR)/usr/lib/libmlag_pb.so*),...) and
+    # that silently expanded to NOTHING -- run 33891736212 installed the library
+    # into PKG_INSTALL_DIR at 16:42:20.85 and then ran this very recipe at
+    # 16:42:25.64 emitting copies for libfrr and libmgmt_be_nb and none for
+    # libmlag_pb, failing frr-zebra packaging 3s later on the same missing
+    # libmlag_pb.so.0. GNU make caches its directory globs, so a $(wildcard) on
+    # a path that Build/Install populates LATER in the same make invocation keeps
+    # returning the stale empty listing. The feed's own $(if $(CONFIG_FRR_SNMP),...)
+    # idiom this was modelled on is keyed off a Kconfig symbol, which is fixed at
+    # parse time; a filesystem glob is not, and that is the difference.
+    #
+    # Unconditional is also the safer failure mode: at this tag the library is
+    # always built shared (configure sets PROTO3 whenever protobuf is enabled),
+    # and if some future build does disable protobuf the cp fails loudly at build
+    # time instead of quietly shipping a zebra that cannot start on a router only
+    # a human can reach.
     (r"(?m)^(\t\$\(CP\) \$\(PKG_INSTALL_DIR\)/usr/lib/libmgmt_be_nb\.so\* \$\(1\)/usr/lib/)$",
-     "\\1\n\t$(if $(wildcard $(PKG_INSTALL_DIR)/usr/lib/libmlag_pb.so*),"
-     "$(CP) $(PKG_INSTALL_DIR)/usr/lib/libmlag_pb.so* $(1)/usr/lib/,)"),
+     "\\1\n\t$(CP) $(PKG_INSTALL_DIR)/usr/lib/libmlag_pb.so* $(1)/usr/lib/"),
 ]
 for entry in subs:
     pat, repl = entry[0], entry[1]

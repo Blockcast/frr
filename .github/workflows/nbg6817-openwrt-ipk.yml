@@ -249,8 +249,16 @@ jobs:
             echo '#'
             echo '# 1. Copy the packages over and install them together, so opkg'
             echo '#    resolves the inter-package deps in one transaction.'
-            echo 'scp frr*.ipk root@<nbg6817>:/tmp/'
-            echo 'ssh root@<nbg6817> "cd /tmp && opkg install ./frr*.ipk"'
+            echo '#'
+            echo '#    Staged in a VERSION-SCOPED directory on purpose. /tmp on the'
+            echo '#    router is tmpfs that persists until reboot, and an r3 set was'
+            echo '#    already delivered to /tmp this way. Installing from a bare'
+            echo '#    /tmp/frr*.ipk glob would hand opkg two versions of the same'
+            echo '#    package in one transaction if any earlier .ipk is still there.'
+            echo "D=/tmp/frr-r${PKG_RELEASE}"
+            echo "ssh root@<nbg6817> \"rm -rf \$D && mkdir -p \$D\""
+            echo "scp frr*.ipk root@<nbg6817>:\$D/"
+            echo "ssh root@<nbg6817> \"cd \$D && opkg install ./frr*.ipk\""
             echo '#    (same-version rebuild: add --force-reinstall)'
             echo '#'
             echo '# 2. Confirm the fix is in the installed binary (BLO-22372 step 0).'
