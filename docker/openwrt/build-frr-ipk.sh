@@ -194,9 +194,33 @@ fi
 
 echo "=== produced packages ==="
 mkdir -p /builder/artifacts
+# Copy ONLY the daemon set this PoP runs -- deliberately not `find -name 'frr*.ipk'`.
+#
+# `make defconfig` marks every other FRR daemon =m (the SDK's default for package
+# symbols), so the build also produces frr-ospfd, frr-isisd, frr-ldpd, frr-nhrpd,
+# frr-pythontools and a dozen more. Shipping those to the operator is actively
+# harmful, not merely untidy: the retrieval instructions say
+# `opkg install ./frr*.ipk` (one transaction, so opkg resolves the inter-package
+# deps together), and frr-pythontools DEPENDS on +python3-base +python3-light
+# +python3-logging. A home router has none of those and no configured network
+# feed to fetch them from, so opkg fails the WHOLE transaction on an unsatisfied
+# dependency -- inside a one-shot operator window, on a device only a human can
+# reach. Filtering here is what keeps the glob in those instructions safe.
+#
+# It also honours frr-openwrt-build.md's standing rule: "do not let the SDK's
+# default package selection silently add daemons this fork doesn't ship config
+# for."
 # OpenWrt 24.10 still ships opkg/.ipk; apk arrives after 24.10.
-find bin/packages -name 'frr*.ipk' -exec cp {} /builder/artifacts/ \;
+for p in "${FRR_PKGS[@]}"; do
+  found=$(find bin/packages -name "${p}_*.ipk" | head -1)
+  if [ -n "$found" ]; then cp "$found" /builder/artifacts/; fi
+done
 ls -la /builder/artifacts
+
+echo "=== built but deliberately NOT shipped ==="
+find bin/packages -name 'frr*.ipk' -printf '%f\n' | sort > /tmp/all_built.txt
+find /builder/artifacts -name '*.ipk' -printf '%f\n' | sort > /tmp/shipped.txt
+comm -23 /tmp/all_built.txt /tmp/shipped.txt | sed 's/^/  excluded: /' || true
 
 if [ -z "$(ls -A /builder/artifacts 2>/dev/null)" ]; then
   echo "FATAL: no frr .ipk produced" >&2
@@ -211,6 +235,16 @@ for p in "${FRR_PKGS[@]}"; do
 done
 [ "$missing" -eq 0 ] || exit 1
 echo "OK: all ${#FRR_PKGS[@]} expected packages produced"
+
+# The delivered set must be EXACTLY the daemon set -- no extras. This is the
+# check that keeps the operator's `opkg install ./frr*.ipk` a safe instruction.
+shipped_count=$(find /builder/artifacts -name '*.ipk' | wc -l)
+if [ "$shipped_count" -ne "${#FRR_PKGS[@]}" ]; then
+  echo "FATAL: artifacts hold ${shipped_count} .ipk but the daemon set is ${#FRR_PKGS[@]}" >&2
+  ls -1 /builder/artifacts >&2
+  exit 1
+fi
+echo "OK: artifacts hold exactly ${#FRR_PKGS[@]} .ipk, matching the daemon set"
 
 # vtysh ships inside the base frr package rather than a frr-vtysh package.
 # Prove it from the artifact instead of asserting it in prose.
