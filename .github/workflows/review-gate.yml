@@ -96,7 +96,17 @@ jobs:
     if: >-
       github.event_name != 'issue_comment' ||
       github.event.issue.pull_request != null
-    runs-on: default
+    # arc-light, not `default`: this job is `actions/checkout` plus one Python
+    # script -- seconds of work. `default` is the heavyweight DinD pool (each
+    # runner reserves 14Gi ephemeral-storage and 2 CPU, and mounts a Docker
+    # socket, /dev/kvm and a Postgres volume), which caps it at 12 slots and
+    # keeps it saturated behind multi-minute build lanes. Because this gate is
+    # fail-closed with no maintainer override, a queued run is not a slow merge
+    # -- it is an impossible one. arc-light runs the byte-identical runner image
+    # at maxRunners=32 and mounts none of the privileged surface, which also
+    # suits a `pull_request_target` job holding `statuses: write`.
+    # Matches the canonical wiring in Blockcast/review-gate-action's README.
+    runs-on: arc-light
     steps:
       - name: Checkout
         uses: actions/checkout@v5
