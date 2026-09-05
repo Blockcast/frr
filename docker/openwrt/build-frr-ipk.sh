@@ -75,7 +75,16 @@ echo "=== SDK identity (must match the router's firmware) ==="
 # The workflow asserts the same pair on the runner before `docker create`; this
 # re-asserts it where the compile happens, for the same reason the FRR_SHA check
 # below is duplicated in here.
-SDK_RELEASE="${VERSION_PATH#releases/}"
+#
+# Both reads MUST be defaulted. `${VERSION_PATH#releases/}` on an unset variable
+# dies at THIS line under `set -u` (:23), before the guard below can attribute
+# it -- which made that guard dead code for the VERSION_PATH half. Reproduced:
+# with both unset, bash prints "VERSION_PATH: unbound variable" and exits 1
+# without ever reaching the `FATAL: SDK image carries no VERSION_PATH/TARGET`
+# message written for exactly that case. Strip in a second step so the default
+# survives the prefix removal.
+SDK_RELEASE="${VERSION_PATH:-}"
+SDK_RELEASE="${SDK_RELEASE#releases/}"
 SDK_TARGET="${TARGET:-}"
 echo "sdk_release=${SDK_RELEASE:-<unset>} sdk_target=${SDK_TARGET:-<unset>}"
 if [ -z "${SDK_RELEASE:-}" ] || [ -z "${SDK_TARGET:-}" ]; then
@@ -477,7 +486,22 @@ ipk_control_field() {
   [ -n "$v" ] && printf '%s\n' "$v" || printf 'unknown\n'
 }
 
+# Same contract for a `.config` value: yield the literal "unknown" rather than
+# an empty field, so a missing key is legible in the record instead of reading
+# as a blank someone forgot to fill in.
+config_field() {
+  local v
+  v=$(grep -E "^${1}=" .config 2>/dev/null | head -1 | cut -d'"' -f2) || true
+  [ -n "$v" ] && printf '%s\n' "$v" || printf 'unknown\n'
+}
+
 # The durable record that closes frr-openwrt-build.md's version-parity contract.
+#
+# ⚠ `{ ... } > MANIFEST.txt` truncates the file before the first echo runs, so a
+# mid-block failure ships a TRUNCATED manifest next to valid .ipk files -- and
+# the salvage path at the top of this script copies artifacts out on failure, so
+# it would ship. Every construction below must therefore be `|| true`-guarded or
+# yield "unknown"; none may exit non-zero under `set -e`/`pipefail`.
 {
   echo "# nbg6817 OpenWrt FRR .ipk build manifest"
   echo
@@ -490,15 +514,15 @@ ipk_control_field() {
   echo "sdk_image:           ${SDK_IMAGE}"
   echo "sdk_digest:          ${SDK_DIGEST}"
   echo "router_firmware:     ${ROUTER_OPENWRT_RELEASE} (asserted equal to sdk_version)"
-  echo "target:              $(grep -E '^CONFIG_TARGET_BOARD=' .config | cut -d'"' -f2)/$(grep -E '^CONFIG_TARGET_SUBTARGET=' .config | cut -d'"' -f2)"
-  echo "arch_packages:       $(grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2)"
+  echo "target:              $(config_field CONFIG_TARGET_BOARD)/$(config_field CONFIG_TARGET_SUBTARGET)"
+  echo "arch_packages:       $(config_field CONFIG_TARGET_ARCH_PACKAGES)"
   echo "built_at:            $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo
   echo "## selected frr config"
-  grep -E '^CONFIG_PACKAGE_frr' .config | sort
+  grep -E '^CONFIG_PACKAGE_frr' .config | sort || true
   echo
   echo "## packages (sha256)"
-  (cd /builder/artifacts && sha256sum ./*.ipk)
+  (cd /builder/artifacts && sha256sum ./*.ipk) || true
   echo
   # Each package's declared Depends, so the operator can diff the required set
   # against `opkg list-installed` BEFORE opening the one-shot install window.

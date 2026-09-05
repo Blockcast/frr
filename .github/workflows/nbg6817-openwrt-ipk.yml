@@ -46,13 +46,28 @@ on:
   # build definition re-proves itself.
   #
   # ⚠ MERGE GATE, in this order and not the other one:
-  #   1. this branch produces ONE green run (as of head 5b414a13 there have been
-  #      five runs and zero green: 33884020708 cancelled, 33884148336 failure,
-  #      33891736212 failure, 33892673791 cancelled, 33900460174 failure);
+  #   1. a green run EXISTS AT THE HEAD BEING MERGED -- not merely somewhere on
+  #      this branch. Every push here changes build behaviour, so an older green
+  #      run is evidence about a tree that no longer exists. Check it, do not
+  #      recite it (a hand-maintained run list in a comment goes stale by the
+  #      next push, which is why there is no longer one here):
+  #        gh run list --repo Blockcast/frr \
+  #          --workflow nbg6817-openwrt-ipk.yml --limit 20 \
+  #          --json headSha,conclusion,databaseId \
+  #          --jq '.[]|select(.headSha=="<merge head>")|"\(.databaseId) \(.conclusion)"'
   #   2. THEN delete the feature-branch line below, leaving only master;
   #   3. THEN merge.
+  #
   # Deleting it before step 1 removes the only trigger that can produce that
   # green run -- there is no dispatch path until this file is on master.
+  #
+  # The one intrinsic exception, stated so nobody has to rediscover it: the
+  # step-2 commit CANNOT itself be covered by step 1, because removing the
+  # branch from `push.branches` is exactly what stops a run firing for it. So
+  # the step-2 commit must be trigger-removal-ONLY, and that is mechanically
+  # checkable rather than a promise -- the diff between the green head and the
+  # merge head must touch nothing else:
+  #   git diff --stat <green head>..<merge head>   # only this file, only :NN
   push:
     branches:
       - master
@@ -76,6 +91,11 @@ env:
   # libc/kernel ABI skew, so this is pinned here AND asserted against the
   # image's own metadata in the job below.
   ROUTER_OPENWRT_RELEASE: "24.10.7"
+  # The router's OpenWrt target/subtarget. Lives here rather than as a literal
+  # at each use site because it and ROUTER_OPENWRT_RELEASE describe ONE router
+  # and must drift together or not at all -- three separate literals is three
+  # chances for half a migration.
+  ROUTER_OPENWRT_TARGET: ipq806x/generic
   SDK_IMAGE: openwrt/sdk:ipq806x-generic-24.10.7
   # The IPv6 MVPN NLRI length fix. Its presence in the built tree is the entire
   # reason this artifact exists, so it is a build gate, not a review note.
@@ -192,11 +212,31 @@ jobs:
             echo "::error::SDK image release '${IMG_VER}' != router firmware '${ROUTER_OPENWRT_RELEASE}' — ABI skew risk, refusing to build."
             exit 1
           fi
-          if [ "${IMG_TARGET}" != "ipq806x/generic" ]; then
-            echo "::error::SDK image target '${IMG_TARGET}' != 'ipq806x/generic' (zyxel_nbg6817)."
+          if [ "${IMG_TARGET}" != "${ROUTER_OPENWRT_TARGET}" ]; then
+            echo "::error::SDK image target '${IMG_TARGET}' != '${ROUTER_OPENWRT_TARGET}' (zyxel_nbg6817)."
             exit 1
           fi
           echo "sdk_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+          # Pin the RUN to the digest, not the tag. Without this the manifest's
+          # sdk_digest describes what was *inspected* here while the build ran
+          # whatever the tag pointed at a few steps later -- a provenance record
+          # that is only accidentally true. RepoDigests entries already carry the
+          # repo (`openwrt/sdk@sha256:...`), so use it as-is; the `case` keeps
+          # this correct if a future docker/format ever yields a bare digest.
+          case "$DIGEST" in
+            *@sha256:*) SDK_REF="$DIGEST" ;;
+            sha256:*)   SDK_REF="${SDK_IMAGE%%:*}@${DIGEST}" ;;
+            *) echo "::error::unparseable SDK digest '${DIGEST}'"; exit 1 ;;
+          esac
+          # Fail here, in seconds, rather than at `docker create` two steps on:
+          # the digest ref must resolve to the same local image as the tag.
+          if [ "$(docker inspect --format '{{.Id}}' "$SDK_REF")" \
+             != "$(docker inspect --format '{{.Id}}' "$SDK_IMAGE")" ]; then
+            echo "::error::digest ref '${SDK_REF}' does not resolve to the inspected image"
+            exit 1
+          fi
+          echo "sdk_ref=${SDK_REF}" >> "$GITHUB_OUTPUT"
 
       - name: Build the .ipk set in the SDK container
         env:
@@ -205,6 +245,7 @@ jobs:
           FRR_PKG_VERSION: ${{ steps.resolve.outputs.frr_version }}
           PKG_RELEASE: ${{ steps.resolve.outputs.pkg_release }}
           SDK_DIGEST: ${{ steps.sdk.outputs.sdk_digest }}
+          SDK_REF: ${{ steps.sdk.outputs.sdk_ref }}
         run: |
           set -euo pipefail
           mkdir -p out
@@ -214,17 +255,21 @@ jobs:
           # dind sidecar a host path given to `-v` resolves inside the DIND
           # container, not this one, so bind mounts are a portability trap.
           # Copying in and out is mount-free and behaves the same anywhere.
+          #
+          # The image is referenced by DIGEST ($SDK_REF), not by tag, so the
+          # manifest's sdk_digest is a property of what actually compiled these
+          # bytes rather than of what was inspected in an earlier step.
           docker create --name ob \
             -e FRR_REF="$FRR_REF" \
             -e FRR_SHA="$FRR_SHA" \
             -e FRR_PKG_VERSION="$FRR_PKG_VERSION" \
             -e PKG_RELEASE="$PKG_RELEASE" \
             -e ROUTER_OPENWRT_RELEASE="$ROUTER_OPENWRT_RELEASE" \
-            -e ROUTER_OPENWRT_TARGET="ipq806x/generic" \
+            -e ROUTER_OPENWRT_TARGET="$ROUTER_OPENWRT_TARGET" \
             -e SDK_IMAGE="$SDK_IMAGE" \
             -e SDK_DIGEST="$SDK_DIGEST" \
             -e FRR_SRC=/src \
-            "$SDK_IMAGE" bash /tmp/build-frr-ipk.sh
+            "$SDK_REF" bash /tmp/build-frr-ipk.sh
 
           docker cp ci/docker/openwrt/build-frr-ipk.sh ob:/tmp/build-frr-ipk.sh
           # The private fork is handed over as a plain local git repo. No token
