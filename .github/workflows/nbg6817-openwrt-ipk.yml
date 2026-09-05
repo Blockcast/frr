@@ -204,6 +204,7 @@ jobs:
           FRR_SHA: ${{ steps.resolve.outputs.frr_sha }}
           FRR_PKG_VERSION: ${{ steps.resolve.outputs.frr_version }}
           PKG_RELEASE: ${{ steps.resolve.outputs.pkg_release }}
+          SDK_DIGEST: ${{ steps.sdk.outputs.sdk_digest }}
         run: |
           set -euo pipefail
           mkdir -p out
@@ -218,6 +219,10 @@ jobs:
             -e FRR_SHA="$FRR_SHA" \
             -e FRR_PKG_VERSION="$FRR_PKG_VERSION" \
             -e PKG_RELEASE="$PKG_RELEASE" \
+            -e ROUTER_OPENWRT_RELEASE="$ROUTER_OPENWRT_RELEASE" \
+            -e ROUTER_OPENWRT_TARGET="ipq806x/generic" \
+            -e SDK_IMAGE="$SDK_IMAGE" \
+            -e SDK_DIGEST="$SDK_DIGEST" \
             -e FRR_SRC=/src \
             "$SDK_IMAGE" bash /tmp/build-frr-ipk.sh
 

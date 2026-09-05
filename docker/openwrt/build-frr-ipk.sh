@@ -24,6 +24,10 @@ set -euo pipefail
 
 : "${FRR_REF:?FRR_REF (Blockcast/frr tag) is required}"
 : "${FRR_SHA:?FRR_SHA (full commit SHA the tag resolves to) is required}"
+: "${ROUTER_OPENWRT_RELEASE:?ROUTER_OPENWRT_RELEASE (nbg6817 firmware point release) is required}"
+: "${ROUTER_OPENWRT_TARGET:=ipq806x/generic}"
+: "${SDK_IMAGE:=unknown}"
+: "${SDK_DIGEST:=unknown}"
 : "${PKG_RELEASE:=4}"
 : "${FRR_SRC:=/src}"
 : "${FRR_PKG_VERSION:=10.8.0}"
@@ -58,8 +62,37 @@ if [ ! -x ./scripts/feeds ]; then
 fi
 
 echo "=== SDK identity (must match the router's firmware) ==="
-cat ./version 2>/dev/null || true
-grep -E '^CONFIG_TARGET_(BOARD|SUBTARGET|ARCH_PACKAGES)=' .config 2>/dev/null || true
+# This block used to be `cat ./version || true` + `grep .config || true`. Both
+# are best-effort no-ops here: the SDK image ships no ./version, and .config
+# does not exist until `make defconfig` runs much later. So the block printed
+# NOTHING and asserted NOTHING, while its header claimed a firmware match --
+# and that is why every manifest so far recorded `sdk_version: unknown`, the
+# exact "not recorded at build time" pattern BLO-31631 exists to eliminate.
+#
+# Read the identity the SDK image actually carries. VERSION_PATH and TARGET are
+# set in the image's own Config.Env by OpenWrt's SDK build, so they describe the
+# toolchain that will compile these bytes rather than the tag someone typed.
+# The workflow asserts the same pair on the runner before `docker create`; this
+# re-asserts it where the compile happens, for the same reason the FRR_SHA check
+# below is duplicated in here.
+SDK_RELEASE="${VERSION_PATH#releases/}"
+SDK_TARGET="${TARGET:-}"
+echo "sdk_release=${SDK_RELEASE:-<unset>} sdk_target=${SDK_TARGET:-<unset>}"
+if [ -z "${SDK_RELEASE:-}" ] || [ -z "${SDK_TARGET:-}" ]; then
+  echo "FATAL: SDK image carries no VERSION_PATH/TARGET -- cannot establish toolchain identity" >&2
+  exit 1
+fi
+# An ABI-skewed .ipk installs cleanly and then crashes at runtime, on a router
+# only a human standing next to it can recover. Fail the build, not the router.
+if [ "$SDK_RELEASE" != "$ROUTER_OPENWRT_RELEASE" ]; then
+  echo "FATAL: SDK release '$SDK_RELEASE' != router firmware '$ROUTER_OPENWRT_RELEASE' -- ABI skew" >&2
+  exit 1
+fi
+if [ "$SDK_TARGET" != "$ROUTER_OPENWRT_TARGET" ]; then
+  echo "FATAL: SDK target '$SDK_TARGET' != router target '$ROUTER_OPENWRT_TARGET'" >&2
+  exit 1
+fi
+echo "OK: SDK $SDK_RELEASE / $SDK_TARGET matches the nbg6817 firmware"
 
 echo "=== source repo handed in by the workflow ==="
 git -C "$FRR_SRC" log -1 --format='%H %ci %s' || {
@@ -328,11 +361,11 @@ ipk_extract() { tar -xzOf "$1" ./data.tar.gz 2>/dev/null | tar -xzOf - "$2" 2>/d
 # archive is opened one time and each check is a pure string match.
 BASE_FILES=$(ipk_list "$BASE") || exit 1
 
-if printf '%s\n' "$BASE_FILES" | grep -qE '(^|/)usr/bin/vtysh$'; then
+if grep -qE '(^|/)usr/bin/vtysh$' <<<"$BASE_FILES"; then
   echo "OK: usr/bin/vtysh present in $(basename "$BASE")"
 else
   echo "WARN: could not confirm vtysh inside $(basename "$BASE")"
-  printf '%s\n' "$BASE_FILES" | head -30
+  head -30 <<<"$BASE_FILES"
 fi
 
 # --- Artifact-level acceptance checks -------------------------------------
@@ -351,9 +384,9 @@ fail=0
 #    time, but assert it against the artifact too so the guarantee survives any
 #    future change to that check.
 echo "=== libmlag_pb.so in base frr package ==="
-if printf '%s\n' "$BASE_FILES" | grep -qE '(^|/)usr/lib/libmlag_pb\.so'; then
+if grep -qE '(^|/)usr/lib/libmlag_pb\.so' <<<"$BASE_FILES"; then
   echo "OK: libmlag_pb.so* present in $(basename "$BASE")"
-  printf '%s\n' "$BASE_FILES" | grep -E '(^|/)usr/lib/' | sort
+  grep -E '(^|/)usr/lib/' <<<"$BASE_FILES" | sort || true
 else
   echo "FATAL: libmlag_pb.so missing from $(basename "$BASE") -- zebra will not start" >&2
   echo "       (the archive read completely, so this is a genuine absence)" >&2
@@ -373,7 +406,7 @@ elif ! P6_FILES=$(ipk_list "$P6"); then
   # ipk_list already named the archive fault. Do not let it read as a missing
   # daemon: "no pim6d" and "cannot read the package" need different fixes.
   fail=1
-elif printf '%s\n' "$P6_FILES" | grep -qE '(^|/)usr/sbin/pim6d$'; then
+elif grep -qE '(^|/)usr/sbin/pim6d$' <<<"$P6_FILES"; then
   echo "OK: usr/sbin/pim6d present in $(basename "$P6")"
 else
   echo "FATAL: no usr/sbin/pim6d in frr-pim6d package -- the probe would originate no Type-7" >&2
@@ -408,10 +441,10 @@ elif ! BGPD_FILES=$(ipk_list "$BGPD_IPK"); then
   # the one check the PoP deploy decision actually rests on.
   fail=1
 else
-  BGPD_MEMBER=$(printf '%s\n' "$BGPD_FILES" | grep -E '(^|/)usr/sbin/bgpd$' | head -1)
+  BGPD_MEMBER=$(grep -m1 -E '(^|/)usr/sbin/bgpd$' <<<"$BGPD_FILES" || true)
   if [ -z "${BGPD_MEMBER:-}" ]; then
     echo "FATAL: no usr/sbin/bgpd member in $(basename "$BGPD_IPK")" >&2
-    printf '%s\n' "$BGPD_FILES" | head -20
+    head -20 <<<"$BGPD_FILES"
     fail=1
   else
     ipk_extract "$BGPD_IPK" "$BGPD_MEMBER" > /tmp/bgpd.bin || true
@@ -452,7 +485,11 @@ ipk_control_field() {
   echo "frr_commit_sha:      $FRR_SHA"
   echo "frr_source:          ${FRR_SRC} (tag checked out on the runner from Blockcast/frr)"
   echo "openwrt_pkg_version: ${FRR_PKG_VERSION}-r${PKG_RELEASE}"
-  echo "sdk_version:         $(cat ./version 2>/dev/null || echo unknown)"
+  echo "sdk_version:         ${SDK_RELEASE}"
+  echo "sdk_target:          ${SDK_TARGET}"
+  echo "sdk_image:           ${SDK_IMAGE}"
+  echo "sdk_digest:          ${SDK_DIGEST}"
+  echo "router_firmware:     ${ROUTER_OPENWRT_RELEASE} (asserted equal to sdk_version)"
   echo "target:              $(grep -E '^CONFIG_TARGET_BOARD=' .config | cut -d'"' -f2)/$(grep -E '^CONFIG_TARGET_SUBTARGET=' .config | cut -d'"' -f2)"
   echo "arch_packages:       $(grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2)"
   echo "built_at:            $(date -u +%Y-%m-%dT%H:%M:%SZ)"
