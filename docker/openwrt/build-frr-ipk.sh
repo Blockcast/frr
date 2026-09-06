@@ -18,8 +18,15 @@
 # this build runs with `V=s` — which echoes command lines, so a credentialed URL
 # could land in a retained CI log. The workflow instead checks the tag out on
 # the runner (where actions/checkout already holds a scoped token) and hands the
-# repo to the container as a plain local git repo. No secret ever enters the
-# container, and PKG_SOURCE_VERSION still pins to the tag.
+# repo to the container as a plain local git repo. PKG_SOURCE_VERSION still
+# pins to the tag.
+#
+# ⚠ "No secret enters the container" is an invariant with a NAMED enforcement
+# point, not an assumption: both checkouts set `persist-credentials: false`.
+# Without it actions/checkout leaves an `http.<host>.extraheader` AUTHORIZATION
+# line in .git/config, and the `docker cp src/frr ob:/src` that hands this repo
+# over is recursive — it would carry .git/ and the live token in with it. If you
+# add a checkout to that workflow, it needs the same flag.
 set -euo pipefail
 
 : "${FRR_REF:?FRR_REF (Blockcast/frr tag) is required}"
@@ -223,7 +230,14 @@ done
 make defconfig >/dev/null
 
 echo "--- resolved frr config ---"
-grep -E '^(CONFIG_PACKAGE_frr|# CONFIG_PACKAGE_frr)' .config | sort
+# `|| true` because this is informational, and it is informational about
+# EXACTLY the case where it would otherwise exit 1: no CONFIG_PACKAGE_frr* line
+# at all is what a silently-failed `scripts/feeds install -a` looks like. Under
+# `set -e` + `pipefail` (:23) an unguarded grep would then terminate the script
+# right here, six lines above the gate written to diagnose it -- so the operator
+# would get a two-hour build that died after printing only the header above.
+# Same guard as the identical grep in the manifest block below.
+grep -E '^(CONFIG_PACKAGE_frr|# CONFIG_PACKAGE_frr)' .config | sort || true
 
 # AC gate: frr-pim6d is not optional. BLO-22372's probe drives
 # `ipv6 mld static-group`, which lives in pim6d; a build without it yields a
@@ -248,6 +262,66 @@ if [ -n "${CFGLOG:-}" ]; then
 else
   echo "(no config.log found)"
 fi
+
+# ⚠ From the staging copy below onwards, /builder/artifacts holds an INSTALLABLE
+# package set -- and it is staged ~200 lines before the acceptance checks that
+# can reject it. The workflow salvages this directory unconditionally on failure
+# (a failed build's log is the only thing that makes the next attempt cheaper)
+# and uploads it under the artifact name a green run produces. So on a REJECTED
+# build the operator would otherwise receive correctly-named frr*.ipk files
+# whose ONLY evidence of rejection is the ABSENCE of MANIFEST.txt -- a negative,
+# which the job summary renders as the benign-looking "(no manifest)". The
+# precise case this build exists to catch (bytes proven not to carry d3cfdeb8)
+# is the case that would ship most convincingly. nbg6817 is recoverable only by
+# a human standing next to it, so a negative signal is not good enough.
+#
+# The verdict therefore travels INSIDE the download:
+#   - the .ipk set is QUARANTINED into artifacts/REJECTED/. This is the
+#     load-bearing half: the operator instructions say `scp frr*.ipk` from the
+#     directory they unzipped into, and that glob then matches NOTHING rather
+#     than matching a rejected set;
+#   - REJECTED.txt states the verdict positively, so it still says so when the
+#     zip is opened a week later with no run page in front of the reader;
+#   - a partially-written MANIFEST.txt is removed: the manifest is the green
+#     run's record and must never accompany a rejected set.
+# The build log is deliberately left in place -- salvaging it is the entire
+# reason the workflow copies this directory out on failure.
+#
+# A trap, not a line before each `exit 1`: EVERY failure path after the staging
+# copy ships an installable set, and a trap cannot be forgotten when the next
+# check is added.
+quarantine_on_failure() {
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then return 0; fi
+  if [ ! -d /builder/artifacts ]; then exit "$rc"; fi
+  mkdir -p /builder/artifacts/REJECTED 2>/dev/null || true
+  find /builder/artifacts -maxdepth 1 -name '*.ipk' \
+    -exec mv -t /builder/artifacts/REJECTED/ {} + 2>/dev/null || true
+  rm -f /builder/artifacts/MANIFEST.txt 2>/dev/null || true
+  {
+    echo "ARTIFACT ACCEPTANCE FAILED -- DO NOT INSTALL THESE PACKAGES"
+    echo
+    echo "The .ipk files under REJECTED/ compiled, but did NOT pass this build's"
+    echo "artifact acceptance checks. They are therefore not known to carry the"
+    echo "IPv6 MVPN NLRI length fix d3cfdeb8, or are not a complete and"
+    echo "consistent daemon set."
+    echo
+    echo "Installing them on the nbg6817 PoP can reset the live BGP session, and"
+    echo "the router is recoverable only by a human standing next to it."
+    echo
+    echo "frr_tag:        ${FRR_REF:-unknown}"
+    echo "frr_commit_sha: ${FRR_SHA:-unknown}"
+    echo "exit_code:      ${rc}"
+    echo
+    echo "Read build.log.gz for the FATAL line that caused this, fix it, and"
+    echo "re-run. A rejected build has no MANIFEST.txt by design."
+  } > /builder/artifacts/REJECTED.txt 2>/dev/null || true
+  echo "REJECTED: quarantined the .ipk set into /builder/artifacts/REJECTED/ (exit ${rc})" >&2
+  # Re-assert the original status explicitly. The point of this trap is that the
+  # run stays RED; nothing in it may launder a failure into a green build.
+  exit "$rc"
+}
+trap quarantine_on_failure EXIT
 
 echo "=== produced packages ==="
 mkdir -p /builder/artifacts
@@ -303,9 +377,8 @@ if [ "$shipped_count" -ne "${#FRR_PKGS[@]}" ]; then
 fi
 echo "OK: artifacts hold exactly ${#FRR_PKGS[@]} .ipk, matching the daemon set"
 
-# vtysh ships inside the base frr package rather than a frr-vtysh package.
-# Prove it from the artifact instead of asserting it in prose.
-echo "=== vtysh presence in base frr package ==="
+# The base `frr` package is the subject of two acceptance checks below (vtysh
+# and libmlag_pb), so locate it once here.
 BASE=$(find /builder/artifacts -name 'frr_*.ipk' | head -1)
 
 # .ipk payload members may be listed with or without a leading "./" depending on
@@ -352,6 +425,13 @@ ipk_list() {
   if ! list=$(set -o pipefail; tar -xzOf "$1" ./data.tar.gz 2>/dev/null | tar -tzf - 2>/dev/null); then
     echo "FATAL: cannot read the payload of $(basename "$1") -- truncated, corrupt," >&2
     echo "       or not an .ipk. This is an ARCHIVE fault, not a missing file." >&2
+    # Named because every check reading this archive would go red at once if it
+    # ever happened, and the message above would otherwise send the reader
+    # hunting a corrupt build. The outer member is matched as the literal
+    # `./data.tar.gz`; GNU tar does not normalise that against a `data.tar.gz`
+    # stored without the prefix.
+    echo "       If the build itself looks clean, check whether ipkg-build changed" >&2
+    echo "       the outer member name or compression (e.g. data.tar.zst)." >&2
     return 1
   fi
   if [ -z "$list" ]; then
@@ -370,22 +450,41 @@ ipk_extract() { tar -xzOf "$1" ./data.tar.gz 2>/dev/null | tar -xzOf - "$2" 2>/d
 # archive is opened one time and each check is a pure string match.
 BASE_FILES=$(ipk_list "$BASE") || exit 1
 
-if grep -qE '(^|/)usr/bin/vtysh$' <<<"$BASE_FILES"; then
-  echo "OK: usr/bin/vtysh present in $(basename "$BASE")"
-else
-  echo "WARN: could not confirm vtysh inside $(basename "$BASE")"
-  head -30 <<<"$BASE_FILES"
-fi
-
 # --- Artifact-level acceptance checks -------------------------------------
 #
 # Everything above proves things about the build INPUTS (the tag, its ancestry,
-# the SDK release). These three prove things about the OUTPUT bytes the operator
+# the SDK release). These four prove things about the OUTPUT bytes the operator
 # will actually install, which is what the acceptance criteria ask for.
+#
+# `fail` accumulates rather than exiting at the first defect, so one run reports
+# all of them -- a rebuild here costs two hours.
+#
+# ⚠ fail=0 MUST stay above check 1. It used to sit below the vtysh check, which
+# silently made that check advisory: any fail=1 it set would have been clobbered
+# by the initialisation on the next line, so a base package with no vtysh gave a
+# green build ending in "all artifact acceptance checks passed" -- while :40 and
+# check 1 below both describe it as binding.
 
 fail=0
 
-# 1. libmlag_pb.so must be in the base package. zebra has a NEEDED entry for
+# 1. vtysh must be in the base package. vtysh is NOT a separate OpenWrt package;
+#    it ships inside `frr` (see FRR_PKGS above), so nothing in the package
+#    selection proves it came out the far end -- prove it from the artifact
+#    instead of asserting it in prose. It is also the ONLY configuration path on
+#    the router: without it the operator installs a clean-looking set and then
+#    cannot apply the `ipv6 mld static-group` config BLO-22372's probe needs, on
+#    a device reachable only in person.
+echo "=== vtysh presence in base frr package ==="
+if grep -qE '(^|/)usr/bin/vtysh$' <<<"$BASE_FILES"; then
+  echo "OK: usr/bin/vtysh present in $(basename "$BASE")"
+else
+  echo "FATAL: no usr/bin/vtysh in $(basename "$BASE") -- the operator would have no" >&2
+  echo "       way to configure FRR on the router" >&2
+  head -30 <<<"$BASE_FILES"
+  fail=1
+fi
+
+# 2. libmlag_pb.so must be in the base package. zebra has a NEEDED entry for
 #    libmlag_pb.so.0 (see the feed patch above); without the library present
 #    zebra does not start -- it dies at load time with "cannot open shared
 #    object file", which on a remote router looks like a bad flash rather than
@@ -393,8 +492,14 @@ fail=0
 #    time, but assert it against the artifact too so the guarantee survives any
 #    future change to that check.
 echo "=== libmlag_pb.so in base frr package ==="
-if grep -qE '(^|/)usr/lib/libmlag_pb\.so' <<<"$BASE_FILES"; then
-  echo "OK: libmlag_pb.so* present in $(basename "$BASE")"
+# Anchored on `.so.[0-9]`, not a bare `.so` prefix: the requirement above is the
+# SONAME libmlag_pb.so.0, which is what the dynamic loader resolves. An
+# unanchored match is also satisfied by the bare `libmlag_pb.so` linker symlink
+# alone, which would not start zebra. The patched recipe's `libmlag_pb.so*` glob
+# always copies .so, .so.0 and .so.0.0.0 together, so this is the check matching
+# its own stated contract rather than a live defect being fixed.
+if grep -qE '(^|/)usr/lib/libmlag_pb\.so\.[0-9]' <<<"$BASE_FILES"; then
+  echo "OK: libmlag_pb.so.<N> present in $(basename "$BASE")"
   grep -E '(^|/)usr/lib/' <<<"$BASE_FILES" | sort || true
 else
   echo "FATAL: libmlag_pb.so missing from $(basename "$BASE") -- zebra will not start" >&2
@@ -402,7 +507,7 @@ else
   fail=1
 fi
 
-# 2. frr-pim6d must contain a real pim6d binary. AC2 asks for the daemon to be
+# 3. frr-pim6d must contain a real pim6d binary. AC2 asks for the daemon to be
 #    evidenced from the produced packages rather than asserted, and a selected
 #    CONFIG_PACKAGE_frr-pim6d=y alone does not prove a binary came out the far
 #    end. BLO-22372's probe drives `ipv6 mld static-group`, which lives here.
@@ -422,7 +527,7 @@ else
   fail=1
 fi
 
-# 3. The compiled bgpd must actually carry d3cfdeb8. Ancestry proves the SOURCE
+# 4. The compiled bgpd must actually carry d3cfdeb8. Ancestry proves the SOURCE
 #    contained the fix; this proves the BYTES do, which is the claim the PoP
 #    deploy actually rests on.
 #

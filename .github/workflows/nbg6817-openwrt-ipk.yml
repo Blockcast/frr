@@ -116,10 +116,29 @@ jobs:
       # that triggered this run, while the SOURCE must come from the requested
       # tag. Checking out only the tag would run whatever build script that tag
       # happened to contain (for older tags: none).
+      #
+      # ⚠ persist-credentials: false on BOTH checkouts, and it is load-bearing
+      # rather than hygiene. It defaults to TRUE, which makes actions/checkout
+      # write
+      #   http.https://github.com/.extraheader = AUTHORIZATION: basic <b64>
+      # into <path>/.git/config, where <b64> decodes to x-access-token:<TOKEN>.
+      # `docker cp src/frr ob:/src` below is a recursive copy that carries .git/
+      # verbatim, so the live token would land in cleartext-decodable form
+      # inside an unpinned third-party SDK image that runs `feeds update -a` and
+      # arbitrary upstream feed Makefiles with V=s -- directly contradicting the
+      # "No secret ever enters the container" invariant that build-frr-ipk.sh's
+      # header comment builds the whole file:// design around.
+      #
+      # Removing the credential at the source is the right lever; stripping
+      # .git/ is NOT an alternative, because the container needs a real git repo
+      # for PKG_SOURCE_PROTO:=git and for the rev-parse re-assertion inside the
+      # build script. Nothing here needs the token after the fetch: every later
+      # git operation is local (rev-parse, merge-base, log) or a file:// clone.
       - name: Checkout build definition
         uses: actions/checkout@v5
         with:
           path: ci
+          persist-credentials: false
 
       - name: Checkout requested FRR tag
         uses: actions/checkout@v5
@@ -127,6 +146,7 @@ jobs:
           ref: ${{ github.event.inputs.ref || env.DEFAULT_REF }}
           fetch-depth: 0
           path: src/frr
+          persist-credentials: false
 
       - name: Assert the ref is a tag containing d3cfdeb8
         id: resolve
@@ -201,8 +221,18 @@ jobs:
           DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$SDK_IMAGE")
           echo "sdk digest: ${DIGEST}"
 
-          # The tag encodes the point release; confirm the image itself agrees,
-          # so a moved or retagged upstream image cannot silently skew the ABI.
+          # The tag encodes the point release; confirm the image itself agrees.
+          # ⚠ This is a TYPO/MISMATCH guard, not a supply-chain control, and the
+          # difference matters: VERSION_PATH and TARGET are read from the same
+          # image's own Config.Env, so they are self-attested -- any substituted
+          # image declaring the right pair passes this, and build-frr-ipk.sh
+          # re-runs the identical self-attested comparison inside the container.
+          # What it does catch is the realistic failure: SDK_IMAGE and
+          # ROUTER_OPENWRT_RELEASE drifting apart when one is edited and the
+          # other is not, which is the ABI-skew hazard this file is built around.
+          # Pinning an expected digest would make it a real control; that is a
+          # separate decision because it also fails the build closed whenever
+          # upstream legitimately republishes the tag.
           IMG_VER=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$SDK_IMAGE" \
                     | sed -n 's#^VERSION_PATH=releases/##p' | head -1)
           IMG_TARGET=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$SDK_IMAGE" \
@@ -298,6 +328,11 @@ jobs:
           FRR_SHA: ${{ steps.resolve.outputs.frr_sha }}
           PKG_RELEASE: ${{ steps.resolve.outputs.pkg_release }}
           SDK_DIGEST: ${{ steps.sdk.outputs.sdk_digest }}
+          # Stays `if: always()` -- a failed run's summary is where the operator
+          # looks first, so it must still render. What is conditional is the
+          # INSTALL RUNBOOK: a run that proved the bytes lack d3cfdeb8 must not
+          # print `opkg install ./frr*.ipk` under a table of green-looking rows.
+          JOB_STATUS: ${{ job.status }}
         run: |
           set -uo pipefail
           {
@@ -305,9 +340,24 @@ jobs:
             echo
             echo "| field | value |"
             echo "|---|---|"
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo "| **verdict** | ✅ ACCEPTED — artifact acceptance checks passed |"
+            else
+              echo "| **verdict** | ⛔ **REJECTED — DO NOT INSTALL** (job: ${JOB_STATUS}) |"
+            fi
             echo "| Blockcast/frr tag | \`${FRR_REF:-?}\` |"
             echo "| resolved commit | \`${FRR_SHA:-?}\` |"
-            echo "| contains d3cfdeb8 | asserted via \`git merge-base --is-ancestor\` (job fails otherwise) |"
+            # Scoped to the TAG on purpose. This row is about ancestry, asserted
+            # on the runner before anything compiled; it says nothing about the
+            # produced bytes, and on a rejected run it is an affirmative claim
+            # that did pass while the build still failed. The sentinel row below
+            # is the one that speaks for the binary.
+            echo "| tag ancestry contains d3cfdeb8 | asserted on the runner via \`git merge-base --is-ancestor\` |"
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo "| compiled bgpd carries d3cfdeb8 | ✅ sentinel found in the built binary |"
+            else
+              echo "| compiled bgpd carries d3cfdeb8 | ⛔ NOT ESTABLISHED — this run did not pass its checks |"
+            fi
             echo "| OpenWrt pkg version | \`10.8.0-r${PKG_RELEASE:-?}\` |"
             echo "| SDK image | \`${SDK_IMAGE}\` |"
             echo "| SDK digest | \`${SDK_DIGEST:-?}\` |"
@@ -317,6 +367,31 @@ jobs:
             echo '```'
             ls -1 out/artifacts 2>/dev/null || echo "(none produced)"
             echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${JOB_STATUS}" != "success" ]; then
+            # Stop here. No manifest, no install instructions. The build script
+            # has already quarantined any .ipk set into artifacts/REJECTED/ and
+            # written REJECTED.txt, so the verdict is inside the download too --
+            # this is the same statement on the surface the operator reads first.
+            {
+              echo '### ⛔ ACCEPTANCE CHECKS FAILED — DO NOT INSTALL'
+              echo
+              echo "This run finished **${JOB_STATUS}**. Any \`.ipk\` files in the uploaded"
+              echo 'artifact are quarantined under `REJECTED/` and are **not** known to carry'
+              echo 'the IPv6 MVPN NLRI length fix `d3cfdeb8`.'
+              echo
+              echo 'Installing them on the nbg6817 PoP can reset the live BGP session, and the'
+              echo 'router is recoverable only by a human standing next to it.'
+              echo
+              echo 'Read `build.log.gz` in the artifact for the `FATAL:` line, fix it, re-run,'
+              echo 'and use the summary of the **green** run. No install instructions are'
+              echo 'printed for a rejected build by design.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
             echo '### Manifest'
             echo '```'
             cat out/artifacts/MANIFEST.txt 2>/dev/null || echo "(no manifest)"
@@ -369,7 +444,17 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nbg6817-frr-ipk-${{ steps.resolve.outputs.frr_ref || 'unresolved' }}-r${{ steps.resolve.outputs.pkg_release || '0' }}
+          # The name carries the verdict, so a downloaded zip is self-describing
+          # even when nobody looks at the run page. A red X is the only other
+          # signal, and it is a negative one competing with a correctly-named,
+          # install-ready package set.
+          #
+          # ⚠ Written as `<failure test> && <suffix> || ''` and NOT as
+          # `<success test> && '' || '<suffix>'`. In GitHub expressions the empty
+          # string is FALSY, so the latter form falls through to the right-hand
+          # side on BOTH branches and would tag every run -- including green ones
+          # -- as rejected. The non-empty value has to sit on the left of `||`.
+          name: nbg6817-frr-ipk-${{ steps.resolve.outputs.frr_ref || 'unresolved' }}-r${{ steps.resolve.outputs.pkg_release || '0' }}${{ job.status != 'success' && '-REJECTED-DO-NOT-INSTALL' || '' }}
           path: out/**
           if-no-files-found: warn
           retention-days: 90
