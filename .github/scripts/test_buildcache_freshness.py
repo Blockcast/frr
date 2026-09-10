@@ -474,5 +474,106 @@ class TestFreshnessGateFailsClosedOnFailedVerify(unittest.TestCase):
         self.assertIn("always()", block)
 
 
+class TestEveryJobIsConfinedToTheCanonicalRepo(unittest.TestCase):
+    """No job in the seeder may run outside Blockcast/frr.
+
+    The registry coordinates at `cache-to` are hard-coded to
+    registry.blockcast.net, so a job that runs in a fork points a build and a
+    cache push at *our* registry -- an external side effect of someone else's
+    push. `probe-before` carries `github.repository == 'Blockcast/frr'`, and
+    while every other job merely inherited that boundary transitively through
+    `needs` + the default success() condition, that was enough.
+
+    It stops being enough the moment a job takes `always()`: always() runs the
+    job even when its dependency was *skipped*, so a fork's push skips
+    probe-before and the boundary silently evaporates for everything
+    downstream. The condition that makes a probe outage non-blocking is the
+    same condition that drops the fork guard -- one expression doing two
+    unrelated jobs, which is why this needs a check and not a comment.
+
+    So: assert the boundary directly on every job, rather than assuming the
+    dependency graph carries it.
+    """
+
+    WORKFLOW = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "workflows",
+        "buildcache-seed.yml",
+    )
+    BOUNDARY = "github.repository == 'Blockcast/frr'"
+
+    def _jobs(self):
+        """{job_id: block_text} for every top-level job in the seeder."""
+        with open(self.WORKFLOW, encoding="utf-8") as handle:
+            text = handle.read()
+        jobs_at = text.index("\njobs:\n")
+        blocks = {}
+        for match in re.finditer(
+            r"^  ([A-Za-z0-9_-]+):\n(.*?)(?=^  \S|\Z)", text[jobs_at:], re.S | re.M
+        ):
+            blocks[match.group(1)] = match.group(2)
+        self.assertTrue(blocks, "no jobs parsed from buildcache-seed.yml")
+        return blocks
+
+    def _condition(self, block):
+        """The job-level `if:` expression, or None when the job has none."""
+        match = re.search(r"^    if:(.*)$", block, re.M)
+        return match.group(1).strip() if match else None
+
+    def test_parser_found_the_expected_jobs(self):
+        # Guard against the regex matching nothing and every assertion below
+        # passing vacuously over an empty dict.
+        jobs = self._jobs()
+        for expected in ("probe-before", "seed", "verify", "freshness-gate"):
+            self.assertIn(expected, jobs)
+
+    def test_every_job_carries_the_repository_boundary(self):
+        for job_id, block in sorted(self._jobs().items()):
+            with self.subTest(job=job_id):
+                condition = self._condition(block)
+                self.assertIsNotNone(
+                    condition,
+                    f"job '{job_id}' has no `if:` at all, so it runs in any "
+                    f"fork that pushes. Add {self.BOUNDARY}.",
+                )
+                self.assertIn(
+                    self.BOUNDARY,
+                    condition,
+                    f"job '{job_id}' can run outside Blockcast/frr. Every job "
+                    f"here touches registry.blockcast.net directly or gates "
+                    f"something that does.",
+                )
+
+    def test_always_jobs_still_restate_the_boundary(self):
+        # The specific regression: always() ignores a skipped dependency, so
+        # inheriting the boundary via `needs` does not hold for these jobs.
+        always_jobs = {
+            job_id: condition
+            for job_id, block in self._jobs().items()
+            if (condition := self._condition(block)) and "always()" in condition
+        }
+        self.assertTrue(
+            always_jobs,
+            "expected at least one always() job; if the seeder no longer uses "
+            "always(), delete this test rather than letting it pass vacuously.",
+        )
+        for job_id, condition in sorted(always_jobs.items()):
+            with self.subTest(job=job_id):
+                self.assertIn(self.BOUNDARY, condition, f"always() job '{job_id}'")
+
+    def test_the_registry_writer_is_boundary_guarded(self):
+        # Narrowest, highest-consequence case stated on its own: the only job
+        # that runs `cache-to` must never execute in a fork.
+        jobs = self._jobs()
+        writers = [job_id for job_id, block in jobs.items() if "cache-to:" in block]
+        self.assertEqual(
+            ["seed"],
+            sorted(writers),
+            "the set of cache-writing jobs changed; re-check the boundary on "
+            "each new writer.",
+        )
+        self.assertIn(self.BOUNDARY, self._condition(jobs["seed"]))
+
+
 if __name__ == "__main__":
     unittest.main()

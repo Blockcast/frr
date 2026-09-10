@@ -135,7 +135,14 @@ jobs:
     #
     # So seed unconditionally. `verify` below still fails closed when the
     # baseline is missing, so a probe outage stays loud without being blocking.
-    if: ${{ always() && !cancelled() }}
+    #
+    # The repository check is NOT redundant with probe-before's. always()
+    # ignores a skipped dependency, so without repeating it here a fork's push
+    # would skip probe-before and still run this job -- executing the build and
+    # pushing cache-to against our hard-coded Harbor registry. The default
+    # success() condition used to inherit that boundary for free; always()
+    # discards it, so each always() job below restates it.
+    if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
     runs-on: default
     name: Seed ${{ matrix.cfg.name }}
     timeout-minutes: 90
@@ -188,7 +195,8 @@ jobs:
     needs: [probe-before, seed]
     # `needs` jobs default to success(); always() is required to report which
     # seed leg failed instead of silently skipping verification and its gate.
-    if: ${{ always() && !cancelled() }}
+    # Repository check restated because always() ignores skipped dependencies.
+    if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
     runs-on: default
     name: Verify buildcache advanced
     timeout-minutes: 10
@@ -228,7 +236,8 @@ jobs:
     needs: verify
     # This also needs always(): otherwise a failed verification is converted
     # into a skipped freshness signal rather than a visible failure state.
-    if: ${{ always() && !cancelled() }}
+    # Repository check restated because always() ignores skipped dependencies.
+    if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
     runs-on: default
     name: Buildcache freshness gate (${{ github.event_name }})
     timeout-minutes: 10
