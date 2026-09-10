@@ -69,7 +69,7 @@ env:
   # median gap between successful cache writes was 25h, so 72h is ~3x the
   # normal cadence -- loose enough not to fire on ordinary quiet weekends,
   # tight enough that all four observed multi-day outages (192h, 215h, 222h,
-  442h) would have fired.
+  # 442h) would have fired.
   MAX_CACHE_AGE_HOURS: '72'
 
 jobs:
@@ -197,6 +197,20 @@ jobs:
     name: Buildcache freshness gate (${{ github.event_name }})
     timeout-minutes: 10
     steps:
+      # always() lets this job run after a failed verify so the failure is
+      # visible here rather than converted into a skip -- but the age probe
+      # below only asks how old the EXISTING cache is. A seed that failed today
+      # leaves yesterday's cache well inside the 72h budget, so without this
+      # step a red verify still produced a green required gate. Propagate the
+      # upstream verdict first; the age probe is only meaningful once the seed
+      # this run performed is known to have landed.
+      - name: Fail closed unless verification succeeded
+        if: ${{ needs.verify.result != 'success' }}
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          echo "::error::verify concluded '${VERIFY_RESULT}'; refusing to report the buildcache fresh on the strength of a previously published cache."
+          exit 1
       - name: Checkout
         uses: actions/checkout@v5
         with:

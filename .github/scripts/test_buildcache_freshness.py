@@ -437,5 +437,42 @@ class TestSeederMatrixMatchesCI(unittest.TestCase):
         self.assertGreaterEqual(len(ci), 3)
 
 
+class TestFreshnessGateFailsClosedOnFailedVerify(unittest.TestCase):
+    """The required gate must not go green on a still-fresh cache after a failed seed.
+
+    `freshness-gate` runs with `always()` so a failed `verify` is visible rather
+    than skipped, but the age probe only measures the cache that already exists.
+    A seed that fails today leaves yesterday's cache inside the 72h budget, so
+    the gate must consume `needs.verify.result` before it ever probes age.
+    """
+
+    def _freshness_gate_block(self):
+        path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "buildcache-seed.yml"
+        )
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        match = re.search(r"^  freshness-gate:\n(.*?)(?=^  \S|\Z)", text, re.S | re.M)
+        self.assertIsNotNone(match, "freshness-gate job not found in buildcache-seed.yml")
+        return match.group(1)
+
+    def test_gate_propagates_a_non_success_verify_result(self):
+        block = self._freshness_gate_block()
+        self.assertIn("needs.verify.result != 'success'", block)
+        self.assertRegex(block, r"if: \$\{\{ needs\.verify\.result != 'success' \}\}[\s\S]*?exit 1")
+
+    def test_verify_verdict_is_consumed_before_the_age_probe(self):
+        block = self._freshness_gate_block()
+        guard = block.index("needs.verify.result != 'success'")
+        probe = block.index("buildcache_freshness.py")
+        self.assertLess(guard, probe, "the age probe must not run before the verify verdict is consumed")
+
+    def test_gate_still_runs_after_a_failed_verify(self):
+        # Without always() a failed verify skips the gate entirely, which is the
+        # other way to hide the failure; the guard above only helps if it runs.
+        block = self._freshness_gate_block()
+        self.assertIn("always()", block)
+
+
 if __name__ == "__main__":
     unittest.main()
