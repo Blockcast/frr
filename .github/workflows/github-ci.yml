@@ -11,6 +11,13 @@ on:
       - 'ci/**'
 
 # Cancel older in-progress runs for the same ref to save runners.
+#
+# This applies to master too, and deliberately so: nothing in this workflow
+# writes the buildcache (see the `cache-from` comment on the Build job), so
+# cancelling a master run can no longer strand the cache. Do not add a
+# `cache-to` here to "make master useful" -- that is precisely the coupling
+# that kept the cache stale for 8-18 days at a stretch. Cache writes belong in
+# buildcache-seed.yml, which is never cancelled.
 concurrency:
   group: github-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -146,13 +153,15 @@ jobs:
     name: ${{ matrix.cfg.name }}
     # Guardrail in case a build leg hangs.
     #
-    # PRs read cache but never write it, so a warm PR build is fast and 45m is a
-    # tight, useful bound -- it is what surfaced the shared-cache defect instead
-    # of hiding it behind a slow green. Only master writes `cache-to`, and any
-    # change to the Dockerfile's shared layers makes that first master build cold
-    # by definition. Giving the cache-seeding build room avoids a deadlock where
-    # the seeding run times out, never publishes cache, and leaves every
-    # subsequent PR cold.
+    # Every run here reads cache and none writes it, so a warm build is fast and
+    # 45m is a tight, useful bound on PRs -- it is what surfaced the
+    # shared-cache defect instead of hiding it behind a slow green.
+    #
+    # master keeps more headroom because a merge that changes the Dockerfile's
+    # shared layers builds cold here by definition: buildcache-seed.yml has not
+    # re-seeded that commit's layers yet (its push trigger runs in parallel with
+    # this one, not before it). 90m keeps the merge from failing on a timeout
+    # while the cache is catching up.
     timeout-minutes: ${{ github.ref == 'refs/heads/master' && 90 || 45 }}
     strategy:
       # Keep all matrix legs running so we get full failure signal.
@@ -206,8 +215,21 @@ jobs:
           # Keep existing test flow: export as docker image tar artifact.
           outputs: type=docker,dest=/tmp/frr-${{ matrix.cfg.platform }}.tar
           # Harbor connectivity is intentionally required for heavy image builds.
+          #
+          # Read-only, on every ref including master. `cache-to` deliberately
+          # lives in buildcache-seed.yml instead, because this workflow sets
+          # `cancel-in-progress: true` on a group keyed only on `github.ref`:
+          # when master was the sole cache writer it was also the most
+          # cancellable run, so a second master push killed the write. Measured
+          # over 44 master push runs (2026-07-02 -> 2026-08-21), 23 were
+          # cancelled, 16 of them provably by the next master push. See
+          # buildcache-seed.yml for the full reasoning and why exempting master
+          # from cancellation was rejected instead.
+          #
+          # Keeping exactly one writer also avoids the concurrent-writer hazard
+          # the matrix comment above records: two runs exporting to one
+          # registry cache ref overwrite each other's manifest.
           cache-from: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.platform }}-buildcache
-          cache-to: ${{ github.ref == 'refs/heads/master' && format('type=registry,ref=registry.blockcast.net/cache/frr-ci:{0}-buildcache,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=3', matrix.cfg.platform) || '' }}
       - name: Upload docker image artifact
         uses: actions/upload-artifact@v7
         with:
