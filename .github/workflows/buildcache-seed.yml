@@ -83,6 +83,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       baseline: ${{ steps.probe.outputs.baseline }}
+      probe_ok: ${{ steps.probe.outputs.probe_ok }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -94,20 +95,54 @@ jobs:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: |
-          set -euo pipefail
+          # Deliberately NOT `set -e`. This probe is a measurement, and a
+          # measurement that cannot run must not stop the action it measures.
+          # `--report-only` already swallows a stale cache (exit 1); what is
+          # caught here is the probe-error path (exit 2): Harbor unreachable,
+          # credentials rejected, or the artifacts API refusing the read.
+          set -uo pipefail
+          rc=0
           python3 .github/scripts/buildcache_freshness.py \
             --tag amd64_u22-buildcache \
             --tag amd64_u24-buildcache \
             --tag amd64_u24_lttng-buildcache \
             --max-age-hours "${MAX_CACHE_AGE_HOURS}" \
             --json-out /tmp/buildcache-before.json \
-            --report-only
+            --report-only || rc=$?
+          if [ "${rc}" -ne 0 ]; then
+            echo "::warning::baseline probe failed (exit ${rc}); seeding still runs, but advancement cannot be proven and the freshness gate fails closed."
+            # An object, not a list: --baseline rejects anything but a JSON object.
+            printf '{}' > /tmp/buildcache-before.json
+            printf 'probe_ok=false\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'probe_ok=true\n' >> "$GITHUB_OUTPUT"
+          fi
           # Single-line JSON so it survives GITHUB_OUTPUT.
           printf 'baseline=%s\n' "$(tr -d '\n ' < /tmp/buildcache-before.json)" \
             >> "$GITHUB_OUTPUT"
 
   seed:
     needs: probe-before
+    # The baseline probe is a measurement, not a precondition. `needs` defaults
+    # to success(), so gating the seed on it means a Harbor API outage stops the
+    # cache being written at all -- the exact failure this workflow exists to
+    # prevent, reintroduced one job upstream.
+    #
+    # Measured 2026-09-10: the first master run of this workflow (34448313408)
+    # hit HTTP 403 on the Harbor artifacts API, `probe-before` exited 2, and all
+    # three seed legs were skipped -- leaving master with no cache writer at all
+    # now that github-ci.yml is correctly cache-read-only.
+    #
+    # So seed unconditionally. `verify` below still fails closed when the
+    # baseline is missing, so a probe outage stays loud without being blocking.
+    #
+    # The repository check is NOT redundant with probe-before's. always()
+    # ignores a skipped dependency, so without repeating it here a fork's push
+    # would skip probe-before and still run this job -- executing the build and
+    # pushing cache-to against our hard-coded Harbor registry. The default
+    # success() condition used to inherit that boundary for free; always()
+    # discards it, so each always() job below restates it.
+    if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
     runs-on: default
     name: Seed ${{ matrix.cfg.name }}
     timeout-minutes: 90
@@ -160,11 +195,20 @@ jobs:
     needs: [probe-before, seed]
     # `needs` jobs default to success(); always() is required to report which
     # seed leg failed instead of silently skipping verification and its gate.
-    if: ${{ always() && !cancelled() }}
+    # Repository check restated because always() ignores skipped dependencies.
+    if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
     runs-on: default
     name: Verify buildcache advanced
     timeout-minutes: 10
     steps:
+      # The seed is allowed to run without a baseline (see the `seed` job), but
+      # "advanced" is unprovable without one. Refuse to certify rather than
+      # comparing against an empty baseline, which would vacuously pass.
+      - name: Fail closed if the baseline probe could not run
+        if: ${{ needs.probe-before.outputs.probe_ok != 'true' }}
+        run: |
+          echo "::error::pre-seed baseline probe did not run, so cache advancement cannot be proven for this run. The seed legs themselves may have succeeded -- check them -- but this gate will not certify an unmeasured cache."
+          exit 1
       - name: Checkout
         uses: actions/checkout@v5
         with:
@@ -192,7 +236,8 @@ jobs:
     needs: verify
     # This also needs always(): otherwise a failed verification is converted
     # into a skipped freshness signal rather than a visible failure state.
-    if: ${{ always() && !cancelled() }}
+    # Repository check restated because always() ignores skipped dependencies.
+    if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
     runs-on: default
     name: Buildcache freshness gate (${{ github.event_name }})
     timeout-minutes: 10
