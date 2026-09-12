@@ -207,7 +207,6 @@ jobs:
         with:
           context: .
           file: docker/ubuntu-ci/Dockerfile
-          tags: frr-${{ matrix.cfg.platform }}
           build-args: |
             UBUNTU_VERSION=${{ matrix.cfg.rel }}
             ENABLE_LTTNG=${{ matrix.cfg.lttng || 'false' }}
@@ -226,8 +225,18 @@ jobs:
           # that is not already exercised on every master push. The `img-` prefix
           # keeps it out of the `-buildcache` tag namespace that
           # buildcache_freshness.py asserts on.
+          #
+          # Each exporter carries its OWN name, and there is deliberately no
+          # `tags:` input. `tags:` becomes a global `--tag`, which buildx applies
+          # to *every* exporter -- so with two exporters the pushing one also
+          # received the unqualified `frr-<platform>`, resolved it to
+          # docker.io/library/frr-<platform>, and failed with
+          # `insufficient_scope` (run 34682460908, all three legs). The `Test`
+          # lane still needs that bare name baked into the tar, because it does
+          # `docker load` then `docker run frr-<platform>`; `Unit-Test` re-tags
+          # the registry image itself after pulling.
           outputs: |
-            type=docker,dest=/tmp/frr-${{ matrix.cfg.platform }}.tar
+            type=docker,dest=/tmp/frr-${{ matrix.cfg.platform }}.tar,name=frr-${{ matrix.cfg.platform }}
             type=image,name=registry.blockcast.net/cache/frr-ci:img-${{ github.sha }}-${{ matrix.cfg.platform }},push=true
           # Harbor connectivity is intentionally required for heavy image builds.
           #
