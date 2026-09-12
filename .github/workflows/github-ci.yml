@@ -467,11 +467,31 @@ jobs:
     # capacity-capped arc-e2e slot for longer than necessary -- 240 keeps that
     # bound at 4h while clearing the measured distribution.
     #
+    # 2026-09-12: 240 was itself re-tripped -- 6 cap kills at 241..248 min in
+    # the 12 runs after it landed, 3 of them with the suite still incomplete.
+    # Both terms had grown, but they are not equally fixable: the overhead p100
+    # went 21.9 -> 43.0 min (+120%) entirely inside "Fetch docker image
+    # artifact", which moved a ~1 GiB tar through Actions artifact storage and
+    # measured 5..43 min for the same bytes.  5 of the 6 kills had a fetch >=34
+    # min.  That step is now a `docker pull` off Harbor instead (below), which
+    # measured 2.0 and 4.3 min on the two `Unit-Test` legs of run 34688739805
+    # -- the same image, the same registry, pulled minutes apart.
+    #
+    # The cap is deliberately NOT changed.  Raising it is the move that was
+    # already tried here and regressed inside 16 days; what had actually eroded
+    # was the 65.5 min this derivation set aside for overhead, and deleting the
+    # artifact round-trip returns ~36-40 min of it to the suite.  A cap change
+    # would also need TOPOTEST_JOB_CAP_MIN re-mirrored below for no gain.
+    #
     # Re-derive with:
     #   gh api "repos/Blockcast/frr/actions/runs/$RID/jobs?per_page=100" | jq -r \
     #     '.jobs[]|select(.name|test("amd64 Test"))|"\(.name) \(.conclusion) \(((.completed_at|fromdate)-(.started_at|fromdate))/60|floor)min"'
     timeout-minutes: 240
     env:
+      # Pushed by Build's second exporter. Tagged on `github.sha`, not
+      # `github.run_id`, so a --failed-only re-run of just this job still
+      # resolves after Build is skipped.
+      TEST_IMAGE: registry.blockcast.net/cache/frr-ci:img-${{ github.sha }}-${{ matrix.cfg.platform }}
       # arc-e2e's DinD sidecar is capped at 2 CPUs. Nested Docker containers
       # still see all 48 host CPUs, so nproc-based sizing launched 120 pytest
       # workers per matrix leg and wedged a 64 GiB runner node under concurrent
@@ -505,11 +525,28 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
-      - name: Fetch docker image artifact
-        uses: actions/download-artifact@v7
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
         with:
-          name: ${{ matrix.cfg.platform }}-image
-          path: /tmp
+          registry: registry.blockcast.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Fetch docker image
+        # Replaces a `download-artifact` + `docker load` round-trip that
+        # measured 5..43 min for the same bytes and caused 5 of the 6 cap kills
+        # at 241..248 min -- see the timeout-minutes derivation above.
+        #
+        # `Build` still exports the tar and still uploads the
+        # `<platform>-image` artifact; this job was its only consumer, so both
+        # are now dead weight.
+        # ponytail: kept one run as a rollback path because this is the first
+        # registry pull from arc-e2e in this repo. Delete Build's
+        # `type=docker,dest=` exporter and its "Upload docker image artifact"
+        # step once this lane is green post-merge.
+        run: |
+          set -euo pipefail
+          docker pull "${TEST_IMAGE}"
+          docker tag "${TEST_IMAGE}" frr-${{ matrix.cfg.platform }}
       - name: Fetch previous results
         # The seed artifact is (re-)created by Build's "Clear any previous
         # results" step. A --failed-only re-run of just this job skips Build,
@@ -545,7 +582,6 @@ jobs:
           sudo modprobe vrf || true
           sudo modprobe mpls-iptunnel
           sudo modprobe mpls-router
-          docker load --input /tmp/frr-${{ matrix.cfg.platform }}.tar
 
           ADD_DOCKER_ENV=""
           if ! grep CONFIG_IP_MROUTE_MULTIPLE_TABLES=y /boot/config*; then
@@ -687,7 +723,7 @@ jobs:
       - name: Cleanup
         if: ${{ always() }}
         run: |
-          rm -rf test-results-${{ matrix.cfg.platform }}* /tmp/frr-${{ matrix.cfg.platform }}.tar
+          rm -rf test-results-${{ matrix.cfg.platform }}*
           docker stop frr-${{ matrix.cfg.platform }}-cont || true
           docker rm frr-${{ matrix.cfg.platform }}-cont || true
       - name: Report lane runtime and attribute any cap kill
@@ -777,7 +813,7 @@ jobs:
                 # finished and reported, then the cap killed the tail.
                 echo "**:stopwatch: KILLED BY THE JOB TIMEOUT — and the tests had already finished (\`${SUITE_CONCLUSION}\`).**" >> "${summary}"
                 echo "" >> "${summary}"
-                echo "This job was **not** cancelled by a person and **not** evicted by concurrency. The suite ran to completion; the ${cap}-minute cap fired during the artifact/cleanup tail, so GitHub stamped the job \`cancelled\` and the rollup went red over a result that was actually \`${SUITE_CONCLUSION}\`. Raise \`timeout-minutes\` (see the derivation above it) rather than re-running. Ref BLO-29817." >> "${summary}"
+                echo "This job was **not** cancelled by a person and **not** evicted by concurrency. The suite ran to completion; the ${cap}-minute cap fired during the artifact/cleanup tail, so GitHub stamped the job \`cancelled\` and the rollup went red over a result that was actually \`${SUITE_CONCLUSION}\`. Do **not** just raise \`timeout-minutes\` — that was tried twice here (180 -> 240) and was re-consumed within 16 days both times. Find the overhead and delete it; see the derivation above. Ref BLO-29817." >> "${summary}"
                 echo "::error title=Job timeout (tests already ${SUITE_CONCLUSION})::Cap kill at ${elapsed}/${cap} min during the post-suite tail — NOT a human cancel or concurrency eviction. Tests concluded ${SUITE_CONCLUSION}. See BLO-29817."
                 ;;
               *)
