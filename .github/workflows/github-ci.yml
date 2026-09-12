@@ -212,8 +212,23 @@ jobs:
             UBUNTU_VERSION=${{ matrix.cfg.rel }}
             ENABLE_LTTNG=${{ matrix.cfg.lttng || 'false' }}
             FRR_SOURCE_REV=${{ github.sha }}
-          # Keep existing test flow: export as docker image tar artifact.
-          outputs: type=docker,dest=/tmp/frr-${{ matrix.cfg.platform }}.tar
+          # Two exporters, one build:
+          #
+          #   * the tar, still consumed by the `Test` (arc-e2e) lane, which has
+          #     no proven route to registry.blockcast.net -- that reachability
+          #     probe is tracked separately on BLO-29817.
+          #   * a registry image, consumed by `Unit-Test`. Moving that lane off
+          #     Actions artifact storage deletes a 5-43 min variance term that
+          #     was consuming 100% of its 20-minute budget (BLO-29817).
+          #
+          # The tag lives under the same `cache/frr-ci` repository the buildcache
+          # already writes (buildcache-seed.yml), so this needs no registry scope
+          # that is not already exercised on every master push. The `img-` prefix
+          # keeps it out of the `-buildcache` tag namespace that
+          # buildcache_freshness.py asserts on.
+          outputs: |
+            type=docker,dest=/tmp/frr-${{ matrix.cfg.platform }}.tar
+            type=image,name=registry.blockcast.net/cache/frr-ci:img-${{ github.sha }}-${{ matrix.cfg.platform }},push=true
           # Harbor connectivity is intentionally required for heavy image builds.
           #
           # Read-only, on every ref including master. `cache-to` deliberately
@@ -260,9 +275,34 @@ jobs:
     runs-on: default
     needs: Build
     name: ${{ matrix.cfg.name }}
-    timeout-minutes: 20
+    # Derived, not rounded (BLO-29817 AC3).
+    #
+    # The work inside this job is hard-bounded: `make check` runs under
+    # `timeout 15m --kill-after=1m`, so 16 min is the worst case no matter how
+    # the suite grows. The only unbounded term was fetching the image, and the
+    # 20-minute cap here was NOT a slow-job problem -- across runs 34458773163
+    # / 34457085145 / 33977047139 the "Fetch docker image artifact" step
+    # consumed 19.8 of the 20 minutes on its own and `Run unit tests` never
+    # started. Median fetch was ~27 min, i.e. the old cap was unsatisfiable in
+    # the median case and passed only when the fetch landed in the fastest
+    # ~20%, matching the observed 3-success/7-cancelled rate.
+    #
+    # Replacing that artifact round-trip with a registry pull (below) is what
+    # makes a finite cap meaningful again. 16 (bounded inner work) + 14 (pull
+    # budget) = 30. The pull budget is a ceiling, not a measurement -- there is
+    # no pull-time data for this lane yet, by construction. Re-derive it from
+    # the "Fetch docker image" step across the first 5 post-merge runs and
+    # tighten; if pulls land where the buildcache reads do, this should come
+    # down a lot.
+    #
+    # Note this is NOT the `Test` lane's "just raise the cap" move, which was
+    # tried and regressed inside 16 days: there the suite itself is unbounded
+    # and grew past any cap. Here the suite is capped from the inside and the
+    # variance term is being deleted rather than budgeted for.
+    timeout-minutes: 30
     env:
       UNIT_TEST_CONTAINER: frr-${{ matrix.cfg.platform }}-unit-${{ github.run_id }}-${{ github.run_attempt }}
+      UNIT_TEST_IMAGE: registry.blockcast.net/cache/frr-ci:img-${{ github.sha }}-${{ matrix.cfg.platform }}
     strategy:
       fail-fast: false
       matrix:
@@ -270,14 +310,22 @@ jobs:
         -  { name: 'Ubuntu 22.04 amd64 Unit Test', platform: 'amd64_u22' }
         -  { name: 'Ubuntu 24.04 amd64 Unit Test', platform: 'amd64_u24' }
     steps:
-      - name: Fetch docker image artifact
-        uses: actions/download-artifact@v7
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
         with:
-          name: ${{ matrix.cfg.platform }}-image
-          path: /tmp
-      - name: Load docker image
-        run: docker load --input /tmp/frr-${{ matrix.cfg.platform }}.tar
+          registry: registry.blockcast.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Fetch docker image
+        id: fetch_image
+        # Tagged on `github.sha`, not `github.run_id`, so a --failed-only re-run
+        # of just this job still resolves after Build is skipped.
+        run: |
+          set -euo pipefail
+          docker pull "${UNIT_TEST_IMAGE}"
+          docker tag "${UNIT_TEST_IMAGE}" frr-${{ matrix.cfg.platform }}
       - name: Run unit tests
+        id: unit_tests
         run: |
           set -euo pipefail
           timeout --signal=TERM --kill-after=1m 15m \
@@ -340,8 +388,38 @@ jobs:
       - name: Cleanup
         if: ${{ always() }}
         run: |
-          rm -rf unit-test-results-${{ matrix.cfg.platform }} /tmp/frr-${{ matrix.cfg.platform }}.tar
+          rm -rf unit-test-results-${{ matrix.cfg.platform }}
           docker rm -f "${UNIT_TEST_CONTAINER}" || true
+      - name: Report why this job ended
+        # BLO-29817 AC2, for this lane. A `timeout-minutes` kill is reported by
+        # GitHub as `cancelled`, indistinguishable at a glance from a human
+        # cancel or a `cancel-in-progress` eviction -- both routine in this
+        # repo. Say it explicitly instead.
+        #
+        # This lane needs none of the elapsed-time machinery the `Test` lane
+        # carries, because the work here is bounded from the inside: `make
+        # check` runs under `timeout 15m`, so it can only ever FAIL on time,
+        # never hang to the cap. A `cancelled` job therefore attributes off
+        # which step was still in flight, with no clock involved.
+        #
+        # Guarded on `always()` + `job.status` rather than `cancelled()`, to
+        # match the `Test` lane: that guard is the one observed to actually run
+        # inside the post-cap grace window on this runner pool. Betting on
+        # `cancelled()` firing for a *timeout* kill is the same assumption that
+        # made this class of failure invisible in the first place.
+        if: ${{ always() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          FETCH_OUTCOME: ${{ steps.fetch_image.outcome }}
+          TESTS_OUTCOME: ${{ steps.unit_tests.outcome }}
+        run: |
+          set -uo pipefail
+          [ "${JOB_STATUS}" = "cancelled" ] || exit 0
+          if [ -z "${TESTS_OUTCOME}" ] || [ "${TESTS_OUTCOME}" = "skipped" ]; then
+            echo "::error title=BLO-29817 cap kill on image fetch::Job hit its \`timeout-minutes\` while \"Fetch docker image\" was still running (outcome=${FETCH_OUTCOME:-in-flight}); no unit test ever executed. This is NOT a human cancel and NOT a concurrency eviction. The registry pull is over budget -- re-derive the cap against the measured pull time rather than re-running. Ref BLO-29817."
+          else
+            echo "::error title=BLO-29817 cap kill after tests started::Job hit its \`timeout-minutes\` with \"Run unit tests\" at outcome=${TESTS_OUTCOME}. \`make check\` is capped at 15m internally, so this is tail/upload overrun rather than a slow suite. NOT a human cancel. Ref BLO-29817."
+          fi
 
   Test:
     # BLO-21606: moved off arc-default — this ~43min Docker-heavy lane is the
