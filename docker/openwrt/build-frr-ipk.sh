@@ -442,8 +442,12 @@ ipk_list() {
   printf '%s\n' "$list"
 }
 
-# Stream one payload member out of an .ipk to stdout. The caller checks the
-# extracted bytes (`[ -s ]`), not this status, for the same reason as above.
+# Stream one payload member out of an .ipk to stdout. `pipefail` is global (:30)
+# and the caller redirects to a file, consuming the stream to EOF -- so nothing
+# exits early, nothing is SIGPIPEd, and this status means what it says. The
+# caller MUST check it: non-empty output alone is not sufficient, because a
+# truncated nested payload can emit a partial member that still contains an
+# early-enough string to satisfy a content probe.
 ipk_extract() { tar -xzOf "$1" ./data.tar.gz 2>/dev/null | tar -xzOf - "$2" 2>/dev/null; }
 
 # Listed once here and reused by every base-package check below, so the
@@ -561,8 +565,25 @@ else
     head -20 <<<"$BGPD_FILES"
     fail=1
   else
-    ipk_extract "$BGPD_IPK" "$BGPD_MEMBER" > /tmp/bgpd.bin || true
-    if [ ! -s /tmp/bgpd.bin ]; then
+    # Extraction status is part of the gate, not advisory. Previously this was
+    # `|| true` and acceptance rested on `[ -s ]` alone, so a truncated payload
+    # could emit a PARTIAL bgpd that still carried the sentinel -- it sits at
+    # byte 1,999,632 of 3,525,339, so everything after 56.7% can be missing --
+    # and publish an artifact whose binary was never completely verified.
+    # An archive/extraction fault is kept distinct from a genuine missing
+    # sentinel for the same reason as the ipk_list branch above: "cannot read
+    # the package" must never be reported as "the bytes do not carry the fix".
+    rm -f /tmp/bgpd.bin
+    xs=0
+    ipk_extract "$BGPD_IPK" "$BGPD_MEMBER" > /tmp/bgpd.bin || xs=$?
+    if [ "$xs" -ne 0 ]; then
+      rm -f /tmp/bgpd.bin
+      echo "FATAL: extracting ${BGPD_MEMBER} from $(basename "$BGPD_IPK") failed" >&2
+      echo "       (status $xs) -- truncated or corrupt payload. This is an" >&2
+      echo "       ARCHIVE fault, NOT a missing sentinel: do not read it as a" >&2
+      echo "       PRE-FIX verdict." >&2
+      fail=1
+    elif [ ! -s /tmp/bgpd.bin ]; then
       echo "FATAL: could not extract ${BGPD_MEMBER} from $(basename "$BGPD_IPK")" >&2
       fail=1
     elif grep -aqF "$SENTINEL" /tmp/bgpd.bin; then
