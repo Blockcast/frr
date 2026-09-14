@@ -71,7 +71,6 @@ on:
   push:
     branches:
       - master
-      - platform-sre/blo-31631-nbg6817-openwrt-ipk
     paths:
       - docker/openwrt/build-frr-ipk.sh
       - .github/workflows/nbg6817-openwrt-ipk.yml
