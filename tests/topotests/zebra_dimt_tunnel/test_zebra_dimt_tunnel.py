@@ -117,15 +117,6 @@ def require_strace(router):
 # WindowNeverOpened is an AssertionError, which is what lets
 # assert_injection_fired() and the precondition guard break out of an xfail
 # rather than be swallowed by it.
-XFAIL_BLO_28405 = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "BLO-28405: zebra reports result=0 for a DIMT create whose netlink "
-        "sendmsg was injected with EIO. Remove this marker in the BLO-28405 "
-        "fix PR."
-    ),
-)
 
 
 class WindowNeverOpened(Exception):
@@ -360,7 +351,32 @@ def request(action, tunnel_id, encap="gre", outer_remote=None):
     return json.loads(output)
 
 
-def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
+def _route_netlink_fds(router, zebra_pid, thread_id):
+    """Return route-netlink FDs in the target thread's descriptor table."""
+    command = (
+        "for fd in /proc/{}/fd/*; do "
+        "target=$(readlink \"$fd\" 2>/dev/null) || continue; "
+        "case \"$target\" in socket:\\[*\\]) ;; *) continue ;; esac; "
+        "inode=${{target#socket:[}}; inode=${{inode%]}}; "
+        # /proc/net/netlink's Eth column is field 2; NETLINK_ROUTE is 0.
+        "awk -v inode=\"$inode\" 'NR > 1 && $2 == 0 && $10 == inode "
+        "{{ found=1 }} END {{ exit !found }}' "
+        "/proc/{}/net/netlink >/dev/null 2>&1 && "
+        "basename \"$fd\"; "
+        "done"
+    ).format(thread_id, zebra_pid)
+    fds = router.run(command).split()
+    if not fds:
+        pytest.fail(
+            "zebra_dplane route-netlink FD not found -- "
+            "send-side failure injection cannot run"
+        )
+    return ",".join(fds)
+
+
+def inject_netlink_syscall_failure(
+    router, syscall, when, errno_name="EIO", trace_fds=None
+):
     require_strace(router)
     zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
     dplane_tid = router.run(
@@ -372,17 +388,24 @@ def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
         pytest.fail(
             "zebra_dplane worker not found -- netlink failure injection cannot run"
         )
-    tracer = router.popen(
+    command = [
+        "strace",
+        "-qq",
+        "-e",
+        "trace={}".format(syscall),
+    ]
+    if trace_fds is not None:
+        command.extend(["-e", "trace-fds={}".format(trace_fds)])
+    command.extend(
         [
-            "strace",
-            "-qq",
-            "-e",
-            "trace={}".format(syscall),
             "-e",
             "inject={}:error={}:when={}".format(syscall, errno_name, when),
             "-p",
             dplane_tid,
         ],
+    )
+    tracer = router.popen(
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -405,7 +428,20 @@ def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
 
 
 def inject_netlink_send_failure(router, when):
-    return inject_netlink_syscall_failure(router, "sendmsg", when)
+    zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
+    dplane_tid = router.run(
+        f"for task in /proc/{zebra_pid}/task/*; do "
+        '[ "$(cat $task/comm)" = zebra_dplane ] && basename "$task"; '
+        "done"
+    ).strip()
+    if not dplane_tid:
+        pytest.fail(
+            "zebra_dplane worker not found -- netlink failure injection cannot run"
+        )
+    route_fds = _route_netlink_fds(router, zebra_pid, dplane_tid)
+    return inject_netlink_syscall_failure(
+        router, "sendmsg", when, trace_fds=route_fds
+    )
 
 
 def inject_netlink_recv_failure(router, when):
@@ -517,8 +553,8 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
 def _text(data):
     """popen output is str under some topotest/python combinations and bytes
     under others.  Four tests died on AttributeError: 'str' object has no
-    attribute 'decode' -- a harness bug that had been sitting under an
-    XFAIL_BLO_28405 marker, attributed to zebra.
+    attribute 'decode' -- a harness bug that had been sitting under the
+    since-removed BLO-28405 xfail, attributed to zebra.
     """
     if data is None:
         return ""
@@ -694,7 +730,6 @@ def test_external_delete_does_not_reuse_stale_ifindex():
     assert request("del", 3)["result"] == 2
 
 
-@XFAIL_BLO_28405
 def test_address_failure_cleans_up_and_allows_tunnel_id_reuse():
     router = get_topogen().gears["r1"]
     tracer = inject_netlink_send_failure(router, 2)
