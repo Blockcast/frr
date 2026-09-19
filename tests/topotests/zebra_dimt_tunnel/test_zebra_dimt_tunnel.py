@@ -351,8 +351,22 @@ def request(action, tunnel_id, encap="gre", outer_remote=None):
     return json.loads(output)
 
 
-def _route_netlink_fds(router, zebra_pid, thread_id):
-    """Return route-netlink FDs in the target thread's descriptor table."""
+def _route_netlink_fds(router, thread_id):
+    """Return zebra's route-netlink FDs as an strace -e trace-fds= set.
+
+    This scan does NOT narrow anything to the dplane thread, and reading it
+    that way would credit it with a precision it does not have.  Linux
+    threads share one descriptor table, so /proc/<tid>/fd is the whole of
+    zebra's -- the returned set includes the main thread's netlink and
+    netlink_cmd sockets alongside netlink_dplane_out/_in.  Confinement to
+    the dplane comes from `strace -p <dplane_tid>`; all this scan does is
+    exclude sockets that are not NETLINK_ROUTE, notably the genetlink
+    ge_netlink_cmd (protocol 16) whose ethtool probes the old unnarrowed
+    when=N ordinal was landing on (BLO-28405).
+
+    thread_id serves both paths: /proc/<tid>/net is the thread's netns view
+    and is identical to /proc/<pid>/net, so no separate zebra pid is needed.
+    """
     command = (
         "for fd in /proc/{}/fd/*; do "
         "target=$(readlink \"$fd\" 2>/dev/null) || continue; "
@@ -364,7 +378,7 @@ def _route_netlink_fds(router, zebra_pid, thread_id):
         "/proc/{}/net/netlink >/dev/null 2>&1 && "
         "basename \"$fd\"; "
         "done"
-    ).format(thread_id, zebra_pid)
+    ).format(thread_id, thread_id)
     fds = router.run(command).split()
     if not fds:
         pytest.fail(
@@ -375,16 +389,11 @@ def _route_netlink_fds(router, zebra_pid, thread_id):
 
 
 def inject_netlink_syscall_failure(
-    router, syscall, when, errno_name="EIO", trace_fds=None
+    router, syscall, when, errno_name="EIO", route_netlink_fds=False
 ):
     require_strace(router)
-    zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
-    dplane_tid = router.run(
-        f"for task in /proc/{zebra_pid}/task/*; do "
-        '[ "$(cat $task/comm)" = zebra_dplane ] && basename "$task"; '
-        "done"
-    ).strip()
-    if not dplane_tid:
+    worker = dplane_tid(router)
+    if not worker:
         pytest.fail(
             "zebra_dplane worker not found -- netlink failure injection cannot run"
         )
@@ -394,14 +403,16 @@ def inject_netlink_syscall_failure(
         "-e",
         "trace={}".format(syscall),
     ]
-    if trace_fds is not None:
-        command.extend(["-e", "trace-fds={}".format(trace_fds)])
+    if route_netlink_fds:
+        command.extend(
+            ["-e", "trace-fds={}".format(_route_netlink_fds(router, worker))]
+        )
     command.extend(
         [
             "-e",
             "inject={}:error={}:when={}".format(syscall, errno_name, when),
             "-p",
-            dplane_tid,
+            worker,
         ],
     )
     tracer = router.popen(
@@ -428,19 +439,21 @@ def inject_netlink_syscall_failure(
 
 
 def inject_netlink_send_failure(router, when):
-    zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
-    dplane_tid = router.run(
-        f"for task in /proc/{zebra_pid}/task/*; do "
-        '[ "$(cat $task/comm)" = zebra_dplane ] && basename "$task"; '
-        "done"
-    ).strip()
-    if not dplane_tid:
-        pytest.fail(
-            "zebra_dplane worker not found -- netlink failure injection cannot run"
-        )
-    route_fds = _route_netlink_fds(router, zebra_pid, dplane_tid)
+    """Fail the when'th route-netlink sendmsg issued by the dplane worker.
+
+    `when` counts dplane route-netlink sendmsg CALLS, and nl_batch_send()
+    packs several netlink messages per call -- so the ordinal is over
+    BATCHES, not over operations.  when=2 lands on the address-add only
+    because zebra must flush the link-create in its own batch (the address
+    needs the resulting ifindex).  If batching ever coalesces the two, the
+    ordinal silently re-points at a later operation and
+    assert_injection_fired() still passes, because it only proves that
+    SOME injection fired; the symptom would surface as
+    `assert failed["result"] == 1` -- i.e. dressed up as a zebra defect.
+    Re-derive the ordinal from the trace before believing that.
+    """
     return inject_netlink_syscall_failure(
-        router, "sendmsg", when, trace_fds=route_fds
+        router, "sendmsg", when, route_netlink_fds=True
     )
 
 

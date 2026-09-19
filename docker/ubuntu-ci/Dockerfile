@@ -213,8 +213,13 @@ RUN python3 -m pip install 'libyang<4'
 ARG STRACE_VERSION=6.8
 ARG STRACE_SHA256=ba6950a96824cdf93a584fa04f0a733896d2a6bc5f0ad9ffe505d9b41e970149
 RUN set -eux; \
+    # Two sources so a single-host outage cannot stop every image build.
+    # Both serve the byte-identical tarball (digest verified against the pin
+    # below); the sha256sum -c is what makes a second source safe.
     curl -fsSL --retry 5 --retry-connrefused -o /tmp/strace.tar.xz \
-      "https://strace.io/files/${STRACE_VERSION}/strace-${STRACE_VERSION}.tar.xz"; \
+      "https://strace.io/files/${STRACE_VERSION}/strace-${STRACE_VERSION}.tar.xz" \
+    || curl -fsSL --retry 5 --retry-connrefused -o /tmp/strace.tar.xz \
+      "https://github.com/strace/strace/releases/download/v${STRACE_VERSION}/strace-${STRACE_VERSION}.tar.xz"; \
     echo "${STRACE_SHA256}  /tmp/strace.tar.xz" | sha256sum -c -; \
     tar -C /tmp -xf /tmp/strace.tar.xz; \
     cd "/tmp/strace-${STRACE_VERSION}"; \
