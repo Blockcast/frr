@@ -58,16 +58,23 @@ def require_strace(router):
 
 # Nine of these tests executed for the first time once strace was installed and
 # require_strace() started failing hard instead of skipping -- and nine failed.
-# Seven were one leaked link; three tickets remain, and only two of those are
-# zebra questions. (The reasoning that reclassified them is in the commit log,
+# Seven were one leaked link; three tickets remain, and only one of those was a
+# zebra question. (The reasoning that reclassified them is in the commit log,
 # not here.)
 #
-#   BLO-28405  zebra. The injection genuinely fires -- r1/zebra.out carries
-#              `netlink_send_msg error: Input/output error` exactly once, inside
-#              this test's TEST-START/TEST-END -- so the live question is only
-#              whether result=0 is correct for a create whose second sendmsg was
-#              injected. test_address_failure_cleans_up_and_allows_tunnel_id_reuse
-#              asserts that, and keeps its marker.
+#   BLO-28405  HARNESS, not zebra. FIXED -- marker removed. The assertion is
+#              unchanged; what changed is that the injection now lands on the
+#              create it was always meant to fail. The thread-wide `when=N`
+#              ordinal carried no socket qualifier, so it selected an ethtool
+#              probe on the genetlink ge_netlink_cmd socket instead of the
+#              RTM_NEWADDR sendmsg on the dplane route-netlink socket. Both
+#              messages of the create therefore succeeded, and the test asserted
+#              result=1 against a create that had correctly returned 0.
+#              _route_netlink_fds() narrows the traced set to NETLINK_ROUTE,
+#              which fixes the aim. result=0 was zebra behaving correctly
+#              throughout -- the "zebra swallows a netlink sendmsg failure"
+#              premise this entry used to carry is falsified, and no zebra
+#              change was needed.
 #
 #   BLO-29583  zebra. FIXED -- marker removed, the test now asserts the real
 #              behaviour. Reconciliation of the surviving link after a lost
@@ -751,11 +758,12 @@ def test_address_failure_cleans_up_and_allows_tunnel_id_reuse():
     finally:
         trace = stop_tracer(tracer)
     assert_injection_fired(trace, tracer.injection_label)
-    # Only the TRACER used to be protected, so when this assertion fired -- as
-    # it does today, see the marker above -- the `del` at the end of the test
-    # never ran and dimt-00000004 survived.  The autouse reaper now covers that
-    # regardless, but the assertion still belongs after the tracer stop and
-    # before anything that depends on the create having failed.
+    # Only the TRACER used to be protected, so back when this assertion fired --
+    # under the since-removed BLO-28405 xfail, before the injection was aimed at
+    # the route-netlink socket -- the `del` at the end of the test never ran and
+    # dimt-00000004 survived.  The autouse reaper now covers that regardless,
+    # but the assertion still belongs after the tracer stop and before anything
+    # that depends on the create having failed.
     assert failed["result"] == 1, failed
     _, link = topotest.run_and_expect(
         lambda: router.run("ip link show dimt-00000004 2>/dev/null"),
