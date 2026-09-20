@@ -117,15 +117,6 @@ def require_strace(router):
 # WindowNeverOpened is an AssertionError, which is what lets
 # assert_injection_fired() and the precondition guard break out of an xfail
 # rather than be swallowed by it.
-XFAIL_BLO_28405 = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "BLO-28405: zebra reports result=0 for a DIMT create whose netlink "
-        "sendmsg was injected with EIO. Remove this marker in the BLO-28405 "
-        "fix PR."
-    ),
-)
 
 
 class WindowNeverOpened(Exception):
@@ -360,29 +351,72 @@ def request(action, tunnel_id, encap="gre", outer_remote=None):
     return json.loads(output)
 
 
-def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
-    require_strace(router)
-    zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
-    dplane_tid = router.run(
-        f"for task in /proc/{zebra_pid}/task/*; do "
-        '[ "$(cat $task/comm)" = zebra_dplane ] && basename "$task"; '
+def _route_netlink_fds(router, thread_id):
+    """Return zebra's route-netlink FDs as an strace -e trace-fds= set.
+
+    This scan does NOT narrow anything to the dplane thread, and reading it
+    that way would credit it with a precision it does not have.  Linux
+    threads share one descriptor table, so /proc/<tid>/fd is the whole of
+    zebra's -- the returned set includes the main thread's netlink and
+    netlink_cmd sockets alongside netlink_dplane_out/_in.  Confinement to
+    the dplane comes from `strace -p <dplane_tid>`; all this scan does is
+    exclude sockets that are not NETLINK_ROUTE, notably the genetlink
+    ge_netlink_cmd (protocol 16) whose ethtool probes the old unnarrowed
+    when=N ordinal was landing on (BLO-28405).
+
+    thread_id serves both paths: /proc/<tid>/net is the thread's netns view
+    and is identical to /proc/<pid>/net, so no separate zebra pid is needed.
+    """
+    command = (
+        "for fd in /proc/{}/fd/*; do "
+        "target=$(readlink \"$fd\" 2>/dev/null) || continue; "
+        "case \"$target\" in socket:\\[*\\]) ;; *) continue ;; esac; "
+        "inode=${{target#socket:[}}; inode=${{inode%]}}; "
+        # /proc/net/netlink's Eth column is field 2; NETLINK_ROUTE is 0.
+        "awk -v inode=\"$inode\" 'NR > 1 && $2 == 0 && $10 == inode "
+        "{{ found=1 }} END {{ exit !found }}' "
+        "/proc/{}/net/netlink >/dev/null 2>&1 && "
+        "basename \"$fd\"; "
         "done"
-    ).strip()
-    if not dplane_tid:
+    ).format(thread_id, thread_id)
+    fds = router.run(command).split()
+    if not fds:
+        pytest.fail(
+            "zebra_dplane route-netlink FD not found -- "
+            "send-side failure injection cannot run"
+        )
+    return ",".join(fds)
+
+
+def inject_netlink_syscall_failure(
+    router, syscall, when, errno_name="EIO", route_netlink_fds=False
+):
+    require_strace(router)
+    worker = dplane_tid(router)
+    if not worker:
         pytest.fail(
             "zebra_dplane worker not found -- netlink failure injection cannot run"
         )
-    tracer = router.popen(
+    command = [
+        "strace",
+        "-qq",
+        "-e",
+        "trace={}".format(syscall),
+    ]
+    if route_netlink_fds:
+        command.extend(
+            ["-e", "trace-fds={}".format(_route_netlink_fds(router, worker))]
+        )
+    command.extend(
         [
-            "strace",
-            "-qq",
-            "-e",
-            "trace={}".format(syscall),
             "-e",
             "inject={}:error={}:when={}".format(syscall, errno_name, when),
             "-p",
-            dplane_tid,
+            worker,
         ],
+    )
+    tracer = router.popen(
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -405,7 +439,22 @@ def inject_netlink_syscall_failure(router, syscall, when, errno_name="EIO"):
 
 
 def inject_netlink_send_failure(router, when):
-    return inject_netlink_syscall_failure(router, "sendmsg", when)
+    """Fail the when'th route-netlink sendmsg issued by the dplane worker.
+
+    `when` counts dplane route-netlink sendmsg CALLS, and nl_batch_send()
+    packs several netlink messages per call -- so the ordinal is over
+    BATCHES, not over operations.  when=2 lands on the address-add only
+    because zebra must flush the link-create in its own batch (the address
+    needs the resulting ifindex).  If batching ever coalesces the two, the
+    ordinal silently re-points at a later operation and
+    assert_injection_fired() still passes, because it only proves that
+    SOME injection fired; the symptom would surface as
+    `assert failed["result"] == 1` -- i.e. dressed up as a zebra defect.
+    Re-derive the ordinal from the trace before believing that.
+    """
+    return inject_netlink_syscall_failure(
+        router, "sendmsg", when, route_netlink_fds=True
+    )
 
 
 def inject_netlink_recv_failure(router, when):
@@ -517,8 +566,8 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
 def _text(data):
     """popen output is str under some topotest/python combinations and bytes
     under others.  Four tests died on AttributeError: 'str' object has no
-    attribute 'decode' -- a harness bug that had been sitting under an
-    XFAIL_BLO_28405 marker, attributed to zebra.
+    attribute 'decode' -- a harness bug that had been sitting under the
+    since-removed BLO-28405 xfail, attributed to zebra.
     """
     if data is None:
         return ""
@@ -694,7 +743,6 @@ def test_external_delete_does_not_reuse_stale_ifindex():
     assert request("del", 3)["result"] == 2
 
 
-@XFAIL_BLO_28405
 def test_address_failure_cleans_up_and_allows_tunnel_id_reuse():
     router = get_topogen().gears["r1"]
     tracer = inject_netlink_send_failure(router, 2)
