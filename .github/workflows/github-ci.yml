@@ -331,7 +331,14 @@ jobs:
         # of just this job still resolves after Build is skipped.
         run: |
           set -euo pipefail
-          docker pull "${UNIT_TEST_IMAGE}"
+          # BLO-34778: a transient registry error must not burn the whole lane;
+          # three attempts with a short back-off, then fail loudly.
+          for attempt in 1 2 3; do
+            docker pull "${UNIT_TEST_IMAGE}" && break
+            [ "${attempt}" -eq 3 ] && { echo "::error::docker pull ${UNIT_TEST_IMAGE} failed after 3 attempts" >&2; exit 1; }
+            echo "::warning::docker pull ${UNIT_TEST_IMAGE} attempt ${attempt}/3 failed; retrying"
+            sleep $((attempt * 10))
+          done
           docker tag "${UNIT_TEST_IMAGE}" frr-${{ matrix.cfg.platform }}
       - name: Run unit tests
         id: unit_tests
@@ -545,7 +552,14 @@ jobs:
         # step once this lane is green post-merge.
         run: |
           set -euo pipefail
-          docker pull "${TEST_IMAGE}"
+          # BLO-34778: a transient registry error must not burn the whole lane;
+          # three attempts with a short back-off, then fail loudly.
+          for attempt in 1 2 3; do
+            docker pull "${TEST_IMAGE}" && break
+            [ "${attempt}" -eq 3 ] && { echo "::error::docker pull ${TEST_IMAGE} failed after 3 attempts" >&2; exit 1; }
+            echo "::warning::docker pull ${TEST_IMAGE} attempt ${attempt}/3 failed; retrying"
+            sleep $((attempt * 10))
+          done
           docker tag "${TEST_IMAGE}" frr-${{ matrix.cfg.platform }}
       - name: Fetch previous results
         # The seed artifact is (re-)created by Build's "Clear any previous
