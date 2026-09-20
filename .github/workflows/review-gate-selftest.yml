@@ -54,7 +54,7 @@ permissions:
 jobs:
   selftest:
     name: Review gate self-test
-    runs-on: default
+    runs-on: arc-light
     steps:
       - name: Checkout
         uses: actions/checkout@v5
