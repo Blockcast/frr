@@ -62,12 +62,17 @@ def require_strace(router):
 # zebra questions. (The reasoning that reclassified them is in the commit log,
 # not here.)
 #
-#   BLO-28405  zebra. The injection genuinely fires -- r1/zebra.out carries
-#              `netlink_send_msg error: Input/output error` exactly once, inside
-#              this test's TEST-START/TEST-END -- so the live question is only
-#              whether result=0 is correct for a create whose second sendmsg was
-#              injected. test_address_failure_cleans_up_and_allows_tunnel_id_reuse
-#              asserts that, and keeps its marker.
+#   BLO-28405  HARNESS, not zebra. FIXED -- marker removed, the test now asserts
+#              the real behaviour. The thread-wide `when=N` ordinal carried no
+#              socket qualifier, so it selected an ethtool probe on the genetlink
+#              ge_netlink_cmd socket instead of the RTM_NEWADDR sendmsg on the
+#              dplane route-netlink socket. Both messages of the create therefore
+#              succeeded, and the test asserted result=1 against a create that
+#              had correctly returned 0. _route_netlink_fds() narrows the traced
+#              set to NETLINK_ROUTE, which fixes the aim. result=0 was zebra
+#              behaving correctly throughout -- the "zebra swallows a netlink
+#              sendmsg failure" premise this entry used to carry is falsified,
+#              and no zebra change was needed.
 #
 #   BLO-29583  zebra. FIXED -- marker removed, the test now asserts the real
 #              behaviour. Reconciliation of the surviving link after a lost
