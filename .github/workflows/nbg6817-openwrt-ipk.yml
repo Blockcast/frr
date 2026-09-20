@@ -1,0 +1,459 @@
+name: Build nbg6817 OpenWrt FRR .ipk
+
+# Builds the nbg6817 PoP's OpenWrt FRR package set (frr*_10.8.0-rN_arm_cortex-a15_neon-vfpv4.ipk)
+# from a caller-specified Blockcast/frr TAG and publishes it as a workflow
+# artifact for manual `opkg install`. OpenWrt has no package-registry equivalent
+# to Harbor, so a retained build artifact is the delivery mechanism.
+#
+# WHY THIS EXISTS (BLO-31631): the nbg6817 PoP is the only FRR speaker in the
+# MVPN path that is not container-deployed, so it has no image pipeline — unlike
+# the GTM container image, which gtm-image-build.yml covers. The PoP's installed
+# build (10.8.0-r3, deployed 2026-07-31) pre-dates the IPv6 MVPN NLRI length fix
+# d3cfdeb8 (merged 2026-08-03T22:58Z), and a post-fix PE talking to a pre-fix PoP
+# does not degrade gracefully — it resets the BGP session. The pre-fix decoder
+# allow-lists NLRI body lengths {22,58} while the post-fix encoder derives and
+# emits 46 for the mixed-family IPv6 Type-3 that GTM always produces, so the
+# decoder returns BGP_NLRI_PARSE_ERROR_PACKET_LENGTH, which reaches
+# bgp_notify_send(BGP_NOTIFY_UPDATE_ERR). BLO-22372's AC1 ("the PE *and PoP* run
+# a build containing d3cfdeb8 before the probe starts") therefore cannot be
+# satisfied without this artifact, and none existed.
+#
+# SCOPE: build only. `opkg install` stays manual — nbg6817 is a physical home
+# router reachable only by a human operator, and onprem-k8s
+# pop-fleet/nbg6817/frr-openwrt-build.md's argument that automating *that* is
+# low-ROI still stands. Automating the *build* is what makes the SDK/firmware
+# point-release match and the source-tag record properties of this file rather
+# than of whoever happened to run it — which is precisely the version-parity
+# contract that doc asks for, and which its current
+# "unknown (not recorded at build time)" log row shows going unmet.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: >-
+          Blockcast/frr TAG to build. Must be a tag (not a branch or bare SHA)
+          and must contain d3cfdeb8 — both are asserted, the job fails otherwise.
+        required: true
+        default: v10.8.0-blockcast.3
+      pkg_release:
+        description: OpenWrt package release suffix N in 10.8.0-r<N>
+        required: true
+        default: "4"
+  # Bootstrap trigger: workflow_dispatch only becomes selectable once this file
+  # is on the default branch, so BLO-31631's pre-merge evidence run has to come
+  # from a push to the feature branch. master is kept so a later change to the
+  # build definition re-proves itself.
+  #
+  # ⚠ MERGE GATE, in this order and not the other one:
+  #   1. a green run EXISTS AT THE HEAD BEING MERGED -- not merely somewhere on
+  #      this branch. Every push here changes build behaviour, so an older green
+  #      run is evidence about a tree that no longer exists. Check it, do not
+  #      recite it (a hand-maintained run list in a comment goes stale by the
+  #      next push, which is why there is no longer one here):
+  #        gh run list --repo Blockcast/frr \
+  #          --workflow nbg6817-openwrt-ipk.yml --limit 20 \
+  #          --json headSha,conclusion,databaseId \
+  #          --jq '.[]|select(.headSha=="<merge head>")|"\(.databaseId) \(.conclusion)"'
+  #   2. THEN delete the feature-branch line below, leaving only master;
+  #   3. THEN merge.
+  #
+  # Deleting it before step 1 removes the only trigger that can produce that
+  # green run -- there is no dispatch path until this file is on master.
+  #
+  # The one intrinsic exception, stated so nobody has to rediscover it: the
+  # step-2 commit CANNOT itself be covered by step 1, because removing the
+  # branch from `push.branches` is exactly what stops a run firing for it. So
+  # the step-2 commit must be trigger-removal-ONLY, and that is mechanically
+  # checkable rather than a promise -- the diff between the green head and the
+  # merge head must touch nothing else:
+  #   git diff --stat <green head>..<merge head>   # only this file, only :NN
+  push:
+    branches:
+      - master
+    paths:
+      - docker/openwrt/build-frr-ipk.sh
+      - .github/workflows/nbg6817-openwrt-ipk.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nbg6817-openwrt-ipk-${{ github.event.inputs.ref || 'default' }}
+  cancel-in-progress: false
+
+env:
+  # MUST match the router's installed firmware point release. nbg6817 runs
+  # OpenWrt 24.10.7 (zyxel_nbg6817, ipq806x/generic, kernel 6.6.141 — see
+  # onprem-k8s pop-fleet/nbg6817/facts.example.yaml). A mismatched SDK point
+  # release produces an .ipk that installs and then crashes at runtime on
+  # libc/kernel ABI skew, so this is pinned here AND asserted against the
+  # image's own metadata in the job below.
+  ROUTER_OPENWRT_RELEASE: "24.10.7"
+  # The router's OpenWrt target/subtarget. Lives here rather than as a literal
+  # at each use site because it and ROUTER_OPENWRT_RELEASE describe ONE router
+  # and must drift together or not at all -- three separate literals is three
+  # chances for half a migration.
+  ROUTER_OPENWRT_TARGET: ipq806x/generic
+  SDK_IMAGE: openwrt/sdk:ipq806x-generic-24.10.7
+  # The IPv6 MVPN NLRI length fix. Its presence in the built tree is the entire
+  # reason this artifact exists, so it is a build gate, not a review note.
+  REQUIRED_ANCESTOR: d3cfdeb8e7842f7d592ab6bdb4ba421fb35bcca1
+  DEFAULT_REF: v10.8.0-blockcast.3
+
+jobs:
+  build:
+    # This workflow only ever exists in the Blockcast fork, but the fork syncs
+    # some workflow files from upstream frrouting/frr — same belt-and-braces gate
+    # gtm-image-build.yml and docker-daily-master.yml use, so a sync can never
+    # make this fire upstream.
+    if: github.repository == 'Blockcast/frr'
+    runs-on: arc-dind
+    timeout-minutes: 120
+    steps:
+      # Two checkouts on purpose. The build DEFINITION must come from the ref
+      # that triggered this run, while the SOURCE must come from the requested
+      # tag. Checking out only the tag would run whatever build script that tag
+      # happened to contain (for older tags: none).
+      #
+      # ⚠ persist-credentials: false on BOTH checkouts, and it is load-bearing
+      # rather than hygiene. It defaults to TRUE, which makes actions/checkout
+      # write
+      #   http.https://github.com/.extraheader = AUTHORIZATION: basic <b64>
+      # into <path>/.git/config, where <b64> decodes to x-access-token:<TOKEN>.
+      # `docker cp src/frr ob:/src` below is a recursive copy that carries .git/
+      # verbatim, so the live token would land in cleartext-decodable form
+      # inside an unpinned third-party SDK image that runs `feeds update -a` and
+      # arbitrary upstream feed Makefiles with V=s -- directly contradicting the
+      # "No secret ever enters the container" invariant that build-frr-ipk.sh's
+      # header comment builds the whole file:// design around.
+      #
+      # Removing the credential at the source is the right lever; stripping
+      # .git/ is NOT an alternative, because the container needs a real git repo
+      # for PKG_SOURCE_PROTO:=git and for the rev-parse re-assertion inside the
+      # build script. Nothing here needs the token after the fetch: every later
+      # git operation is local (rev-parse, merge-base, log) or a file:// clone.
+      - name: Checkout build definition
+        uses: actions/checkout@v5
+        with:
+          path: ci
+          persist-credentials: false
+
+      - name: Checkout requested FRR tag
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.ref || env.DEFAULT_REF }}
+          fetch-depth: 0
+          path: src/frr
+          persist-credentials: false
+
+      - name: Assert the ref is a tag containing d3cfdeb8
+        id: resolve
+        env:
+          FRR_REF: ${{ github.event.inputs.ref || env.DEFAULT_REF }}
+          PKG_RELEASE: ${{ github.event.inputs.pkg_release || '4' }}
+        run: |
+          set -euo pipefail
+          cd src/frr
+
+          # pkg_release is a free-form dispatch input that ends up interpolated
+          # into the copy-paste operator block at the end of this job, on the
+          # line immediately above an `ssh root@<nbg6817> "rm -rf $D ..."`.
+          # The person PASTING that block is not the person who dispatched it,
+          # so validate here rather than trusting the input: a value of
+          # `4; rm -rf ~` would render as `D=/tmp/frr-r4; rm -rf ~` and run on
+          # the operator's workstation the moment they paste it.
+          #
+          # Use bash's [[ =~ ]] and NOT `grep -qE`. grep is LINE-based, so it
+          # accepts a multi-line value whose FIRST line is numeric -- which is
+          # precisely the GITHUB_OUTPUT injection shape this check exists to
+          # stop ("4\nfrr_sha=<attacker>" passes grep and would forge the
+          # provenance fields the version-parity contract rests on). [[ =~ ]]
+          # anchors against the whole string, so it rejects that.
+          #
+          # ^[1-9][0-9]*$ rather than ^[0-9]+$: it also rejects "0" and a
+          # leading-zero "04", which would silently produce a package version
+          # that does not match the one recorded in the build-log row.
+          if [[ ! "$PKG_RELEASE" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::pkg_release must be a positive integer without leading zeros (got: '${PKG_RELEASE}')"
+            exit 1
+          fi
+          echo "OK: pkg_release=${PKG_RELEASE}"
+
+          # Reject a branch or bare SHA masquerading as a tag. The parity
+          # contract exists because an untagged build is neither reproducible
+          # nor attributable to a reviewed commit set.
+          if ! git rev-parse -q --verify "refs/tags/${FRR_REF}" >/dev/null; then
+            echo "::error::${FRR_REF} is not a tag in Blockcast/frr. Build from a tag, not a branch or SHA."
+            exit 1
+          fi
+
+          FRR_SHA=$(git rev-parse "refs/tags/${FRR_REF}^{commit}")
+          echo "tag ${FRR_REF} -> ${FRR_SHA}"
+
+          # Ancestry, not equality: any tag at or after the fix is acceptable.
+          # Local git is authoritative here and needs no API call.
+          if ! git merge-base --is-ancestor "${REQUIRED_ANCESTOR}" "${FRR_SHA}"; then
+            echo "::error::${FRR_REF} (${FRR_SHA}) does not contain ${REQUIRED_ANCESTOR}. Refusing to build a PoP package that would reset the live BGP session."
+            exit 1
+          fi
+          echo "OK: ${REQUIRED_ANCESTOR} is an ancestor of ${FRR_REF}"
+
+          # FRR's own version, from configure.ac AC_INIT (e.g. "10.8.0-dev").
+          # The OpenWrt package version carries the r<N> release suffix.
+          FRR_VER=$(sed -n 's/^AC_INIT(\[frr\], \[\([0-9.]*\).*/\1/p' configure.ac | head -1)
+          [ -n "$FRR_VER" ] || { echo "::error::could not parse FRR version from configure.ac"; exit 1; }
+          echo "frr version from configure.ac: ${FRR_VER}"
+
+          {
+            echo "frr_ref=${FRR_REF}"
+            echo "frr_sha=${FRR_SHA}"
+            echo "frr_version=${FRR_VER}"
+            echo "pkg_release=${PKG_RELEASE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Pull SDK image and assert point release
+        id: sdk
+        run: |
+          set -euo pipefail
+          docker pull -q "$SDK_IMAGE"
+          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$SDK_IMAGE")
+          echo "sdk digest: ${DIGEST}"
+
+          # The tag encodes the point release; confirm the image itself agrees.
+          # ⚠ This is a TYPO/MISMATCH guard, not a supply-chain control, and the
+          # difference matters: VERSION_PATH and TARGET are read from the same
+          # image's own Config.Env, so they are self-attested -- any substituted
+          # image declaring the right pair passes this, and build-frr-ipk.sh
+          # re-runs the identical self-attested comparison inside the container.
+          # What it does catch is the realistic failure: SDK_IMAGE and
+          # ROUTER_OPENWRT_RELEASE drifting apart when one is edited and the
+          # other is not, which is the ABI-skew hazard this file is built around.
+          # Pinning an expected digest would make it a real control; that is a
+          # separate decision because it also fails the build closed whenever
+          # upstream legitimately republishes the tag.
+          IMG_VER=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$SDK_IMAGE" \
+                    | sed -n 's#^VERSION_PATH=releases/##p' | head -1)
+          IMG_TARGET=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$SDK_IMAGE" \
+                    | sed -n 's#^TARGET=##p' | head -1)
+          echo "image release=${IMG_VER:-<unset>} target=${IMG_TARGET:-<unset>}"
+          if [ "${IMG_VER}" != "${ROUTER_OPENWRT_RELEASE}" ]; then
+            echo "::error::SDK image release '${IMG_VER}' != router firmware '${ROUTER_OPENWRT_RELEASE}' — ABI skew risk, refusing to build."
+            exit 1
+          fi
+          if [ "${IMG_TARGET}" != "${ROUTER_OPENWRT_TARGET}" ]; then
+            echo "::error::SDK image target '${IMG_TARGET}' != '${ROUTER_OPENWRT_TARGET}' (zyxel_nbg6817)."
+            exit 1
+          fi
+          echo "sdk_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+          # Pin the RUN to the digest, not the tag. Without this the manifest's
+          # sdk_digest describes what was *inspected* here while the build ran
+          # whatever the tag pointed at a few steps later -- a provenance record
+          # that is only accidentally true. RepoDigests entries already carry the
+          # repo (`openwrt/sdk@sha256:...`), so use it as-is; the `case` keeps
+          # this correct if a future docker/format ever yields a bare digest.
+          case "$DIGEST" in
+            *@sha256:*) SDK_REF="$DIGEST" ;;
+            sha256:*)   SDK_REF="${SDK_IMAGE%%:*}@${DIGEST}" ;;
+            *) echo "::error::unparseable SDK digest '${DIGEST}'"; exit 1 ;;
+          esac
+          # Fail here, in seconds, rather than at `docker create` two steps on:
+          # the digest ref must resolve to the same local image as the tag.
+          if [ "$(docker inspect --format '{{.Id}}' "$SDK_REF")" \
+             != "$(docker inspect --format '{{.Id}}' "$SDK_IMAGE")" ]; then
+            echo "::error::digest ref '${SDK_REF}' does not resolve to the inspected image"
+            exit 1
+          fi
+          echo "sdk_ref=${SDK_REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Build the .ipk set in the SDK container
+        env:
+          FRR_REF: ${{ steps.resolve.outputs.frr_ref }}
+          FRR_SHA: ${{ steps.resolve.outputs.frr_sha }}
+          FRR_PKG_VERSION: ${{ steps.resolve.outputs.frr_version }}
+          PKG_RELEASE: ${{ steps.resolve.outputs.pkg_release }}
+          SDK_DIGEST: ${{ steps.sdk.outputs.sdk_digest }}
+          SDK_REF: ${{ steps.sdk.outputs.sdk_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          chmod 0755 ci/docker/openwrt/build-frr-ipk.sh
+
+          # `docker create` + `docker cp` rather than bind mounts: under ARC's
+          # dind sidecar a host path given to `-v` resolves inside the DIND
+          # container, not this one, so bind mounts are a portability trap.
+          # Copying in and out is mount-free and behaves the same anywhere.
+          #
+          # The image is referenced by DIGEST ($SDK_REF), not by tag, so the
+          # manifest's sdk_digest is a property of what actually compiled these
+          # bytes rather than of what was inspected in an earlier step.
+          docker create --name ob \
+            -e FRR_REF="$FRR_REF" \
+            -e FRR_SHA="$FRR_SHA" \
+            -e FRR_PKG_VERSION="$FRR_PKG_VERSION" \
+            -e PKG_RELEASE="$PKG_RELEASE" \
+            -e ROUTER_OPENWRT_RELEASE="$ROUTER_OPENWRT_RELEASE" \
+            -e ROUTER_OPENWRT_TARGET="$ROUTER_OPENWRT_TARGET" \
+            -e SDK_IMAGE="$SDK_IMAGE" \
+            -e SDK_DIGEST="$SDK_DIGEST" \
+            -e FRR_SRC=/src \
+            "$SDK_REF" bash /tmp/build-frr-ipk.sh
+
+          docker cp ci/docker/openwrt/build-frr-ipk.sh ob:/tmp/build-frr-ipk.sh
+          # The private fork is handed over as a plain local git repo. No token
+          # ever enters the container — see the header comment in build-frr-ipk.sh.
+          # `/src` does not exist in the image, so docker cp uses rename
+          # semantics and the repo lands AT /src (not /src/frr) — hence FRR_SRC=/src.
+          docker cp src/frr ob:/src
+
+          set +e
+          docker start -a ob 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          # Salvage artifacts and the log even on failure: a failed build's log
+          # is the only thing that makes the next attempt cheaper.
+          docker cp ob:/builder/artifacts ./out 2>/dev/null || true
+          docker rm -f ob >/dev/null 2>&1 || true
+          mkdir -p out/artifacts
+          gzip -9 build.log && mv build.log.gz out/artifacts/
+          exit "$rc"
+
+      - name: Operator retrieval instructions
+        if: always()
+        env:
+          FRR_REF: ${{ steps.resolve.outputs.frr_ref }}
+          FRR_SHA: ${{ steps.resolve.outputs.frr_sha }}
+          PKG_RELEASE: ${{ steps.resolve.outputs.pkg_release }}
+          SDK_DIGEST: ${{ steps.sdk.outputs.sdk_digest }}
+          # Stays `if: always()` -- a failed run's summary is where the operator
+          # looks first, so it must still render. What is conditional is the
+          # INSTALL RUNBOOK: a run that proved the bytes lack d3cfdeb8 must not
+          # print `opkg install ./frr*.ipk` under a table of green-looking rows.
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -uo pipefail
+          {
+            echo "## nbg6817 OpenWrt FRR .ipk build"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo "| **verdict** | ✅ ACCEPTED — artifact acceptance checks passed |"
+            else
+              echo "| **verdict** | ⛔ **REJECTED — DO NOT INSTALL** (job: ${JOB_STATUS}) |"
+            fi
+            echo "| Blockcast/frr tag | \`${FRR_REF:-?}\` |"
+            echo "| resolved commit | \`${FRR_SHA:-?}\` |"
+            # Scoped to the TAG on purpose. This row is about ancestry, asserted
+            # on the runner before anything compiled; it says nothing about the
+            # produced bytes, and on a rejected run it is an affirmative claim
+            # that did pass while the build still failed. The sentinel row below
+            # is the one that speaks for the binary.
+            echo "| tag ancestry contains d3cfdeb8 | asserted on the runner via \`git merge-base --is-ancestor\` |"
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo "| compiled bgpd carries d3cfdeb8 | ✅ sentinel found in the built binary |"
+            else
+              echo "| compiled bgpd carries d3cfdeb8 | ⛔ NOT ESTABLISHED — this run did not pass its checks |"
+            fi
+            echo "| OpenWrt pkg version | \`10.8.0-r${PKG_RELEASE:-?}\` |"
+            echo "| SDK image | \`${SDK_IMAGE}\` |"
+            echo "| SDK digest | \`${SDK_DIGEST:-?}\` |"
+            echo "| router firmware | OpenWrt ${ROUTER_OPENWRT_RELEASE} / ipq806x-generic / zyxel_nbg6817 |"
+            echo
+            echo '### Packages produced'
+            echo '```'
+            ls -1 out/artifacts 2>/dev/null || echo "(none produced)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${JOB_STATUS}" != "success" ]; then
+            # Stop here. No manifest, no install instructions. The build script
+            # has already quarantined any .ipk set into artifacts/REJECTED/ and
+            # written REJECTED.txt, so the verdict is inside the download too --
+            # this is the same statement on the surface the operator reads first.
+            {
+              echo '### ⛔ ACCEPTANCE CHECKS FAILED — DO NOT INSTALL'
+              echo
+              echo "This run finished **${JOB_STATUS}**. Any \`.ipk\` files in the uploaded"
+              echo 'artifact are quarantined under `REJECTED/` and are **not** known to carry'
+              echo 'the IPv6 MVPN NLRI length fix `d3cfdeb8`.'
+              echo
+              echo 'Installing them on the nbg6817 PoP can reset the live BGP session, and the'
+              echo 'router is recoverable only by a human standing next to it.'
+              echo
+              echo 'Read `build.log.gz` in the artifact for the `FATAL:` line, fix it, re-run,'
+              echo 'and use the summary of the **green** run. No install instructions are'
+              echo 'printed for a rejected build by design.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo '### Manifest'
+            echo '```'
+            cat out/artifacts/MANIFEST.txt 2>/dev/null || echo "(no manifest)"
+            echo '```'
+            echo '### Install (operator, on the router)'
+            echo
+            echo 'Download the artifact from this run **into an empty directory**'
+            echo '(the scp below globs your LOCAL frr*.ipk), then:'
+            echo
+            echo '```sh'
+            echo '# 0. CONFIRM the firmware matches what this .ipk was built against.'
+            echo '#    A point-release mismatch installs cleanly and then crashes at runtime.'
+            echo "cat /etc/openwrt_release   # expect DISTRIB_RELEASE='${ROUTER_OPENWRT_RELEASE}'"
+            echo '#'
+            echo '# 1. Copy the packages over and install them together, so opkg'
+            echo '#    resolves the inter-package deps in one transaction.'
+            echo '#'
+            echo '#    Staged in a VERSION-SCOPED directory on purpose. /tmp on the'
+            echo '#    router is tmpfs that persists until reboot, and an r3 set was'
+            echo '#    already delivered to /tmp this way. Installing from a bare'
+            echo '#    /tmp/frr*.ipk glob would hand opkg two versions of the same'
+            echo '#    package in one transaction if any earlier .ipk is still there.'
+            echo "D=/tmp/frr-r${PKG_RELEASE}"
+            echo "ssh root@<nbg6817> \"rm -rf \$D && mkdir -p \$D\""
+            echo "scp frr*.ipk root@<nbg6817>:\$D/"
+            echo "ssh root@<nbg6817> \"cd \$D && opkg install ./frr*.ipk\""
+            echo '#    (same-version rebuild: add --force-reinstall)'
+            echo '#'
+            echo '# 2. Confirm the fix is in the installed binary (BLO-22372 step 0).'
+            echo '#    This is the positive confirmation that the PoP is post-fix.'
+            echo '#'
+            echo '#    The sentinel is the flog_err format string d3cfdeb8 adds to'
+            echo '#    bgpd/bgp_mvpn.c (0 occurrences at d3cfdeb8^, 1 at this tag).'
+            echo '#    Do NOT grep for BGP_MVPN_TYPE3_V6_V4_SPEC_LEN: it is a #define'
+            echo '#    used in an integer comparison, so it compiles to a number and'
+            echo '#    is absent from pre-fix AND post-fix binaries alike -- it reads'
+            echo '#    as a confident PRE-FIX no matter what the box is running.'
+            echo '#    The -f guard reports UNKNOWN rather than PRE-FIX when the'
+            echo '#    binary is missing, for the same reason.'
+            echo '#'
+            echo '#    `tr -c` is used instead of `strings` (binutils is not on the'
+            echo '#    router) and instead of `grep -a` (busybox grep has no -a).'
+            echo "ssh root@<nbg6817> 'B=/usr/sbin/bgpd; [ -f \"\$B\" ] || { echo UNKNOWN-no-binary; exit 2; }; tr -c \"[:print:]\" \"\\n\" < \"\$B\" | grep -qF \"body does not match advertised length\" && echo POST-FIX || echo PRE-FIX'"
+            echo 'ssh root@<nbg6817> "/usr/sbin/bgpd --version; /usr/sbin/pim6d --version"'
+            echo 'ssh root@<nbg6817> "opkg list-installed | grep ^frr"   # for the build-log row'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload .ipk set + build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # The name carries the verdict, so a downloaded zip is self-describing
+          # even when nobody looks at the run page. A red X is the only other
+          # signal, and it is a negative one competing with a correctly-named,
+          # install-ready package set.
+          #
+          # ⚠ Written as `<failure test> && <suffix> || ''` and NOT as
+          # `<success test> && '' || '<suffix>'`. In GitHub expressions the empty
+          # string is FALSY, so the latter form falls through to the right-hand
+          # side on BOTH branches and would tag every run -- including green ones
+          # -- as rejected. The non-empty value has to sit on the left of `||`.
+          name: nbg6817-frr-ipk-${{ steps.resolve.outputs.frr_ref || 'unresolved' }}-r${{ steps.resolve.outputs.pkg_release || '0' }}${{ job.status != 'success' && '-REJECTED-DO-NOT-INSTALL' || '' }}
+          path: out/**
+          if-no-files-found: warn
+          retention-days: 90
