@@ -811,6 +811,31 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		}
 
 		/*
+		 * AS-path loop detection, mirroring bgp_update(): this parser installs
+		 * straight into the MCAST-VPN RIB and never passes through
+		 * bgp_update(), so without this an eBGP peer's copy of OUR OWN route
+		 * is accepted, re-advertised back with our AS prepended again, and
+		 * the two speakers ping-pong every MCAST-VPN route forever. Measured
+		 * live 2026-09-22 between the sfo12 PE (AS 65001) and the nbg6817 PoP
+		 * (AS 65010): AS_PATH "65001 65010 65001 65010 ..." grown to 1,946
+		 * bytes, ~115 UPDATEs/s at idle. Installs only; a withdraw carries no
+		 * attributes and must still remove the NLRI by key.
+		 */
+		if (!is_withdraw && attr && peer != peer->bgp->peer_self) {
+			int allowas_in = peer->allowas_in[packet->afi][SAFI_MCAST_VPN];
+
+			if (aspath_loop_check(attr->aspath, peer->bgp->as) > allowas_in ||
+			    (CHECK_FLAG(peer->bgp->config, BGP_CONFIG_CONFEDERATION) &&
+			     aspath_loop_check_confed(attr->aspath, peer->bgp->confed_id) >
+				     allowas_in)) {
+				peer->stat_pfx_aspath_loop++;
+				if (bgp_debug_update(peer, NULL, NULL, 1))
+					zlog_debug("%s MVPN Type-%u %pFX: as-path contains our own AS; dropping",
+						   peer->host, route_type, (struct prefix *)&p);
+				continue;
+			}
+		}
+		/*
 		 * A GTM Type-1 (Intra-AS I-PMSI A-D) is only meaningful with an
 		 * Ingress-Replication PMSI Tunnel attribute (RFC 6514 Section 5).
 		 * Checked on install only; a withdraw (including the NULL-attr

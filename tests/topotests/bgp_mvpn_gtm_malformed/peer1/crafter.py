@@ -14,6 +14,14 @@ It sends, in order:
   D. empty MP_UNREACH_NLRI (AFI+SAFI only, zero withdrawn NLRI) -- must NOT
      crash the receiver. Before the fix this hit stream_new(0) -> assert(0)
      and aborted bgpd.
+  H. Type-5 whose AS_PATH contains the receiver's OWN AS (65001) -- must be
+     dropped. bgp_nlri_parse_mvpn() installs straight into the MCAST-VPN RIB
+     and never runs bgp_update()'s aspath_loop_check(), so before the fix an
+     eBGP neighbour's echo of our own route was accepted and re-advertised
+     with our AS prepended again, ping-ponging every MVPN route forever.
+  H2. Type-5 with a NON-EMPTY foreign-only AS_PATH (65010) -- POSITIVE
+     CONTROL for H: proves a non-empty AS_PATH is encoded and accepted, so
+     H's absence is the loop check, not a rejected attribute.
 
 The positive control is essential: it proves the crafted NLRI encoding and
 the AF negotiation are correct, so that "route absent" for B and C means the
@@ -78,6 +86,13 @@ V6_TRUNC_RECOVER_GRP = "ff3e::42"
 V6_NESTED_RECOVER_SRC = "2001:db8:40::4"
 V6_NESTED_RECOVER_GRP = "ff3e::43"
 REFLECTED_TYPE1_ORIGINATOR = "10.0.0.1"
+LOOP_SRC = "10.50.50.1"
+LOOP_GRP = "232.50.50.1"      # valid SSM/RD 0, but AS_PATH contains 65001
+FOREIGN_SRC = "10.50.50.2"
+FOREIGN_GRP = "232.50.50.2"   # valid SSM/RD 0, AS_PATH = 65010 only -> install
+RECEIVER_AS = 65001
+FOREIGN_AS = 65010
+AS_SEQUENCE = 2
 
 
 def build_open(local_as, router_id):
@@ -176,8 +191,14 @@ def build_mvpn_update(
     local_id, nlri, afi=AFI_IP, include_pmsi=False,
     pmsi_flags=PMSI_FLAG_LEAF_INFO_REQUIRED,
     pmsi_label=0,
+    as_path=None,
 ):
-    """UPDATE with ORIGIN, empty AS_PATH (iBGP) and one MCAST-VPN NLRI."""
+    """UPDATE with ORIGIN, AS_PATH and one MCAST-VPN NLRI.
+
+    as_path is None for the empty (iBGP) path, else a list of ASNs emitted as
+    one AS4 AS_SEQUENCE in order (the OPEN negotiated the 4-octet-AS
+    capability, so every AS_PATH ASN is 4 bytes wide).
+    """
 
     # MP_REACH_NLRI value: AFI(2) SAFI(1) NHLen(1) NH(4) Reserved(1) NLRI
     next_hop = _packed_addr(local_id)
@@ -192,8 +213,14 @@ def build_mvpn_update(
     attrs = b""
     # ORIGIN: well-known transitive (0x40), type 1, len 1, IGP(0)
     attrs += struct.pack("!BBBB", 0x40, 1, 1, 0)
-    # AS_PATH: well-known transitive, type 2, len 0 (empty path, iBGP)
-    attrs += struct.pack("!BBB", 0x40, 2, 0)
+    # AS_PATH: well-known transitive, type 2. Empty (iBGP) unless as_path.
+    if as_path:
+        seg = struct.pack("!BB", AS_SEQUENCE, len(as_path)) + b"".join(
+            struct.pack("!I", asn) for asn in as_path
+        )
+        attrs += struct.pack("!BBB", 0x40, 2, len(seg)) + seg
+    else:
+        attrs += struct.pack("!BBB", 0x40, 2, 0)
     # LOCAL_PREF: well-known transitive, type 5, len 4 (mandatory for iBGP)
     attrs += struct.pack("!BBB", 0x40, 5, 4) + struct.pack("!I", 100)
     if include_pmsi:
@@ -413,6 +440,23 @@ def main():
                 zero_rd, V6_NESTED_RECOVER_SRC, V6_NESTED_RECOVER_GRP,
             ),
             afi=AFI_IP6,
+        )
+    )
+    # H: AS_PATH already contains the receiver's own AS -- must be dropped.
+    # Shaped like the live PE<->PoP ping-pong: "65010 65001" as seen by 65001.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type5_nlri(zero_rd, LOOP_SRC, LOOP_GRP),
+            as_path=[FOREIGN_AS, RECEIVER_AS],
+        )
+    )
+    # H2: positive control for H -- a non-empty, foreign-only AS_PATH installs.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type5_nlri(zero_rd, FOREIGN_SRC, FOREIGN_GRP),
+            as_path=[FOREIGN_AS],
         )
     )
     # F: empty MP_UNREACH -- must not crash the receiver.

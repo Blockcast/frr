@@ -23,7 +23,10 @@ MP_UNREACH. The FRR side must:
   * install valid S-PMSI A-D and Leaf A-D routes,
   * DROP a Leaf A-D route with a malformed embedded S-PMSI route key,
   * NOT crash on an MP_UNREACH that carries only AFI+SAFI (empty NLRI) -- the
-    stream_new(0) assertion-abort that the receive-path hardening fixes.
+    stream_new(0) assertion-abort that the receive-path hardening fixes,
+  * DROP a Type-5 whose AS_PATH already contains r1's own AS (the MVPN parser
+    bypasses bgp_update(), so it needs its own aspath_loop_check()), while
+    still installing a Type-5 with a non-empty foreign-only AS_PATH.
 
 The positive control is load-bearing: it proves the crafted NLRI encoding and
 AF negotiation are correct, so a dropped route means the reject logic fired,
@@ -69,6 +72,8 @@ V6_TYPE4_RECOVER_SG = ("2001:db8:40::2", "ff3e::41")
 V6_TRUNC_RECOVER_SG = ("2001:db8:40::3", "ff3e::42")
 V6_NESTED_RECOVER_SG = ("2001:db8:40::4", "ff3e::43")
 SELECTIVE_LABEL = 0x12345
+LOOP_SG = ("10.50.50.1", "232.50.50.1")
+FOREIGN_SG = ("10.50.50.2", "232.50.50.2")
 
 
 def build_topo(tgen):
@@ -352,6 +357,53 @@ def test_no_crash_after_empty_mp_unreach():
 
     _, result = topotest.run_and_expect(_healthy, None, count=60, wait=1)
     assert result is None, "r1 unhealthy after empty MP_UNREACH: bgpd did not survive"
+
+
+def test_own_as_in_path_rejected():
+    """A Type-5 whose AS_PATH contains r1's own AS must be dropped.
+
+    bgp_nlri_parse_mvpn() installs into the MCAST-VPN RIB directly and never
+    passes through bgp_update(), so it needs its own AS-path loop check.
+    Without one, an eBGP neighbour's copy of OUR route is accepted and
+    re-advertised with our AS prepended again; measured live between the
+    sfo12 PE (AS 65001) and the nbg6817 PoP (AS 65010) the AS_PATH had grown
+    to ~1.9 kB and the session carried ~115 UPDATEs/s at idle.
+
+    Gate on crafter case H2 (a Type-5 carrying a non-empty, foreign-only
+    AS_PATH) being installed: that proves the AS4 AS_SEQUENCE encoding is
+    accepted, so LOOP_SG's absence is the loop check firing and nothing else.
+    The neighbour's aspathLoop denial counter must have moved as well.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _control_present():
+        if _has_type5(_mvpn_routes("r1"), FOREIGN_SG):
+            return None
+        return "foreign-AS_PATH positive control {} not yet installed".format(
+            FOREIGN_SG
+        )
+
+    _, result = topotest.run_and_expect(_control_present, None, count=60, wait=1)
+    assert result is None, (
+        "r1 did not install the Type-5 with a non-empty foreign-only AS_PATH; "
+        "the AS_PATH encoding is wrong, so the loop-rejection assertion below "
+        "would be meaningless"
+    )
+
+    routes = _mvpn_routes("r1")
+    assert not _has_type5(routes, LOOP_SG), (
+        "r1 installed a Type-5 {} whose AS_PATH contains its own AS 65001; "
+        "routes={}".format(LOOP_SG, routes)
+    )
+
+    nb = json.loads(tgen.gears["r1"].vtysh_cmd("show bgp neighbor 10.0.0.2 json"))
+    loops = nb["10.0.0.2"].get("prefixStats", {}).get("aspathLoop")
+    assert loops == 1, (
+        "expected exactly one AS-path loop denial on the crafter session, "
+        "got {}: {}".format(loops, nb["10.0.0.2"].get("prefixStats"))
+    )
 
 
 if __name__ == "__main__":
