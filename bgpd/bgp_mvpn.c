@@ -820,6 +820,31 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 					: bgp_mvpn_prefix_afi(&p);
 
 		/*
+		 * Reflected-local Type-1 is checked BEFORE the AS-path loop test
+		 * below, and the order is load-bearing.
+		 *
+		 * Our own Type-1 coming back to us over eBGP necessarily carries our
+		 * AS in its AS_PATH, so the loop check would reject it first and this
+		 * more specific diagnostic would never be emitted -- the check would
+		 * be dead code in every eBGP topology, and only reachable for iBGP
+		 * reflection where AS_PATH is not prepended. Both checks reject, so
+		 * routing is unaffected either way, but "reflects the local
+		 * originator" tells an operator what actually happened and
+		 * "as-path contains our own AS" does not.
+		 *
+		 * Found by bgp_mvpn_v6_join_leave, whose r1/r2 (AS 65001) reflect
+		 * through r3 (AS 65003) and which counts this exact log line.
+		 */
+		if (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI && !is_withdraw &&
+		    peer != peer->bgp->peer_self && IS_IPADDR_V4(&p.prefix.src) &&
+		    p.prefix.src.ipaddr_v4.s_addr == peer->bgp->router_id.s_addr) {
+			flog_err(EC_BGP_UPDATE_RCV,
+				 "%s [Error] MVPN Type-1 reflects the local originator; dropping duplicate",
+				 peer->host);
+			continue;
+		}
+
+		/*
 		 * AS-path loop detection. This parser installs straight into the
 		 * MCAST-VPN RIB through bgp_mvpn_route_install() and never passes
 		 * through bgp_update(), so it inherits none of bgp_update()'s inbound
@@ -892,15 +917,6 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		 * Checked on install only; a withdraw (including the NULL-attr
 		 * treat-as-withdraw case) matches on the NLRI key alone.
 		 */
-		if (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI && !is_withdraw &&
-		    peer != peer->bgp->peer_self && IS_IPADDR_V4(&p.prefix.src) &&
-		    p.prefix.src.ipaddr_v4.s_addr == peer->bgp->router_id.s_addr) {
-			flog_err(EC_BGP_UPDATE_RCV,
-				 "%s [Error] MVPN Type-1 reflects the local originator; dropping duplicate",
-				 peer->host);
-			continue;
-		}
-
 		if (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI && !is_withdraw &&
 		    bgp_attr_get_pmsi_tnl_type(attr) != PMSI_TNLTYPE_INGR_REPL) {
 			flog_err(EC_BGP_UPDATE_RCV,
