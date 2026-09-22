@@ -148,7 +148,7 @@ static void pim_if_membership_refresh(struct interface *ifp)
 	sg_start = gm_sgs_first(gm_ifp->sgs);
 
 	frr_each_from (gm_sgs, gm_ifp->sgs, sg, sg_start) {
-		if (sg->tib_joined && !in6_multicast_nofwd(&sg->sgaddr.grp)) {
+		if (sg->tib_joined && !pim_addr_nofwd(sg->sgaddr.grp)) {
 			pim_ifchannel_local_membership_add(
 				ifp, &sg->sgaddr, false /*is_vxlan*/);
 		}

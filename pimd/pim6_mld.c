@@ -87,18 +87,6 @@ static const pim_addr gm_dummy_untracked = {
 };
 /* clang-format on */
 
-#define IPV6_MULTICAST_SCOPE_LINK 2
-
-static inline uint8_t in6_multicast_scope(const pim_addr *addr)
-{
-	return addr->s6_addr[1] & 0xf;
-}
-
-bool in6_multicast_nofwd(const pim_addr *addr)
-{
-	return in6_multicast_scope(addr) <= IPV6_MULTICAST_SCOPE_LINK;
-}
-
 /*
  * (S,G) -> subscriber,(S,G)
  */
@@ -110,7 +98,7 @@ static int gm_packet_sg_cmp(const struct gm_packet_sg *a,
 
 	s_a = gm_packet_sg2state(a);
 	s_b = gm_packet_sg2state(b);
-	return IPV6_ADDR_CMP(&s_a->subscriber->addr, &s_b->subscriber->addr);
+	return pim_addr_cmp(s_a->subscriber->addr, s_b->subscriber->addr);
 }
 
 DECLARE_RBTREE_UNIQ(gm_packet_sg_subs, struct gm_packet_sg, subs_itm,
@@ -149,7 +137,7 @@ static struct gm_packet_sg *gm_packet_sg_find(struct gm_sg *sg,
 static int gm_grp_pending_cmp(const struct gm_grp_pending *a,
 			      const struct gm_grp_pending *b)
 {
-	return IPV6_ADDR_CMP(&a->grp, &b->grp);
+	return pim_addr_cmp(a->grp, b->grp);
 }
 
 DECLARE_RBTREE_UNIQ(gm_grp_pends, struct gm_grp_pending, itm,
@@ -165,7 +153,7 @@ static int gm_gsq_pending_cmp(const struct gm_gsq_pending *a,
 	if (a->s_bit != b->s_bit)
 		return numcmp(a->s_bit, b->s_bit);
 
-	return IPV6_ADDR_CMP(&a->grp, &b->grp);
+	return pim_addr_cmp(a->grp, b->grp);
 }
 
 static uint32_t gm_gsq_pending_hash(const struct gm_gsq_pending *a)
@@ -316,7 +304,7 @@ DECLARE_DLIST(gm_packets, struct gm_packet_state, pkt_itm);
 static int gm_subscriber_cmp(const struct gm_subscriber *a,
 			     const struct gm_subscriber *b)
 {
-	return IPV6_ADDR_CMP(&a->addr, &b->addr);
+	return pim_addr_cmp(a->addr, b->addr);
 }
 
 static uint32_t gm_subscriber_hash(const struct gm_subscriber *a)
@@ -507,7 +495,7 @@ static void gm_sg_update(struct gm_sg *sg, bool has_expired)
 	prev = sg->state;
 	sg->state = desired;
 
-	if (in6_multicast_nofwd(&sg->sgaddr.grp) || gm_ifp->stopping)
+	if (pim_addr_nofwd(sg->sgaddr.grp) || gm_ifp->stopping)
 		new_join = false;
 	else
 		new_join = gm_sg_state_want_join(desired);
