@@ -38,7 +38,9 @@ MP_UNREACH. The FRR side must:
     stream_new(0) assertion-abort that the receive-path hardening fixes,
   * DROP a Type-5 whose AS_PATH already contains r1's own AS (the MVPN parser
     bypasses bgp_update(), so it needs its own aspath_loop_check()), while
-    still installing a Type-5 with a non-empty foreign-only AS_PATH.
+    still installing a Type-5 with a non-empty foreign-only AS_PATH,
+  * and treat that denial as an implicit withdraw: a looping re-advertisement
+    of an (S,G) the peer had already installed must REMOVE the earlier copy.
 
 The positive control is load-bearing: it proves the crafted NLRI encoding and
 AF negotiation are correct, so a dropped route means the reject logic fired,
@@ -93,6 +95,9 @@ V6_NESTED_RECOVER_SG = ("2001:db8:40::4", "ff3e::43")
 SELECTIVE_LABEL = 0x12345
 LOOP_SG = ("10.50.50.1", "232.50.50.1")
 FOREIGN_SG = ("10.50.50.2", "232.50.50.2")
+# Crafter case H3 installs this (S,G) with a foreign-only AS_PATH; case H4,
+# sent only once the test fires phase "h4", re-advertises it with 65001 in the path.
+WITHDRAW_SG = ("10.50.50.3", "232.50.50.3")
 # Crafter case Z: the LAST UPDATE on the wire. Reject assertions gate on this
 # so that "route absent" cannot mean "not processed yet".
 SENTINEL_SG = ("10.70.70.1", "232.70.70.1")
@@ -762,7 +767,9 @@ def test_own_as_in_path_rejected():
     same rejection over a genuine eBGP session, where a check written against
     peer->as would wrongly drop every route the peer sends.
 
-    Gate on crafter case H2 (a Type-5 carrying a non-empty, foreign-only
+    Gate on the sentinel (case Z) like every other reject test here, so
+    "absent" cannot mean "not reached yet" whatever order the crafter sends in,
+    and ALSO on crafter case H2 (a Type-5 carrying a non-empty, foreign-only
     AS_PATH) being installed: that proves the AS_PATH encoding is accepted, so
     LOOP_SG's absence is the loop check firing and nothing else. The
     neighbour's aspathLoop denial counter must have moved as well.
@@ -770,6 +777,9 @@ def test_own_as_in_path_rejected():
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
+
+    _, result = topotest.run_and_expect(_sentinel_present, None, count=60, wait=1)
+    assert result is None, "sentinel missing; cannot assert rejection"
 
     def _control_present():
         if _has_type5(_mvpn_routes("r1"), FOREIGN_SG):
@@ -796,6 +806,76 @@ def test_own_as_in_path_rejected():
     assert loops == 1, (
         "expected exactly one AS-path loop denial on the crafter session, "
         "got {}: {}".format(loops, nb["10.0.0.2"].get("prefixStats"))
+    )
+
+
+def _aspath_loops():
+    nb = json.loads(
+        get_topogen().gears["r1"].vtysh_cmd("show bgp neighbor 10.0.0.2 json")
+    )
+    return nb["10.0.0.2"].get("prefixStats", {}).get("aspathLoop")
+
+
+def test_own_as_in_path_withdraws_prior_copy():
+    """A looping re-advertisement must REMOVE the copy the peer sent before.
+
+    Denying an install is an implicit withdraw (RFC 4271 Section 9): the peer
+    has replaced its earlier route for that NLRI, so r1 must drop the copy it
+    holds rather than keep using a path the peer no longer advertises. That is
+    the bgp_mvpn_route_remove() call in bgp_nlri_parse_mvpn()'s loop branch.
+    test_own_as_in_path_rejected cannot reach it: LOOP_SG is the first UPDATE
+    at its (S,G), so there is no dest and the remove returns before deleting
+    anything.
+
+    Here crafter case H3 installs WITHDRAW_SG with a foreign-only AS_PATH;
+    this test proves it is installed, then releases case H4 -- the same
+    (S,G) with 65001 in the path -- and requires the H3 copy to be gone.
+    Removal is two-stage (mark, then reaped on the work queue), so poll.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    _, result = topotest.run_and_expect(_sentinel_present, None, count=60, wait=1)
+    assert result is None, "sentinel missing; cannot assert on case H3"
+    routes = _mvpn_routes("r1")
+    assert _has_type5(routes, WITHDRAW_SG), (
+        "precondition: crafter case H3 {} (foreign-only AS_PATH) was not "
+        "installed, so its removal would prove nothing; routes={}".format(
+            WITHDRAW_SG, routes
+        )
+    )
+    loops_before = _aspath_loops()
+
+    _fire_phase("h4")
+
+    def _withdrawn():
+        if _has_type5(_mvpn_routes("r1"), WITHDRAW_SG):
+            return (
+                "first copy of {} still present after the looping "
+                "re-advertisement".format(WITHDRAW_SG)
+            )
+        return None
+
+    _, result = topotest.run_and_expect(_withdrawn, None, count=30, wait=1)
+    assert result is None, (
+        "{} -- a denied MVPN install did not implicitly withdraw the peer's "
+        "earlier route (bgp_mvpn_route_remove() in the AS-path loop branch)".format(
+            result
+        )
+    )
+
+    # The removal must be the loop check's doing, not a session reset that
+    # flushed everything: exactly one more denial, and unrelated routes stay.
+    loops = _aspath_loops()
+    assert loops == loops_before + 1, (
+        "expected exactly one more AS-path loop denial for case H4, got {} "
+        "(was {})".format(loops, loops_before)
+    )
+    assert _has_type5(_mvpn_routes("r1"), FOREIGN_SG), (
+        "the implicit withdraw of {} also removed unrelated {}".format(
+            WITHDRAW_SG, FOREIGN_SG
+        )
     )
 
 
