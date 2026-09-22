@@ -325,15 +325,22 @@ class TestWorkflowWiring(unittest.TestCase):
         self.assertRegex(run, r"\[ \$\{#run_tests\[@\]\} -gt 0 \] \|\|")
 
     def test_full_run_is_asserted_equal_to_the_plan(self):
-        """Critic (e): with no usable prior, run list == universe exactly."""
+        """Critic (e): with no usable prior, run list == the shard plan exactly.
+
+        Since sharding the plan is the shard's scope (its plan, restricted to
+        collected files, in plan order), and that is also the --universe the
+        resume helper is given, so a full run returns it unchanged.
+        """
         run = self.step("Run topotests")
         self.assertIn("--prior-out", run)
+        self.assertIn('--universe "${RUNNER_TEMP}/shard-universe.txt"', run)
         self.assertRegex(
             run,
             r"if \[ \$\{#prior_args\[@\]\} -eq 0 \] && ! cmp -s "
-            r'"\$\{RUNNER_TEMP\}/run-list\.txt" "\$\{RUNNER_TEMP\}/universe\.txt"; then'
+            r'"\$\{RUNNER_TEMP\}/run-list\.txt" '
+            r'"\$\{RUNNER_TEMP\}/shard-universe\.txt"; then'
             r"(?:\n(?!\s*fi\b)[^\n]*)*\n\s*exit 1\n\s*fi",
-            "the no-prior run list is not asserted equal to the universe",
+            "the no-prior run list is not asserted equal to the shard plan",
         )
 
     def test_previous_results_download_survives_the_run_step_cleanup(self):
@@ -349,8 +356,8 @@ class TestWorkflowWiring(unittest.TestCase):
     def test_layout_marker_pins_both_dirs_and_is_not_hidden(self):
         gather = self.step("Gather results")
         for d in (
-            "test-results-${{ matrix.cfg.platform }}/layout.txt",
-            "test-results-${{ matrix.cfg.platform }}-initial/layout.txt",
+            '"test-results-${RESULT_ID}"/layout.txt',
+            '"test-results-${RESULT_ID}-initial"/layout.txt',
         ):
             self.assertIn(d, gather)
         self.assertNotRegex(gather, r"/\.layout")

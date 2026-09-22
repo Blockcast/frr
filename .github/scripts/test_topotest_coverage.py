@@ -197,6 +197,47 @@ class TestFullRun(Base):
         self.assertEqual(self.run_main(rec, run_list=narrowed), 1)
 
 
+class TestAccountedOut(Base):
+    """--accounted-out feeds CI-Verdict's per-platform sum across shards.
+
+    It must name exactly what was certified, and nothing at all on a red
+    check: a file left behind by a failed check would let the verdict count
+    tests no shard accounted for.
+    """
+
+    def _main(self, results, **kw):
+        out = os.path.join(self.tmp, "accounted.txt")
+        args = [
+            "--collected",
+            write(self.tmp, "collected.txt", "\n".join(kw.get("collected", COLLECTED))),
+            "--run-list",
+            write(self.tmp, "run.txt", "\n".join(kw.get("run_list", FILES))),
+            "--results",
+            write(self.tmp, "results.xml", junit(results)),
+            "--accounted-out",
+            out,
+        ]
+        with open(os.devnull, "w") as devnull:
+            saved = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = devnull
+            try:
+                rc = cov.main(args)
+            finally:
+                sys.stdout, sys.stderr = saved
+        return rc, out
+
+    def test_success_writes_the_normalized_collection(self):
+        rc, out = self._main(ALL_PASS)
+        self.assertEqual(rc, 0)
+        with open(out) as f:
+            self.assertEqual(f.read().split(), sorted(COLLECTED))
+
+    def test_failure_writes_nothing(self):
+        rc, out = self._main([r for r in ALL_PASS if r[0] != MSDP_LEAK])
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(out))
+
+
 class TestNormalization(unittest.TestCase):
     def test_class_based_collected_id_matches_junit(self):
         collected = ["a_dir/test_a.py::TestThing::test_one[1.2.3.4]"]

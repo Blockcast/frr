@@ -251,6 +251,14 @@ def main(argv=None):
             "(initial, then its serial rerun).  Omit on a full run."
         ),
     )
+    parser.add_argument(
+        "--accounted-out",
+        help=(
+            "on success only, write the normalized collected IDs this check "
+            "certified as accounted for, one per line (CI-Verdict sums them "
+            "across shards).  Never written when the check fails."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -289,6 +297,13 @@ def main(argv=None):
         )
         sys.stderr.flush()
         return 1
+    if args.accounted_out:
+        # check() returned no problem, so every collected ID has a result in
+        # this attempt or a non-failing prior one: the whole normalized
+        # collection is what was accounted for.
+        accounted = sorted({normalize(c) for c in collected})
+        with open(args.accounted_out, "w") as f:
+            f.writelines(cid + "\n" for cid in accounted)
     print("Topotest coverage OK: every collected test is accounted for.")
     return 0
 

@@ -22,6 +22,14 @@ on:
       - '.github/scripts/test_topotest_coverage.py'
       - '.github/scripts/topotest_resume.py'
       - '.github/scripts/test_topotest_resume.py'
+      - '.github/scripts/topotest_shards.py'
+      - '.github/scripts/test_topotest_shards.py'
+      - '.github/scripts/topotest_durations.py'
+      - '.github/scripts/test_topotest_durations.py'
+      - '.github/scripts/topotest_verdict.py'
+      - '.github/scripts/test_topotest_verdict.py'
+      - '.github/topotest-durations.json'
+      - 'tests/topotests/pytest.ini'
       - '.github/workflows/github-ci.yml'
       - '.github/workflows/rerun-guard-selftest.yml'
   push:
@@ -35,6 +43,14 @@ on:
       - '.github/scripts/test_topotest_coverage.py'
       - '.github/scripts/topotest_resume.py'
       - '.github/scripts/test_topotest_resume.py'
+      - '.github/scripts/topotest_shards.py'
+      - '.github/scripts/test_topotest_shards.py'
+      - '.github/scripts/topotest_durations.py'
+      - '.github/scripts/test_topotest_durations.py'
+      - '.github/scripts/topotest_verdict.py'
+      - '.github/scripts/test_topotest_verdict.py'
+      - '.github/topotest-durations.json'
+      - 'tests/topotests/pytest.ini'
 
 permissions:
   contents: read
@@ -54,8 +70,11 @@ jobs:
             -p 'test_verify_rerun_coverage.py' -v
 
       - name: Run topotest coverage and resume decision-logic tests
-        # BLO-35428: the parallel-run coverage check and the "Re-run failed
-        # jobs" resume decision, plus their wiring into github-ci.yml.
+        # BLO-35428: the parallel-run coverage check, the "Re-run failed
+        # jobs" resume decision, the shard planner (over the real tree, so a
+        # pytest.ini norecursedirs change re-runs it), the duration table
+        # builder and CI-Verdict's fail-closed rules, plus their wiring into
+        # github-ci.yml.
         run: |
           python3 -m unittest discover -s .github/scripts \
             -p 'test_topotest_*.py' -v
