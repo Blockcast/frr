@@ -600,14 +600,22 @@ jobs:
         # The seed artifact is (re-)created by Build's "Clear any previous
         # results" step. A --failed-only re-run of just this job skips Build,
         # so the seed from a prior attempt is never recreated and this
-        # download 404s. Tolerate that: the script below already handles a
-        # missing test-results-<platform> dir (BLO-21652).
+        # download 404s. Tolerate that: topotest_resume.py treats a missing
+        # download as "run the whole tree" (BLO-21652).
+        #
+        # BLO-35428: downloaded to `prev-results`, NOT test-results-<platform>.
+        # "Run topotests" does `rm -rf test-results-<platform>*` before its
+        # run, and upload-artifact nests a failed leg's artifact one level
+        # deeper (test-results-<p>/{test-results-<p>,test-results-<p>-initial}/,
+        # read off run 35709500854's artifact), so the old
+        # test-results-<p>/topotests.xml probe missed exactly the legs that had
+        # failures and "Re-run failed jobs" re-ran the whole tree.
         if: ${{ github.run_attempt > 1 }}
         continue-on-error: true
         uses: actions/download-artifact@v7
         with:
           name: test-results-${{ matrix.cfg.platform }}
-          path: test-results-${{ matrix.cfg.platform }}
+          path: prev-results
       - name: Run topotests
         # BLO-29817: `id` lets the runtime report below distinguish "the cap
         # killed the suite mid-run" from "the suite finished and the cap killed
@@ -638,19 +646,62 @@ jobs:
           fi
           echo "ADD_DOCKER_ENV: ${ADD_DOCKER_ENV}"
 
-          if [ -f test-results-${{ matrix.cfg.platform }}/topotests.xml ]; then
-            ./tests/topotests/analyze.py -r test-results-${{ matrix.cfg.platform }}
-            ls -l test-results-${{ matrix.cfg.platform }}/topotests.xml
-            run_tests_raw=$(./tests/topotests/analyze.py -r test-results-${{ matrix.cfg.platform }}| cut -f1 -d: | sort -u)
-            mapfile -t run_tests < <(printf '%s' "${run_tests_raw}")
-          else
-            echo "No test results dir"
-            run_tests=()
+          # BLO-35428: collect the whole tree first, in the same privileged
+          # image the run uses, so what the run produced can be checked
+          # against what exists rather than against itself.  A collection
+          # failure fails the step here: a module that cannot be collected can
+          # be neither run nor accounted for.  -p no:warnings and the
+          # anchored grep keep indented warnings-summary lines out of the
+          # expected set, where they would be IDs that can never match.
+          # Collection measured 48-94 s inside the run (jobs 105814256640 /
+          # 101386930609); the elapsed time below records it on its own.
+          collect_start=$(date +%s)
+          collect_rc=0
+          timeout 15m docker run --rm --init --privileged ${ADD_DOCKER_ENV} -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
+            bash -c 'cd ~/frr/tests/topotests && sudo -E pytest --collect-only -q -p no:cacheprovider -p no:warnings "$@"' pytest-collect \
+            > "${RUNNER_TEMP}/collect.out" || collect_rc=$?
+          echo "collect-only rc=${collect_rc} after $(( $(date +%s) - collect_start ))s"
+          if [ "${collect_rc}" -ne 0 ]; then
+            tail -n 100 "${RUNNER_TEMP}/collect.out" >&2
+            echo "::error title=Topotest collection failed::pytest --collect-only exited ${collect_rc} (124 = the 15m timeout); nothing can be run or accounted for." >&2
+            exit 1
+          fi
+          grep -E '^[^[:space:]]+::' "${RUNNER_TEMP}/collect.out" | LC_ALL=C sort -u > "${RUNNER_TEMP}/collected-all.txt"
+          cut -d: -f1 "${RUNNER_TEMP}/collected-all.txt" | LC_ALL=C sort -u > "${RUNNER_TEMP}/universe.txt"
+          echo "collected $(wc -l < "${RUNNER_TEMP}/collected-all.txt") node IDs in $(wc -l < "${RUNNER_TEMP}/universe.txt") files"
+
+          # BLO-35428: what this attempt runs.  topotest_resume.py prints the
+          # files that still failed in the previous attempt's artifact, or the
+          # whole universe whenever that artifact cannot justify a narrower
+          # list (missing, cleared seed, partial junit, nothing left failing).
+          # Captured by command substitution FIRST, as the rerun harvest below
+          # is: feeding mapfile straight from a process substitution of the
+          # helper would hide its exit status from `set -e`, so a crash after
+          # partial output would silently narrow the run.  printf '%s' (no
+          # trailing newline) so an empty capture yields zero elements, which
+          # the next line refuses.
+          run_tests_raw=$(python3 .github/scripts/topotest_resume.py --prev prev-results --id ${{ matrix.cfg.platform }} \
+            --collected "${RUNNER_TEMP}/collected-all.txt" --universe "${RUNNER_TEMP}/universe.txt" \
+            --prior-out "${RUNNER_TEMP}/prior-used.txt")
+          mapfile -t run_tests < <(printf '%s' "${run_tests_raw}")
+          [ ${#run_tests[@]} -gt 0 ] || { echo '::error::empty run list refused (an empty array would run the whole tree)' >&2; exit 1; }
+          printf '%s\n' "${run_tests[@]}" > "${RUNNER_TEMP}/run-list.txt"
+          # The junit(s) a resume was based on, in overlay order; none on a
+          # full run.  With none, the run list must BE the plan, byte for
+          # byte: a narrowed first attempt would otherwise produce a junit
+          # that is complete for what it ran and looks green.
+          prior_args=()
+          while IFS= read -r prior; do prior_args+=(--prior "${prior}"); done < "${RUNNER_TEMP}/prior-used.txt"
+          if [ ${#prior_args[@]} -eq 0 ] && ! cmp -s "${RUNNER_TEMP}/run-list.txt" "${RUNNER_TEMP}/universe.txt"; then
+            echo "::error title=Run list is not the plan::no usable prior results, yet the run list differs from the collected universe" >&2
+            diff "${RUNNER_TEMP}/universe.txt" "${RUNNER_TEMP}/run-list.txt" | head -n 50 >&2 || true
+            exit 1
           fi
           rm -rf test-results-${{ matrix.cfg.platform }}* /tmp/topotests
 
-          echo "RUN_TESTS: ${run_tests[*]}"
+          echo "RUN_TESTS (${#run_tests[@]} of $(wc -l < "${RUNNER_TEMP}/universe.txt") files): ${run_tests[*]}"
           [[ "${TOPOTEST_WORKERS}" =~ ^[1-9][0-9]*$ ]]
+
           # BLO-35428 footprint sampler -- measurement only, nothing gates on
           # it.  The container is not inside the DinD sidecar's cgroup and has
           # no resource bounds (see TOPOTEST_WORKERS), so this is the only
@@ -686,13 +737,33 @@ jobs:
           # turns the rest into positional parameters of the -c script, which
           # would silently narrow a targeted rerun to a single file.
           # The list is carried in a mapfile array so that one array element is
-          # exactly one analyze.py record; expanding a scalar unquoted would
+          # exactly one run-list record; expanding a scalar unquoted would
           # re-split those records on spaces and glob them, which the full node
-          # IDs below make reachable.  An empty array expands to zero words, so
-          # the ordinary "no prior results" path still runs the whole tree.
-          if docker run --init -i --privileged --name frr-${{ matrix.cfg.platform }}-cont ${ADD_DOCKER_ENV} \
+          # IDs below make reachable.
+          #
+          # BLO-35428 rc gate: pytest's rc is inspected, not just "non-zero".
+          # 0 and 1 are the only codes after which the junit describes a
+          # finished session; anything else means it is partial, and the
+          # failed-only rerun below could only re-verify the failures that
+          # partial junit happened to record.
+          par_rc=0
+          docker run --init -i --privileged --name frr-${{ matrix.cfg.platform }}-cont ${ADD_DOCKER_ENV} \
             -e TOPOTEST_WORKERS="${TOPOTEST_WORKERS}" -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
-            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest -n"${TOPOTEST_WORKERS}" --dist=loadfile "$@"' pytest-run "${run_tests[@]}"; then
+            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest -n"${TOPOTEST_WORKERS}" --dist=loadfile "$@"' pytest-run "${run_tests[@]}" || par_rc=$?
+          echo "parallel pytest rc=${par_rc}"
+          case "${par_rc}" in
+            0|1) ;;
+            *) echo "::error title=Topotest run incomplete::parallel pytest exited ${par_rc} (2 interrupted/xdist max-crashed-workers, 3 internal error, 4 usage, 5 nothing collected, >=125 docker). Its junit is partial; a failed-only rerun cannot certify it." >&2; exit 1 ;;
+          esac
+          docker cp frr-${{ matrix.cfg.platform }}-cont:/tmp/topotests/topotests.xml "${RUNNER_TEMP}/parallel.xml" || { echo '::error::parallel run produced no topotests.xml' >&2; exit 1; }
+          # Every collected test must be accounted for: by this attempt's junit
+          # if it was in the run list, otherwise by a NON-failing result in the
+          # prior attempt it resumed from.  With no prior, this attempt alone
+          # must account for the whole collection.
+          python3 .github/scripts/topotest_coverage.py --collected "${RUNNER_TEMP}/collected-all.txt" \
+            --run-list "${RUNNER_TEMP}/run-list.txt" --results "${RUNNER_TEMP}/parallel.xml" \
+            ${prior_args[@]+"${prior_args[@]}"}
+          if [ "${par_rc}" -eq 0 ]; then
             echo "All tests passed."
             exit 0
           fi
@@ -786,6 +857,16 @@ jobs:
               echo "ERROR: gathering results produced an error, perhaps due earlier run cancellation." >&2
             fi
           fi
+          # BLO-35428: pin the artifact layout.  upload-artifact roots an
+          # artifact at the least common ancestor of the paths that exist, so
+          # a clean leg (one dir) uploaded flat and a leg with failures (two
+          # dirs) uploaded nested, and the resume probe could not tell where
+          # topotests.xml was.  Both dirs now always exist, so the layout is
+          # always test-results-<p>/ + test-results-<p>-initial/.  The marker
+          # is NOT a dotfile: upload-artifact drops hidden files by default.
+          mkdir -p test-results-${{ matrix.cfg.platform }} test-results-${{ matrix.cfg.platform }}-initial
+          echo "attempt ${GITHUB_RUN_ATTEMPT}" > test-results-${{ matrix.cfg.platform }}/layout.txt
+          cp test-results-${{ matrix.cfg.platform }}/layout.txt test-results-${{ matrix.cfg.platform }}-initial/layout.txt
       - name: Upload test results
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
@@ -843,7 +924,7 @@ jobs:
       - name: Cleanup
         if: ${{ always() }}
         run: |
-          rm -rf test-results-${{ matrix.cfg.platform }}*
+          rm -rf test-results-${{ matrix.cfg.platform }}* prev-results
           docker stop frr-${{ matrix.cfg.platform }}-cont || true
           docker rm frr-${{ matrix.cfg.platform }}-cont || true
       - name: Report lane runtime and attribute any cap kill
