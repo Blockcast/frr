@@ -55,6 +55,22 @@ site in main() carries the matching label.
       "the receiver processed the whole stream and rejected it", not "the
       receiver has not reached that UPDATE yet".
 
+PHASE 2 (sent PHASE2_DELAY_S after the burst above, then sentinel Z2). Every
+case here was advertised ACCEPTABLY in phase 1 and is now re-advertised in a
+form the receiver must reject, which is the only way to tell "rejected and
+withdrew the earlier copy" from "rejected and stranded it":
+
+  P1. Type-3 (STRAND_T3) re-sent WITHOUT its PMSI Tunnel attribute -- same
+      NLRI, attribute removed, so RFC 4271 Section 9 makes it a replacement
+      route and the earlier copy MUST be gone.
+  P2. Type-1 (STRAND_T1_ORIGINATOR) re-sent WITHOUT PMSI -- same, for the
+      Type-1 gate and its separate RIB-AFI selection.
+  P3. Type-5 (RDKEEP) re-sent with RD 1 for the SAME (S,G) -- a DIFFERENT
+      NLRI, so the earlier RD-0 route MUST SURVIVE. This is the regression
+      guard for the deliberate RD exception: our RIB key drops the RD, so a
+      reject that withdrew here would silently delete a valid route.
+  Z2. Second sentinel, the last UPDATE of the session.
+
 WARNING: case H is the ONLY case whose AS_PATH may contain 65001. The test
 asserts the neighbour's aspathLoop denial counter is exactly 1, which catches
 double-counting; a second looping case would have to update that assertion.
@@ -142,6 +158,21 @@ FOREIGN_SRC = "10.50.50.2"
 FOREIGN_GRP = "232.50.50.2"   # valid SSM/RD 0, AS_PATH = 65010 only -> install
 SENTINEL_SRC = "10.70.70.1"
 SENTINEL_GRP = "232.70.70.1"  # last UPDATE on the wire; see case Z above
+
+# Phase-2 (see below): routes advertised well-formed in phase 1, then RE-sent
+# in a way that must be rejected. They prove a reject either withdraws the
+# earlier copy or deliberately leaves it alone.
+STRAND_T3_SRC = "10.90.90.1"
+STRAND_T3_GRP = "232.90.90.1"   # Type-3 with PMSI, then re-sent without it
+STRAND_T1_ORIGINATOR = "10.0.0.7"  # Type-1 with PMSI, then re-sent without it
+RDKEEP_SRC = "10.91.91.1"
+RDKEEP_GRP = "232.91.91.1"      # Type-5 RD 0, then RD 1 for the SAME (S,G)
+SENTINEL2_SRC = "10.92.92.1"
+SENTINEL2_GRP = "232.92.92.1"   # last UPDATE of phase 2
+# Phase 2 is deliberately late so a test can observe the phase-1 state first.
+# It is a delay, not a synchronisation primitive: the tests gate on the phase-2
+# sentinel, never on a sleep of their own.
+PHASE2_DELAY_S = 30
 RECEIVER_AS = 65001
 FOREIGN_AS = 65010
 AS_SEQUENCE = 2
@@ -552,6 +583,26 @@ def main():
     )
     # F: empty MP_UNREACH -- must not crash the receiver.
     sock.sendall(build_empty_mp_unreach())
+    # Phase-1 halves of the phase-2 probes: all three must INSTALL here.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type3_nlri(zero_rd, STRAND_T3_SRC, STRAND_T3_GRP, TYPE3_ORIGINATOR),
+            include_pmsi=True,
+            pmsi_label=SELECTIVE_LABEL,
+        )
+    )
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type1_nlri(zero_rd, STRAND_T1_ORIGINATOR),
+            include_pmsi=True,
+            pmsi_label=SELECTIVE_LABEL,
+        )
+    )
+    sock.sendall(
+        build_mvpn_update(local_id, _type5_nlri(zero_rd, RDKEEP_SRC, RDKEEP_GRP))
+    )
     # Z: sentinel, always last. Tests that assert an earlier case was REJECTED
     # gate on this one being installed, which proves the receiver consumed the
     # whole stream rather than merely the first few UPDATEs.
@@ -562,8 +613,46 @@ def main():
 
     # Keepalive loop so the session stays up for the test to observe steady state.
     # Exits cleanly (0) on teardown -- the peer socket is torn down under us.
+    # Keepalive loop. At PHASE2_DELAY_S it fires phase 2 once, then keeps the
+    # session up so the receiver's post-phase-2 state can be observed.
+    started = time.monotonic()
+    phase2_sent = False
     sock.settimeout(1)
     while True:
+        if not phase2_sent and time.monotonic() - started >= PHASE2_DELAY_S:
+            try:
+                # P1: same Type-3 NLRI, PMSI attribute removed -> must withdraw.
+                sock.sendall(
+                    build_mvpn_update(
+                        local_id,
+                        _type3_nlri(zero_rd, STRAND_T3_SRC, STRAND_T3_GRP,
+                                    TYPE3_ORIGINATOR),
+                    )
+                )
+                # P2: same Type-1 NLRI, PMSI attribute removed -> must withdraw.
+                sock.sendall(
+                    build_mvpn_update(local_id, _type1_nlri(zero_rd,
+                                                            STRAND_T1_ORIGINATOR))
+                )
+                # P3: DIFFERENT NLRI (RD 1) for an installed (S,G) -> must NOT
+                # touch the RD-0 route.
+                sock.sendall(
+                    build_mvpn_update(
+                        local_id,
+                        _type5_nlri(nonzero_rd, RDKEEP_SRC, RDKEEP_GRP),
+                    )
+                )
+                # Z2: phase-2 sentinel, last UPDATE of the session.
+                sock.sendall(
+                    build_mvpn_update(
+                        local_id,
+                        _type5_nlri(zero_rd, SENTINEL2_SRC, SENTINEL2_GRP),
+                    )
+                )
+                print("phase 2 sent", flush=True)
+            except OSError:
+                break
+            phase2_sent = True
         try:
             mt, _ = recv_msg(sock)
             if mt == BGP_KEEPALIVE:
