@@ -27,6 +27,10 @@ MP_UNREACH. The FRR side must:
     attr->extra from the shared packet attr, so everything behind it lost its
     PMSI and was dropped),
   * DROP a Leaf A-D route with a malformed embedded S-PMSI route key,
+  * WITHDRAW an earlier copy when a reject carries the SAME NLRI (a Type-3 or
+    Type-1 re-sent without its PMSI Tunnel attribute) and KEEP it when the
+    reject carries a different NLRI (a non-zero-RD Type-5 for an installed
+    (S,G)) -- RFC 4271 Section 9 replacement-route semantics,
   * install the trailing sentinel Type-5, which is what proves the receiver
     consumed the whole crafted stream rather than stopping at the first
     rejection,
@@ -94,6 +98,12 @@ FOREIGN_SG = ("10.50.50.2", "232.50.50.2")
 SENTINEL_SG = ("10.70.70.1", "232.70.70.1")
 # r1's own router-id, i.e. the originator the crafter reflects back in case G2.
 R1_ORIGINATOR = "10.0.0.1"
+# Crafter phase 2: each of these installs cleanly in phase 1, then is re-sent
+# ~30 s later in a form that must be rejected.
+STRAND_T3_SG = ("10.90.90.1", "232.90.90.1")
+STRAND_T1_ORIGINATOR = "10.0.0.7"
+RDKEEP_SG = ("10.91.91.1", "232.91.91.1")
+SENTINEL2_SG = ("10.92.92.1", "232.92.92.1")
 
 
 def _pick_route(routes, route_type, sg):
@@ -213,6 +223,90 @@ def test_session_established():
 
     _, result = topotest.run_and_expect(_established, None, count=60, wait=1)
     assert result is None, "r1 did not reach Established with the crafter"
+
+
+def test_reject_withdraws_or_keeps_per_nlri_identity():
+    """A reject must withdraw an earlier copy only when it is the SAME NLRI.
+
+    RFC 4271 Section 9: a replacement route carrying the same NLRI implicitly
+    withdraws the previous advertisement. So the question at every reject is
+    not "is this route bad" but "is this the same NLRI I already hold".
+
+    Phase 1 installs three routes. ~30 s later phase 2 re-advertises all three
+    in rejectable forms:
+
+      Type-3, PMSI removed  -> same NLRI, so our copy MUST GO.
+      Type-1, PMSI removed  -> same NLRI, so our copy MUST GO.
+      Type-5, RD 0 -> RD 1  -> DIFFERENT NLRI, so our copy MUST SURVIVE.
+
+    The last one is the load-bearing case. Our RIB key (struct prefix_mvpn)
+    drops the Route Distinguisher because GTM mandates RD 0, so RD-0 and RD-1
+    for one (S,G) collide on a single key. A reject that withdrew there would
+    delete a route the peer never retracted. This test is what stops someone
+    "fixing" the RD reject for symmetry with the other two.
+
+    This test runs early and asserts the phase-1 state first, so it must see
+    the installed routes before phase 2 fires.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _phase1_installed():
+        routes = _mvpn_routes("r1")
+        if _pick_route(routes, 3, STRAND_T3_SG) is None:
+            return "phase-1 Type-3 {} not installed: {}".format(STRAND_T3_SG, routes)
+        if not any(
+            r.get("routeType") == 1 and r.get("originator") == STRAND_T1_ORIGINATOR
+            for r in routes
+        ):
+            return "phase-1 Type-1 {} not installed".format(STRAND_T1_ORIGINATOR)
+        if not _has_type5(routes, RDKEEP_SG):
+            return "phase-1 RD-0 Type-5 {} not installed".format(RDKEEP_SG)
+        return None
+
+    _, result = topotest.run_and_expect(_phase1_installed, None, count=60, wait=1)
+    assert result is None, (
+        "phase-1 routes were not all installed, so the phase-2 assertions below "
+        "could not distinguish a withdrawal from a route that never existed: "
+        "{}".format(result)
+    )
+
+    # Phase 2 lands with its own sentinel; wait for that, never for a sleep.
+    def _phase2_done():
+        if _has_type5(_mvpn_routes("r1"), SENTINEL2_SG):
+            return None
+        return "phase-2 sentinel {} not seen yet".format(SENTINEL2_SG)
+
+    _, result = topotest.run_and_expect(_phase2_done, None, count=90, wait=1)
+    assert result is None, "phase-2 sentinel never arrived: {}".format(result)
+
+    routes = _mvpn_routes("r1")
+
+    assert _pick_route(routes, 3, STRAND_T3_SG) is None, (
+        "Type-3 {} survived a re-advertisement that removed its PMSI Tunnel "
+        "attribute. Same NLRI, so that UPDATE replaced the earlier one and the "
+        "stale selective-tunnel binding is still feeding leaf reconciliation; "
+        "routes={}".format(STRAND_T3_SG, routes)
+    )
+
+    assert not any(
+        r.get("routeType") == 1 and r.get("originator") == STRAND_T1_ORIGINATOR
+        for r in routes
+    ), (
+        "Type-1 {} survived a re-advertisement that removed its PMSI Tunnel "
+        "attribute; we would keep replicating to a PE that withdrew itself as "
+        "an ingress-replication leaf; routes={}".format(STRAND_T1_ORIGINATOR, routes)
+    )
+
+    assert _has_type5(routes, RDKEEP_SG), (
+        "RD-0 Type-5 {} was DELETED by a rejected RD-1 UPDATE for the same "
+        "(S,G). Those are different NLRI: the peer never retracted the RD-0 "
+        "route. The RD reject must skip, not withdraw -- our RIB key drops the "
+        "RD, so withdrawing there destroys a valid route; routes={}".format(
+            RDKEEP_SG, routes
+        )
+    )
 
 
 def test_valid_type5_accepted():
