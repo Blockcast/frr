@@ -22,6 +22,9 @@ MP_UNREACH. The FRR side must:
   * DROP a Type-5 carrying a non-zero Route Distinguisher (GTM requires RD 0),
   * install valid S-PMSI A-D and Leaf A-D routes,
   * DROP a Leaf A-D route with a malformed embedded S-PMSI route key,
+  * install the trailing sentinel Type-5, which is what proves the receiver
+    consumed the whole crafted stream rather than stopping at the first
+    rejection,
   * NOT crash on an MP_UNREACH that carries only AFI+SAFI (empty NLRI) -- the
     stream_new(0) assertion-abort that the receive-path hardening fixes,
   * DROP a Type-5 whose AS_PATH already contains r1's own AS (the MVPN parser
@@ -74,6 +77,24 @@ V6_NESTED_RECOVER_SG = ("2001:db8:40::4", "ff3e::43")
 SELECTIVE_LABEL = 0x12345
 LOOP_SG = ("10.50.50.1", "232.50.50.1")
 FOREIGN_SG = ("10.50.50.2", "232.50.50.2")
+# Crafter case Z: the LAST UPDATE on the wire. Reject assertions gate on this
+# so that "route absent" cannot mean "not processed yet".
+SENTINEL_SG = ("10.70.70.1", "232.70.70.1")
+# r1's own router-id, i.e. the originator the crafter reflects back in case G2.
+R1_ORIGINATOR = "10.0.0.1"
+
+
+def _sentinel_present():
+    """The crafter's last UPDATE (case Z) has been installed.
+
+    Any assertion of the form "case X was rejected" must wait for this, not for
+    an earlier positive control: the earlier control proves only that the
+    receiver got that far, while the sentinel proves it consumed the whole
+    crafted stream.
+    """
+    if _has_type5(_mvpn_routes("r1"), SENTINEL_SG):
+        return None
+    return "sentinel Type-5 {} not installed yet".format(SENTINEL_SG)
 
 
 def build_topo(tgen):
@@ -189,15 +210,10 @@ def test_non_ssm_group_rejected():
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
-    # Gate on the positive control so "absent" means "rejected", not "not yet
-    # processed".
-    def _control_present():
-        if _has_type5(_mvpn_routes("r1"), VALID_SG):
-            return None
-        return "positive control not yet present"
-
-    _, result = topotest.run_and_expect(_control_present, None, count=60, wait=1)
-    assert result is None, "positive control missing; cannot assert rejection"
+    # Gate on the SENTINEL (the crafter's last UPDATE), not on case A: case A
+    # arrives first, so its presence would not prove this case was processed.
+    _, result = topotest.run_and_expect(_sentinel_present, None, count=60, wait=1)
+    assert result is None, "sentinel missing; cannot assert rejection"
 
     routes = _mvpn_routes("r1")
     assert not _has_type5(routes, NONSSM_SG), (
@@ -212,13 +228,8 @@ def test_non_zero_rd_rejected():
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
-    def _control_present():
-        if _has_type5(_mvpn_routes("r1"), VALID_SG):
-            return None
-        return "positive control not yet present"
-
-    _, result = topotest.run_and_expect(_control_present, None, count=60, wait=1)
-    assert result is None, "positive control missing; cannot assert rejection"
+    _, result = topotest.run_and_expect(_sentinel_present, None, count=60, wait=1)
+    assert result is None, "sentinel missing; cannot assert rejection"
 
     routes = _mvpn_routes("r1")
     assert not _has_type5(routes, NONRD_SG), (
@@ -290,19 +301,37 @@ def test_valid_ipv6_type3_and_type4_accepted():
 
 
 def test_reflected_local_type1_rejected():
-    """A peer cannot install a second Type-1 for this router's originator."""
-    routes = [r for r in _mvpn_routes("r1") if r.get("routeType") == 1]
+    """A peer cannot install a second Type-1 for this router's originator.
+
+    Filter by originator rather than counting every Type-1: a peer may
+    legitimately advertise Type-1s for ITS OWN originators, and this assertion
+    is about the reflected copy of OURS.
+    """
+    _, result = topotest.run_and_expect(_sentinel_present, None, count=60, wait=1)
+    assert result is None, "sentinel missing; cannot assert rejection"
+
+    routes = [
+        r
+        for r in _mvpn_routes("r1")
+        if r.get("routeType") == 1 and r.get("originator") == R1_ORIGINATOR
+    ]
     assert len(routes) == 1 and routes[0].get("selfOriginated"), routes
 
 
 def test_type3_without_pmsi_rejected():
     """A Type-3 without an ingress-replication PMSI binding is unusable."""
+    _, result = topotest.run_and_expect(_sentinel_present, None, count=60, wait=1)
+    assert result is None, "sentinel missing; cannot assert rejection"
+
     routes = _mvpn_routes("r1")
     assert not _has_selective_route(routes, 3, NO_PMSI_SG), routes
 
 
 def test_malformed_nested_type3_rejected():
     """A Leaf A-D route with a lying embedded Type-3 length must not install."""
+    _, result = topotest.run_and_expect(_sentinel_present, None, count=60, wait=1)
+    assert result is None, "sentinel missing; cannot assert rejection"
+
     routes = _mvpn_routes("r1")
     assert not _has_selective_route(routes, 4, MALFORMED_SG, TYPE4_LEAF), routes
 
@@ -353,7 +382,9 @@ def test_no_crash_after_empty_mp_unreach():
             return "session not Established (bgpd may have aborted)"
         if not _has_type5(_mvpn_routes("r1"), VALID_SG):
             return "positive control gone (bgpd may have restarted)"
-        return None
+        # The sentinel is sent AFTER the empty MP_UNREACH, so its presence is
+        # what proves bgpd survived that UPDATE and kept parsing.
+        return _sentinel_present()
 
     _, result = topotest.run_and_expect(_healthy, None, count=60, wait=1)
     assert result is None, "r1 unhealthy after empty MP_UNREACH: bgpd did not survive"
@@ -364,15 +395,21 @@ def test_own_as_in_path_rejected():
 
     bgp_nlri_parse_mvpn() installs into the MCAST-VPN RIB directly and never
     passes through bgp_update(), so it needs its own AS-path loop check.
-    Without one, an eBGP neighbour's copy of OUR route is accepted and
-    re-advertised with our AS prepended again; measured live between the
-    sfo12 PE (AS 65001) and the nbg6817 PoP (AS 65010) the AS_PATH had grown
-    to ~1.9 kB and the session carried ~115 UPDATEs/s at idle.
+    Without one a neighbour's copy of OUR route is accepted and re-advertised
+    with our AS prepended again, and the two speakers ping-pong every MVPN
+    route indefinitely.
+
+    The live trigger was an eBGP session; this suite's session is iBGP. The
+    check keys on the LOCAL AS (bgp->as), not on the peer's, so it fires the
+    same either way -- but that also means this case alone cannot tell the two
+    apart. bgp_mvpn_gtm_umh_ebgp::test_ebgp_own_as_in_path_rejected covers the
+    same rejection over a genuine eBGP session, where a check written against
+    peer->as would wrongly drop every route the peer sends.
 
     Gate on crafter case H2 (a Type-5 carrying a non-empty, foreign-only
-    AS_PATH) being installed: that proves the AS4 AS_SEQUENCE encoding is
-    accepted, so LOOP_SG's absence is the loop check firing and nothing else.
-    The neighbour's aspathLoop denial counter must have moved as well.
+    AS_PATH) being installed: that proves the AS_PATH encoding is accepted, so
+    LOOP_SG's absence is the loop check firing and nothing else. The
+    neighbour's aspathLoop denial counter must have moved as well.
     """
     tgen = get_topogen()
     if tgen.routers_have_failure():

@@ -29,6 +29,20 @@ eBGP-reachable trust boundary is GA != origin, which cases 1-3 cover.
 The UMH parameter is the same endian known-answer used elsewhere
 (184549374 == 10.255.255.254).
 
+It then sends two MCAST-VPN Type-5 (Source Active) NLRIs that probe the
+receive path's AS-path loop check over this same eBGP session:
+
+  loop : AS_PATH "65001 65010" -- contains the PE's OWN AS, the exact shape a
+         PE sees when the PoP echoes the PE's route back. Must be DROPPED.
+  ok   : AS_PATH "65010" -- the peer's own AS only. Must be INSTALLED.
+
+The pair is what makes the check's reference AS observable. bgp_nlri_parse_mvpn()
+must compare against the LOCAL AS (bgp->as); a check written against peer->as
+would drop the "ok" route too, because over eBGP every route the peer sends
+begins with the peer's AS. The iBGP crafter in bgp_mvpn_gtm_malformed cannot
+see that distinction (there bgp->as == peer->as), which is why this case lives
+here.
+
 Usage: umh_ebgp_peer.py <peer_ip> <local_as> <local_id> <pe_as>
 """
 
@@ -52,6 +66,16 @@ SAFI_MCAST_VPN = 5
 
 AS_SET = 1
 AS_SEQUENCE = 2
+
+MVPN_TYPE5 = 5
+IPV4_BITLEN = 32
+
+# MCAST-VPN Type-5 probes for the receive-path AS-path loop check. Both are
+# valid GTM routes (RD 0, SSM group); they differ only in AS_PATH.
+LOOP_SRC = "10.80.80.1"
+LOOP_GRP = "232.80.80.1"
+OK_SRC = "10.80.80.2"
+OK_GRP = "232.80.80.2"
 
 ECOMMUNITY_ENCODE_IP = 0x01
 ECOMMUNITY_VRF_ROUTE_IMPORT = 0x0B
@@ -117,6 +141,45 @@ def _rt_import_attr(rt_import):
         socket.inet_aton(rt_import), 0,
     )
     return struct.pack("!BBB", 0xC0, 16, len(ec)) + ec
+
+
+def _type5_nlri(src, grp):
+    """MVPN Type-5 NLRI: RouteType, Length, RD(8, zero under GTM), S, G."""
+    body = (
+        b"\x00" * 8
+        + struct.pack("!B", IPV4_BITLEN)
+        + socket.inet_aton(src)
+        + struct.pack("!B", IPV4_BITLEN)
+        + socket.inet_aton(grp)
+    )
+    return struct.pack("!BB", MVPN_TYPE5, len(body)) + body
+
+
+def build_mvpn_update(src, grp, next_hop, as_path):
+    """UPDATE carrying one MCAST-VPN Type-5 with an explicit AS_PATH.
+
+    as_path is a list of ASNs emitted in order as one AS_SEQUENCE segment of
+    the ordinary AS_PATH attribute (type 2). The OPEN negotiates the 4-octet-AS
+    capability, so each ASN is 4 bytes wide. No LOCAL_PREF: this is eBGP.
+    """
+    nh = socket.inet_aton(next_hop)
+    mp_reach_val = (
+        struct.pack("!HB", AFI_IP, SAFI_MCAST_VPN)
+        + struct.pack("!B", len(nh))
+        + nh
+        + struct.pack("!B", 0)
+        + _type5_nlri(src, grp)
+    )
+
+    seg = struct.pack("!BB", AS_SEQUENCE, len(as_path)) + b"".join(
+        struct.pack("!I", asn) for asn in as_path
+    )
+    attrs = struct.pack("!BBBB", 0x40, 1, 1, 0)  # ORIGIN = IGP
+    attrs += struct.pack("!BBB", 0x40, 2, len(seg)) + seg  # AS_PATH
+    attrs += struct.pack("!BBB", 0x80, 14, len(mp_reach_val)) + mp_reach_val
+
+    payload = struct.pack("!H", 0) + struct.pack("!H", len(attrs)) + attrs
+    return MARKER + struct.pack("!HB", 19 + len(payload), BGP_UPDATE) + payload
 
 
 def build_update(route, next_hop, local_as):
@@ -215,6 +278,18 @@ def main():
             ),
             flush=True,
         )
+
+    # MCAST-VPN loop-check probes. Order matters: the "ok" control is sent
+    # LAST, so a test that waits for it knows the "loop" route was already
+    # decided on.
+    sock.sendall(
+        build_mvpn_update(LOOP_SRC, LOOP_GRP, args.local_id, [args.local_as, args.pe_as])
+    )
+    print("advertised MVPN Type-5 {} as_path=[{}, {}] (loop)".format(
+        LOOP_SRC, args.local_as, args.pe_as), flush=True)
+    sock.sendall(build_mvpn_update(OK_SRC, OK_GRP, args.local_id, [args.local_as]))
+    print("advertised MVPN Type-5 {} as_path=[{}] (ok)".format(
+        OK_SRC, args.local_as), flush=True)
 
     sock.settimeout(1)
     while True:

@@ -6,22 +6,44 @@ crafter.py: minimal raw BGP speaker that negotiates the IPv4 and IPv6
 MCAST-VPN address families and sends deliberately crafted MVPN Route Type 3,
 4 and 5 NLRIs to exercise the receive path in bgp_nlri_parse_mvpn().
 
-It sends, in order:
+Cases, in the order main() sends them. The letters are historical; each send
+site in main() carries the matching label.
 
-  A. VALID Type-5 (RD 0, SSM group) -- POSITIVE CONTROL, must be installed.
-  B. non-SSM Type-5 (group outside 232.0.0.0/8) -- must be dropped.
-  C. non-zero-RD Type-5 (RD != 0 under GTM) -- must be dropped.
-  D. empty MP_UNREACH_NLRI (AFI+SAFI only, zero withdrawn NLRI) -- must NOT
-     crash the receiver. Before the fix this hit stream_new(0) -> assert(0)
-     and aborted bgpd.
-  H. Type-5 whose AS_PATH contains the receiver's OWN AS (65001) -- must be
-     dropped. bgp_nlri_parse_mvpn() installs straight into the MCAST-VPN RIB
-     and never runs bgp_update()'s aspath_loop_check(), so before the fix an
-     eBGP neighbour's echo of our own route was accepted and re-advertised
-     with our AS prepended again, ping-ponging every MVPN route forever.
+  A.  VALID Type-5 (RD 0, SSM group) -- POSITIVE CONTROL, must be installed.
+  B.  non-SSM Type-5 (group outside 232.0.0.0/8) -- must be dropped.
+  C.  non-zero-RD Type-5 (RD != 0 under GTM) -- must be dropped.
+  D.  valid Type-3 (S-PMSI A-D) with an IR PMSI Tunnel -- must install.
+  D2. Type-3 with no usable PMSI binding -- must be dropped.
+  G.  IPv6-AF Type-3 + trailing Type-5 (dual-stack codec control).
+  G2. Type-1 reflecting our own originator -- must be dropped as a duplicate.
+  G3. Type-3 whose body ends after C-S, then a Type-5 -- framing recovery.
+  E.  Type-4 whose embedded Type-3 length lies -- must be dropped.
+  E2. that malformed Type-4 followed by a well-formed Type-5 in the SAME
+      MP_REACH -- the trailing Type-5 must still install.
+  E3. Type-4 with an allowed nested length but malformed C-G framing, then a
+      Type-5 -- the trailing Type-5 must still install.
+  H.  Type-5 whose AS_PATH contains the receiver's OWN AS (65001) -- must be
+      dropped. bgp_nlri_parse_mvpn() installs straight into the MCAST-VPN RIB
+      and never runs bgp_update()'s aspath_loop_check(), so before the fix a
+      neighbour's echo of our own route was accepted and re-advertised with
+      our AS prepended again, ping-ponging every MVPN route forever. The live
+      trigger was an eBGP session; the check keys on the local AS rather than
+      the peer's, so it fires identically on this suite's iBGP session.
+      bgp_mvpn_gtm_umh_ebgp carries the same case over a real eBGP session.
   H2. Type-5 with a NON-EMPTY foreign-only AS_PATH (65010) -- POSITIVE
-     CONTROL for H: proves a non-empty AS_PATH is encoded and accepted, so
-     H's absence is the loop check, not a rejected attribute.
+      CONTROL for H: proves a non-empty AS_PATH is encoded and accepted, so
+      H's absence is the loop check, not a rejected attribute.
+  F.  empty MP_UNREACH_NLRI (AFI+SAFI only, zero withdrawn NLRI) -- must NOT
+      crash the receiver. Before the fix this hit stream_new(0) -> assert(0)
+      and aborted bgpd.
+  Z.  SENTINEL valid Type-5, sent LAST. A test that asserts on the absence of
+      an earlier case gates on this instead of on case A, so "absent" means
+      "the receiver processed the whole stream and rejected it", not "the
+      receiver has not reached that UPDATE yet".
+
+WARNING: case H is the ONLY case whose AS_PATH may contain 65001. The test
+asserts the neighbour's aspathLoop denial counter is exactly 1, which catches
+double-counting; a second looping case would have to update that assertion.
 
 The positive control is essential: it proves the crafted NLRI encoding and
 the AF negotiation are correct, so that "route absent" for B and C means the
@@ -90,6 +112,8 @@ LOOP_SRC = "10.50.50.1"
 LOOP_GRP = "232.50.50.1"      # valid SSM/RD 0, but AS_PATH contains 65001
 FOREIGN_SRC = "10.50.50.2"
 FOREIGN_GRP = "232.50.50.2"   # valid SSM/RD 0, AS_PATH = 65010 only -> install
+SENTINEL_SRC = "10.70.70.1"
+SENTINEL_GRP = "232.70.70.1"  # last UPDATE on the wire; see case Z above
 RECEIVER_AS = 65001
 FOREIGN_AS = 65010
 AS_SEQUENCE = 2
@@ -193,11 +217,12 @@ def build_mvpn_update(
     pmsi_label=0,
     as_path=None,
 ):
-    """UPDATE with ORIGIN, AS_PATH and one MCAST-VPN NLRI.
+    """UPDATE with ORIGIN, AS_PATH and one or more MCAST-VPN NLRI.
 
-    as_path is None for the empty (iBGP) path, else a list of ASNs emitted as
-    one AS4 AS_SEQUENCE in order (the OPEN negotiated the 4-octet-AS
-    capability, so every AS_PATH ASN is 4 bytes wide).
+    as_path is None for the empty AS_PATH legal on this iBGP session, else a
+    list of ASNs emitted in order as one AS_SEQUENCE segment of the ordinary
+    AS_PATH attribute (type 2, not AS4_PATH/type 17). build_open() negotiates
+    the 4-octet-AS capability, so each ASN in it is 4 bytes wide.
     """
 
     # MP_REACH_NLRI value: AFI(2) SAFI(1) NHLen(1) NH(4) Reserved(1) NLRI
@@ -461,6 +486,12 @@ def main():
     )
     # F: empty MP_UNREACH -- must not crash the receiver.
     sock.sendall(build_empty_mp_unreach())
+    # Z: sentinel, always last. Tests that assert an earlier case was REJECTED
+    # gate on this one being installed, which proves the receiver consumed the
+    # whole stream rather than merely the first few UPDATEs.
+    sock.sendall(
+        build_mvpn_update(local_id, _type5_nlri(zero_rd, SENTINEL_SRC, SENTINEL_GRP))
+    )
     print("crafted UPDATEs sent", flush=True)
 
     # Keepalive loop so the session stays up for the test to observe steady state.

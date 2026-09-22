@@ -810,31 +810,82 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			}
 		}
 
-		/*
-		 * AS-path loop detection, mirroring bgp_update(): this parser installs
-		 * straight into the MCAST-VPN RIB and never passes through
-		 * bgp_update(), so without this an eBGP peer's copy of OUR OWN route
-		 * is accepted, re-advertised back with our AS prepended again, and
-		 * the two speakers ping-pong every MCAST-VPN route forever. Measured
-		 * live 2026-09-22 between the sfo12 PE (AS 65001) and the nbg6817 PoP
-		 * (AS 65010): AS_PATH "65001 65010 65001 65010 ..." grown to 1,946
-		 * bytes, ~115 UPDATEs/s at idle. Installs only; a withdraw carries no
-		 * attributes and must still remove the NLRI by key.
+		/* Type-1's plane is the AF the NLRI arrived on (RFC 6515 permits a
+		 * v4 originator inside the IPv6 AF); Type-5/7 key off the C-S/C-G
+		 * family, which the length checks above already tied to the body.
+		 * Needed from here on: the AS-path loop check below withdraws by it.
 		 */
-		if (!is_withdraw && attr && peer != peer->bgp->peer_self) {
-			int allowas_in = peer->allowas_in[packet->afi][SAFI_MCAST_VPN];
+		afi_t rib_afi = (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI)
+					? packet->afi
+					: bgp_mvpn_prefix_afi(&p);
 
-			if (aspath_loop_check(attr->aspath, peer->bgp->as) > allowas_in ||
-			    (CHECK_FLAG(peer->bgp->config, BGP_CONFIG_CONFEDERATION) &&
-			     aspath_loop_check_confed(attr->aspath, peer->bgp->confed_id) >
-				     allowas_in)) {
+		/*
+		 * AS-path loop detection. This parser installs straight into the
+		 * MCAST-VPN RIB through bgp_mvpn_route_install() and never passes
+		 * through bgp_update(), so it inherits none of bgp_update()'s inbound
+		 * checks. Without this one an eBGP peer's copy of OUR OWN route is
+		 * accepted, re-advertised back with our AS prepended again, and the
+		 * two speakers ping-pong every MCAST-VPN route indefinitely. Observed
+		 * on a live PE<->PoP session: an AS_PATH of 486 alternating ASNs in
+		 * 1,950 bytes, ~9 UPDATEs/s in each direction while otherwise idle.
+		 *
+		 * Runs the same three checks bgp_update() runs -- local AS,
+		 * confederation id, and change_local_as -- honouring the neighbour's
+		 * allowas-in count. It deliberately does NOT implement bgp_update()'s
+		 * allowas-in route-map gating or "allowas-in origin": `neighbor ...
+		 * allowas-in` has no MVPN address-family form (bgp_vty.c installs it
+		 * for unicast/multicast/labeled/VPN/EVPN only), so allowas_in here is
+		 * always 0 and those refinements have nothing to refine. Wire them up
+		 * alongside the command if it ever gains one.
+		 *
+		 * Installs only: a withdraw must remove the NLRI by key whatever
+		 * attributes accompany it (an MP_UNREACH can share an UPDATE with
+		 * attributes), and the NULL-attr treat-as-withdraw case is already
+		 * folded into is_withdraw, which is why attr is known non-NULL here.
+		 * A denied install is an implicit withdraw (RFC 4271 Section 9) -- the
+		 * peer has replaced what it told us before -- so drop any copy we
+		 * still hold instead of stranding it, as bgp_update()'s filtered:
+		 * path does via bgp_rib_remove().
+		 */
+		if (!is_withdraw) {
+			int allowas_in = peer->allowas_in[packet->afi][SAFI_MCAST_VPN];
+			int32_t local_as_loops = 0;
+			const char *reason = NULL;
+
+			if (peer->change_local_as) {
+				if (CHECK_FLAG(peer->af_flags[packet->afi][SAFI_MCAST_VPN],
+					       PEER_FLAG_ALLOWAS_IN))
+					local_as_loops = allowas_in;
+				else if (!CHECK_FLAG(peer->flags, PEER_FLAG_LOCAL_AS_NO_PREPEND))
+					local_as_loops = 1;
+			}
+
+			if (aspath_loop_check(attr->aspath, peer->bgp->as) > allowas_in)
+				reason = "as-path contains our own AS";
+			else if (CHECK_FLAG(peer->bgp->config, BGP_CONFIG_CONFEDERATION) &&
+				 aspath_loop_check_confed(attr->aspath, peer->bgp->confed_id) >
+					 allowas_in)
+				reason = "as-path contains our own confed AS";
+			else if (peer->change_local_as &&
+				 aspath_loop_check(attr->aspath, peer->change_local_as) >
+					 local_as_loops)
+				reason = "as-path contains our own local-as";
+
+			if (reason) {
 				peer->stat_pfx_aspath_loop++;
-				if (bgp_debug_update(peer, NULL, NULL, 1))
-					zlog_debug("%s MVPN Type-%u %pFX: as-path contains our own AS; dropping",
-						   peer->host, route_type, (struct prefix *)&p);
+				if (bgp_debug_update(peer, (struct prefix *)&p, NULL, 1))
+					zlog_debug("%s MVPN Type-%u %pFX -- DENIED due to: %s; as-path %s",
+						   peer->host, route_type, (struct prefix *)&p,
+						   reason,
+						   attr->aspath && attr->aspath->str
+							   ? attr->aspath->str
+							   : "(empty)");
+				bgp_mvpn_route_remove(peer->bgp, peer, rib_afi, &p,
+						      BGP_ROUTE_NORMAL);
 				continue;
 			}
 		}
+
 		/*
 		 * A GTM Type-1 (Intra-AS I-PMSI A-D) is only meaningful with an
 		 * Ingress-Replication PMSI Tunnel attribute (RFC 6514 Section 5).
@@ -868,14 +919,6 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 				 peer->host);
 			continue;
 		}
-
-		/* Type-1's plane is the AF the NLRI arrived on (RFC 6515 permits a
-		 * v4 originator inside the IPv6 AF); Type-5/7 key off the C-S/C-G
-		 * family, which the length checks above already tied to the body.
-		 */
-		afi_t rib_afi = (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI)
-					? packet->afi
-					: bgp_mvpn_prefix_afi(&p);
 
 		if (is_withdraw)
 			bgp_mvpn_route_remove(peer->bgp, peer, rib_afi, &p, BGP_ROUTE_NORMAL);
