@@ -104,6 +104,21 @@ STRAND_T3_SG = ("10.90.90.1", "232.90.90.1")
 STRAND_T1_ORIGINATOR = "10.0.0.7"
 RDKEEP_SG = ("10.91.91.1", "232.91.91.1")
 SENTINEL2_SG = ("10.92.92.1", "232.92.92.1")
+SENTINEL3_SG = ("10.93.93.1", "232.93.93.1")
+SENTINEL4_SG = ("10.94.94.1", "232.94.94.1")
+TRIGGER_DIR = None  # set in setup_module; the crafter polls it for phase files
+
+
+def _fire_phase(name):
+    """Tell the crafter to send a later phase, and wait for nothing.
+
+    The crafter polls for this file rather than sleeping, so the test decides
+    when each phase lands. A timed crafter would race this test: whichever ran
+    first would decide whether the earlier state was still observable, and a
+    lost race reports as "route not installed" -- the same message a real parse
+    regression produces.
+    """
+    get_topogen().gears["peer1"].cmd("touch {}/{}".format(TRIGGER_DIR, name))
 
 
 def _pick_route(routes, route_type, sg):
@@ -164,7 +179,13 @@ def setup_module(mod):
     log_dir = os.path.join(peer.logdir, peer.name)
     peer.cmd("chmod 777 {}".format(log_dir))
     log_file = os.path.join(log_dir, "crafter.log")
-    peer.cmd("python3 {} 10.0.0.1 65001 10.0.0.2 > {} 2>&1 &".format(crafter, log_file))
+    global TRIGGER_DIR
+    TRIGGER_DIR = log_dir
+    peer.cmd(
+        "python3 {} 10.0.0.1 65001 10.0.0.2 {} > {} 2>&1 &".format(
+            crafter, TRIGGER_DIR, log_file
+        )
+    )
     logger.info("crafter started on peer1")
 
 
@@ -272,14 +293,33 @@ def test_reject_withdraws_or_keeps_per_nlri_identity():
         "{}".format(result)
     )
 
-    # Phase 2 lands with its own sentinel; wait for that, never for a sleep.
-    def _phase2_done():
-        if _has_type5(_mvpn_routes("r1"), SENTINEL2_SG):
-            return None
-        return "phase-2 sentinel {} not seen yet".format(SENTINEL2_SG)
+    _fire_phase("phase2")
 
-    _, result = topotest.run_and_expect(_phase2_done, None, count=90, wait=1)
-    assert result is None, "phase-2 sentinel never arrived: {}".format(result)
+    # POLL for the two withdrawals rather than snapshotting when the sentinel
+    # lands. Removal is two-stage -- BGP_PATH_REMOVED is set and the reap runs
+    # later on the work queue -- so a snapshot taken the instant the sentinel
+    # appears can still see a route that is on its way out. That matters most
+    # for the RD assertion below: polling until the two EXPECTED removals are
+    # visible means a wrongly-removed RDKEEP would be gone by then too, which
+    # is what keeps that assertion from passing vacuously.
+    def _phase2_done():
+        routes = _mvpn_routes("r1")
+        if not _has_type5(routes, SENTINEL2_SG):
+            return "phase-2 sentinel {} not seen yet".format(SENTINEL2_SG)
+        if _pick_route(routes, 3, STRAND_T3_SG) is not None:
+            return "Type-3 {} still present".format(STRAND_T3_SG)
+        if any(
+            r.get("routeType") == 1 and r.get("originator") == STRAND_T1_ORIGINATOR
+            for r in routes
+        ):
+            return "Type-1 {} still present".format(STRAND_T1_ORIGINATOR)
+        return None
+
+    _, result = topotest.run_and_expect(_phase2_done, None, count=60, wait=1)
+    assert result is None, (
+        "phase 2 did not take effect: {}. A reject carrying the SAME NLRI must "
+        "withdraw the earlier copy (RFC 4271 Section 9)".format(result)
+    )
 
     routes = _mvpn_routes("r1")
 
@@ -307,6 +347,78 @@ def test_reject_withdraws_or_keeps_per_nlri_identity():
             RDKEEP_SG, routes
         )
     )
+
+
+def test_reject_withdraw_then_readvertise_restores_route():
+    """A route withdrawn by a reject must come back when re-advertised well.
+
+    Removal is two-stage: bgp_mvpn_route_remove() sets BGP_PATH_REMOVED and the
+    reap runs later on the work queue. A re-advertisement that arrives before
+    that drains hits the same bgp_path_info, so the install path has to call
+    bgp_path_info_restore() instead of handing back a doomed one. Without that,
+    the attrhash_cmp fast path returns early with the path still REMOVED and the
+    route is black-holed: the peer's adj-rib-out still reads "advertised", so it
+    never re-sends, and nothing recovers until a route refresh or session reset.
+
+    This is exactly the toggle the reject-withdraw change makes easy to hit -- a
+    peer whose Type-3 PMSI attribute comes and goes -- which is why it is tested
+    here rather than left to the pre-existing MP_UNREACH path.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    _fire_phase("phase3")
+
+    def _restored():
+        routes = _mvpn_routes("r1")
+        if not _has_type5(routes, SENTINEL3_SG):
+            return "phase-3 sentinel not seen yet"
+        t3 = _pick_route(routes, 3, STRAND_T3_SG)
+        if t3 is None:
+            return "Type-3 {} did not come back".format(STRAND_T3_SG)
+        if t3.get("pmsiTunnel", {}).get("label") != SELECTIVE_LABEL:
+            return "Type-3 came back without its PMSI binding: {}".format(t3)
+        if not any(
+            r.get("routeType") == 1 and r.get("originator") == STRAND_T1_ORIGINATOR
+            for r in routes
+        ):
+            return "Type-1 {} did not come back".format(STRAND_T1_ORIGINATOR)
+        return None
+
+    _, result = topotest.run_and_expect(_restored, None, count=60, wait=1)
+    assert result is None, (
+        "a route withdrawn by a reject did not return when re-advertised "
+        "correctly: {}. The install path must restore a path still flagged "
+        "BGP_PATH_REMOVED".format(result)
+    )
+
+
+def test_real_mp_unreach_withdraws_by_nlri():
+    """An ordinary MP_UNREACH carrying an NLRI must remove that route.
+
+    This is the withdraw path the reject-withdraw work is modelled on, and
+    until now nothing in the tree exercised it: every other MP_UNREACH in these
+    suites carries zero NLRI, and the other suites' withdrawals come from
+    session teardown. Without this, someone consolidating the four
+    bgp_mvpn_route_remove() call sites could break the real one and stay green.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    _fire_phase("phase4")
+
+    def _withdrawn():
+        routes = _mvpn_routes("r1")
+        if not _has_type5(routes, SENTINEL4_SG):
+            return "phase-4 sentinel not seen yet"
+        if _pick_route(routes, 3, STRAND_T3_SG) is not None:
+            return "Type-3 {} survived a real MP_UNREACH".format(STRAND_T3_SG)
+        return None
+
+    _, result = topotest.run_and_expect(_withdrawn, None, count=60, wait=1)
+    assert result is None, result
 
 
 def test_valid_type5_accepted():

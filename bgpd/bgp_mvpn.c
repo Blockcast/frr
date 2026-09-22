@@ -369,7 +369,27 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, afi_t afi
 			break;
 
 	if (pi) {
-		if (attrhash_cmp(pi->attr, attr_new)) {
+		/*
+		 * A path marked for delete is not gone yet: bgp_mvpn_route_remove()
+		 * only sets BGP_PATH_REMOVED and schedules bgp_process(), and the
+		 * reap happens later on the work queue. If the peer re-advertises the
+		 * NLRI before that drains -- trivially easy now that an ordinary
+		 * rejected UPDATE removes (a Type-3 whose PMSI attribute comes and
+		 * goes, say) -- we must resurrect the path rather than hand back a
+		 * doomed one.
+		 *
+		 * Both branches below were unsafe without this. The attrhash_cmp
+		 * early return would leave BGP_PATH_REMOVED set and return, so the
+		 * route was reaped moments later and the peer, whose adj-rib-out
+		 * still says "advertised", never re-sent it: silently black-holed
+		 * until a route refresh. The reuse branch below would swap in the new
+		 * attribute while the path stayed REMOVED and !VALID, with the same
+		 * outcome. bgp_update() handles exactly this at its "flapped quicker
+		 * than processing" case; this is the same fix.
+		 */
+		if (CHECK_FLAG(pi->flags, BGP_PATH_REMOVED))
+			bgp_path_info_restore(dest, pi);
+		else if (attrhash_cmp(pi->attr, attr_new)) {
 			bgp_dest_unlock_node(dest);
 			bgp_attr_unintern_clear_reuse(attr, &attr_new);
 			return;
@@ -2323,8 +2343,22 @@ void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_
 			continue;
 
 		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
-			bool self = (pi->peer == bgp->peer_self);
-			struct ecommunity *ecom = bgp_attr_get_ecommunity(pi->attr);
+			bool self;
+			struct ecommunity *ecom;
+
+			/*
+			 * Skip paths already marked for delete. Removal is two-stage --
+			 * bgp_mvpn_route_remove() sets BGP_PATH_REMOVED and clears
+			 * BGP_PATH_VALID, and the reap happens later on the work queue --
+			 * so without this an operator (and every topotest) sees withdrawn
+			 * MCAST-VPN routes for as long as that queue takes to drain.
+			 * bgp_show_table() filters the same way for the unicast RIBs.
+			 */
+			if (CHECK_FLAG(pi->flags, BGP_PATH_REMOVED))
+				continue;
+
+			self = (pi->peer == bgp->peer_self);
+			ecom = bgp_attr_get_ecommunity(pi->attr);
 			/* ecommunity_str() lazily builds and caches the display
 			 * string (RFC 7716 Section 2.8.2 group-address RT on
 			 * Type-5, and any RT a later route type carries). */
