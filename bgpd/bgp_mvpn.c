@@ -354,6 +354,14 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, afi_t afi
 	dest = bgp_afi_node_get(bgp->rib[afi][SAFI_MCAST_VPN], afi, SAFI_MCAST_VPN,
 				(const struct prefix *)p, NULL);
 
+	/*
+	 * Interns the caller's attr directly -- never a modified copy. The
+	 * receive path marks that attr as its own parsed_attr, so this feeds
+	 * bgp_attr_intern()'s reuse cache across the NLRI of one UPDATE, and
+	 * the unintern calls below must clear the cache rather than leave it
+	 * pointing at an attr whose last reference they just dropped (the same
+	 * pairing bgp_update() uses).
+	 */
 	attr_new = bgp_attr_intern(attr);
 
 	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
@@ -363,10 +371,10 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, afi_t afi
 	if (pi) {
 		if (attrhash_cmp(pi->attr, attr_new)) {
 			bgp_dest_unlock_node(dest);
-			bgp_attr_unintern(&attr_new);
+			bgp_attr_unintern_clear_reuse(attr, &attr_new);
 			return;
 		}
-		bgp_attr_unintern(&pi->attr);
+		bgp_attr_unintern_clear_reuse(attr, &pi->attr);
 		pi->attr = attr_new;
 		pi->uptime = monotime(NULL);
 		bgp_path_info_set_flag(dest, pi, BGP_PATH_ATTR_CHANGED);
@@ -616,16 +624,29 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 
 	/*
 	 * Mark the packet attr as the NLRI-scoped parsed attr, exactly as
-	 * bgp_nlri_parse_ip() does. bgp_attr_intern() treats an attr whose
-	 * attr_intern_reuse.parsed_attr is not itself as CALLER-OWNED and
-	 * either steals its attr->extra on a hash miss (bgp_attr_hash_alloc)
-	 * or frees it on a hash hit (bgp_attr_extra_discard). Every NLRI in
-	 * this MP_REACH shares this one attr, so without the mark the first
-	 * install stripped the PMSI Tunnel attribute from all the NLRI that
-	 * followed it in the same UPDATE, and each later Type-1/Type-3 was
-	 * dropped as "without Ingress-Replication PMSI Tunnel". With the mark
-	 * the intern path copies attr->extra instead and the reuse cache
-	 * also spares one hash lookup per NLRI.
+	 * bgp_nlri_parse_ip() does, before any NLRI is installed.
+	 *
+	 * bgp_attr_owns_extra() calls an attr's extra CALLER-OWNED when it has
+	 * one, its refcnt is 0, and its attr_intern_reuse.parsed_attr is not
+	 * itself -- all three true of an unmarked packet attr. bgp_attr_intern()
+	 * then either steals attr->extra on a hash miss (bgp_attr_hash_alloc
+	 * takes the pointer and NULLs it on the caller) or frees it on a hash
+	 * hit (bgp_attr_extra_discard). Every NLRI in this MP_REACH shares this
+	 * one attr, so unmarked, the first install stripped the PMSI Tunnel
+	 * info from all the NLRI behind it and each later Type-1/Type-3 was
+	 * dropped for want of an Ingress-Replication PMSI Tunnel.
+	 *
+	 * Marked, bgp_attr_hash_alloc() duplicates the extra instead and the
+	 * discard is skipped, so ownership stays here and bgp_update_receive()
+	 * releases it exactly once via bgp_attr_unintern_sub(). The mark also
+	 * arms the reuse cache, sparing an attribute hash lookup per NLRI after
+	 * the first.
+	 *
+	 * Safe only while this parser never mutates attr between NLRI, which it
+	 * does not: bgp_mvpn_route_install() interns this pointer itself rather
+	 * than a modified copy. A future change that interns a copy must anchor
+	 * that copy to this attr the way bgp_update() does, or it will steal the
+	 * shared extra through the copy.
 	 */
 	if (attr) {
 		memset(&attr->attr_intern_reuse, 0, sizeof(attr->attr_intern_reuse));
@@ -947,6 +968,11 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 
 done:
 	/* Reset the attr_intern_reuse cache, mirroring bgp_nlri_parse_ip(). */
+	/*
+	 * Leave no parsed_attr/interned pointer behind in the caller's attr,
+	 * which outlives this call. bgp_nlri_parse_ip() resets on its normal
+	 * exit only; both exits here do, including the truncation path below.
+	 */
 	if (attr)
 		memset(&attr->attr_intern_reuse, 0, sizeof(attr->attr_intern_reuse));
 	stream_free(data);
@@ -955,6 +981,7 @@ done:
 stream_failure:
 	flog_err(EC_BGP_UPDATE_RCV, "%s [Error] MVPN NLRI parse error (truncated NLRI of size %u)",
 		 peer->host, packet->length);
+	/* Reuse cache reset, as at done: above. */
 	if (attr)
 		memset(&attr->attr_intern_reuse, 0, sizeof(attr->attr_intern_reuse));
 	stream_free(data);
