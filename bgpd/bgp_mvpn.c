@@ -827,11 +827,54 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		 * to install without letting a misbehaving peer weaponize a
 		 * session reset. getp is already at the next NLRI here.
 		 */
+		/*
+		 * WITHDRAW-OR-SKIP: the rule every semantic reject below follows.
+		 *
+		 * RFC 4271 Section 9 makes a replacement route carrying the SAME NLRI
+		 * an implicit withdraw of the previous advertisement. So a reject must
+		 * ask one question: is the NLRI we are rejecting the same NLRI as one
+		 * we already hold from this peer?
+		 *
+		 *   same NLRI, different attributes -> it IS a replacement. Drop our
+		 *       copy (bgp_mvpn_route_remove), or we strand a route the peer
+		 *       has already superseded.
+		 *   different NLRI                  -> it is NOT a replacement. Skip
+		 *       it and leave our copy alone.
+		 *
+		 * Careful: our RIB key (struct prefix_mvpn) is a LOSSY projection of
+		 * the RFC 6514 NLRI -- it drops the Route Distinguisher, because GTM
+		 * mandates RD 0 (RFC 7716). Two distinct on-the-wire NLRI, RD 0 and
+		 * RD 1 for one (S,G), therefore collide on one key. The RD reject just
+		 * below is what keeps that projection safe: it is the reason a
+		 * non-zero RD can never occupy the key. The reject and the RD-free key
+		 * are a matched pair; do not remove or relax either alone.
+		 *
+		 * Per site:
+		 *   non-zero RD   SKIP     -- different NLRI (the RD differs). Removing
+		 *                             would delete the peer's legitimate RD-0
+		 *                             route for the same (S,G).
+		 *   non-SSM group SKIP     -- the group IS in the key, so any colliding
+		 *                             route has the same group, is also non-SSM
+		 *                             and could never have installed. Removing
+		 *                             would be a no-op; skipping says so.
+		 *   reflected T-1 WITHDRAW -- same NLRI. Normally nothing is installed,
+		 *                             but after our router-id becomes a value
+		 *                             the peer already advertised, its formerly
+		 *                             valid Type-1 turns "reflected" and would
+		 *                             otherwise sit beside our own forever.
+		 *   missing PMSI  WITHDRAW -- same NLRI, attribute removed. This is the
+		 *                             textbook replacement route: the peer has
+		 *                             told us the tunnel binding is gone.
+		 *
+		 * (Not RFC 7606 treat-as-withdraw: that covers MALFORMED attributes.
+		 * A Type-3 with no PMSI Tunnel attribute is well-formed and merely
+		 * unusable under RFC 6514 Section 5.)
+		 */
 		if (!mvpn_rd_is_zero(rd)) {
 			flog_err(EC_BGP_UPDATE_RCV,
 				 "%s [Error] MVPN Type-%u non-zero RD under GTM (RFC 7716); dropping route",
 				 peer->host, route_type);
-			continue;
+			continue; /* SKIP: different NLRI -- see WITHDRAW-OR-SKIP above */
 		}
 
 		if (route_type == BGP_MVPN_ROUTE_TYPE_S_PMSI_AD ||
@@ -845,6 +888,8 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 				flog_err(EC_BGP_UPDATE_RCV,
 					 "%s [Error] MVPN Type-%u group %pIA outside SSM range (232.0.0.0/8 or ff3x::/32); dropping route",
 					 peer->host, route_type, &grp);
+				/* SKIP: a colliding key carries this same non-SSM group and
+				 * so could never have installed. See WITHDRAW-OR-SKIP. */
 				continue;
 			}
 		}
@@ -880,6 +925,13 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			flog_err(EC_BGP_UPDATE_RCV,
 				 "%s [Error] MVPN Type-1 reflects the local originator; dropping duplicate",
 				 peer->host);
+			/* WITHDRAW: same NLRI. Steady state has nothing installed here,
+			 * but if our router-id has just become a value this peer already
+			 * advertised, its previously valid Type-1 is now "reflected" and
+			 * would sit beside our own until the session drops. The removal
+			 * is scoped to (peer, BGP_ROUTE_NORMAL), so our self-originated
+			 * copy is never touched. */
+			bgp_mvpn_route_remove(peer->bgp, peer, rib_afi, &p, BGP_ROUTE_NORMAL);
 			continue;
 		}
 
@@ -961,6 +1013,10 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			flog_err(EC_BGP_UPDATE_RCV,
 				 "%s [Error] MVPN Type-1 without Ingress-Replication PMSI Tunnel; dropping route",
 				 peer->host);
+			/* WITHDRAW: same NLRI, PMSI attribute gone. The peer is telling
+			 * us it is no longer an ingress-replication leaf; keeping the
+			 * old copy would keep replicating to it. */
+			bgp_mvpn_route_remove(peer->bgp, peer, rib_afi, &p, BGP_ROUTE_NORMAL);
 			continue;
 		}
 
@@ -972,6 +1028,10 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			flog_err(EC_BGP_UPDATE_RCV,
 				 "%s [Error] MVPN Type-3 without Ingress-Replication PMSI Tunnel; dropping route",
 				 peer->host);
+			/* WITHDRAW: same NLRI, PMSI attribute gone. Stranding this one
+			 * leaves a selective-tunnel binding installed that still feeds
+			 * bgp_mvpn_leaf_from_type3_set() long after the peer dropped it. */
+			bgp_mvpn_route_remove(peer->bgp, peer, rib_afi, &p, BGP_ROUTE_NORMAL);
 			continue;
 		}
 
