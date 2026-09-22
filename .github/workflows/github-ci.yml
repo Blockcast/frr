@@ -259,6 +259,10 @@ jobs:
         with:
           name: ${{ matrix.cfg.platform }}-image
           path: /tmp/frr-${{ matrix.cfg.platform }}.tar
+          # Artifacts are run-scoped across attempts (BLO-35428: attempt 2 of
+          # run 35409722977 downloaded an artifact attempt 1 uploaded), so a
+          # re-run leg re-uploading this name 409s without overwrite.
+          overwrite: true
           # Docker images are intermediate CI artifacts; keep for a short period.
           retention-days: 7
           if-no-files-found: error
@@ -399,6 +403,8 @@ jobs:
         with:
           name: unit-test-results-${{ matrix.cfg.platform }}
           path: unit-test-results-${{ matrix.cfg.platform }}/tests.xml
+          # Run-scoped across attempts; see the Build image upload (BLO-35428).
+          overwrite: true
           retention-days: 14
           if-no-files-found: error
       - name: Cleanup
@@ -499,11 +505,17 @@ jobs:
       # `github.run_id`, so a --failed-only re-run of just this job still
       # resolves after Build is skipped.
       TEST_IMAGE: registry.blockcast.net/cache/frr-ci:img-${{ github.sha }}-${{ matrix.cfg.platform }}
-      # arc-e2e's DinD sidecar is capped at 2 CPUs. Nested Docker containers
-      # still see all 48 host CPUs, so nproc-based sizing launched 120 pytest
-      # workers per matrix leg and wedged a 64 GiB runner node under concurrent
-      # legs. Preserve the intended 2.5x oversubscription against the real
-      # cgroup budget instead.
+      # nproc-based sizing launched 120 pytest workers per matrix leg and
+      # wedged a 64 GiB runner node under concurrent legs (PR #55). 5 was then
+      # sized as 2.5x arc-e2e's 2-CPU DinD sidecar cap, but that cap does not
+      # bound it: the nested topotest container is NOT inside the dind
+      # sidecar's cgroup (BLO-34281, onprem-k8s arc/dind-cgroup-accounting.md).
+      # dind used 126.4 CPU-s over a whole 3h35m leg (pod
+      # arc-e2e-ssnb2-runner-gzqh6, run 35744612980), and the `docker run`
+      # below passes no --cpus/--memory/--pids-limit. So 5 is a self-imposed
+      # per-node load bound, nothing more. Keep it until the container has
+      # real resource bounds (BLO-35428 capacity levers); the footprint
+      # sampler in "Run topotests" records what one leg actually uses.
       TOPOTEST_WORKERS: "5"
       # BLO-29817: must mirror `timeout-minutes` above (a job cannot read its
       # own cap at runtime).  Used only to report headroom and to attribute a
@@ -513,10 +525,33 @@ jobs:
     strategy:
       # Keep running remaining platforms when one leg fails.
       fail-fast: false
-      # Both privileged topotest legs create hundreds of network namespaces and
-      # write back through the same node-local DinD store. Run one leg per
-      # workflow at a time so a scheduler co-location cannot multiply that load.
-      max-parallel: 1
+      # BLO-35428: legs run concurrently. max-parallel only ever serialized legs
+      # WITHIN one run; legs from different runs already co-locate (runners
+      # vlhgz/x77mr on k8s-paperclip-9, 2026-09-20/21) at -n5 without a wedge.
+      # The 2026-08-09 wedge was two legs at ~120 workers each (PR #55).
+      #
+      # Rollback: set this back to 1 if, while it is 2, EITHER
+      #   * any 22.04 "Run topotests" step exceeds 229 min -- the 240 cap less
+      #     the 11.3 min of measured fixed per-leg overhead, i.e. the point
+      #     where the one leg that still reaches a verdict starts being
+      #     cap-killed; OR
+      #   * the median 22.04 "Run topotests" step over the next 5 runs rises
+      #     more than 15% above 172 min (the 22.04 first-pass median, n=16),
+      #     i.e. past 197.8 min.
+      # The step also carries 5.8 min of measured in-step overhead (4.3 setup +
+      # 1.5 serial rerun) plus the new collect-only pass on top of that 172,
+      # so both triggers err towards rolling back early.
+      #
+      # Keyed on outcomes, not node PSI: cap-killed legs already sat at PSI
+      # 'some' 0.226-0.548, and the legs that concluded at 204.7 and 209.4 min
+      # at 0.408/0.42 (runs 35520360360, 35744612980), so a PSI>0.6 rule would
+      # never fire before the verdict was lost.  Leg-window PSI above 0.4 or
+      # steal above 0.25 (the measured cap-kill band) is an early warning
+      # only.  The frr CI lane checks after each of the first 5 runs:
+      #   gh api "repos/Blockcast/frr/actions/runs/$RID/jobs?per_page=100" | jq -r \
+      #     '.jobs[]|select(.name=="Ubuntu 22.04 amd64 Test")|.steps[]|select(.name=="Run topotests")|
+      #      "\(.conclusion) \(((.completed_at|fromdate)-(.started_at|fromdate))/60|floor)min"'
+      max-parallel: 2
       matrix:
         cfg:
         -  { rel: '22.04', name: 'Ubuntu 22.04 amd64 Test', platform: 'amd64_u22' }
@@ -616,6 +651,35 @@ jobs:
 
           echo "RUN_TESTS: ${run_tests[*]}"
           [[ "${TOPOTEST_WORKERS}" =~ ^[1-9][0-9]*$ ]]
+          # BLO-35428 footprint sampler -- measurement only, nothing gates on
+          # it.  The container is not inside the DinD sidecar's cgroup and has
+          # no resource bounds (see TOPOTEST_WORKERS), so this is the only
+          # record of one leg's real CPU/mem/pids; it feeds the capacity work.
+          # It runs in the background and can never fail this step: its exit
+          # status is never waited on, errexit is off inside it, and the EXIT
+          # trap kills it.  The first sample goes to this log with stderr
+          # intact, so a blind sampler (docker stats erroring, or reading 0
+          # for a container outside its cgroup view) shows up here and in
+          # "Check topotest footprint samples" instead of as a silently empty
+          # artifact.  After it the loop re-points its output at the log file
+          # so it no longer holds this step's output pipes.
+          stats_log="${RUNNER_TEMP}/topotest-stats.log"
+          : > "${stats_log}"
+          (
+            set +e +o pipefail
+            sleep 30 > /dev/null 2>&1
+            ts=$(date -u +%FT%TZ)
+            docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} pids={{.PIDs}}' 2>&1 \
+              | sed "s/^/${ts} /" | tee -a "${stats_log}" | sed 's/^/topotest footprint, first sample: /'
+            exec >> "${stats_log}" 2>&1 < /dev/null
+            while sleep 30; do
+              docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} pids={{.PIDs}}' 2>&1 \
+                | sed "s/^/$(date -u +%FT%TZ) /"
+            done
+          ) &
+          STATS_PID=$!
+          trap 'kill "${STATS_PID}" 2>/dev/null || true' EXIT
+
           # As in the serial rerun below, the selected tests go through "$@"
           # rather than being glued onto the `bash -c` string: appending an
           # unquoted list there delivers only its first word to pytest and
@@ -734,6 +798,48 @@ jobs:
           # Keep test artifacts longer to aid flaky test/debug investigations.
           retention-days: 14
           if-no-files-found: warn
+      - name: Upload topotest footprint samples
+        # BLO-35428, measurement only: a SEPARATE artifact so the
+        # test-results layout the resume path reads is untouched.
+        # continue-on-error so a measurement can never turn a leg red, and
+        # overwrite so a "Re-run failed jobs" attempt does not 409 on the
+        # name attempt 1 already used (artifacts are run-scoped across
+        # attempts: attempt 2 of run 35409722977 downloaded the
+        # test-results-amd64_u22 artifact attempt 1 uploaded).
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: topotest-stats-${{ matrix.cfg.platform }}
+          path: ${{ runner.temp }}/topotest-stats.log
+          overwrite: true
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Check topotest footprint samples
+        # BLO-35428: the sampler reads `docker stats` from inside DinD for a
+        # container that lands outside the sidecar's cgroup, so it may read
+        # nothing or zeros without anyone noticing.  Flag that here, where it
+        # is visible.  continue-on-error: it marks this step, never the leg.
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          log="${RUNNER_TEMP}/topotest-stats.log"
+          cont="frr-${{ matrix.cfg.platform }}-cont"
+          if [ ! -s "${log}" ]; then
+            echo "::warning title=Footprint sampler recorded nothing::${log} is missing or empty; this leg's CPU/mem/pids footprint is unknown."
+            exit 1
+          fi
+          first=$(grep -m1 -F " ${cont} " "${log}" || true)
+          echo "first sample of ${cont}: ${first:-<none>}"
+          awk -v c="${cont}" '$2 == c {
+              n++; v = $3; sub(/^cpu=/, "", v); sub(/%$/, "", v); if (v + 0 > cpu) cpu = v + 0
+              p = $NF; sub(/^pids=/, "", p); if (p + 0 > pids) pids = p + 0
+            } END { printf "samples=%d peak_cpu=%.2f%% peak_pids=%d\n", n, cpu, pids }' "${log}"
+          if [ -z "${first}" ] || [[ "${first}" =~ cpu=0(\.0+)?% ]] || [[ "${first}" =~ pids=0$ ]]; then
+            echo "::warning title=Footprint sampler looks blind::first sample of ${cont} is missing or reads 0% CPU / 0 pids; the topotest-stats artifact cannot be trusted as a footprint for this leg."
+            exit 1
+          fi
       - name: Cleanup
         if: ${{ always() }}
         run: |
