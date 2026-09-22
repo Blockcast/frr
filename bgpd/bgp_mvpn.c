@@ -1063,9 +1063,9 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 	}
 
 done:
-	/* Reset the attr_intern_reuse cache, mirroring bgp_nlri_parse_ip(). */
 	/*
-	 * Leave no parsed_attr/interned pointer behind in the caller's attr,
+	 * Reset the attr_intern_reuse cache, mirroring bgp_nlri_parse_ip():
+	 * leave no parsed_attr/interned pointer behind in the caller's attr,
 	 * which outlives this call. bgp_nlri_parse_ip() resets on its normal
 	 * exit only; both exits here do, including the truncation path below.
 	 */
