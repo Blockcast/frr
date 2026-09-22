@@ -30,7 +30,6 @@ import urllib.parse
 import urllib.request
 
 DEFAULT_ALLY_LOGINS = ["allyblockcast[bot]", "app/allyblockcast", "allyblockcast"]
-TRUSTED_REVIEWER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 # author_association on a review is computed relative to the *requesting
 # token's* visibility of org membership, not the reviewer's actual repo
@@ -39,8 +38,9 @@ TRUSTED_REVIEWER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 # even though the same reviewer shows MEMBER to a personal PAT -- causing the
 # gate to intermittently reject a valid distinct-reviewer approval. The
 # collaborator-permission endpoint reflects the reviewer's actual repo-level
-# grant directly and is not requester-view-dependent, so it is the primary
-# trust signal; association stays a fallback for when that lookup itself fails.
+# grant directly and is not requester-view-dependent, so it is the ONLY trust
+# signal: a lookup that errors leaves the login untrusted (there is no
+# author_association fallback -- COLLABORATOR can mean read or triage).
 TRUSTED_COLLABORATOR_PERMISSIONS = {"admin", "maintain", "write"}
 
 STATUS_CONTEXT = os.environ.get("STATUS_CONTEXT") or "review/ally-complete"
@@ -2664,12 +2664,12 @@ def fetch_collaborator_permission_map(api_base_url, owner, repo, token, candidat
     means naming which tier the author actually holds.
 
     A login whose lookup ERRORED is absent from the map, which
-    trusted_deferrals reads as "no permission" and refuses. There is
-    deliberately no author_association fallback here: association is
-    requester-view-dependent and is a fallback for GRANTING the write-tier trust
-    the rest of this file needs, whereas this path is the only lever that turns
-    a red required status green -- an unresolved input must not become a
-    permissive default for it.
+    trusted_deferrals reads as "no permission" and refuses -- the same
+    fail-closed rule as fetch_trusted_permission_logins. What is distinct here
+    is only the shape: this returns the TIER, because deferral trust is
+    admin-only and refusing loudly means naming the tier the author holds, and
+    because this path is the one lever that turns a red required status green,
+    so an unresolved input must never become a permissive default for it.
     """
     permissions = {}
     for login in candidate_logins:
