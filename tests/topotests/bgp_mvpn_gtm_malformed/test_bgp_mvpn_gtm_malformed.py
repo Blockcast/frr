@@ -21,6 +21,9 @@ MP_UNREACH. The FRR side must:
   * DROP a Type-5 whose group is outside the SSM range 232.0.0.0/8,
   * DROP a Type-5 carrying a non-zero Route Distinguisher (GTM requires RD 0),
   * install valid S-PMSI A-D and Leaf A-D routes,
+  * install BOTH Type-3s of a pair that share one PMSI Tunnel attribute in
+    one MP_REACH (the parser used to let the first install strip attr->extra
+    from the shared packet attr, so the second lost its PMSI and was dropped),
   * DROP a Leaf A-D route with a malformed embedded S-PMSI route key,
   * install the trailing sentinel Type-5, which is what proves the receiver
     consumed the whole crafted stream rather than stopping at the first
@@ -66,6 +69,8 @@ MALFORMED_SG = ("10.30.30.2", "232.30.30.2")
 RECOVER_SG = ("10.40.40.1", "232.40.40.1")
 TYPE3_ORIGINATOR = "10.0.0.2"
 TYPE4_LEAF = "10.0.0.3"
+PAIR_A_SG = ("10.60.60.1", "232.60.60.1")
+PAIR_B_SG = ("10.60.60.2", "232.60.60.2")
 NO_PMSI_SG = ("10.30.30.9", "232.30.30.9")
 V6_SELECTIVE_SG = ("2001:db8:30::1", "ff3e::30")
 V6_TYPE3_ORIGINATOR = "10.0.0.2"
@@ -256,6 +261,56 @@ def test_valid_type3_and_type4_accepted():
             )
         if not _has_selective_route(routes, 4, SELECTIVE_SG, TYPE4_LEAF):
             return "valid Type-4 not installed: {}".format(routes)
+        return None
+
+    _, result = topotest.run_and_expect(_present, None, count=60, wait=1)
+    assert result is None, result
+
+
+def test_two_type3_one_pmsi_attr_both_install():
+    """Two Type-3s sharing one PMSI Tunnel attribute in one UPDATE both install.
+
+    bgp_nlri_parse_mvpn() passes the packet's single attr to every NLRI in
+    the MP_REACH. bgp_attr_intern() treats an attr not marked as the
+    NLRI-scoped parsed attr as caller-owned and either steals attr->extra
+    (hash miss) or frees it (hash hit), so before the fix the first install
+    stripped the PMSI Tunnel info from the shared attr and every following
+    Type-3 in the same UPDATE was dropped as "without Ingress-Replication
+    PMSI Tunnel". Live: a 17-Type-3 UPDATE from the sfo12 PE lost 16.
+
+    PAIR_A (first NLRI) is the positive control that always installed;
+    PAIR_B (second NLRI) is the one that used to vanish. Both must carry the
+    IR tunnel type, the L-bit and the label -- proving the extra was copied
+    into the RIB attr, not merely present at parse time.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _present():
+        routes = _mvpn_routes("r1")
+        if not _has_selective_route(routes, 3, PAIR_A_SG):
+            return "first Type-3 of the pair {} not installed: {}".format(
+                PAIR_A_SG, routes
+            )
+        if not _has_selective_route(routes, 3, PAIR_B_SG):
+            return (
+                "second Type-3 {} of a two-NLRI UPDATE not installed -- the "
+                "first install stripped the shared attr's PMSI extra".format(
+                    PAIR_B_SG
+                )
+            )
+        for sg in (PAIR_A_SG, PAIR_B_SG):
+            r = next(
+                x
+                for x in routes
+                if x.get("routeType") == 3
+                and x.get("source") == sg[0]
+                and x.get("group") == sg[1]
+            )
+            pm = r.get("pmsiTunnel", {})
+            if not pm.get("leafInfoRequired") or pm.get("label") != SELECTIVE_LABEL:
+                return "Type-3 {} installed without its PMSI binding: {}".format(sg, r)
         return None
 
     _, result = topotest.run_and_expect(_present, None, count=60, wait=1)

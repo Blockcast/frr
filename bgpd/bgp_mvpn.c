@@ -615,6 +615,24 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 	addpath_capable = bgp_addpath_encode_rx(peer, packet->afi, packet->safi);
 
 	/*
+	 * Mark the packet attr as the NLRI-scoped parsed attr, exactly as
+	 * bgp_nlri_parse_ip() does. bgp_attr_intern() treats an attr whose
+	 * attr_intern_reuse.parsed_attr is not itself as CALLER-OWNED and
+	 * either steals its attr->extra on a hash miss (bgp_attr_hash_alloc)
+	 * or frees it on a hash hit (bgp_attr_extra_discard). Every NLRI in
+	 * this MP_REACH shares this one attr, so without the mark the first
+	 * install stripped the PMSI Tunnel attribute from all the NLRI that
+	 * followed it in the same UPDATE, and each later Type-1/Type-3 was
+	 * dropped as "without Ingress-Replication PMSI Tunnel". With the mark
+	 * the intern path copies attr->extra instead and the reuse cache
+	 * also spares one hash lookup per NLRI.
+	 */
+	if (attr) {
+		memset(&attr->attr_intern_reuse, 0, sizeof(attr->attr_intern_reuse));
+		attr->attr_intern_reuse.parsed_attr = attr;
+	}
+
+	/*
 	 * A NULL attr on the reachable path is BGP's treat-as-withdraw signal
 	 * (RFC 7606): the UPDATE carried malformed attributes, so its NLRI must
 	 * be withdrawn rather than installed. bgp_mvpn_route_install() would
@@ -928,12 +946,17 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 	}
 
 done:
+	/* Reset the attr_intern_reuse cache, mirroring bgp_nlri_parse_ip(). */
+	if (attr)
+		memset(&attr->attr_intern_reuse, 0, sizeof(attr->attr_intern_reuse));
 	stream_free(data);
 	return ret;
 
 stream_failure:
 	flog_err(EC_BGP_UPDATE_RCV, "%s [Error] MVPN NLRI parse error (truncated NLRI of size %u)",
 		 peer->host, packet->length);
+	if (attr)
+		memset(&attr->attr_intern_reuse, 0, sizeof(attr->attr_intern_reuse));
 	stream_free(data);
 	return BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
 }
