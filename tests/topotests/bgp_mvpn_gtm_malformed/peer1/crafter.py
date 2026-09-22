@@ -13,6 +13,20 @@ site in main() carries the matching label.
   B.  non-SSM Type-5 (group outside 232.0.0.0/8) -- must be dropped.
   C.  non-zero-RD Type-5 (RD != 0 under GTM) -- must be dropped.
   D.  valid Type-3 (S-PMSI A-D) with an IR PMSI Tunnel -- must install.
+  D3. TWO Type-3s sharing ONE PMSI Tunnel attribute in ONE MP_REACH -- BOTH
+      must install WITH the PMSI binding. bgp_nlri_parse_mvpn() hands the
+      packet's single attr to every NLRI; before the fix the first install's
+      bgp_attr_intern() stole (hash miss) or freed (hash hit) attr->extra, so
+      every later Type-1/Type-3 in the same UPDATE read no PMSI and was
+      dropped. Observed live: a 17-Type-3 UPDATE of which only the first could
+      have been kept. D3's attributes are byte-identical to D's, which makes
+      its intern a hash HIT -- the free-on-hit half of the bug.
+  D4. Same shape as D3 but with a PMSI label no other case uses, so its intern
+      is a hash MISS -- the steal-on-miss half. Both halves are needed: each is
+      a different branch of bgp_attr_intern().
+  D5. Type-1 + Type-3 behind one PMSI attribute in one MP_REACH, the shape seen
+      live. The Type-1 has its own PMSI gate and its own RIB-afi selection, so
+      it is not covered by the Type-3-only pairs above.
   D2. Type-3 with no usable PMSI binding -- must be dropped.
   G.  IPv6-AF Type-3 + trailing Type-5 (dual-stack codec control).
   G2. Type-1 reflecting our own originator -- must be dropped as a duplicate.
@@ -95,6 +109,10 @@ MALFORMED_SRC = "10.30.30.2"
 MALFORMED_GRP = "232.30.30.2"
 RECOVER_SRC = "10.40.40.1"
 RECOVER_GRP = "232.40.40.1"   # valid SSM; trailing NLRI after a malformed one
+PAIR_A_SRC = "10.60.60.1"
+PAIR_A_GRP = "232.60.60.1"    # first of two Type-3s sharing one PMSI attribute
+PAIR_B_SRC = "10.60.60.2"
+PAIR_B_GRP = "232.60.60.2"    # second: must keep the PMSI binding too
 V6_SELECTIVE_SRC = "2001:db8:30::1"
 V6_SELECTIVE_GRP = "ff3e::30"
 V6_TYPE3_ORIGINATOR = "10.0.0.2"
@@ -354,6 +372,17 @@ def main():
         build_mvpn_update(
             local_id,
             _type3_nlri(zero_rd, SELECTIVE_SRC, SELECTIVE_GRP, TYPE3_ORIGINATOR),
+            include_pmsi=True,
+            pmsi_label=SELECTIVE_LABEL,
+        )
+    )
+    # D3: two Type-3s behind ONE PMSI Tunnel attribute in ONE MP_REACH. The
+    # second NLRI is the one that used to lose the attribute.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type3_nlri(zero_rd, PAIR_A_SRC, PAIR_A_GRP, TYPE3_ORIGINATOR)
+            + _type3_nlri(zero_rd, PAIR_B_SRC, PAIR_B_GRP, TYPE3_ORIGINATOR),
             include_pmsi=True,
             pmsi_label=SELECTIVE_LABEL,
         )
