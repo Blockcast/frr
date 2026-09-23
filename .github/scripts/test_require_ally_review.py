@@ -68,9 +68,12 @@ def comment(body, login="allyblockcast[bot]", at="2026-07-27T10:00:00Z", updated
     """Defaults to the App seat (type Bot): positive Ally evidence requires
     it, and most fixtures exercise the authoritative path. Pass utype="User"
     to model the shared `allyblockcast` User seat."""
-    row = {"body": body, "user": {"login": login, "type": utype}, "created_at": at}
-    if updated is not None:
-        row["updated_at"] = updated
+    # Real REST comment objects always carry updated_at; an unedited comment
+    # has updated_at == created_at, which is what the edit-provenance guards
+    # (deferral_comment_is_unedited, and the override loop that reuses it)
+    # require before they attribute a line to the reported author.
+    row = {"body": body, "user": {"login": login, "type": utype}, "created_at": at,
+           "updated_at": at if updated is None else updated}
     return row
 
 
@@ -829,6 +832,22 @@ class TestDistinctReviewerHeadBinding(unittest.TestCase):
         # BLO-25488: the reviewer's own head-bound authorization comment
         # binds their empty-body approval, clearing the gate.
         self.assertEqual(state, "success")
+
+    def test_edited_authorization_comment_does_not_bind(self):
+        # GitHub's `write` role can edit anyone else's comment and the REST
+        # object reports only the ORIGINAL author, so an edited authorization
+        # line cannot bind that login's approval -- the same rule
+        # deferral_comment_is_unedited enforces for deferrals. Without this,
+        # any write-role collaborator could forge the binding that turns a
+        # drifted empty-body approval green.
+        state, _ = decide(
+            reviews=[self._approve("")],
+            comments=[comment(override_body(HEAD), login=HUMAN,
+                              updated="2026-07-27T12:00:00Z")],
+            author="app/allyblockcast",
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "pending")
 
     def test_authorization_by_a_different_login_does_not_bind(self):
         # The approver must bind their own approval; a third party's

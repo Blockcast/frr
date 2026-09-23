@@ -2073,6 +2073,13 @@ def override_attestation_logins(comments, head_sha):
         login = (comment.get("user") or {}).get("login")
         if not isinstance(login, str):
             continue
+        # Same threat model as deferral_comment_is_unedited: GitHub's `write`
+        # role can edit anyone else's comment and the REST object exposes only
+        # the ORIGINAL author, so an edited comment cannot bind this override
+        # (and, through head_authorized_logins, someone's drifting approval)
+        # to the login it reports.
+        if not deferral_comment_is_unedited(comment):
+            continue
         if pattern.search(str(comment.get("body") or "")):
             logins.add(login)
     return logins
