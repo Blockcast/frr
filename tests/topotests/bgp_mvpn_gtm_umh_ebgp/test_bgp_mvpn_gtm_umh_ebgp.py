@@ -76,6 +76,9 @@ PEER_AS = 65010
 UMH_KAT = "10.255.255.254"
 # Fallback Route Import EC on the two routes whose UMH tuple must be rejected.
 EC_RT = "10.9.9.9"
+# MCAST-VPN Type-5 loop-check probes sent by the speaker (see umh_ebgp_peer.py).
+LOOP_SG = ("10.80.80.1", "232.80.80.1")   # AS_PATH contains the PE's own AS
+OK_SG = ("10.80.80.2", "232.80.80.2")     # AS_PATH is the peer's AS only
 
 # (source, group) per crafted route; sources are covered by the speaker's /24s.
 JOINS = {
@@ -253,6 +256,63 @@ def test_matching_origin_accepts():
     src, grp = JOINS["ok"]
     _join(src, grp)
     _expect_type7(src, grp, PEER_AS, UMH_KAT)
+
+
+def _has_type5(routes, sg):
+    src, grp = sg
+    return any(
+        r.get("routeType") == 5 and r.get("source") == src and r.get("group") == grp
+        for r in routes
+    )
+
+
+def test_ebgp_own_as_in_path_rejected():
+    """Over eBGP, an MVPN route whose AS_PATH carries OUR AS must be dropped.
+
+    bgp_nlri_parse_mvpn() installs straight into the MCAST-VPN RIB and never
+    passes through bgp_update(), so it runs its own AS-path loop check. This is
+    the eBGP half of that coverage; bgp_mvpn_gtm_malformed exercises the same
+    rejection over iBGP.
+
+    Why it has to be tested here too: on that iBGP session bgp->as == peer->as,
+    so a check written against the PEER's AS instead of the LOCAL AS passes
+    there while blackholing every route in production. Here the two differ
+    (r1 65001, speaker 65010), and the OK_SG control -- whose AS_PATH is the
+    peer's own AS and nothing else -- is exactly the route such a check would
+    wrongly drop.
+
+    OK_SG is sent after LOOP_SG on one TCP stream, so waiting for it proves
+    LOOP_SG was already decided on.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _control_present():
+        if _has_type5(_mvpn_routes(), OK_SG):
+            return None
+        return "eBGP control Type-5 {} not installed yet".format(OK_SG)
+
+    _, result = topotest.run_and_expect(_control_present, None, count=90, wait=1)
+    assert result is None, (
+        "r1 did not install the Type-5 whose AS_PATH is just the peer's AS "
+        "({}); either the MVPN AF is not usable over this eBGP session or the "
+        "loop check is comparing against the peer's AS instead of ours".format(OK_SG)
+    )
+
+    routes = _mvpn_routes()
+    assert not _has_type5(routes, LOOP_SG), (
+        "r1 installed an eBGP Type-5 {} whose AS_PATH contains its own AS "
+        "{}; routes={}".format(LOOP_SG, LOCAL_AS, routes)
+    )
+
+    nb = json.loads(tgen.gears["r1"].vtysh_cmd("show bgp neighbor 10.30.0.2 json"))
+    loops = nb["10.30.0.2"].get("prefixStats", {}).get("aspathLoop")
+    assert loops == 1, (
+        "expected exactly one AS-path loop denial on the eBGP session, got "
+        "{}: {}".format(loops, nb["10.30.0.2"].get("prefixStats"))
+    )
 
 
 if __name__ == "__main__":
