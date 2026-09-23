@@ -2375,7 +2375,7 @@ def _retry_backoff_seconds(attempt):
     return REQUEST_BACKOFF_SECONDS * (2 ** (attempt - 1))
 
 
-def _http_error_diagnostics(error):
+def _http_error_diagnostics(error, budget_deadline=None):
     """Best-effort snapshot of a 4xx/5xx HTTPError: body + rate-limit headers.
 
     _request() used to raise straight off `error.code` with nothing else
@@ -2399,16 +2399,29 @@ def _http_error_diagnostics(error):
     every signal _request() classifies on -- Retry-After, X-RateLimit-* --
     comes from the HEADERS, which are already fully received by the time an
     HTTPError exists. Losing the body costs log detail, never correctness.
+
+    `budget_deadline` is _request()'s REQUEST_RETRY_BUDGET_SECONDS deadline.
+    The read is clamped to it as well as to REQUEST_TIMEOUT_SECONDS: this runs
+    BEFORE _request() consults the budget, so a fresh per-attempt deadline
+    alone would let every retry spend up to a full timeout here first, and a
+    trickling 5xx could hold the required check pending ~2x the budget.
     """
     headers = error.headers or {}
+    read_deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+    if budget_deadline is not None:
+        read_deadline = min(read_deadline, budget_deadline)
     try:
         body = _read_bounded_response(
             error,
-            time.monotonic() + REQUEST_TIMEOUT_SECONDS,
+            read_deadline,
             max_bytes=REQUEST_ERROR_BODY_MAX_BYTES,
         )
         body_text = body.decode("utf-8", "replace")[:500] if body else ""
-    except Exception as exc:
+    except (TimeoutError, ValueError, TypeError, OSError, http.client.HTTPException) as exc:
+        # Exactly what a bounded read of a damaged or hostile body can raise:
+        # _read_bounded_response()'s own three, socket errors, and protocol
+        # damage such as IncompleteRead. Anything else is a bug in this file
+        # and must surface rather than be logged as an unreadable body.
         body_text = "<body unreadable: %s>" % type(exc).__name__
     return {
         "body": body_text,
@@ -2518,7 +2531,7 @@ def _request(url, token, method="GET", payload=None):
                 return json.loads(body) if body else None
         except urllib.error.HTTPError as error:
             # HTTPError subclasses URLError, so this arm MUST precede the next.
-            diagnostics = _http_error_diagnostics(error)
+            diagnostics = _http_error_diagnostics(error, deadline)
             print(
                 "GitHub API %s %s -> HTTP %d: %s "
                 "(retry-after=%s x-ratelimit-remaining=%s x-ratelimit-reset=%s)"

@@ -72,10 +72,16 @@ jobs:
         # for every vendored consumer rather than only for frr's own tree.
         # --break-system-packages is required because these images are PEP
         # 668 externally-managed, where a bare `pip install` hard-fails.
+        # `python3 -m pip`, not bare `pip`: the guard, the install and the
+        # test step below must all resolve the SAME interpreter. On a
+        # multi-Python image a PATH `pip` can belong to another one, so the
+        # install "succeeds" while python3 still cannot import yaml. Pinned so
+        # the gate's own self-test does not pull whatever PyPI serves today.
         run: |
           if ! python3 -c 'import yaml' 2>/dev/null; then
-            pip install --quiet --break-system-packages pyyaml
+            python3 -m pip install --quiet --break-system-packages 'pyyaml==6.0.2'
           fi
+          python3 -c 'import yaml'
 
       - name: Run gate decision-logic tests
         # -v so a regression names the exact protected branch it broke.
