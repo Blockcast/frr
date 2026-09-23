@@ -17,6 +17,8 @@ import importlib.util
 import io
 import os
 import re
+import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -232,6 +234,27 @@ class TestCli(Base):
         self.assertEqual((rc, out), (1, ""))
 
 
+def collect_invocation(text):
+    """(docker args, pytest args) of the `pytest --collect-only` docker run."""
+    m = re.search(
+        r"docker run ([^\n]*?)\s*\\\n\s*bash -c '[^']*?sudo -E pytest ([^']*?)"
+        r" \"\$@\"' pytest-collect",
+        text,
+    )
+    assert m, "the collect-only `docker run` was not found"
+    return shlex.split(m.group(1)), shlex.split(m.group(2))
+
+
+def docker_env(args):
+    """{NAME: value} for each literal `-e NAME=value` in docker run args."""
+    env = {}
+    for flag, value in zip(args, args[1:]):
+        if flag in ("-e", "--env") and "=" in value:
+            name, val = value.split("=", 1)
+            env[name] = val
+    return env
+
+
 class TestWorkflowWiring(unittest.TestCase):
     """Plain-text assertions over github-ci.yml -- no YAML parser needed."""
 
@@ -256,6 +279,31 @@ class TestWorkflowWiring(unittest.TestCase):
         ]
         self.assertEqual(len(found), 1, "expected exactly one step named " + name)
         return found[0]
+
+    def test_collect_sets_the_env_its_conftest_reads_and_keeps_the_summary(self):
+        """Review blocker: collect-only crashed on every run without it.
+
+        conftest.py returns from pytest_configure under --collect-only before
+        setting PYTEST_XDIST_MODE, then reads it unguarded in
+        pytest_terminal_summary, so the collect exited 1 (KeyError) and both
+        legs were permanently red.  --no-summary would also avoid the crash,
+        but it drops the ERRORS section naming a module that failed to
+        collect, so the fix is the variable.
+        """
+        docker_args, pytest_args = collect_invocation(self.step("Run topotests"))
+        self.assertEqual(docker_env(docker_args).get("PYTEST_XDIST_MODE"), "no")
+        self.assertNotIn("--no-summary", pytest_args)
+        self.assertIn("--collect-only", pytest_args)
+
+    def test_collect_rc_gate_is_exact(self):
+        """Any non-zero collect rc (1 = an uncaught exception) is red."""
+        run = self.step("Run topotests")
+        self.assertIn("|| collect_rc=$?", run)
+        self.assertRegex(
+            run,
+            r'if \[ "\$\{collect_rc\}" -ne 0 \]; then'
+            r"(?:\n(?!\s*fi\b)[^\n]*)*\n\s*exit 1\n\s*fi",
+        )
 
     def test_no_python_helper_feeds_mapfile_through_process_substitution(self):
         """Critic (d): `mapfile < <(python3 ...)` hides the helper's exit status.
@@ -338,6 +386,47 @@ class TestWorkflowWiring(unittest.TestCase):
         first = re.search(r"docker stats --no-stream[^\n]*\n[^\n]*first sample", run)
         self.assertIsNotNone(first, "first footprint sample is not logged")
         self.assertNotIn("2>/dev/null", first.group(0))
+
+
+@unittest.skipUnless(importlib.util.find_spec("pytest"), "pytest is not installed")
+class TestCollectInvocationOnTheRealConftest(unittest.TestCase):
+    """Runs the workflow's collect-only invocation over tests/topotests.
+
+    The collect runs in the CI image, which this cannot start.  It can run
+    the same pytest arguments, with the same literal `-e` environment,
+    against the same conftest.py (the one that crashed on a KeyError), over
+    one directory -- the check the mocked workflow harness never made.
+    Skipped where pytest is absent (the selftest runner has only python3);
+    the wiring tests above pin the invocation regardless.
+    """
+
+    TOPOTESTS = os.path.normpath(
+        os.path.join(_HERE, os.pardir, os.pardir, "tests", "topotests")
+    )
+    TARGET = "bfd_topo1"
+
+    def test_collect_exits_zero_and_lists_node_ids(self):
+        path = os.path.join(_HERE, os.pardir, "workflows", "github-ci.yml")
+        with open(os.path.normpath(path)) as f:
+            docker_args, pytest_args = collect_invocation(f.read())
+        self.assertTrue(os.path.isdir(os.path.join(self.TOPOTESTS, self.TARGET)))
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("PYTEST_XDIST_", "PYTEST_ADDOPTS"))
+        }
+        env.update(docker_env(docker_args))
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest"] + pytest_args + [self.TARGET],
+            cwd=self.TOPOTESTS,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-4000:])
+        self.assertRegex(proc.stdout, r"(?m)^" + self.TARGET + r"/\S+\.py::test_")
 
 
 if __name__ == "__main__":

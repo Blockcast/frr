@@ -655,9 +655,28 @@ jobs:
           # expected set, where they would be IDs that can never match.
           # Collection measured 48-94 s inside the run (jobs 105814256640 /
           # 101386930609); the elapsed time below records it on its own.
+          #
+          # PYTEST_XDIST_MODE=no is required, not cosmetic.  conftest.py's
+          # pytest_configure returns under --collect-only (:631-632) before
+          # it sets PYTEST_XDIST_MODE (:635), and pytest_terminal_summary,
+          # which pytest still calls at the end of a collect-only session,
+          # reads os.environ["PYTEST_XDIST_MODE"] with no default (:953).
+          # Without it every collect exits 1 on a KeyError after printing
+          # the node IDs (reproduced locally, outside the image, with CI's
+          # pytest 9.1.1 on this tree's conftest: rc=1; with the variable,
+          # rc=0 and the same IDs; test_topotest_resume.py re-runs that
+          # where pytest is installed), so both legs would be red on every
+          # run, before any topotest.  Nothing else sets it: the image has
+          # no ENV for it and the munet hooks that set it are not loaded.
+          # `sudo -E` carries it, as it carries TOPOTEST_WORKERS.
+          # Not --no-summary, which also passes: it drops the ERRORS section
+          # that names a module that failed to collect, which is what the
+          # tail below is for.  The rc gate stays exact: rc=1 here is an
+          # uncaught exception, and tolerating it would accept any crash of
+          # the collecting process, not just this one.
           collect_start=$(date +%s)
           collect_rc=0
-          timeout 15m docker run --rm --init --privileged ${ADD_DOCKER_ENV} -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
+          timeout 15m docker run --rm --init --privileged ${ADD_DOCKER_ENV} -e PYTEST_XDIST_MODE=no -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
             bash -c 'cd ~/frr/tests/topotests && sudo -E pytest --collect-only -q -p no:cacheprovider -p no:warnings "$@"' pytest-collect \
             > "${RUNNER_TEMP}/collect.out" || collect_rc=$?
           echo "collect-only rc=${collect_rc} after $(( $(date +%s) - collect_start ))s"
