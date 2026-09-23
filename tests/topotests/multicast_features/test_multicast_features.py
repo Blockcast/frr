@@ -13,6 +13,7 @@
 test_multicast_features.py: Test the FRR PIM multicast features.
 """
 
+import ipaddress
 import os
 import sys
 import json
@@ -773,6 +774,118 @@ def test_mld_router_alert():
         interface r1-eth2
          no ipv6 mld require-router-alert
     """
+    )
+
+
+def _find_interface(obj, ifname):
+    """The JSON object for ifname, wherever the command nests it (per VRF or not)."""
+    if isinstance(obj, dict):
+        if isinstance(obj.get(ifname), dict):
+            return obj[ifname]
+        for value in obj.values():
+            found = _find_interface(value, ifname)
+            if found is not None:
+                return found
+    return None
+
+
+def test_mldv1_querier_not_eligible():
+    """An MLDv1 querier must not win the election on an MLDv2 interface.
+
+    RFC 3810 Section 8.3.1 leaves falling back to MLDv1 to configuration, so r1
+    keeps querying at MLDv2 rather than hand the link to a router that cannot
+    carry source lists. h1 injects MLDv1 General Queries from fe80::1, lower
+    than r1-eth2's link-local, so without the rule r1 would yield to it.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    r1 = tgen.gears["r1"]
+
+    def mld_if():
+        out = r1.vtysh_cmd("show ipv6 mld interface json", isjson=True)
+        return _find_interface(out, "r1-eth2") or {}
+
+    def v1_general_queries():
+        out = r1.vtysh_cmd("show ipv6 mld statistics interface r1-eth2 json", isjson=True)
+        return (_find_interface(out, "r1-eth2") or {}).get("rxV1QueryGeneral", 0)
+
+    before = mld_if()
+    assert before.get("querier") is True, "precondition: r1-eth2 is not the MLD querier: {}".format(before)
+    own = before["querierIp"]
+    assert ipaddress.ip_address("fe80::1") < ipaddress.ip_address(own), (
+        "precondition: fe80::1 must be lower than r1-eth2's link-local {}".format(own)
+    )
+    rx_before = v1_general_queries()
+
+    command = "python3 {}/../lib/packet/mld/mld_v1.py".format(CWD)
+    command += " --type=0x82 --gaddr=:: --dst_ip=ff02::1 --src_ip=fe80::1"
+    command += " --max_response_delay=10000 --enable_router_alert"
+    command += " --iface=h1-eth0 --count=3 --interval=1"
+    tgen.gears["h1"].run(command)
+
+    # Positive control: the queries arrived and were classified as MLDv1.
+    # Without it, "r1 is still querier" could just mean nothing was received.
+    def arrived():
+        return v1_general_queries() >= rx_before + 3
+
+    _, ok = topotest.run_and_expect(arrived, True, count=10, wait=1)
+    assert ok, "MLDv1 queries from h1 never reached r1-eth2 (rxV1QueryGeneral {} -> {})".format(
+        rx_before, v1_general_queries()
+    )
+
+    after = mld_if()
+    assert after.get("querier") is True and after.get("querierIp") == own, (
+        "r1-eth2 yielded the MLD querier role to an MLDv1 router: {}".format(after)
+    )
+
+
+def test_igmpv2_querier_not_eligible():
+    """An IGMPv2 querier must not win the election on an IGMPv3 interface.
+
+    Same rule for IGMP (RFC 3376 Section 7.3.1). r1-eth2 is 192.168.100.1, the
+    lowest host address on its subnet, so h1 sources the queries from the
+    network address 192.168.100.0: the only on-link address that is lower, and
+    it passes the connected-source check.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    r1 = tgen.gears["r1"]
+
+    def igmp_if():
+        out = r1.vtysh_cmd("show ip igmp interface json", isjson=True)
+        return _find_interface(out, "r1-eth2") or {}
+
+    def v2_queries():
+        out = r1.vtysh_cmd("show ip igmp statistics interface r1-eth2 json", isjson=True)
+        return (_find_interface(out, "r1-eth2") or {}).get("queryV2", 0)
+
+    def is_querier(entry):
+        # "show ip igmp interface json" reports a boolean; other IGMP views use
+        # "local"/"other". Accept either spelling of "we are the querier".
+        return entry.get("querier") in (True, "local")
+
+    before = igmp_if()
+    assert is_querier(before), "precondition: r1-eth2 is not the IGMP querier: {}".format(before)
+    rx_before = v2_queries()
+
+    command = "python3 {}/../lib/packet/igmp/igmp_v2.py".format(CWD)
+    command += " --type=0x11 --gaddr=224.0.0.1 --src_ip=192.168.100.0"
+    command += " --enable_router_alert --iface=h1-eth0 --count=3 --interval=1"
+    tgen.gears["h1"].run(command)
+
+    def arrived():
+        return v2_queries() >= rx_before + 3
+
+    _, ok = topotest.run_and_expect(arrived, True, count=10, wait=1)
+    assert ok, "IGMPv2 queries from h1 never reached r1-eth2 (queryV2 {} -> {})".format(
+        rx_before, v2_queries()
+    )
+
+    after = igmp_if()
+    assert is_querier(after) and after.get("querierIp") == before.get("querierIp"), (
+        "r1-eth2 yielded the IGMP querier role to an IGMPv2 router: {}".format(after)
     )
 
 

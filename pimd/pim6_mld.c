@@ -1602,6 +1602,25 @@ static void gm_handle_query(struct gm_if *gm_ifp,
 		}
 	}
 
+	/* An MLDv1 querier is not eligible to win the election on an MLDv2
+	 * interface.  RFC 3810 Section 8.3.1 leaves falling back to MLDv1 to
+	 * administrative configuration; yielding here would stop our MLDv2
+	 * queries and hand the link to a router that cannot carry source
+	 * lists, silently degrading SSM.  Count and warn instead.  Hosts that
+	 * hear its queries still fall back (Section 8.2.1), which only
+	 * configuring that router for MLDv2 can prevent.
+	 */
+	if (len == sizeof(struct mld_v1_pkt) &&
+	    gm_ifp->cur_version == GM_MLDV2) {
+		if (general_query)
+			gm_ifp->stats.rx_query_old_general++;
+		else
+			gm_ifp->stats.rx_query_old_group++;
+		zlog_warn(log_pkt_src(
+			"MLDv1 query ignored for querier election on an MLDv2 interface; configure every router on this link for MLDv2"));
+		return;
+	}
+
 	if (pim_addr_cmp(pkt_src->sin6_addr, gm_ifp->querier) < 0) {
 		if (PIM_DEBUG_GM_EVENTS)
 			zlog_debug(
