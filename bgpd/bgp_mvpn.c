@@ -965,9 +965,14 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		 * on a live PE<->PoP session: an AS_PATH of 486 alternating ASNs in
 		 * 1,950 bytes, ~9 UPDATEs/s in each direction while otherwise idle.
 		 *
-		 * Runs the same three checks bgp_update() runs -- local AS,
-		 * confederation id, and change_local_as -- honouring the neighbour's
-		 * allowas-in count. It deliberately does NOT implement bgp_update()'s
+		 * Runs the same three checks bgp_update() runs, in its order and with
+		 * its reason text -- change_local_as, then the local AS, then the
+		 * confederation id -- honouring the neighbour's allowas-in count.
+		 * Every arm denies, so the order only picks which reason is logged
+		 * when several match; keeping bgp_update()'s means an MVPN denial and
+		 * a unicast denial of the same AS_PATH log the same reason (which is
+		 * also why the change_local_as and bgp->as arms share one string, as
+		 * they do there). It deliberately does NOT implement bgp_update()'s
 		 * allowas-in route-map gating or "allowas-in origin": `neighbor ...
 		 * allowas-in` has no MVPN address-family form (bgp_vty.c installs it
 		 * for unicast/multicast/labeled/VPN/EVPN only), so allowas_in here is
@@ -996,26 +1001,23 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 					local_as_loops = 1;
 			}
 
-			if (aspath_loop_check(attr->aspath, peer->bgp->as) > allowas_in)
+			if (peer->change_local_as &&
+			    aspath_loop_check(attr->aspath, peer->change_local_as) >
+				    local_as_loops)
+				reason = "as-path contains our own AS";
+			else if (aspath_loop_check(attr->aspath, peer->bgp->as) > allowas_in)
 				reason = "as-path contains our own AS";
 			else if (CHECK_FLAG(peer->bgp->config, BGP_CONFIG_CONFEDERATION) &&
 				 aspath_loop_check_confed(attr->aspath, peer->bgp->confed_id) >
 					 allowas_in)
 				reason = "as-path contains our own confed AS";
-			else if (peer->change_local_as &&
-				 aspath_loop_check(attr->aspath, peer->change_local_as) >
-					 local_as_loops)
-				reason = "as-path contains our own local-as";
 
 			if (reason) {
 				peer->stat_pfx_aspath_loop++;
 				if (bgp_debug_update(peer, (struct prefix *)&p, NULL, 1))
 					zlog_debug("%s MVPN Type-%u %pFX -- DENIED due to: %s; as-path %s",
 						   peer->host, route_type, (struct prefix *)&p,
-						   reason,
-						   attr->aspath && attr->aspath->str
-							   ? attr->aspath->str
-							   : "(empty)");
+						   reason, aspath_print(attr->aspath));
 				bgp_mvpn_route_remove(peer->bgp, peer, rib_afi, &p,
 						      BGP_ROUTE_NORMAL);
 				continue;

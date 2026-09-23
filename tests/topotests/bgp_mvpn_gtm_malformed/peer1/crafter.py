@@ -47,6 +47,8 @@ site in main() carries the matching label.
   H2. Type-5 with a NON-EMPTY foreign-only AS_PATH (65010) -- POSITIVE
       CONTROL for H: proves a non-empty AS_PATH is encoded and accepted, so
       H's absence is the loop check, not a rejected attribute.
+  H3. Type-5 with a foreign-only AS_PATH (65010) at its own (S,G) -- must
+      install. It is the route H4 later replaces.
   F.  empty MP_UNREACH_NLRI (AFI+SAFI only, zero withdrawn NLRI) -- must NOT
       crash the receiver. Before the fix this hit stream_new(0) -> assert(0)
       and aborted bgpd.
@@ -88,9 +90,21 @@ the tree covers -- every other MP_UNREACH here carries zero NLRI:
   W1. MP_UNREACH carrying the Type-3 NLRI by key -- must remove it.
   Z4. Phase-4 sentinel.
 
-WARNING: case H is the ONLY case whose AS_PATH may contain 65001. The test
-asserts the neighbour's aspathLoop denial counter is exactly 1, which catches
-double-counting; a second looping case would have to update that assertion.
+PHASE H4 (fires when the test touches trigger file "h4", after it has seen
+H3 installed):
+
+  H4. H3's (S,G) again, now with 65001 in its AS_PATH -- must be denied, and
+      the denial is an implicit withdraw (RFC 4271 Section 9): H3's copy must
+      be REMOVED, not left stranded. H alone cannot show this -- it is the
+      first UPDATE at its (S,G), so bgp_mvpn_route_remove() finds no dest and
+      returns before it deletes anything. H4 is deferred rather than sent
+      straight after H3 so the test can prove H3 installed before asserting
+      that it is gone.
+
+WARNING: case H is the ONLY case in the phase-1 stream whose AS_PATH may
+contain 65001. The test asserts the neighbour's aspathLoop denial counter is
+exactly 1 before H4 fires, which catches double-counting; a second looping
+case would have to update that assertion. H4 moves it by exactly one more.
 
 The positive control is essential: it proves the crafted NLRI encoding and
 the AF negotiation are correct, so that "route absent" for B and C means the
@@ -174,6 +188,8 @@ LOOP_SRC = "10.50.50.1"
 LOOP_GRP = "232.50.50.1"      # valid SSM/RD 0, but AS_PATH contains 65001
 FOREIGN_SRC = "10.50.50.2"
 FOREIGN_GRP = "232.50.50.2"   # valid SSM/RD 0, AS_PATH = 65010 only -> install
+WITHDRAW_SRC = "10.50.50.3"
+WITHDRAW_GRP = "232.50.50.3"  # H3 installs it, H4 must implicitly withdraw it
 SENTINEL_SRC = "10.70.70.1"
 SENTINEL_GRP = "232.70.70.1"  # last UPDATE of phase 1; see case Z above
 
@@ -607,6 +623,14 @@ def main():
             as_path=[FOREIGN_AS],
         )
     )
+    # H3: a foreign-only AS_PATH at WITHDRAW_SG -- installs; H4 replaces it.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type5_nlri(zero_rd, WITHDRAW_SRC, WITHDRAW_GRP),
+            as_path=[FOREIGN_AS],
+        )
+    )
     # F: empty MP_UNREACH -- must not crash the receiver.
     sock.sendall(build_mp_unreach())
     # Phase-1 halves of the phase-2 probes: all three must INSTALL here.
@@ -704,6 +728,16 @@ def main():
             ]):
                 break
             done.add(4)
+        # H4, once the test has seen H3 installed: the same (S,G) with our
+        # own AS in the AS_PATH, which must withdraw H3's copy implicitly.
+        if "h4" not in done and _fired("h4"):
+            if not _send_phase("H4", [
+                build_mvpn_update(local_id,
+                                  _type5_nlri(zero_rd, WITHDRAW_SRC, WITHDRAW_GRP),
+                                  as_path=[FOREIGN_AS, RECEIVER_AS]),
+            ]):
+                break
+            done.add("h4")
         try:
             mt, _ = recv_msg(sock)
             if mt == BGP_KEEPALIVE:
