@@ -21,6 +21,11 @@ MP_UNREACH. The FRR side must:
   * DROP a Type-5 whose group is outside the SSM range 232.0.0.0/8,
   * DROP a Type-5 carrying a non-zero Route Distinguisher (GTM requires RD 0),
   * install valid S-PMSI A-D and Leaf A-D routes,
+  * install BOTH NLRI of a pair that share one PMSI Tunnel attribute in one
+    MP_REACH -- for a hash HIT and a hash MISS on the shared attr, and for a
+    Type-1 + Type-3 mix (the parser used to let the first install strip
+    attr->extra from the shared packet attr, so everything behind it lost its
+    PMSI and was dropped),
   * DROP a Leaf A-D route with a malformed embedded S-PMSI route key,
   * install the trailing sentinel Type-5, which is what proves the receiver
     consumed the whole crafted stream rather than stopping at the first
@@ -66,6 +71,13 @@ MALFORMED_SG = ("10.30.30.2", "232.30.30.2")
 RECOVER_SG = ("10.40.40.1", "232.40.40.1")
 TYPE3_ORIGINATOR = "10.0.0.2"
 TYPE4_LEAF = "10.0.0.3"
+PAIR_A_SG = ("10.60.60.1", "232.60.60.1")
+PAIR_B_SG = ("10.60.60.2", "232.60.60.2")
+MISS_A_SG = ("10.61.61.1", "232.61.61.1")
+MISS_B_SG = ("10.61.61.2", "232.61.61.2")
+MIX_T3_SG = ("10.62.62.1", "232.62.62.1")
+MIX_T1_ORIGINATOR = "10.0.0.4"
+MISS_LABEL = 0x23456
 NO_PMSI_SG = ("10.30.30.9", "232.30.30.9")
 V6_SELECTIVE_SG = ("2001:db8:30::1", "ff3e::30")
 V6_TYPE3_ORIGINATOR = "10.0.0.2"
@@ -82,6 +94,24 @@ FOREIGN_SG = ("10.50.50.2", "232.50.50.2")
 SENTINEL_SG = ("10.70.70.1", "232.70.70.1")
 # r1's own router-id, i.e. the originator the crafter reflects back in case G2.
 R1_ORIGINATOR = "10.0.0.1"
+
+
+def _pick_route(routes, route_type, sg):
+    """The route with this exact type and (S,G), or None.
+
+    Never `next(r for r in routes if r["routeType"] == N)`: several cases now
+    install Type-3s, so the first one in JSON order is not necessarily the one
+    under test, and the assertion would pass or fail on iteration order.
+    """
+    src, grp = sg
+    for route in routes:
+        if (
+            route.get("routeType") == route_type
+            and route.get("source") == src
+            and route.get("group") == grp
+        ):
+            return route
+    return None
 
 
 def _sentinel_present():
@@ -247,7 +277,7 @@ def test_valid_type3_and_type4_accepted():
         routes = _mvpn_routes("r1")
         if not _has_selective_route(routes, 3, SELECTIVE_SG):
             return "valid Type-3 not installed: {}".format(routes)
-        type3 = next(route for route in routes if route.get("routeType") == 3)
+        type3 = _pick_route(routes, 3, SELECTIVE_SG)
         if not type3.get("pmsiTunnel", {}).get("leafInfoRequired"):
             return "Type-3 PMSI L-bit was not preserved: {}".format(type3)
         if type3.get("pmsiTunnel", {}).get("label") != SELECTIVE_LABEL:
@@ -256,6 +286,126 @@ def test_valid_type3_and_type4_accepted():
             )
         if not _has_selective_route(routes, 4, SELECTIVE_SG, TYPE4_LEAF):
             return "valid Type-4 not installed: {}".format(routes)
+        return None
+
+    _, result = topotest.run_and_expect(_present, None, count=60, wait=1)
+    assert result is None, result
+
+
+def test_two_type3_one_pmsi_attr_both_install():
+    """Two Type-3s sharing one PMSI Tunnel attribute in one UPDATE both install.
+
+    bgp_nlri_parse_mvpn() passes the packet's single attr to every NLRI in
+    the MP_REACH. bgp_attr_intern() treats an attr not marked as the
+    NLRI-scoped parsed attr as caller-owned and either steals attr->extra
+    (hash miss) or frees it (hash hit), so before the fix the first install
+    stripped the PMSI Tunnel info from the shared attr and every following
+    Type-3 in the same UPDATE was dropped as "without Ingress-Replication
+    PMSI Tunnel". Live: a 17-Type-3 UPDATE from the sfo12 PE lost 16.
+
+    PAIR_A (first NLRI) is the positive control that always installed;
+    PAIR_B (second NLRI) is the one that used to vanish. Both must carry the
+    IR tunnel type, the L-bit and the label -- proving the extra was copied
+    into the RIB attr, not merely present at parse time.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _present():
+        routes = _mvpn_routes("r1")
+        if not _has_selective_route(routes, 3, PAIR_A_SG):
+            return "first Type-3 of the pair {} not installed: {}".format(
+                PAIR_A_SG, routes
+            )
+        if not _has_selective_route(routes, 3, PAIR_B_SG):
+            return (
+                "second Type-3 {} of a two-NLRI UPDATE not installed -- the "
+                "first install stripped the shared attr's PMSI extra".format(
+                    PAIR_B_SG
+                )
+            )
+        for sg in (PAIR_A_SG, PAIR_B_SG):
+            r = next(
+                x
+                for x in routes
+                if x.get("routeType") == 3
+                and x.get("source") == sg[0]
+                and x.get("group") == sg[1]
+            )
+            pm = r.get("pmsiTunnel", {})
+            if not pm.get("leafInfoRequired") or pm.get("label") != SELECTIVE_LABEL:
+                return "Type-3 {} installed without its PMSI binding: {}".format(sg, r)
+        return None
+
+    _, result = topotest.run_and_expect(_present, None, count=60, wait=1)
+    assert result is None, result
+
+
+def test_two_type3_one_pmsi_attr_hash_miss_both_install():
+    """Same as above, but where the shared attr's intern is a hash MISS.
+
+    The two halves of the bug live in different branches of bgp_attr_intern().
+    D3's attributes are byte-identical to case D's, so its intern is a hash HIT
+    and it exercises bgp_attr_extra_discard(). D4 carries a PMSI label no other
+    UPDATE uses, so its intern misses the attribute hash and runs
+    bgp_attr_hash_alloc(), which is the branch that used to TAKE attr->extra and
+    NULL it on the caller. Without this case a regression confined to that
+    branch would pass the suite.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _present():
+        routes = _mvpn_routes("r1")
+        for sg in (MISS_A_SG, MISS_B_SG):
+            route = _pick_route(routes, 3, sg)
+            if route is None:
+                return "hash-miss pair member {} not installed: {}".format(sg, routes)
+            pm = route.get("pmsiTunnel", {})
+            if not pm.get("leafInfoRequired") or pm.get("label") != MISS_LABEL:
+                return "Type-3 {} lost its PMSI binding: {}".format(sg, route)
+        return None
+
+    _, result = topotest.run_and_expect(_present, None, count=60, wait=1)
+    assert result is None, result
+
+
+def test_type1_and_type3_one_pmsi_attr_both_install():
+    """A Type-1 followed by a Type-3 behind one PMSI attribute -- the live shape.
+
+    The live UPDATEs that exposed this carried mixed route types, and Type-1 has
+    its own Ingress-Replication PMSI gate and its own RIB-AFI selection, so the
+    Type-3-only pairs above do not cover it. The Type-1 here carries a FOREIGN
+    originator; a reflection of our own is case G2 and must still be rejected.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    def _present():
+        routes = _mvpn_routes("r1")
+        type1 = [
+            r
+            for r in routes
+            if r.get("routeType") == 1 and r.get("originator") == MIX_T1_ORIGINATOR
+        ]
+        if len(type1) != 1:
+            return "want exactly 1 foreign Type-1 for {}, got {}: {}".format(
+                MIX_T1_ORIGINATOR, len(type1), routes
+            )
+        # Type-1's JSON carries type/label/endpoint but no leafInfoRequired --
+        # the parser gates Type-1 on the tunnel TYPE being ingress replication
+        # (bgp_attr_get_pmsi_tnl_type), so assert that and the label.
+        pm1 = type1[0].get("pmsiTunnel", {})
+        if pm1.get("type") != "ingressReplication" or pm1.get("label") != SELECTIVE_LABEL:
+            return "Type-1 lost its PMSI binding: {}".format(type1[0])
+        type3 = _pick_route(routes, 3, MIX_T3_SG)
+        if type3 is None:
+            return "Type-3 behind the Type-1 not installed: {}".format(routes)
+        if not type3.get("pmsiTunnel", {}).get("leafInfoRequired"):
+            return "Type-3 after a Type-1 lost its PMSI binding: {}".format(type3)
         return None
 
     _, result = topotest.run_and_expect(_present, None, count=60, wait=1)
@@ -279,7 +429,7 @@ def test_valid_ipv6_type3_and_type4_accepted():
             originator=V6_TYPE3_ORIGINATOR,
         ):
             return "valid IPv6 Type-4 not installed: {}".format(routes)
-        type3 = next(route for route in routes if route.get("routeType") == 3)
+        type3 = _pick_route(routes, 3, V6_SELECTIVE_SG)
         if not type3.get("pmsiTunnel", {}).get("leafInfoRequired"):
             return "IPv6 Type-3 PMSI L-bit was not preserved: {}".format(type3)
         if not _has_type5(routes, V6_RECOVER_SG):

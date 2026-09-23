@@ -13,6 +13,20 @@ site in main() carries the matching label.
   B.  non-SSM Type-5 (group outside 232.0.0.0/8) -- must be dropped.
   C.  non-zero-RD Type-5 (RD != 0 under GTM) -- must be dropped.
   D.  valid Type-3 (S-PMSI A-D) with an IR PMSI Tunnel -- must install.
+  D3. TWO Type-3s sharing ONE PMSI Tunnel attribute in ONE MP_REACH -- BOTH
+      must install WITH the PMSI binding. bgp_nlri_parse_mvpn() hands the
+      packet's single attr to every NLRI; before the fix the first install's
+      bgp_attr_intern() stole (hash miss) or freed (hash hit) attr->extra, so
+      every later Type-1/Type-3 in the same UPDATE read no PMSI and was
+      dropped. Observed live: a 17-Type-3 UPDATE of which only the first could
+      have been kept. D3's attributes are byte-identical to D's, which makes
+      its intern a hash HIT -- the free-on-hit half of the bug.
+  D4. Same shape as D3 but with a PMSI label no other case uses, so its intern
+      is a hash MISS -- the steal-on-miss half. Both halves are needed: each is
+      a different branch of bgp_attr_intern().
+  D5. Type-1 + Type-3 behind one PMSI attribute in one MP_REACH, the shape seen
+      live. The Type-1 has its own PMSI gate and its own RIB-afi selection, so
+      it is not covered by the Type-3-only pairs above.
   D2. Type-3 with no usable PMSI binding -- must be dropped.
   G.  IPv6-AF Type-3 + trailing Type-5 (dual-stack codec control).
   G2. Type-1 reflecting our own originator -- must be dropped as a duplicate.
@@ -95,6 +109,20 @@ MALFORMED_SRC = "10.30.30.2"
 MALFORMED_GRP = "232.30.30.2"
 RECOVER_SRC = "10.40.40.1"
 RECOVER_GRP = "232.40.40.1"   # valid SSM; trailing NLRI after a malformed one
+PAIR_A_SRC = "10.60.60.1"
+PAIR_A_GRP = "232.60.60.1"    # first of two Type-3s sharing one PMSI attribute
+PAIR_B_SRC = "10.60.60.2"
+PAIR_B_GRP = "232.60.60.2"    # second: must keep the PMSI binding too
+MISS_A_SRC = "10.61.61.1"
+MISS_A_GRP = "232.61.61.1"    # D4 pair, behind a never-before-seen PMSI label
+MISS_B_SRC = "10.61.61.2"
+MISS_B_GRP = "232.61.61.2"
+MIX_T1_ORIGINATOR = "10.0.0.4"  # foreign Type-1 originator for the D5 mix
+MIX_T3_SRC = "10.62.62.1"
+MIX_T3_GRP = "232.62.62.1"
+# D3 deliberately reuses SELECTIVE_LABEL so its intern is a hash HIT; D4 must
+# use a label no other UPDATE carries so its intern is a hash MISS.
+MISS_LABEL = 0x23456
 V6_SELECTIVE_SRC = "2001:db8:30::1"
 V6_SELECTIVE_GRP = "ff3e::30"
 V6_TYPE3_ORIGINATOR = "10.0.0.2"
@@ -354,6 +382,44 @@ def main():
         build_mvpn_update(
             local_id,
             _type3_nlri(zero_rd, SELECTIVE_SRC, SELECTIVE_GRP, TYPE3_ORIGINATOR),
+            include_pmsi=True,
+            pmsi_label=SELECTIVE_LABEL,
+        )
+    )
+    # D3: two Type-3s behind ONE PMSI Tunnel attribute in ONE MP_REACH. The
+    # second NLRI is the one that used to lose the attribute. The attributes
+    # are byte-identical to case D's, so the first NLRI's bgp_attr_intern() is
+    # a hash HIT and this case covers the free-on-hit half of the bug.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type3_nlri(zero_rd, PAIR_A_SRC, PAIR_A_GRP, TYPE3_ORIGINATOR)
+            + _type3_nlri(zero_rd, PAIR_B_SRC, PAIR_B_GRP, TYPE3_ORIGINATOR),
+            include_pmsi=True,
+            pmsi_label=SELECTIVE_LABEL,
+        )
+    )
+    # D4: the same shape behind a PMSI label no other case uses, so the first
+    # NLRI's intern is a hash MISS and bgp_attr_hash_alloc() -- the steal-on-miss
+    # half -- runs instead. Without both cases a regression confined to one
+    # branch of bgp_attr_intern() would pass.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type3_nlri(zero_rd, MISS_A_SRC, MISS_A_GRP, TYPE3_ORIGINATOR)
+            + _type3_nlri(zero_rd, MISS_B_SRC, MISS_B_GRP, TYPE3_ORIGINATOR),
+            include_pmsi=True,
+            pmsi_label=MISS_LABEL,
+        )
+    )
+    # D5: Type-1 + Type-3 behind one PMSI attribute, the shape seen live. The
+    # Type-1 carries a FOREIGN originator (a reflection of ours is case G2) and
+    # has its own PMSI gate, so the Type-3-only pairs do not cover it.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type1_nlri(zero_rd, MIX_T1_ORIGINATOR)
+            + _type3_nlri(zero_rd, MIX_T3_SRC, MIX_T3_GRP, TYPE3_ORIGINATOR),
             include_pmsi=True,
             pmsi_label=SELECTIVE_LABEL,
         )
