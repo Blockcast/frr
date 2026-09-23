@@ -2060,6 +2060,13 @@ def override_attestation_logins(comments, head_sha):
     comment naming the full head SHA so the authorization dies with the commit
     it was granted for. Full SHA only, for the same reason attestations require
     one: a 7-char prefix is 28 bits and grindable.
+
+    The comment must also be UNEDITED (same rule as deferral_comment_is_unedited):
+    REST reports only the ORIGINAL author, so an edited comment cannot bind the
+    override to the login it names. An override line found on an edited comment
+    is dropped LOUDLY, naming the comment and the remedy, because the override is
+    the last head-scoped lever before the blanket label and a silent drop would
+    push a stuck maintainer straight to that label.
     """
     logins = set()
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha or ""):
@@ -2073,8 +2080,31 @@ def override_attestation_logins(comments, head_sha):
         login = (comment.get("user") or {}).get("login")
         if not isinstance(login, str):
             continue
-        if pattern.search(str(comment.get("body") or "")):
-            logins.add(login)
+        if not pattern.search(str(comment.get("body") or "")):
+            continue
+        # Same threat model as deferral_comment_is_unedited: GitHub's `write`
+        # role can edit anyone else's comment and the REST object exposes only
+        # the ORIGINAL author, so an edited comment cannot bind this override
+        # (and, through head_authorized_logins, someone's drifting approval)
+        # to the login it reports. Say so, in the same shape as the deferral
+        # path's IGNORED line: the most likely reason anyone edits an override
+        # comment is fixing a typo in the 40-hex SHA, and a silent drop would
+        # be indistinguishable from "no override was ever posted".
+        if not deferral_comment_is_unedited(comment):
+            print(
+                "review-gate-override: IGNORED an override line on comment %s by %s "
+                "-- the comment was edited after posting (created %s, updated %s), "
+                "and REST cannot attribute an edited line to its writer. Post a "
+                "NEW comment instead."
+                % (
+                    comment.get("id", "unknown"),
+                    login,
+                    comment.get("created_at", "unknown"),
+                    comment.get("updated_at", "unknown"),
+                )
+            )
+            continue
+        logins.add(login)
     return logins
 
 
