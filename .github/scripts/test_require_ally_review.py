@@ -2421,13 +2421,49 @@ class TestBLO25488PositiveAuthorityRestored(unittest.TestCase):
 
 
 class _FakeResponse:
-    """Minimal urlopen() context-manager stand-in."""
+    """Minimal urlopen() context-manager stand-in.
+
+    read1(amt) mirrors http.client.HTTPResponse's signature, not just a single
+    all-at-once read: _read_bounded_response() calls it in a loop, so a fake
+    that ignored `amt` would hide bugs in that loop. Only read1() is defined,
+    deliberately -- production must never reach for read(), and a fake that
+    offered both would let that regression pass unnoticed.
+    """
 
     def __init__(self, payload):
         self._body = b"" if payload is None else json.dumps(payload).encode()
+        self._offset = 0
 
-    def read(self):
-        return self._body
+    def read1(self, amt=None):
+        end = len(self._body) if amt is None else self._offset + amt
+        chunk = self._body[self._offset:end]
+        self._offset += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class _TricklingResponse:
+    """A peer that yields one byte per read1() call, forever.
+
+    This is a UNIT-level check on _read_bounded_response()'s loop only: it
+    proves the deadline is consulted between receives and that the loop
+    terminates. It CANNOT prove the production property, because returning one
+    byte per top-level call is precisely the behaviour a real HTTPResponse does
+    not have -- see TestBoundedReadOverRealSocket, which is the authoritative
+    fixture for the buffering hazard.
+    """
+
+    def __init__(self):
+        self._sent = 0
+
+    def read1(self, amt=None):
+        self._sent += 1
+        return b"x"
 
     def __enter__(self):
         return self
@@ -2560,7 +2596,13 @@ class TestTransientRetry(unittest.TestCase):
         """(c) part 2: the attempt count is not the only bound. If attempts
         themselves burn time, the budget stops the retry rather than letting
         attempts x timeout hold the merge path open."""
-        with mock.patch.object(gate.time, "monotonic", side_effect=[0.0, 10_000.0]):
+        # Scripted monotonic() reads, in order: [0] arms the budget deadline,
+        # [1] arms _http_error_diagnostics()'s bounded-read deadline, [2] is
+        # that read's loop check, [3] is the pre-sleep budget check that must
+        # stop us.
+        with mock.patch.object(
+            gate.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 10_000.0]
+        ):
             with self._urlopen([_http_error(503)] * 50) as urlopen:
                 with self.assertRaises(urllib.error.HTTPError):
                     gate._request("https://api/x", "t")
@@ -2662,7 +2704,13 @@ class TestRateLimitRetry(unittest.TestCase):
         REQUEST_RETRY_BUDGET_SECONDS. Retrying must not hang the job for an
         hour -- it fails closed exactly like an exhausted 5xx retry, only now
         with the rate-limit diagnostics already printed to the job log."""
-        with mock.patch.object(gate.time, "monotonic", side_effect=[0.0, 0.0]):
+        # Scripted monotonic() reads, in order: [0] arms the budget deadline,
+        # [1] arms _http_error_diagnostics()'s bounded-read deadline, [2] is
+        # that read's loop check, [3] is the pre-sleep budget check that must
+        # reject the 3600s wait.
+        with mock.patch.object(
+            gate.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 0.0]
+        ):
             with self._urlopen(
                 [_rate_limit_error(403, retry_after=3600)] * 8
             ) as urlopen:

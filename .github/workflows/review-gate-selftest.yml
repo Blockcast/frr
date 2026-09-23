@@ -59,6 +59,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Ensure PyYAML
+        # discover -p 'test_*.py' sweeps every test_*.py under .github/scripts,
+        # which is the point (see the header comment above) but also means a
+        # consumer repo that vendors this file byte-identically can have its
+        # OWN unrelated test_*.py land in the same discovery path with a
+        # dependency this job never installed -- trafficcontrol's
+        # test_oidc_resolve_env.py imports PyYAML, which this runner image
+        # does not ship by default. Installing it defensively here, rather
+        # than narrowing discovery, keeps the broad sweep this job exists for
+        # (both the review gate and the buildcache freshness gate) working
+        # for every vendored consumer rather than only for frr's own tree.
+        # --break-system-packages is required because these images are PEP
+        # 668 externally-managed, where a bare `pip install` hard-fails.
+        run: |
+          if ! python3 -c 'import yaml' 2>/dev/null; then
+            pip install --quiet --break-system-packages pyyaml
+          fi
+
       - name: Run gate decision-logic tests
         # -v so a regression names the exact protected branch it broke.
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
