@@ -32,21 +32,32 @@ The UMH parameter is the same endian known-answer used elsewhere
 It then sends two MCAST-VPN Type-5 (Source Active) NLRIs that probe the
 receive path's AS-path loop check over this same eBGP session:
 
-  loop : AS_PATH "65001 65010" -- contains the PE's OWN AS, the exact shape a
-         PE sees when the PoP echoes the PE's route back. Must be DROPPED.
-  ok   : AS_PATH "65010" -- the peer's own AS only. Must be INSTALLED.
+  clean: the LOOP (S,G) with AS_PATH "65010" -- the peer's own AS only. Must
+         be INSTALLED; this is the copy the later loop copy has to withdraw.
+  ok   : a second (S,G) with AS_PATH "65010". Must be INSTALLED, and must
+         SURVIVE the loop denial (the withdraw is keyed by NLRI).
 
-The pair is what makes the check's reference AS observable. bgp_nlri_parse_mvpn()
-must compare against the LOCAL AS (bgp->as); a check written against peer->as
-would drop the "ok" route too, because over eBGP every route the peer sends
-begins with the peer's AS. The iBGP crafter in bgp_mvpn_gtm_malformed cannot
-see that distinction (there bgp->as == peer->as), which is why this case lives
-here.
+Then, ONLY once the test sends SIGUSR1 (after it has seen both installed, so
+the handoff is observable rather than a race):
+
+  loop : the LOOP (S,G) again, AS_PATH "65010 65001" -- contains the PE's OWN
+         AS, the exact shape a PE sees when the PoP echoes the PE's route back.
+         Must be DROPPED, and the drop must WITHDRAW the clean copy: a denied
+         install is an implicit withdraw (RFC 4271 Section 9), and that
+         removal path is only reachable when the PE already holds the NLRI.
+
+The clean/ok pair is what makes the check's reference AS observable.
+bgp_nlri_parse_mvpn() must compare against the LOCAL AS (bgp->as); a check
+written against peer->as would drop those routes too, because over eBGP every
+route the peer sends begins with the peer's AS. The iBGP crafter in
+bgp_mvpn_gtm_malformed cannot see that distinction (there bgp->as == peer->as),
+which is why this case lives here.
 
 Usage: umh_ebgp_peer.py <peer_ip> <local_as> <local_id> <pe_as>
 """
 
 import argparse
+import signal
 import socket
 import struct
 import sys
@@ -267,6 +278,10 @@ def main():
     global LOCAL_PEER_AS
     LOCAL_PEER_AS = args.pe_as
 
+    # Installed before the handshake: SIGUSR1's default action would kill us.
+    loop_requested = []
+    signal.signal(signal.SIGUSR1, lambda *_: loop_requested.append(True))
+
     sock = handshake(args.peer_ip, args.local_as, args.local_id)
     print("eBGP session established with {}".format(args.peer_ip), flush=True)
 
@@ -279,20 +294,30 @@ def main():
             flush=True,
         )
 
-    # MCAST-VPN loop-check probes. Order matters: the "ok" control is sent
-    # LAST, so a test that waits for it knows the "loop" route was already
-    # decided on.
-    sock.sendall(
-        build_mvpn_update(LOOP_SRC, LOOP_GRP, args.local_id, [args.local_as, args.pe_as])
-    )
-    print("advertised MVPN Type-5 {} as_path=[{}, {}] (loop)".format(
-        LOOP_SRC, args.local_as, args.pe_as), flush=True)
+    # MCAST-VPN loop-check probes, phase 1: both install. The "loop" (S,G)
+    # goes out clean here so the looping copy sent in phase 2 has an installed
+    # route to withdraw.
+    sock.sendall(build_mvpn_update(LOOP_SRC, LOOP_GRP, args.local_id, [args.local_as]))
+    print("advertised MVPN Type-5 {} as_path=[{}] (clean)".format(
+        LOOP_SRC, args.local_as), flush=True)
     sock.sendall(build_mvpn_update(OK_SRC, OK_GRP, args.local_id, [args.local_as]))
     print("advertised MVPN Type-5 {} as_path=[{}] (ok)".format(
         OK_SRC, args.local_as), flush=True)
 
+    # Phase 2 is sent from the keepalive loop when the test raises SIGUSR1,
+    # after it has seen both phase-1 routes installed. The handler only flags;
+    # the send happens here so it cannot interleave with a keepalive in flight.
     sock.settimeout(1)
     while True:
+        if loop_requested:
+            loop_requested.clear()
+            sock.sendall(
+                build_mvpn_update(
+                    LOOP_SRC, LOOP_GRP, args.local_id, [args.local_as, args.pe_as]
+                )
+            )
+            print("advertised MVPN Type-5 {} as_path=[{}, {}] (loop)".format(
+                LOOP_SRC, args.local_as, args.pe_as), flush=True)
         try:
             mt, _ = recv_msg(sock)
             if mt == BGP_KEEPALIVE:

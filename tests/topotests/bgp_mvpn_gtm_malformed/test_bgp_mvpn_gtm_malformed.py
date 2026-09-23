@@ -27,9 +27,11 @@ MP_UNREACH. The FRR side must:
     rejection,
   * NOT crash on an MP_UNREACH that carries only AFI+SAFI (empty NLRI) -- the
     stream_new(0) assertion-abort that the receive-path hardening fixes,
-  * DROP a Type-5 whose AS_PATH already contains r1's own AS (the MVPN parser
-    bypasses bgp_update(), so it needs its own aspath_loop_check()), while
-    still installing a Type-5 with a non-empty foreign-only AS_PATH.
+  * DROP a Type-5 and a Type-3 whose AS_PATH already contains r1's own AS
+    (the MVPN parser bypasses bgp_update(), so it needs its own
+    aspath_loop_check()), WITHDRAWING the copies of the same NLRIs it had
+    installed from an earlier clean AS_PATH, while still holding a Type-5 with
+    a non-empty foreign-only AS_PATH at an unrelated (S,G).
 
 The positive control is load-bearing: it proves the crafted NLRI encoding and
 AF negotiation are correct, so a dropped route means the reject logic fired,
@@ -47,6 +49,7 @@ import sys
 import json
 import pytest
 import functools
+import signal
 
 CWD = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(CWD, "../"))
@@ -76,12 +79,16 @@ V6_TRUNC_RECOVER_SG = ("2001:db8:40::3", "ff3e::42")
 V6_NESTED_RECOVER_SG = ("2001:db8:40::4", "ff3e::43")
 SELECTIVE_LABEL = 0x12345
 LOOP_SG = ("10.50.50.1", "232.50.50.1")
+LOOP_TYPE3_SG = ("10.60.60.1", "232.60.60.1")
 FOREIGN_SG = ("10.50.50.2", "232.50.50.2")
 # Crafter case Z: the LAST UPDATE on the wire. Reject assertions gate on this
 # so that "route absent" cannot mean "not processed yet".
 SENTINEL_SG = ("10.70.70.1", "232.70.70.1")
 # r1's own router-id, i.e. the originator the crafter reflects back in case G2.
 R1_ORIGINATOR = "10.0.0.1"
+
+# Written by setup_module; SIGUSR1 to this pid makes the crafter send case H.
+PID_FILE = None
 
 
 def _sentinel_present():
@@ -108,6 +115,7 @@ def build_topo(tgen):
 
 
 def setup_module(mod):
+    global PID_FILE
     tgen = Topogen(build_topo, mod.__name__)
     tgen.start_topology()
 
@@ -124,7 +132,12 @@ def setup_module(mod):
     log_dir = os.path.join(peer.logdir, peer.name)
     peer.cmd("chmod 777 {}".format(log_dir))
     log_file = os.path.join(log_dir, "crafter.log")
-    peer.cmd("python3 {} 10.0.0.1 65001 10.0.0.2 > {} 2>&1 &".format(crafter, log_file))
+    PID_FILE = os.path.join(log_dir, "crafter.pid")
+    peer.cmd(
+        "python3 {} 10.0.0.1 65001 10.0.0.2 > {} 2>&1 & echo $! > {}".format(
+            crafter, log_file, PID_FILE
+        )
+    )
     logger.info("crafter started on peer1")
 
 
@@ -247,7 +260,11 @@ def test_valid_type3_and_type4_accepted():
         routes = _mvpn_routes("r1")
         if not _has_selective_route(routes, 3, SELECTIVE_SG):
             return "valid Type-3 not installed: {}".format(routes)
-        type3 = next(route for route in routes if route.get("routeType") == 3)
+        type3 = next(
+            route
+            for route in routes
+            if route.get("routeType") == 3 and route.get("source") == SELECTIVE_SG[0]
+        )
         if not type3.get("pmsiTunnel", {}).get("leafInfoRequired"):
             return "Type-3 PMSI L-bit was not preserved: {}".format(type3)
         if type3.get("pmsiTunnel", {}).get("label") != SELECTIVE_LABEL:
@@ -391,7 +408,8 @@ def test_no_crash_after_empty_mp_unreach():
 
 
 def test_own_as_in_path_rejected():
-    """A Type-5 whose AS_PATH contains r1's own AS must be dropped.
+    """MVPN routes whose AS_PATH contains r1's own AS must be dropped, and the
+    denial must withdraw the copy r1 already holds.
 
     bgp_nlri_parse_mvpn() installs into the MCAST-VPN RIB directly and never
     passes through bgp_update(), so it needs its own AS-path loop check.
@@ -399,47 +417,90 @@ def test_own_as_in_path_rejected():
     with our AS prepended again, and the two speakers ping-pong every MVPN
     route indefinitely.
 
+    A denied install is an implicit withdraw (RFC 4271 Section 9), so the
+    check hands the NLRI to bgp_mvpn_route_remove(). That removal branch only
+    runs when r1 already holds the same NLRI from this peer, which is why the
+    crafter sends the loop (S,G)s twice: first with a foreign-only AS_PATH
+    (cases H1/H3, part of the initial burst), then, once this test has SEEN
+    those copies installed and raises SIGUSR1, byte-identical UPDATEs whose
+    AS_PATH also carries 65001 (case H). Waiting for the installed copies
+    before signalling is what makes the withdraw observable rather than a
+    race against the crafter; without the two phases the removal path is dead
+    in test because the lookup never finds a route to remove.
+
+    The Type-3 twin reaches the Type-3 leaf reconcile on the removal path as
+    well. FOREIGN_SG (case H2) and the valid Type-3 (case D) must survive,
+    proving the denial withdraws by NLRI key rather than flushing the peer.
+
     The live trigger was an eBGP session; this suite's session is iBGP. The
     check keys on the LOCAL AS (bgp->as), not on the peer's, so it fires the
     same either way -- but that also means this case alone cannot tell the two
     apart. bgp_mvpn_gtm_umh_ebgp::test_ebgp_own_as_in_path_rejected covers the
     same rejection over a genuine eBGP session, where a check written against
     peer->as would wrongly drop every route the peer sends.
-
-    Gate on crafter case H2 (a Type-5 carrying a non-empty, foreign-only
-    AS_PATH) being installed: that proves the AS_PATH encoding is accepted, so
-    LOOP_SG's absence is the loop check firing and nothing else. The
-    neighbour's aspathLoop denial counter must have moved as well.
     """
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
-    def _control_present():
-        if _has_type5(_mvpn_routes("r1"), FOREIGN_SG):
-            return None
-        return "foreign-AS_PATH positive control {} not yet installed".format(
-            FOREIGN_SG
-        )
+    def _clean_copies_present():
+        routes = _mvpn_routes("r1")
+        if not _has_type5(routes, FOREIGN_SG):
+            return "foreign-AS_PATH positive control {} not yet installed".format(
+                FOREIGN_SG
+            )
+        if not _has_type5(routes, LOOP_SG):
+            return "clean Type-5 copy of {} not yet installed".format(LOOP_SG)
+        if not _has_selective_route(routes, 3, LOOP_TYPE3_SG):
+            return "clean Type-3 copy of {} not yet installed".format(LOOP_TYPE3_SG)
+        return _sentinel_present()
 
-    _, result = topotest.run_and_expect(_control_present, None, count=60, wait=1)
+    _, result = topotest.run_and_expect(_clean_copies_present, None, count=60, wait=1)
     assert result is None, (
-        "r1 did not install the Type-5 with a non-empty foreign-only AS_PATH; "
-        "the AS_PATH encoding is wrong, so the loop-rejection assertion below "
-        "would be meaningless"
+        "r1 did not install the Type-5/Type-3 copies with a non-empty "
+        "foreign-only AS_PATH ({}); the AS_PATH encoding is wrong, so the "
+        "loop-rejection assertions below would be meaningless".format(result)
+    )
+
+    # Phase 2: the crafter re-sends LOOP_SG and LOOP_TYPE3_SG with 65001 in
+    # the AS_PATH. Both must be denied AND the copies just observed withdrawn.
+    tgen.gears["peer1"].cmd(
+        "kill -{} $(cat {})".format(int(signal.SIGUSR1), PID_FILE)
+    )
+
+    def _loop_copies_gone():
+        routes = _mvpn_routes("r1")
+        if _has_type5(routes, LOOP_SG):
+            return "Type-5 {} still installed after the looping copy".format(LOOP_SG)
+        if _has_selective_route(routes, 3, LOOP_TYPE3_SG):
+            return "Type-3 {} still installed after the looping copy".format(
+                LOOP_TYPE3_SG
+            )
+        return None
+
+    _, result = topotest.run_and_expect(_loop_copies_gone, None, count=60, wait=1)
+    assert result is None, (
+        "the AS-path loop denial did not withdraw the copy r1 already held: {}"
+        .format(result)
     )
 
     routes = _mvpn_routes("r1")
-    assert not _has_type5(routes, LOOP_SG), (
-        "r1 installed a Type-5 {} whose AS_PATH contains its own AS 65001; "
-        "routes={}".format(LOOP_SG, routes)
+    assert _has_type5(routes, FOREIGN_SG), (
+        "the loop denial withdrew an unrelated Type-5 {}; routes={}".format(
+            FOREIGN_SG, routes
+        )
+    )
+    assert _has_selective_route(routes, 3, SELECTIVE_SG), (
+        "the loop denial withdrew an unrelated Type-3 {}; routes={}".format(
+            SELECTIVE_SG, routes
+        )
     )
 
     nb = json.loads(tgen.gears["r1"].vtysh_cmd("show bgp neighbor 10.0.0.2 json"))
     loops = nb["10.0.0.2"].get("prefixStats", {}).get("aspathLoop")
-    assert loops == 1, (
-        "expected exactly one AS-path loop denial on the crafter session, "
-        "got {}: {}".format(loops, nb["10.0.0.2"].get("prefixStats"))
+    assert loops == 2, (
+        "expected exactly two AS-path loop denials (Type-5 + Type-3) on the "
+        "crafter session, got {}: {}".format(loops, nb["10.0.0.2"].get("prefixStats"))
     )
 
 

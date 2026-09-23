@@ -77,8 +77,8 @@ UMH_KAT = "10.255.255.254"
 # Fallback Route Import EC on the two routes whose UMH tuple must be rejected.
 EC_RT = "10.9.9.9"
 # MCAST-VPN Type-5 loop-check probes sent by the speaker (see umh_ebgp_peer.py).
-LOOP_SG = ("10.80.80.1", "232.80.80.1")   # AS_PATH contains the PE's own AS
-OK_SG = ("10.80.80.2", "232.80.80.2")     # AS_PATH is the peer's AS only
+LOOP_SG = ("10.80.80.1", "232.80.80.1")   # installed clean, then denied+withdrawn
+OK_SG = ("10.80.80.2", "232.80.80.2")     # AS_PATH is the peer's AS only; survives
 
 # (source, group) per crafted route; sources are covered by the speaker's /24s.
 JOINS = {
@@ -267,7 +267,8 @@ def _has_type5(routes, sg):
 
 
 def test_ebgp_own_as_in_path_rejected():
-    """Over eBGP, an MVPN route whose AS_PATH carries OUR AS must be dropped.
+    """Over eBGP, an MVPN route whose AS_PATH carries OUR AS must be dropped,
+    and the drop must withdraw the copy r1 already holds.
 
     bgp_nlri_parse_mvpn() installs straight into the MCAST-VPN RIB and never
     passes through bgp_update(), so it runs its own AS-path loop check. This is
@@ -277,34 +278,63 @@ def test_ebgp_own_as_in_path_rejected():
     Why it has to be tested here too: on that iBGP session bgp->as == peer->as,
     so a check written against the PEER's AS instead of the LOCAL AS passes
     there while blackholing every route in production. Here the two differ
-    (r1 65001, speaker 65010), and the OK_SG control -- whose AS_PATH is the
-    peer's own AS and nothing else -- is exactly the route such a check would
+    (r1 65001, speaker 65010), and the phase-1 routes -- whose AS_PATH is the
+    peer's own AS and nothing else -- are exactly what such a check would
     wrongly drop.
 
-    OK_SG is sent after LOOP_SG on one TCP stream, so waiting for it proves
-    LOOP_SG was already decided on.
+    A denied install is an implicit withdraw (RFC 4271 Section 9), so the check
+    hands the NLRI to bgp_mvpn_route_remove(). That removal branch only runs
+    when r1 already holds the same NLRI from this peer, so the speaker sends
+    LOOP_SG twice: clean in its initial burst, then, once this test has SEEN it
+    installed and raises SIGUSR1, the same UPDATE with 65001 added to the
+    AS_PATH. Signalling only after observing the install is what makes the
+    withdraw observable instead of a race; a single send leaves the removal
+    path dead in test because the lookup never finds a route to remove.
+    OK_SG must survive, proving the withdraw is keyed by NLRI.
     """
     tgen = get_topogen()
 
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
-    def _control_present():
-        if _has_type5(_mvpn_routes(), OK_SG):
-            return None
-        return "eBGP control Type-5 {} not installed yet".format(OK_SG)
+    def _clean_copies_present():
+        routes = _mvpn_routes()
+        for sg in (OK_SG, LOOP_SG):
+            if not _has_type5(routes, sg):
+                return "eBGP Type-5 {} (peer's AS only) not installed yet".format(sg)
+        return None
 
-    _, result = topotest.run_and_expect(_control_present, None, count=90, wait=1)
+    _, result = topotest.run_and_expect(_clean_copies_present, None, count=90, wait=1)
     assert result is None, (
-        "r1 did not install the Type-5 whose AS_PATH is just the peer's AS "
+        "r1 did not install a Type-5 whose AS_PATH is just the peer's AS "
         "({}); either the MVPN AF is not usable over this eBGP session or the "
-        "loop check is comparing against the peer's AS instead of ours".format(OK_SG)
+        "loop check is comparing against the peer's AS instead of ours".format(result)
+    )
+
+    # Phase 2: the speaker re-sends LOOP_SG with r1's AS in the AS_PATH. It
+    # must be denied AND the copy just observed must be withdrawn.
+    tgen.gears["peer1"].cmd(
+        "kill -{} $(cat {})".format(int(signal.SIGUSR1), PID_FILE)
+    )
+
+    def _loop_copy_gone():
+        if _has_type5(_mvpn_routes(), LOOP_SG):
+            return "eBGP Type-5 {} still installed after the looping copy".format(
+                LOOP_SG
+            )
+        return None
+
+    _, result = topotest.run_and_expect(_loop_copy_gone, None, count=90, wait=1)
+    assert result is None, (
+        "the AS-path loop denial did not withdraw the copy r1 already held: {}"
+        .format(result)
     )
 
     routes = _mvpn_routes()
-    assert not _has_type5(routes, LOOP_SG), (
-        "r1 installed an eBGP Type-5 {} whose AS_PATH contains its own AS "
-        "{}; routes={}".format(LOOP_SG, LOCAL_AS, routes)
+    assert _has_type5(routes, OK_SG), (
+        "the loop denial withdrew the unrelated Type-5 {}; routes={}".format(
+            OK_SG, routes
+        )
     )
 
     nb = json.loads(tgen.gears["r1"].vtysh_cmd("show bgp neighbor 10.30.0.2 json"))

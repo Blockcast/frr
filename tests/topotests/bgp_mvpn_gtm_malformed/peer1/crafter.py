@@ -22,28 +22,45 @@ site in main() carries the matching label.
       MP_REACH -- the trailing Type-5 must still install.
   E3. Type-4 with an allowed nested length but malformed C-G framing, then a
       Type-5 -- the trailing Type-5 must still install.
-  H.  Type-5 whose AS_PATH contains the receiver's OWN AS (65001) -- must be
-      dropped. bgp_nlri_parse_mvpn() installs straight into the MCAST-VPN RIB
-      and never runs bgp_update()'s aspath_loop_check(), so before the fix a
-      neighbour's echo of our own route was accepted and re-advertised with
-      our AS prepended again, ping-ponging every MVPN route forever. The live
-      trigger was an eBGP session; the check keys on the local AS rather than
-      the peer's, so it fires identically on this suite's iBGP session.
-      bgp_mvpn_gtm_umh_ebgp carries the same case over a real eBGP session.
-  H2. Type-5 with a NON-EMPTY foreign-only AS_PATH (65010) -- POSITIVE
-      CONTROL for H: proves a non-empty AS_PATH is encoded and accepted, so
-      H's absence is the loop check, not a rejected attribute.
+  H1. Type-5 at LOOP (S,G) with a foreign-only AS_PATH (65010) -- must
+      install. This is the copy that case H later denies, so the denial has
+      something to withdraw (see H).
+  H3. Type-3 at LOOP_TYPE3 (S,G) with an IR PMSI Tunnel and the same
+      foreign-only AS_PATH -- must install; the Type-3 twin of H1.
+  H2. Type-5 with a NON-EMPTY foreign-only AS_PATH (65010) at its own (S,G)
+      -- POSITIVE CONTROL for H: proves a non-empty AS_PATH is encoded and
+      accepted, and must SURVIVE H, proving the denial withdraws by NLRI key
+      rather than flushing the peer.
   F.  empty MP_UNREACH_NLRI (AFI+SAFI only, zero withdrawn NLRI) -- must NOT
       crash the receiver. Before the fix this hit stream_new(0) -> assert(0)
       and aborted bgpd.
-  Z.  SENTINEL valid Type-5, sent LAST. A test that asserts on the absence of
-      an earlier case gates on this instead of on case A, so "absent" means
-      "the receiver processed the whole stream and rejected it", not "the
-      receiver has not reached that UPDATE yet".
+  Z.  SENTINEL valid Type-5, sent LAST in this burst. A test that asserts on
+      the absence of an earlier case gates on this instead of on case A, so
+      "absent" means "the receiver processed the whole stream and rejected
+      it", not "the receiver has not reached that UPDATE yet".
 
-WARNING: case H is the ONLY case whose AS_PATH may contain 65001. The test
-asserts the neighbour's aspathLoop denial counter is exactly 1, which catches
-double-counting; a second looping case would have to update that assertion.
+Then, ONLY once the test sends SIGUSR1 (after it has seen H1 and H3
+installed, so the handoff is observable rather than a race):
+
+  H.  the H1 Type-5 and the H3 Type-3 again, byte-identical except that the
+      AS_PATH now also contains the receiver's OWN AS (65001) -- both must be
+      DENIED, and the denial must WITHDRAW the installed H1/H3 copies.
+      bgp_nlri_parse_mvpn() installs straight into the MCAST-VPN RIB and
+      never runs bgp_update()'s aspath_loop_check(), so before the fix a
+      neighbour's echo of our own route was accepted and re-advertised with
+      our AS prepended again, ping-ponging every MVPN route forever. A denied
+      install is an implicit withdraw (RFC 4271 Section 9): the receiver must
+      drop the copy it already holds, which is only reachable when that copy
+      exists, hence the two-phase send. The Type-3 twin additionally reaches
+      the Type-3 leaf reconcile on the removal path. The live trigger was an
+      eBGP session; the check keys on the local AS rather than the peer's, so
+      it fires identically on this suite's iBGP session.
+      bgp_mvpn_gtm_umh_ebgp carries the same case over a real eBGP session.
+
+WARNING: case H is the ONLY case whose AS_PATH may contain 65001, and it sends
+exactly two NLRIs. The test asserts the neighbour's aspathLoop denial counter
+is exactly 2, which catches double-counting; another looping NLRI would have
+to update that assertion.
 
 The positive control is essential: it proves the crafted NLRI encoding and
 the AF negotiation are correct, so that "route absent" for B and C means the
@@ -53,6 +70,7 @@ Usage: crafter.py <peer_ip> <local_as> <local_id>
 """
 
 import select
+import signal
 import socket
 import struct
 import sys
@@ -109,7 +127,9 @@ V6_NESTED_RECOVER_SRC = "2001:db8:40::4"
 V6_NESTED_RECOVER_GRP = "ff3e::43"
 REFLECTED_TYPE1_ORIGINATOR = "10.0.0.1"
 LOOP_SRC = "10.50.50.1"
-LOOP_GRP = "232.50.50.1"      # valid SSM/RD 0, but AS_PATH contains 65001
+LOOP_GRP = "232.50.50.1"      # installed by H1, then denied+withdrawn by H
+LOOP_TYPE3_SRC = "10.60.60.1"
+LOOP_TYPE3_GRP = "232.60.60.1"  # Type-3 twin: installed by H3, withdrawn by H
 FOREIGN_SRC = "10.50.50.2"
 FOREIGN_GRP = "232.50.50.2"   # valid SSM/RD 0, AS_PATH = 65010 only -> install
 SENTINEL_SRC = "10.70.70.1"
@@ -329,6 +349,27 @@ def handshake(peer_ip, local_as, router_id):
     )
 
 
+def _loop_updates(local_id, zero_rd, as_path):
+    """The two NLRIs case H denies: a Type-5 and a Type-3 at the LOOP (S,G)s.
+
+    Called twice with different as_path values; everything else is identical,
+    so the only difference between the installed copy and the denied copy is
+    the AS_PATH.
+    """
+    return [
+        build_mvpn_update(
+            local_id, _type5_nlri(zero_rd, LOOP_SRC, LOOP_GRP), as_path=as_path
+        ),
+        build_mvpn_update(
+            local_id,
+            _type3_nlri(zero_rd, LOOP_TYPE3_SRC, LOOP_TYPE3_GRP, TYPE3_ORIGINATOR),
+            include_pmsi=True,
+            pmsi_label=SELECTIVE_LABEL,
+            as_path=as_path,
+        ),
+    ]
+
+
 def main():
     if len(sys.argv) != 4:
         print("Usage: crafter.py <peer_ip> <local_as> <local_id>")
@@ -336,6 +377,10 @@ def main():
     peer_ip = sys.argv[1]
     local_as = int(sys.argv[2])
     local_id = sys.argv[3]
+
+    # Installed before the handshake: SIGUSR1's default action would kill us.
+    loop_requested = []
+    signal.signal(signal.SIGUSR1, lambda *_: loop_requested.append(True))
 
     sock = handshake(peer_ip, local_as, local_id)
     print("BGP session established with {}".format(peer_ip), flush=True)
@@ -467,15 +512,11 @@ def main():
             afi=AFI_IP6,
         )
     )
-    # H: AS_PATH already contains the receiver's own AS -- must be dropped.
-    # Shaped like the live PE<->PoP ping-pong: "65010 65001" as seen by 65001.
-    sock.sendall(
-        build_mvpn_update(
-            local_id,
-            _type5_nlri(zero_rd, LOOP_SRC, LOOP_GRP),
-            as_path=[FOREIGN_AS, RECEIVER_AS],
-        )
-    )
+    # H1/H3: the clean copies that case H will deny later. Sent with a
+    # foreign-only AS_PATH so they install; H re-sends the same NLRIs with
+    # our AS added, which must withdraw these.
+    for update in _loop_updates(local_id, zero_rd, [FOREIGN_AS]):
+        sock.sendall(update)
     # H2: positive control for H -- a non-empty, foreign-only AS_PATH installs.
     sock.sendall(
         build_mvpn_update(
@@ -496,8 +537,19 @@ def main():
 
     # Keepalive loop so the session stays up for the test to observe steady state.
     # Exits cleanly (0) on teardown -- the peer socket is torn down under us.
+    # Case H is sent from here when the test raises SIGUSR1, after it has seen
+    # the H1/H3 copies installed. The handler only flags; the send happens in
+    # this loop so it cannot interleave with a keepalive already in flight.
     sock.settimeout(1)
     while True:
+        if loop_requested:
+            loop_requested.clear()
+            # H: AS_PATH already contains the receiver's own AS -- must be
+            # denied, and the denial must withdraw the H1/H3 copies. Shaped
+            # like the live PE<->PoP ping-pong: "65010 65001" as seen by 65001.
+            for update in _loop_updates(local_id, zero_rd, [FOREIGN_AS, RECEIVER_AS]):
+                sock.sendall(update)
+            print("looping UPDATEs sent", flush=True)
         try:
             mt, _ = recv_msg(sock)
             if mt == BGP_KEEPALIVE:
