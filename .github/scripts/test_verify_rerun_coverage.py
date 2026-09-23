@@ -293,9 +293,10 @@ class TestWorkflowWiring(unittest.TestCase):
         """
         self.assertNotRegex(
             self.workflow,
-            r"mapfile[^\n]*<\s*<\([^\n]*analyze\.py",
-            "mapfile reads analyze.py through a process substitution, so a "
-            "failure there no longer aborts the step under set -e",
+            r"mapfile[^\n]*<\s*<\([^\n]*(analyze\.py|python3)",
+            "mapfile reads analyze.py or a python3 helper through a process "
+            "substitution, so a failure there no longer aborts the step under "
+            "set -e",
         )
 
     def test_rerun_result_is_gated_on_the_coverage_check(self):

@@ -398,8 +398,20 @@ class TestSeederMatrixMatchesCI(unittest.TestCase):
         )
         return entries
 
+    def _ci_platforms(self):
+        """Every platform github-ci.yml builds: Build's matrix plus
+        Build-LTTng's (BLO-35428 moved the LTTng leg into its own job so it no
+        longer gates Test). Both read the buildcache the seeder writes."""
+        build = self._matrix_platforms("github-ci.yml", "Build")
+        lttng = self._matrix_platforms("github-ci.yml", "Build-LTTng")
+        both = set(build) & set(lttng)
+        self.assertFalse(
+            both, f"platform(s) built by both Build and Build-LTTng: {sorted(both)}"
+        )
+        return {**build, **lttng}
+
     def test_platform_sets_are_identical(self):
-        ci = self._matrix_platforms("github-ci.yml", "Build")
+        ci = self._ci_platforms()
         seed = self._matrix_platforms("buildcache-seed.yml", "seed")
         unseeded = set(ci) - set(seed)
         self.assertFalse(
@@ -418,23 +430,150 @@ class TestSeederMatrixMatchesCI(unittest.TestCase):
     def test_lttng_flag_matches_per_platform(self):
         # `platform` is the cache key, but LTTng changes the build content. A
         # mismatch would seed a cache the CI build cannot use.
-        ci = self._matrix_platforms("github-ci.yml", "Build")
+        #
+        # Compared as the build arg both workflows actually pass,
+        # ENABLE_LTTNG=${{ matrix.cfg.lttng || 'false' }}: an absent flag (the
+        # seeder's u22/u24 rows) and an explicit 'false' (github-ci.yml's,
+        # spelled out since BLO-35428 left no LTTng row in Build) build the
+        # same image. The expression itself is pinned below, so this
+        # equivalence cannot silently stop holding.
+        ci = self._ci_platforms()
         seed = self._matrix_platforms("buildcache-seed.yml", "seed")
         for platform in sorted(set(ci) & set(seed)):
             with self.subTest(platform=platform):
                 self.assertEqual(
-                    ci[platform],
-                    seed[platform],
+                    ci[platform] or "false",
+                    seed[platform] or "false",
                     f"lttng flag differs for {platform}",
                 )
+        for filename in ("github-ci.yml", "buildcache-seed.yml"):
+            with open(os.path.join(self.WORKFLOWS, filename), encoding="utf-8") as fh:
+                text = "\n".join(
+                    line for line in fh if not line.lstrip().startswith("#")
+                )
+            with self.subTest(workflow=filename):
+                self.assertIn("ENABLE_LTTNG=${{ matrix.cfg.lttng || 'false' }}", text)
+                self.assertNotRegex(text, r"ENABLE_LTTNG=(?!\$\{\{ matrix\.cfg\.lttng)")
 
     def test_parser_actually_found_the_expected_platforms(self):
         # Guard against the regex silently matching nothing and the drift
         # assertions above passing vacuously on two empty sets.
-        ci = self._matrix_platforms("github-ci.yml", "Build")
+        ci = self._ci_platforms()
         self.assertIn("amd64_u22", ci)
         self.assertIn("amd64_u24", ci)
+        self.assertIn("amd64_u24_lttng", ci)
         self.assertGreaterEqual(len(ci), 3)
+        self.assertEqual(ci["amd64_u24_lttng"], "true")
+        self.assertEqual(
+            set(self._matrix_platforms("github-ci.yml", "Build-LTTng")),
+            {"amd64_u24_lttng"},
+        )
+
+
+class TestLttngBuildMirrorsBuild(unittest.TestCase):
+    """Build-LTTng is a hand copy of Build's first five steps (BLO-35428).
+
+    It left Build's matrix so the LTTng leg (which delayed the Build gate in
+    16 of 39 runs, by up to 47.1 min) no longer holds Test back.  The copy
+    may differ from Build only where the move requires: it exports
+    `type=cacheonly` (nothing pulls an LTTng image) and has none of Build's
+    seed/cleanup steps.  Any other drift -- a different cache-from, build
+    arg, MIB key or timeout -- would test a build CI no longer runs for u24,
+    so it fails here.  Comment lines are ignored.
+    """
+
+    WORKFLOW = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "workflows",
+        "github-ci.yml",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        with open(cls.WORKFLOW, encoding="utf-8") as fh:
+            text = fh.read()
+
+        def job(name):
+            m = re.search(
+                r"\n  " + re.escape(name) + r":\n(.*?)(?=\n  [A-Za-z][\w-]*:\n|\Z)",
+                text,
+                re.S,
+            )
+            return m.group(1) if m else ""
+
+        cls.build, cls.lttng = job("Build"), job("Build-LTTng")
+
+    @staticmethod
+    def _code(block):
+        return [
+            line.rstrip()
+            for line in block.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+    def _steps(self, block):
+        self.assertIn("\n    steps:\n", block)
+        body = block[block.index("\n    steps:\n") :]
+        steps = {}
+        for item in body.split("\n      - ")[1:]:
+            code = self._code("      - " + item)
+            name = code[0][len("      - name: ") :]
+            self.assertTrue(code[0].startswith("      - name: "), code[0])
+            self.assertNotIn(name, steps, f"duplicate step name {name!r}")
+            steps[name] = code
+        return steps
+
+    def _header(self, block):
+        """Job-level lines before `steps:`, minus matrix entries and comments."""
+        head = block[: block.index("\n    steps:\n")]
+        return [
+            line
+            for line in self._code(head)
+            if not re.match(r"^\s*-\s*\{", line)
+        ]
+
+    def test_job_exists(self):
+        self.assertTrue(self.lttng, "Build-LTTng job not found in github-ci.yml")
+
+    def test_same_runner_gate_and_timeout(self):
+        self.assertEqual(self._header(self.lttng), self._header(self.build))
+
+    def test_steps_are_builds_first_steps(self):
+        build, lttng = self._steps(self.build), self._steps(self.lttng)
+        names = list(lttng)
+        self.assertEqual(names, list(build)[: len(names)])
+        self.assertEqual(names[-1], "Build docker image (cached)")
+
+    def test_shared_steps_are_identical(self):
+        build, lttng = self._steps(self.build), self._steps(self.lttng)
+        for name in list(lttng)[:-1]:
+            with self.subTest(step=name):
+                self.assertEqual(lttng[name], build[name])
+
+    def test_build_step_differs_only_in_its_exporter(self):
+        name = "Build docker image (cached)"
+        build, lttng = self._steps(self.build)[name], self._steps(self.lttng)[name]
+
+        def without_outputs(code):
+            out, skipping = [], False
+            for line in code:
+                if line == "          outputs: |":
+                    skipping = True
+                    continue
+                if skipping and line.startswith(" " * 12):
+                    continue
+                skipping = False
+                if line.startswith("          outputs:"):
+                    continue
+                out.append(line)
+            return out
+
+        self.assertEqual(without_outputs(lttng), without_outputs(build))
+        self.assertIn("          outputs: type=cacheonly", lttng)
+        self.assertNotIn("push=true", "\n".join(lttng))
+
+    def test_lttng_uploads_nothing(self):
+        self.assertNotIn("actions/upload-artifact", "\n".join(self._code(self.lttng)))
 
 
 class TestFreshnessGateFailsClosedOnFailedVerify(unittest.TestCase):
