@@ -113,6 +113,29 @@ class TestDecision(Base):
         run, _, _ = self.decide()
         self.assertEqual(run, [SPIN_FILE])
 
+    def test_initial_failure_the_rerun_only_skipped_is_still_rerun(self):
+        """Review blocker: a rerun SKIP must not clear a parallel failure.
+
+        Attempt 1: SPIN errored and MSDP_SA failed in the parallel run; the
+        serial rerun skipped SPIN (the `routers_have_failure()` skip) and
+        MSDP_SA failed again, so verify_rerun_coverage.py turned attempt 1
+        red ("a skip is not a pass").  Letting the skip overlay the failure
+        resumed MSDP alone, and a flaky MSDP pass then went green with SPIN
+        never having passed in any attempt.
+        """
+        self.nested(INITIAL_WITH_FAILURES, [(SPIN, "skipped"), (MSDP_SA, "failure")])
+        run, priors, reason = self.decide()
+        self.assertEqual(run, sorted([MSDP_FILE, SPIN_FILE]))
+        self.assertEqual(len(priors), 2)
+        self.assertIn("resume: 2 file(s)", reason)
+
+    def test_rerun_skip_alone_does_not_empty_the_failure_set(self):
+        """Every failure only skipped in the rerun: resume them, not 'nothing'."""
+        self.nested(INITIAL_WITH_FAILURES, [(SPIN, "skipped"), (MSDP_SA, "skipped")])
+        run, _, reason = self.decide()
+        self.assertEqual(run, sorted([MSDP_FILE, SPIN_FILE]))
+        self.assertNotIn("no failing test", reason)
+
     def test_partial_junit_forces_a_full_run(self):
         self.nested([(SPIN, "failure"), (MSDP_SA, "pass")], None)
         run, priors, reason = self.decide()

@@ -27,7 +27,9 @@
 # never counted as verified -- that distinction belongs to
 # verify_rerun_coverage.py, which gates the serial rerun.  A prior FAILURE is
 # deliberately not accounted: a failing test must produce a fresh result in
-# this attempt, or a resume that dropped it would read as coverage.
+# this attempt, or a resume that dropped it would read as coverage.  A prior
+# failure stays a failure when its serial rerun only skipped it: overlay()
+# lets a later pass clear a failure, never a later skip.
 #
 # Every ambiguity fails closed: an empty collection, an empty run list, a
 # run-list entry naming nothing collected, or an unreadable XML is an error,
@@ -137,10 +139,23 @@ def parse_outcomes(path, known_files):
 
 
 def overlay(outcome_maps):
-    """Merge per-attempt outcomes; later maps win (initial, then its rerun)."""
+    """Merge per-attempt outcomes in order (initial, then its serial rerun).
+
+    A later outcome replaces an earlier one, except that a SKIP never clears
+    a FAILURE: only a later pass does.  This is verify_rerun_coverage.py's
+    rule ("a skip is not a pass") carried across attempts.  The serial rerun
+    of a test whose routers failed to start typically comes back skipped
+    (`if tgen.routers_have_failure(): pytest.skip(...)`), and letting that
+    skip win would drop the test from the resume list AND count it as
+    accounted for by the prior attempt, so a failure that turned attempt 1
+    red would be green on attempt 2 without ever passing.
+    """
     merged = {}
     for m in outcome_maps:
-        merged.update(m)
+        for key, outcome in m.items():
+            if outcome == SKIPPED and merged.get(key) == FAILED:
+                continue
+            merged[key] = outcome
     return merged
 
 

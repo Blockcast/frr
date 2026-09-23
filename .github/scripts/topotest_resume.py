@@ -26,6 +26,10 @@
 #     suite, e.g. a cap kill in the upload tail)                -> full run
 #   * otherwise                   -> the files that still fail, sorted
 #
+# "Still fail" is the overlay of the parallel junit and its serial rerun, in
+# which only a pass clears a parallel failure: a test the rerun merely
+# skipped is still failing, and its file is re-run (a skip is not a pass).
+#
 # stdout is the run list, one entry per line, and is never empty.  The reason
 # goes to stderr.  With --prior-out, the junit(s) the decision was based on
 # are written there in overlay order (empty on a full run) so the coverage

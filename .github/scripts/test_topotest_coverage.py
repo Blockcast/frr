@@ -233,6 +233,34 @@ class TestNormalization(unittest.TestCase):
         self.assertEqual(outcomes[cid(SPIN)], cov.FAILED)
 
 
+class TestOverlay(unittest.TestCase):
+    """overlay() is what both the resume list and prior_ok are built from."""
+
+    K = "d/test_x.py::test_y"
+
+    def merged(self, *outcomes):
+        return cov.overlay([{self.K: o} for o in outcomes])[self.K]
+
+    def test_later_pass_clears_a_failure(self):
+        self.assertEqual(self.merged(cov.FAILED, cov.PASSED), cov.PASSED)
+
+    def test_later_skip_does_not_clear_a_failure(self):
+        """A skip is not a pass (verify_rerun_coverage.py), across attempts too."""
+        self.assertEqual(self.merged(cov.FAILED, cov.SKIPPED), cov.FAILED)
+
+    def test_later_failure_replaces_a_pass_or_a_skip(self):
+        self.assertEqual(self.merged(cov.PASSED, cov.FAILED), cov.FAILED)
+        self.assertEqual(self.merged(cov.SKIPPED, cov.FAILED), cov.FAILED)
+
+    def test_later_skip_replaces_a_pass(self):
+        """Either is non-failing, i.e. accounted; neither clears a failure."""
+        self.assertEqual(self.merged(cov.PASSED, cov.SKIPPED), cov.SKIPPED)
+
+    def test_keys_absent_later_keep_their_earlier_outcome(self):
+        merged = cov.overlay([{self.K: cov.FAILED, "a.py::b": cov.PASSED}, {}])
+        self.assertEqual(merged, {self.K: cov.FAILED, "a.py::b": cov.PASSED})
+
+
 class TestResumedAttempt(Base):
     PRIOR = [(MSDP_SA, "failure")] + [
         (p, "pass") for p in (SPIN, MSDP_LEAK, TTL, TTL_LEAK)
@@ -273,6 +301,34 @@ class TestResumedAttempt(Base):
             ),
             0,
         )
+
+    def test_rerun_skip_does_not_account_an_initial_failure(self):
+        """Review blocker: the prior's serial rerun skipped MSDP_SA.
+
+        verify_rerun_coverage.py refuses that skip within attempt 1 ("a skip
+        is not a pass"); the overlay must refuse it across attempts, or an
+        attempt that did not re-run MSDP would be certified as covering it.
+        """
+        rerun = [(MSDP_SA, "skipped")]
+        now = [(TTL, "pass"), (TTL_LEAK, "pass")]
+        self.assertEqual(
+            self.run_main(
+                now,
+                run_list=[cid(TTL).split("::")[0]],
+                priors=[self.PRIOR, rerun],
+            ),
+            1,
+        )
+        initial = {cid(p): cov.PASSED for p in (SPIN, MSDP_LEAK, TTL, TTL_LEAK)}
+        initial[cid(MSDP_SA)] = cov.FAILED
+        problems = cov.check(
+            COLLECTED,
+            [cid(TTL).split("::")[0]],
+            {cid(TTL): cov.PASSED, cid(TTL_LEAK): cov.PASSED},
+            [initial, {cid(MSDP_SA): cov.SKIPPED}],
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(cid(MSDP_SA), problems[0])
 
     def test_partial_prior_leaves_gap(self):
         partial = [(SPIN, "pass"), (MSDP_SA, "failure")]
