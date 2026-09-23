@@ -2,16 +2,22 @@
 """Fixtures pinning CI-Verdict (topotest_verdict.py), BLO-35428.
 
 The property every case protects: the verdict can only be green when Build,
-Unit-Test and every Test shard succeeded and the shards covered the
-collection exactly once -- or in the two deliberately build-less cases, each
-matched exactly.  A filter job that failed, was cancelled or lost its runner
-(empty outputs) must be red, because the jobs behind it were skipped and
-nothing was built or tested (critic blocker: the first draft passed on
-`non_doc != 'true'`).  An empty change list (doc and non_doc both
-'false') is not doc-only, and Documentation-HTML must succeed whenever doc/
-changed, doc-only runs included (review findings on this branch).
+Build-LTTng, Unit-Test and every Test shard succeeded and the shards covered
+the collection exactly once -- or in the two deliberately build-less cases,
+each matched exactly.  A filter job that failed, was cancelled or lost its
+runner (empty outputs) must be red, because the jobs behind it were skipped
+and nothing was built or tested (critic blocker: the first draft passed on
+`non_doc != 'true'`).  An empty change list (doc and non_doc both 'false')
+is not doc-only, and Documentation-HTML must succeed whenever doc/ changed,
+doc-only runs included (review findings on this stack).
 
-Stdlib only, no network.
+Build-LTTng left Build's matrix so it no longer delays Test, and no other
+job needs it, so the verdict is the only thing that turns its failure red
+(critic: that must land in the same change, with a test).  doc-path-filter
+defaults to building everything when its paths-filter step cannot decide;
+TestBuildDecisionStep runs that inline script itself.
+
+Stdlib only, no network (TestBuildDecisionStep runs bash).
 
 Run: python3 -m unittest discover -s .github/scripts -p 'test_topotest_*.py'
 """
@@ -21,6 +27,8 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -54,19 +62,25 @@ COLLECTED_IDS = [
 _DERIVE = object()
 
 
-def needs(filt="success", non_doc="true", doc=_DERIVE, outputs=True, **results):
+def needs(
+    filt="success", build="true", doc=_DERIVE, non_doc=_DERIVE, outputs=True, **results
+):
     """toJSON(needs) as GitHub renders it; results override Build etc.
 
-    The filter's doc output defaults to the doc-only classification when
-    non_doc is 'false' and to a code-only change otherwise; None leaves it
-    out.  Documentation-HTML defaults to what its `if:` makes it: 'success'
-    when the filter succeeded with doc 'true', 'skipped' otherwise.
+    doc-path-filter's outputs: `build` as its decide step writes it, and the
+    raw paths-filter classification, which by default is doc-only when build
+    is 'false' and a code change otherwise.  None leaves a key out.
+    Documentation-HTML defaults to what its `if:` makes it: 'success' when
+    the filter succeeded with doc 'true', 'skipped' otherwise.
     """
+    doc_only = build == "false"
     if doc is _DERIVE:
-        doc = "true" if non_doc == "false" else "false"
+        doc = "true" if doc_only else "false"
+    if non_doc is _DERIVE:
+        non_doc = "false" if doc_only else "true"
     filter_entry = {"result": filt, "outputs": {}}
     if outputs:
-        o = {"doc": doc, "non_doc": non_doc}
+        o = {"build": build, "doc": doc, "non_doc": non_doc}
         filter_entry["outputs"] = {k: v for k, v in o.items() if v is not None}
     n = {"doc-path-filter": filter_entry}
     for job in verdict.REQUIRED_JOBS:
@@ -171,6 +185,13 @@ class Base(unittest.TestCase):
         self.assertEqual(self.run_verdict(*args, **kw), 0, self.out)
 
 
+# Every job behind doc-path-filter skipped, as on a doc-only, mergify or
+# filter-failed run.
+SKIPPED = dict(
+    Build="skipped", Build_LTTng="skipped", Unit_Test="skipped", Test="skipped"
+)
+
+
 class TestFullRun(Base):
     def test_all_green_with_complete_plans(self):
         self.assertGreen(needs())
@@ -179,6 +200,7 @@ class TestFullRun(Base):
             "4 collected IDs, 4 accounted (3 + 1)",
             self.out,
         )
+        self.assertIn("Build-LTTng", self.out)
 
     def test_planned_but_not_collected_is_allowed(self):
         """c/test_c.py is planned and collects nothing (module-level skip)."""
@@ -198,102 +220,183 @@ class TestFullRun(Base):
         self.assertRed(needs(Test="skipped"), why="Test concluded 'skipped'")
 
     def test_every_failed_rule_is_reported(self):
-        self.assertRed(needs(Build="failure", Unit_Test="failure", Test="failure"))
-        self.assertEqual(self.out.count("::error title=CI-Verdict::"), 3, self.out)
+        self.assertRed(
+            needs(
+                Build="failure",
+                Build_LTTng="failure",
+                Unit_Test="failure",
+                Test="failure",
+            )
+        )
+        self.assertEqual(self.out.count("::error title=CI-Verdict::"), 4, self.out)
+
+
+class TestLttngBuild(Base):
+    """Critic: moving LTTng off the Test gate must keep its failure red.
+
+    Build-LTTng is needed by no job but CI-Verdict, so these are the only
+    cases that stand between an LTTng build failure and a green verdict --
+    with Build, Unit-Test and every Test shard green, as they will be when
+    only the LTTng configuration is broken.
+    """
+
+    def test_lttng_build_failure_is_red_while_everything_else_is_green(self):
+        self.assertRed(
+            needs(Build_LTTng="failure"), why="Build-LTTng concluded 'failure'"
+        )
+        self.assertEqual(self.out.count("::error title=CI-Verdict::"), 1, self.out)
+
+    def test_lttng_build_cancelled_or_timed_out_is_red(self):
+        """A `timeout-minutes` kill is stamped 'cancelled'."""
+        self.assertRed(needs(Build_LTTng="cancelled"), why="Build-LTTng concluded")
+
+    def test_lttng_build_skipped_on_a_code_change_is_red(self):
+        self.assertRed(
+            needs(Build_LTTng="skipped"), why="Build-LTTng concluded 'skipped'"
+        )
+
+    def test_lttng_build_missing_from_needs_is_red(self):
+        n = needs()
+        del n["Build-LTTng"]
+        self.assertRed(n, why="needs.Build-LTTng is missing")
+
+    def test_lttng_is_a_required_job(self):
+        self.assertIn("Build-LTTng", verdict.REQUIRED_JOBS)
 
 
 class TestFilterJob(Base):
     """The critic blocker: the filter's own failure must never exempt."""
 
     def test_filter_failed_with_empty_outputs_is_red(self):
-        n = needs(
-            filt="failure",
-            outputs=False,
-            Build="skipped",
-            Unit_Test="skipped",
-            Test="skipped",
-        )
+        n = needs(filt="failure", outputs=False, **SKIPPED)
         self.assertRed(n, why="doc-path-filter concluded 'failure'")
 
     def test_filter_lost_its_runner_is_red(self):
         """Preempted pod: result failure/cancelled, outputs empty strings."""
         for result in ("failure", "cancelled"):
-            n = needs(
-                filt=result,
-                non_doc="",
-                Build="skipped",
-                Unit_Test="skipped",
-                Test="skipped",
-            )
+            n = needs(filt=result, build="", doc="", non_doc="", **SKIPPED)
             self.assertRed(n, why="doc-path-filter concluded")
 
+    def test_filter_failed_after_deciding_doc_only_is_red(self):
+        """e.g. the job died after its decide step wrote build=false."""
+        n = needs(filt="failure", build="false", **SKIPPED)
+        self.assertRed(n, why="doc-path-filter concluded 'failure'")
+
     def test_filter_cancelled_is_red(self):
-        n = needs(
-            filt="cancelled",
-            outputs=False,
-            Build="skipped",
-            Unit_Test="skipped",
-            Test="skipped",
-        )
+        """Also a `timeout-minutes` kill of the folded MIB population."""
+        n = needs(filt="cancelled", outputs=False, **SKIPPED)
         self.assertRed(n)
 
-    def test_filter_success_with_empty_non_doc_is_red(self):
-        n = needs(non_doc="", Build="skipped", Unit_Test="skipped", Test="skipped")
+    def test_filter_success_with_empty_build_is_red(self):
+        n = needs(build="", **SKIPPED)
+        self.assertRed(n, why="neither 'true' nor 'false'")
+
+    def test_filter_success_with_missing_build_is_red(self):
+        """The workflow of item 3, whose filter had no build output."""
+        n = needs(build=None, doc="true", non_doc="false", **SKIPPED)
         self.assertRed(n, why="neither 'true' nor 'false'")
 
     def test_filter_success_with_missing_outputs_is_red(self):
-        n = needs(outputs=False, Build="skipped", Unit_Test="skipped", Test="skipped")
+        n = needs(outputs=False, **SKIPPED)
         self.assertRed(n, why="neither 'true' nor 'false'")
 
-    def test_non_doc_is_compared_exactly(self):
-        for value in ("False", "0", "no", "TRUE"):
-            n = needs(
-                non_doc=value, Build="skipped", Unit_Test="skipped", Test="skipped"
-            )
-            self.assertRed(n)
+    def test_build_is_compared_exactly(self):
+        for value in ("False", "0", "no", "TRUE", "false ", "true\n"):
+            with self.subTest(build=value):
+                n = needs(build=value, doc="true", non_doc="false", **SKIPPED)
+                self.assertRed(n)
+
+    def test_build_false_needs_the_exact_doc_only_classification(self):
+        """The verdict re-derives the decide step's one build=false case."""
+        cases = (
+            ("true", "true"),  # mixed change
+            ("false", "false"),  # empty change list
+            ("false", "true"),  # code-only change
+            ("", ""),  # filter errored (continue-on-error)
+            (None, None),  # outputs missing
+            ("True", "false"),
+            ("true", "False"),
+        )
+        for doc, non_doc in cases:
+            with self.subTest(doc=doc, non_doc=non_doc):
+                n = needs(build="false", doc=doc, non_doc=non_doc, **SKIPPED)
+                self.assertRed(n, why="not exactly doc-only")
+
+    def test_filter_that_could_not_decide_builds_and_is_judged_in_full(self):
+        """paths-filter errored: build=true, empty classification, all ran."""
+        self.assertGreen(needs(build="true", doc="", non_doc=""))
+        self.assertIn("CI-Verdict: green: Build, Build-LTTng", self.out)
+        self.assertRed(
+            needs(build="true", doc="", non_doc="", **SKIPPED),
+            why="Build concluded 'skipped'",
+        )
 
     def test_doc_only_change_is_green(self):
-        n = needs(non_doc="false", Build="skipped", Unit_Test="skipped", Test="skipped")
+        n = needs(build="false", **SKIPPED)
         self.assertGreen(n)
         self.assertIn("doc-only", self.out)
 
     def test_doc_only_does_not_need_plans(self):
-        n = needs(non_doc="false", Build="skipped", Unit_Test="skipped", Test="skipped")
+        n = needs(build="false", **SKIPPED)
         import shutil
 
         shutil.rmtree(self.plans)
         self.assertGreen(n)
 
     def test_doc_only_claim_with_a_job_that_ran_is_red(self):
-        n = needs(non_doc="false", Build="failure", Unit_Test="skipped", Test="skipped")
-        self.assertRed(n, why="did not skip")
+        for job in ("Build", "Build_LTTng", "Unit_Test", "Test"):
+            with self.subTest(job=job):
+                n = needs(build="false", **dict(SKIPPED, **{job: "failure"}))
+                self.assertRed(n, why="did not skip")
 
-    def test_empty_change_list_is_red_not_doc_only(self):
+    def test_empty_change_list_builds_and_is_judged_in_full(self):
         """Review finding: paths-filter says doc 'false', non_doc 'false' when
         it found no changed file (first push of a branch at a commit already
-        on master).  Nothing was built or tested; that is not an exemption."""
-        n = needs(
-            non_doc="false",
-            doc="false",
-            Build="skipped",
-            Unit_Test="skipped",
-            Test="skipped",
+        on master).  That is not doc-only: the decide step builds it, so it
+        is green only when everything ran, and red when anything was skipped
+        or when build 'false' is claimed over it."""
+        empty = dict(doc="false", non_doc="false")
+        self.assertGreen(needs(build="true", **empty))
+        self.assertRed(
+            needs(build="true", **dict(empty, **SKIPPED)),
+            why="Build concluded 'skipped'",
         )
-        self.assertRed(n, why="found no changed file")
-        self.assertNotIn("green", self.out)
+        self.assertRed(
+            needs(build="false", **dict(empty, **SKIPPED)),
+            why="not exactly doc-only",
+        )
 
     def test_doc_output_is_compared_exactly(self):
         for value in ("True", "TRUE", "", "1", None):
             with self.subTest(doc=value):
                 n = needs(
-                    non_doc="false",
+                    build="false",
                     doc=value,
-                    Build="skipped",
-                    Unit_Test="skipped",
-                    Test="skipped",
+                    non_doc="false",
                     Documentation_HTML="success",
+                    **SKIPPED
                 )
-                self.assertRed(n)
+                self.assertRed(n, why="not exactly doc-only")
+
+    def test_mergify_backport_is_green(self):
+        n = needs(filt="skipped", outputs=False, **SKIPPED)
+        self.assertGreen(n, event="pull_request", actor="mergify[bot]")
+        self.assertIn("mergify", self.out)
+
+    def test_filter_skipped_for_anyone_else_is_red(self):
+        n = needs(filt="skipped", outputs=False, **SKIPPED)
+        self.assertRed(n, event="pull_request", actor="omar", why="not the mergify")
+        self.assertRed(n, event="push", actor="mergify[bot]", why="not the mergify")
+
+    def test_mergify_with_a_job_that_ran_is_red(self):
+        for job in ("Build_LTTng", "Test"):
+            with self.subTest(job=job):
+                n = needs(
+                    filt="skipped", outputs=False, **dict(SKIPPED, **{job: "failure"})
+                )
+                self.assertRed(
+                    n, event="pull_request", actor="mergify[bot]", why="did not skip"
+                )
 
 
 class TestDocsJob(Base):
@@ -304,9 +407,7 @@ class TestDocsJob(Base):
     on a mixed run with every other job green.
     """
 
-    DOC_ONLY = dict(
-        non_doc="false", Build="skipped", Unit_Test="skipped", Test="skipped"
-    )
+    DOC_ONLY = dict(build="false", **SKIPPED)
 
     def test_doc_only_needs_the_docs_build_to_succeed(self):
         self.assertGreen(needs(**self.DOC_ONLY))
@@ -333,53 +434,17 @@ class TestDocsJob(Base):
 
     def test_mergify_with_docs_ran_is_red(self):
         n = needs(
-            filt="skipped",
-            outputs=False,
-            Build="skipped",
-            Unit_Test="skipped",
-            Test="skipped",
-            Documentation_HTML="failure",
+            filt="skipped", outputs=False, Documentation_HTML="failure", **SKIPPED
         )
-        self.assertRed(n, event="pull_request", actor="mergify[bot]")
+        self.assertRed(
+            n, event="pull_request", actor="mergify[bot]", why="should have been"
+        )
+        self.assertEqual(self.out.count("::error title=CI-Verdict::"), 1, self.out)
 
     def test_docs_missing_from_needs_is_red(self):
         n = needs(**self.DOC_ONLY)
         del n[verdict.DOCS_JOB]
         self.assertRed(n, why="needs.Documentation-HTML is missing")
-
-    def test_mergify_backport_is_green(self):
-        n = needs(
-            filt="skipped",
-            outputs=False,
-            Build="skipped",
-            Unit_Test="skipped",
-            Test="skipped",
-        )
-        self.assertGreen(n, event="pull_request", actor="mergify[bot]")
-        self.assertIn("mergify", self.out)
-
-    def test_filter_skipped_for_anyone_else_is_red(self):
-        n = needs(
-            filt="skipped",
-            outputs=False,
-            Build="skipped",
-            Unit_Test="skipped",
-            Test="skipped",
-        )
-        self.assertRed(n, event="pull_request", actor="omar", why="not the mergify")
-        self.assertRed(n, event="push", actor="mergify[bot]", why="not the mergify")
-
-    def test_mergify_with_a_job_that_ran_is_red(self):
-        n = needs(
-            filt="skipped",
-            outputs=False,
-            Build="skipped",
-            Unit_Test="skipped",
-            Test="failure",
-        )
-        self.assertRed(
-            n, event="pull_request", actor="mergify[bot]", why="did not skip"
-        )
 
 
 class TestNeedsInput(Base):
@@ -557,6 +622,270 @@ class TestWorkflowWiring(unittest.TestCase):
         self.assertIn("pattern: topotest-plan-*", m.group(1))
         self.assertIn("path: plans", m.group(1))
         self.assertIn("--plans plans", self.job)
+
+
+def _read_workflow():
+    path = os.path.join(_HERE, os.pardir, "workflows", "github-ci.yml")
+    with open(os.path.normpath(path)) as f:
+        return f.read()
+
+
+def _job(workflow, name):
+    """One top-level job's block (without its key line); '' if absent."""
+    m = re.search(
+        r"\n  " + re.escape(name) + r":\n(.*?)(?=\n  [A-Za-z][\w-]*:\n|\Z)",
+        workflow,
+        re.S,
+    )
+    return m.group(1) if m else ""
+
+
+def _code(text):
+    """text without its YAML comment lines."""
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def _steps(job):
+    """The job's step items, each starting at its `- ` line."""
+    body = job[job.index("\n    steps:\n") :]
+    return ["      - " + s for s in body.split("\n      - ")[1:]]
+
+
+def _step(job, name):
+    for s in _steps(job):
+        if s.startswith("      - name: " + name + "\n"):
+            return s
+    return None
+
+
+class TestGateWiring(unittest.TestCase):
+    """BLO-35428 item 4: what gates Build, Unit-Test and Test.
+
+    Every property here is one whose loss lets a run skip building or
+    testing while the verdict does not notice, or lets the verdict stop
+    seeing a job that can fail.
+    """
+
+    # Jobs the verdict does not judge by a success/skip rule of their own:
+    # itself, and the filter, whose result and outputs it reads directly.
+    # Documentation-HTML is judged (conditionally, see TestDocsJob).
+    NOT_GATING = {"CI-Verdict", verdict.FILTER_JOB}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = _read_workflow()
+        cls.filter = _job(cls.workflow, verdict.FILTER_JOB)
+
+    def test_every_building_or_testing_job_is_in_the_verdict(self):
+        """A new job that can fail must not be invisible to CI-Verdict."""
+        jobs_section = self.workflow[self.workflow.index("\njobs:\n") :]
+        jobs = set(re.findall(r"(?m)^  ([A-Za-z][\w-]*):$", jobs_section))
+        self.assertIn("Build-LTTng", jobs)
+        self.assertEqual(
+            sorted(jobs - self.NOT_GATING),
+            sorted(verdict.REQUIRED_JOBS + (verdict.DOCS_JOB,)),
+        )
+
+    def test_prepare_mib_cache_job_is_folded_into_the_filter(self):
+        self.assertNotIn("\n  Prepare-MIB-Cache:\n", self.workflow)
+        self.assertNotIn("needs: Prepare-MIB-Cache", self.workflow)
+
+    def test_builds_key_on_the_decided_build_output(self):
+        for name in ("Build", "Build-LTTng"):
+            with self.subTest(job=name):
+                job = _job(self.workflow, name)
+                self.assertRegex(job, r"(?m)^    needs: doc-path-filter$")
+                self.assertRegex(
+                    job,
+                    r"(?m)^    if: \$\{\{ needs\.doc-path-filter\.outputs\.build "
+                    r"== 'true' \}\}$",
+                )
+
+    def test_nothing_is_gated_on_the_raw_non_doc_output(self):
+        """Only the decided `build` output may skip a build."""
+        for line in self.workflow.splitlines():
+            if re.match(r"^\s*if:", line):
+                self.assertNotIn("non_doc", line, line)
+
+    def test_filter_outputs_build_from_its_decide_step(self):
+        self.assertRegex(
+            self.filter, r"(?m)^      build: \$\{\{ steps\.decide\.outputs\.build \}\}$"
+        )
+
+    def test_a_paths_filter_error_cannot_fail_or_decide(self):
+        (filt,) = [s for s in _steps(self.filter) if "dorny/paths-filter@" in s]
+        self.assertRegex(filt, r"(?m)^        id: filter$")
+        self.assertRegex(filt, r"(?m)^        continue-on-error: true$")
+        decide = _step(self.filter, "Decide whether this run builds")
+        self.assertIsNotNone(decide)
+        self.assertRegex(decide, r"(?m)^        id: decide$")
+        self.assertIn("FILTER_OUTCOME: ${{ steps.filter.outcome }}", decide)
+        self.assertNotRegex(decide, r"(?m)^        continue-on-error:")
+        steps = _steps(self.filter)
+        self.assertLess(steps.index(filt), steps.index(decide))
+
+    def test_mib_population_runs_whenever_a_build_does(self):
+        """Dockerfile:122 hashes mib-cache: a build must find it populated."""
+        steps = _steps(self.filter)
+        decide = steps.index(_step(self.filter, "Decide whether this run builds"))
+        build_job = _job(self.workflow, "Build")
+        for name in (
+            "Ensure local MIB cache directory exists",
+            "Restore cached MIB files",
+            "Populate missing MIB cache files",
+        ):
+            with self.subTest(step=name):
+                s = _step(self.filter, name)
+                self.assertIsNotNone(s)
+                self.assertGreater(steps.index(s), decide)
+                self.assertRegex(
+                    s,
+                    r"(?m)^        if: "
+                    r"\$\{\{ steps\.decide\.outputs\.build == 'true' \}\}$",
+                )
+                self.assertNotRegex(s, r"(?m)^        continue-on-error:")
+        restore = _step(self.filter, "Restore cached MIB files")
+        self.assertIn("uses: actions/cache@v", restore)
+        for key in ("path: docker/ubuntu-ci/mib-cache", "key: mib-cache-v1-ubuntu24"):
+            self.assertIn(key, restore)
+            self.assertIn(key, _step(build_job, "Restore cached MIB files"))
+        self.assertRegex(self.filter, r"(?m)^    timeout-minutes: 20$")
+
+    def test_filter_checkout_is_skipped_only_on_pull_requests(self):
+        co = _step(self.filter, "Checkout")
+        self.assertIsNotNone(co)
+        self.assertRegex(
+            co, r"(?m)^        if: \$\{\{ github\.event_name != 'pull_request' \}\}$"
+        )
+        self.assertIn("fetch-depth: 0", co)
+        self.assertRegex(self.filter, r"(?m)^      pull-requests: read$")
+
+    def test_one_lost_build_leg_does_not_skip_the_other_platform(self):
+        for name in ("Unit-Test", "Test"):
+            with self.subTest(job=name):
+                job = _job(self.workflow, name)
+                self.assertRegex(job, r"(?m)^    needs: Build$")
+                self.assertRegex(
+                    job,
+                    r"(?m)^    if: \$\{\{ !cancelled\(\) && "
+                    r"needs\.Build\.result != 'skipped' \}\}$",
+                )
+
+    def test_build_exports_only_the_registry_image(self):
+        build = _job(self.workflow, "Build")
+        code = _code(build)
+        self.assertNotIn("type=docker", code)
+        self.assertNotIn("/tmp/frr-", code)
+        self.assertIsNone(_step(build, "Upload docker image artifact"))
+        self.assertRegex(
+            build,
+            r"(?m)^          outputs: \|\n"
+            r"            type=image,name=registry\.blockcast\.net/cache/frr-ci:img-"
+            r"\$\{\{ github\.sha \}\}-"
+            r"\$\{\{ matrix\.cfg\.platform \}\},push=true\n          [a-z#]",
+        )
+
+    def test_no_workflow_reads_the_deleted_image_artifact(self):
+        wf_dir = os.path.normpath(os.path.join(_HERE, os.pardir, "workflows"))
+        for fname in sorted(os.listdir(wf_dir)):
+            if not fname.endswith((".yml", ".yaml")):
+                continue
+            with open(os.path.join(wf_dir, fname)) as f:
+                text = f.read()
+            code = _code(text)
+            with self.subTest(workflow=fname):
+                self.assertNotRegex(code, r"(?m)name: [^\n]*\}-image\s*$")
+                self.assertNotIn("docker load", code)
+
+
+class TestBuildDecisionStep(unittest.TestCase):
+    """Runs doc-path-filter's inline "Decide whether this run builds" script.
+
+    It cannot be a repo script: on pull requests that job has no checkout.
+    So the script is lifted out of github-ci.yml and executed the way
+    GitHub runs a `shell: bash` step, over every classification the filter
+    can hand it.  build=false for anything but a successful, exactly
+    doc-only classification would let a code change skip Build.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        step = _step(
+            _job(_read_workflow(), verdict.FILTER_JOB), "Decide whether this run builds"
+        )
+        assert step is not None, "decide step not found"
+        lines = step.split("\n")
+        start = lines.index("        run: |") + 1
+        body = []
+        for line in lines[start:]:
+            if line.strip() and not line.startswith(" " * 10):
+                break
+            body.append(line[10:])
+        cls.script = "\n".join(body).strip() + "\n"
+        cls.bash = shutil.which("bash")
+
+    def decide(self, **env):
+        self.assertIsNotNone(self.bash, "bash is required to run the step")
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "step.sh")
+            out = os.path.join(tmp, "github_output")
+            with open(script, "w") as f:
+                f.write(self.script)
+            open(out, "w").close()
+            full_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "GITHUB_OUTPUT": out,
+            }
+            full_env.update(env)
+            proc = subprocess.run(
+                [self.bash, "--noprofile", "--norc", "-eo", "pipefail", script],
+                env=full_env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(out) as f:
+                written = [line for line in f.read().splitlines() if line]
+        self.assertEqual(len(written), 1, written)
+        self.assertRegex(written[0], r"^build=(true|false)$")
+        return written[0].split("=", 1)[1]
+
+    def test_script_takes_its_inputs_from_env_only(self):
+        self.assertIn('echo "build=${build}" >> "${GITHUB_OUTPUT}"', self.script)
+        self.assertNotIn("${{", self.script)
+
+    def test_only_a_successful_doc_only_classification_skips_the_build(self):
+        self.assertEqual(
+            self.decide(FILTER_OUTCOME="success", DOC="true", NON_DOC="false"), "false"
+        )
+
+    def test_everything_else_builds(self):
+        cases = (
+            ("success", "false", "true"),  # code only
+            ("success", "true", "true"),  # doc + code
+            ("success", "false", "false"),  # empty change list
+            ("failure", "true", "false"),  # errored, yet wrote doc-only outputs
+            ("failure", "", ""),  # errored before writing outputs
+            ("cancelled", "", ""),
+            ("skipped", "", ""),
+            ("", "true", "false"),
+            ("success", "", ""),
+            ("success", "True", "false"),
+            ("success", "true", "False"),
+            ("success", "true ", "false"),
+        )
+        for outcome, doc, non_doc in cases:
+            with self.subTest(outcome=outcome, doc=doc, non_doc=non_doc):
+                self.assertEqual(
+                    self.decide(FILTER_OUTCOME=outcome, DOC=doc, NON_DOC=non_doc),
+                    "true",
+                )
+
+    def test_unset_inputs_build(self):
+        self.assertEqual(self.decide(), "true")
+        self.assertEqual(self.decide(DOC="true", NON_DOC="false"), "true")
 
 
 if __name__ == "__main__":

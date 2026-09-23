@@ -32,23 +32,58 @@ defaults:
 
 jobs:
   # Classify changes: doc/ vs everything else (skip Docker build/tests when only doc/ changed).
+  #
+  # BLO-35428: this job also populates the shared MIB cache, which used to be
+  # a separate Prepare-MIB-Cache job between it and Build.  That job cost the
+  # gate 3.0 min created->done at the median, with a queue p90 of 42.6 min,
+  # for a ~0.5-min run.  Build and Build-LTTng `needs:` this job, so the
+  # population still completes (the actions/cache save included, a post
+  # step) before either restores the cache, and the Dockerfile's
+  # `COPY docker/ubuntu-ci/` (Dockerfile:122, whose layer hashes mib-cache,
+  # restored on the 24.04 legs) stays warm.
+  #
+  # Nothing may skip a build because the classifier could not decide.  The
+  # "Decide whether this run builds" step writes `build`, the one output
+  # Build, Build-LTTng and the MIB steps key on.  It is 'false' only when the
+  # filter step itself succeeded AND classified the change as doc-only
+  # (doc == 'true', non_doc == 'false'); a filter error, missing outputs or an
+  # empty change list all give 'true': build and test everything.  If this
+  # job fails outright (a preempted pod, a MIB fetch out of retries), Build
+  # is skipped and CI-Verdict is red: it passes a build-less run only on this
+  # job's 'success' with build 'false' and that exact doc-only classification
+  # (topotest_verdict.py).
   doc-path-filter:
     if: ${{ github.event_name != 'pull_request' || github.actor != 'mergify[bot]' }}
     runs-on: default
     name: Documentation path filter
+    # The folded MIB population's budget (Prepare-MIB-Cache's 20).
+    timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: read
     outputs:
       doc: ${{ steps.filter.outputs.doc }}
       non_doc: ${{ steps.filter.outputs.non_doc }}
+      build: ${{ steps.decide.outputs.build }}
     steps:
       - name: Checkout
+        # BLO-35428: pull requests skip this full-history checkout (2.48 min
+        # at the median).  For a pull_request event dorny/paths-filter lists
+        # the changed files through the REST API with its `token` input,
+        # which defaults to the job token (hence `pull-requests: read`
+        # above), and reads no working tree, so a PR's classification is the
+        # same with or without it.  push and workflow_dispatch diff with git
+        # and keep the checkout.  The MIB steps below need none: they only
+        # write docker/ubuntu-ci/mib-cache under the workspace.
+        if: ${{ github.event_name != 'pull_request' }}
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - uses: dorny/paths-filter@v4
         id: filter
+        # A filter that errors must not decide anything: the next step turns
+        # any outcome but 'success' into build=true.
+        continue-on-error: true
         with:
           filters: |
             doc:
@@ -56,26 +91,33 @@ jobs:
             non_doc:
               - '**'
               - '!doc/**'
-
-  Prepare-MIB-Cache:
-    needs: doc-path-filter
-    if: ${{ needs.doc-path-filter.outputs.non_doc == 'true' }}
-    runs-on: default
-    name: Prepare shared MIB cache
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 1
+      - name: Decide whether this run builds
+        # The filter's results go through env, never spliced into the script
+        # (test_topotest_verdict.py runs this script over every case).
+        id: decide
+        env:
+          FILTER_OUTCOME: ${{ steps.filter.outcome }}
+          DOC: ${{ steps.filter.outputs.doc }}
+          NON_DOC: ${{ steps.filter.outputs.non_doc }}
+        run: |
+          set -euo pipefail
+          build=true
+          if [ "${FILTER_OUTCOME:-}" = success ] && [ "${DOC:-}" = true ] && [ "${NON_DOC:-}" = false ]; then
+            build=false
+          fi
+          echo "paths-filter outcome=${FILTER_OUTCOME:-<none>} doc=${DOC:-<empty>} non_doc=${NON_DOC:-<empty>} -> build=${build}"
+          echo "build=${build}" >> "${GITHUB_OUTPUT}"
       - name: Ensure local MIB cache directory exists
+        if: ${{ steps.decide.outputs.build == 'true' }}
         run: mkdir -p docker/ubuntu-ci/mib-cache
       - name: Restore cached MIB files
+        if: ${{ steps.decide.outputs.build == 'true' }}
         uses: actions/cache@v5
         with:
           path: docker/ubuntu-ci/mib-cache
           key: mib-cache-v1-ubuntu24
       - name: Populate missing MIB cache files
+        if: ${{ steps.decide.outputs.build == 'true' }}
         run: |
           set -euo pipefail
           fetch_to_cache() {
@@ -149,7 +191,9 @@ jobs:
 
   Build:
     runs-on: default
-    needs: Prepare-MIB-Cache
+    needs: doc-path-filter
+    # `build`, never the raw non_doc: see the comment on doc-path-filter.
+    if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
     name: ${{ matrix.cfg.name }}
     # Guardrail in case a build leg hangs.
     #
@@ -173,9 +217,156 @@ jobs:
         # two 24.04 legs shared one, each overwrote the other's registry manifest
         # on master and every PR build of the loser missed cache and rebuilt the
         # whole image, blowing the 45m timeout.
+        #
+        # The LTTng leg is its own job, Build-LTTng, so that it no longer
+        # gates Test and Unit-Test (BLO-35428); see there.  `lttng: 'false'`
+        # is spelled out because no row here sets it any more, and actionlint
+        # types `matrix.cfg` off these rows: the build step's (shared with
+        # Build-LTTng) `matrix.cfg.lttng || 'false'` would otherwise read an
+        # undefined property.  The build arg is ENABLE_LTTNG=false either way.
         cfg:
-        -  { rel: '22.04', name: 'Ubuntu 22.04 amd64 Build',       platform: 'amd64_u22' }
-        -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 Build',       platform: 'amd64_u24' }
+        -  { rel: '22.04', name: 'Ubuntu 22.04 amd64 Build',       platform: 'amd64_u22', lttng: 'false' }
+        -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 Build',       platform: 'amd64_u24', lttng: 'false' }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Ensure local MIB cache directory exists
+        run: mkdir -p docker/ubuntu-ci/mib-cache
+      - name: Restore cached MIB files
+        if: ${{ matrix.cfg.rel == '24.04' }}
+        uses: actions/cache/restore@v5
+        with:
+          path: docker/ubuntu-ci/mib-cache
+          key: mib-cache-v1-ubuntu24
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: registry.blockcast.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Build docker image (cached)
+        uses: docker/build-push-action@v6
+        env:
+          # Temporary diagnostic to make Buildx cache behavior visible in job summary.
+          DOCKER_BUILD_SUMMARY: true
+        with:
+          context: .
+          file: docker/ubuntu-ci/Dockerfile
+          build-args: |
+            UBUNTU_VERSION=${{ matrix.cfg.rel }}
+            ENABLE_LTTNG=${{ matrix.cfg.lttng || 'false' }}
+            FRR_SOURCE_REV=${{ github.sha }}
+          # One exporter: a registry image, which `Unit-Test` and `Test` both
+          # pull.  Moving them off Actions artifact storage deleted a 5-43 min
+          # variance term for the same bytes (BLO-29817).
+          #
+          # BLO-35428: until then a second, `type=docker` tar exporter fed
+          # `Test` through a `<platform>-image` artifact.  Once `Test` pulled
+          # from Harbor nothing downloaded that artifact (no workflow in
+          # .github/workflows names it), yet every leg still paid for it: the
+          # upload step's 3.3 min and the 0.7-min tarball send, at the median.
+          # Both are gone.
+          #
+          # The tag lives under the same `cache/frr-ci` repository the buildcache
+          # already writes (buildcache-seed.yml), so this needs no registry scope
+          # that is not already exercised on every master push. The `img-` prefix
+          # keeps it out of the `-buildcache` tag namespace that
+          # buildcache_freshness.py asserts on.
+          #
+          # The exporter carries its full registry name inline, and there is
+          # deliberately no `tags:` input.  `tags:` becomes a global `--tag`
+          # that buildx applies to every exporter; an unqualified
+          # `frr-<platform>` there resolves to docker.io/library/frr-<platform>
+          # and fails with `insufficient_scope` (run 34682460908, all three
+          # legs).  `Unit-Test` and `Test` re-tag the pulled image as
+          # `frr-<platform>` themselves.
+          outputs: |
+            type=image,name=registry.blockcast.net/cache/frr-ci:img-${{ github.sha }}-${{ matrix.cfg.platform }},push=true
+          # Harbor connectivity is intentionally required for heavy image builds.
+          #
+          # Read-only, on every ref including master. `cache-to` deliberately
+          # lives in buildcache-seed.yml instead, because this workflow sets
+          # `cancel-in-progress: true` on a group keyed only on `github.ref`:
+          # when master was the sole cache writer it was also the most
+          # cancellable run, so a second master push killed the write. Measured
+          # over 44 master push runs (2026-07-02 -> 2026-08-21), 23 were
+          # cancelled, 16 of them provably by the next master push. See
+          # buildcache-seed.yml for the full reasoning and why exempting master
+          # from cancellation was rejected instead.
+          #
+          # Keeping exactly one writer also avoids the concurrent-writer hazard
+          # the matrix comment above records: two runs exporting to one
+          # registry cache ref overwrite each other's manifest.
+          cache-from: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.platform }}-buildcache
+      - name: Clear any previous results
+        # So if all jobs are re-run then all tests will be re-run.
+        #
+        # BLO-35428: one seed per Test shard, because each shard resumes from
+        # its own test-results-<platform>-s<k> artifact.  The loop below, the
+        # "Save cleared previous results (shard k)" steps, the Test matrix's
+        # `shard:` list, Test's TOPOTEST_SHARDS and CI-Verdict's --shards must
+        # all agree; test_topotest_shards.py pins them together.  A shard with
+        # no seed would, on "Re-run all jobs", resume from the previous
+        # attempt's results instead of re-running its whole plan.
+        run: |
+          rm -rf test-results-${{ matrix.cfg.platform }}*
+          for k in 1 2; do
+            mkdir -p test-results-${{ matrix.cfg.platform }}-s${k}
+            touch test-results-${{ matrix.cfg.platform }}-s${k}/cleared-results.txt
+          done
+      - name: Save cleared previous results (shard 1)
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ matrix.cfg.platform }}-s1
+          path: test-results-${{ matrix.cfg.platform }}-s1
+          overwrite: true
+          retention-days: 14
+          if-no-files-found: error
+      - name: Save cleared previous results (shard 2)
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ matrix.cfg.platform }}-s2
+          path: test-results-${{ matrix.cfg.platform }}-s2
+          overwrite: true
+          retention-days: 14
+          if-no-files-found: error
+      - name: Cleanup
+        if: ${{ always() }}
+        run: rm -rf test-results-${{ matrix.cfg.platform }}*
+
+  Build-LTTng:
+    # BLO-35428: the LTTng image is built on every run but consumed by
+    # nothing -- Unit-Test and Test cover amd64_u22 and amd64_u24 only -- so
+    # all it contributes is the signal that the `--enable-lttng` build and
+    # the image's `make check` (Dockerfile:286) still pass.  As a Build
+    # matrix leg it held Test and Unit-Test until it finished: it delayed
+    # the Build gate in 16 of 39 runs, by up to 47.1 min.  As its own job it
+    # runs alongside Test instead, and CI-Verdict needs it and requires it
+    # to be 'success', so an LTTng failure still turns the run red.
+    #
+    # Its steps are a COPY of Build's first five: keep them in lockstep.
+    # They differ only in `outputs: type=cacheonly` (no image to push:
+    # nothing pulls one) and in having no seed, upload or cleanup steps
+    # (no Test shard reads an LTTng result).  test_buildcache_freshness.py
+    # fails on any other drift, and checks this matrix together with
+    # Build's against buildcache-seed.yml's.
+    runs-on: default
+    needs: doc-path-filter
+    if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
+    name: ${{ matrix.cfg.name }}
+    # Same guardrail, and same reasoning, as Build.
+    timeout-minutes: ${{ github.ref == 'refs/heads/master' && 90 || 45 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # One entry, as a flow mapping, so the matrix parser in
+        # test_buildcache_freshness.py reads it exactly as it reads Build's.
+        cfg:
         -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 LTTng Build', platform: 'amd64_u24_lttng', lttng: 'true' }
 
     steps:
@@ -211,100 +402,24 @@ jobs:
             UBUNTU_VERSION=${{ matrix.cfg.rel }}
             ENABLE_LTTNG=${{ matrix.cfg.lttng || 'false' }}
             FRR_SOURCE_REV=${{ github.sha }}
-          # Two exporters, one build:
-          #
-          #   * the tar, still consumed by the `Test` (arc-e2e) lane, which has
-          #     no proven route to registry.blockcast.net -- that reachability
-          #     probe is tracked separately on BLO-29817.
-          #   * a registry image, consumed by `Unit-Test`. Moving that lane off
-          #     Actions artifact storage deletes a 5-43 min variance term that
-          #     was consuming 100% of its 20-minute budget (BLO-29817).
-          #
-          # The tag lives under the same `cache/frr-ci` repository the buildcache
-          # already writes (buildcache-seed.yml), so this needs no registry scope
-          # that is not already exercised on every master push. The `img-` prefix
-          # keeps it out of the `-buildcache` tag namespace that
-          # buildcache_freshness.py asserts on.
-          #
-          # Each exporter carries its OWN name, and there is deliberately no
-          # `tags:` input. `tags:` becomes a global `--tag`, which buildx applies
-          # to *every* exporter -- so with two exporters the pushing one also
-          # received the unqualified `frr-<platform>`, resolved it to
-          # docker.io/library/frr-<platform>, and failed with
-          # `insufficient_scope` (run 34682460908, all three legs). The `Test`
-          # lane still needs that bare name baked into the tar, because it does
-          # `docker load` then `docker run frr-<platform>`; `Unit-Test` re-tags
-          # the registry image itself after pulling.
-          outputs: |
-            type=docker,dest=/tmp/frr-${{ matrix.cfg.platform }}.tar,name=frr-${{ matrix.cfg.platform }}
-            type=image,name=registry.blockcast.net/cache/frr-ci:img-${{ github.sha }}-${{ matrix.cfg.platform }},push=true
-          # Harbor connectivity is intentionally required for heavy image builds.
-          #
-          # Read-only, on every ref including master. `cache-to` deliberately
-          # lives in buildcache-seed.yml instead, because this workflow sets
-          # `cancel-in-progress: true` on a group keyed only on `github.ref`:
-          # when master was the sole cache writer it was also the most
-          # cancellable run, so a second master push killed the write. Measured
-          # over 44 master push runs (2026-07-02 -> 2026-08-21), 23 were
-          # cancelled, 16 of them provably by the next master push. See
-          # buildcache-seed.yml for the full reasoning and why exempting master
-          # from cancellation was rejected instead.
-          #
-          # Keeping exactly one writer also avoids the concurrent-writer hazard
-          # the matrix comment above records: two runs exporting to one
-          # registry cache ref overwrite each other's manifest.
+          # Build and discard: the build is the signal, and no job pulls an
+          # LTTng image.  Read-only cache, as in Build (see its comment).
+          outputs: type=cacheonly
           cache-from: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.platform }}-buildcache
-      - name: Upload docker image artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.cfg.platform }}-image
-          path: /tmp/frr-${{ matrix.cfg.platform }}.tar
-          # Artifacts are run-scoped across attempts (BLO-35428: attempt 2 of
-          # run 35409722977 downloaded an artifact attempt 1 uploaded), so a
-          # re-run leg re-uploading this name 409s without overwrite.
-          overwrite: true
-          # Docker images are intermediate CI artifacts; keep for a short period.
-          retention-days: 7
-          if-no-files-found: error
-      - name: Clear any previous results
-        # So if all jobs are re-run then all tests will be re-run.
-        #
-        # BLO-35428: one seed per Test shard, because each shard resumes from
-        # its own test-results-<platform>-s<k> artifact.  The loop below, the
-        # "Save cleared previous results (shard k)" steps, the Test matrix's
-        # `shard:` list, Test's TOPOTEST_SHARDS and CI-Verdict's --shards must
-        # all agree; test_topotest_shards.py pins them together.  A shard with
-        # no seed would, on "Re-run all jobs", resume from the previous
-        # attempt's results instead of re-running its whole plan.
-        run: |
-          rm -rf test-results-${{ matrix.cfg.platform }}*
-          for k in 1 2; do
-            mkdir -p test-results-${{ matrix.cfg.platform }}-s${k}
-            touch test-results-${{ matrix.cfg.platform }}-s${k}/cleared-results.txt
-          done
-      - name: Save cleared previous results (shard 1)
-        uses: actions/upload-artifact@v7
-        with:
-          name: test-results-${{ matrix.cfg.platform }}-s1
-          path: test-results-${{ matrix.cfg.platform }}-s1
-          overwrite: true
-          retention-days: 14
-          if-no-files-found: error
-      - name: Save cleared previous results (shard 2)
-        uses: actions/upload-artifact@v7
-        with:
-          name: test-results-${{ matrix.cfg.platform }}-s2
-          path: test-results-${{ matrix.cfg.platform }}-s2
-          overwrite: true
-          retention-days: 14
-          if-no-files-found: error
-      - name: Cleanup
-        if: ${{ always() }}
-        run: rm -rf test-results-${{ matrix.cfg.platform }}* /tmp/frr-${{ matrix.cfg.platform }}.tar
 
   Unit-Test:
     runs-on: default
     needs: Build
+    # BLO-35428: one lost Build leg must not skip the other platform.  With
+    # the default `success()` a failed Build leg skipped every Unit-Test and
+    # Test job of BOTH platforms (run 35776450503, attempt 1: the 22.04 leg
+    # failed 3.5 min in and the finished 24.04 image went untested).  Now the
+    # failed platform's jobs fail in 1-2 min at the 3-attempt `docker pull`
+    # below (or, on a re-run, test the image an earlier attempt of the same
+    # commit pushed) and the other platform runs; either way CI-Verdict
+    # still requires Build to be 'success'.  Skipped Build (doc-only, or
+    # doc-path-filter failed) still skips this job.
+    if: ${{ !cancelled() && needs.Build.result != 'skipped' }}
     name: ${{ matrix.cfg.name }}
     # Derived, not rounded (BLO-29817 AC3).
     #
@@ -421,7 +536,9 @@ jobs:
         with:
           name: unit-test-results-${{ matrix.cfg.platform }}
           path: unit-test-results-${{ matrix.cfg.platform }}/tests.xml
-          # Run-scoped across attempts; see the Build image upload (BLO-35428).
+          # Artifacts are run-scoped across attempts (BLO-35428: attempt 2 of
+          # run 35409722977 downloaded an artifact attempt 1 uploaded), so a
+          # re-run leg re-uploading this name 409s without overwrite.
           overwrite: true
           retention-days: 14
           if-no-files-found: error
@@ -468,6 +585,10 @@ jobs:
     # arc-default's pod template (Docker/NET_ADMIN/KVM) but is capacity-capped.
     runs-on: arc-e2e
     needs: Build
+    # BLO-35428: as for Unit-Test -- one lost Build leg no longer skips the
+    # other platform's shards (run 35776450503); CI-Verdict still requires
+    # Build to be 'success'.
+    if: ${{ !cancelled() && needs.Build.result != 'skipped' }}
     name: ${{ matrix.cfg.name }} (shard ${{ matrix.shard }}/2)
     # Topotest runs can be long; still cap runtime for stuck jobs.
     #
@@ -528,7 +649,7 @@ jobs:
     #     '.jobs[]|select(.name|test("amd64 Test"))|"\(.name) \(.conclusion) \(((.completed_at|fromdate)-(.started_at|fromdate))/60|floor)min"'
     timeout-minutes: 240
     env:
-      # Pushed by Build's second exporter. Tagged on `github.sha`, not
+      # Pushed by Build's image exporter. Tagged on `github.sha`, not
       # `github.run_id`, so a --failed-only re-run of just this job still
       # resolves after Build is skipped.
       TEST_IMAGE: registry.blockcast.net/cache/frr-ci:img-${{ github.sha }}-${{ matrix.cfg.platform }}
@@ -630,14 +751,8 @@ jobs:
         # Replaces a `download-artifact` + `docker load` round-trip that
         # measured 5..43 min for the same bytes and caused 5 of the 6 cap kills
         # at 241..248 min -- see the timeout-minutes derivation above.
-        #
-        # `Build` still exports the tar and still uploads the
-        # `<platform>-image` artifact; this job was its only consumer, so both
-        # are now dead weight.
-        # ponytail: kept one run as a rollback path because this is the first
-        # registry pull from arc-e2e in this repo. Delete Build's
-        # `type=docker,dest=` exporter and its "Upload docker image artifact"
-        # step once this lane is green post-merge.
+        # Build's tar exporter and `<platform>-image` upload, which nothing
+        # downloaded after this change, are deleted (BLO-35428).
         run: |
           set -euo pipefail
           # BLO-34778: a transient registry error must not burn the whole lane;
@@ -1195,23 +1310,29 @@ jobs:
     # GitHub renders a skipped job as neutral.  This job reads every gating
     # job's result plus each shard's plan artifact, and
     # .github/scripts/topotest_verdict.py (its header has the rules) fails
-    # closed: the only two ways to pass without a green Build, Unit-Test and
-    # every Test shard are the two cases this workflow deliberately builds
-    # no image, each matched exactly --
-    #   * doc-only: doc-path-filter concluded 'success' AND its outputs are
-    #     exactly doc 'true', non_doc 'false'.  NOT `non_doc != 'true'`:
+    # closed: the only two ways to pass without a green Build, Build-LTTng,
+    # Unit-Test and every Test shard are the two cases this workflow
+    # deliberately builds no image, each matched exactly --
+    #   * doc-only: doc-path-filter concluded 'success' AND its build output
+    #     is the string 'false' AND the raw classification is doc 'true',
+    #     non_doc 'false'.  Never an inequality such as `build != 'true'`:
     #     doc-path-filter runs on the preemptible `default` pool (a pod was
-    #     preempted there in run 35776450503), and a filter that fails or
-    #     loses its runner leaves its outputs empty and skips Build and
-    #     Test, so an inequality would pass a run that built and tested
-    #     nothing.  NOT non_doc 'false' alone either: paths-filter reports
-    #     doc 'false', non_doc 'false' for a change list with no files (the
-    #     first push of a branch at a commit already on master), and that
-    #     is red, not doc-only;
+    #     preempted there in run 35776450503) and now also fetches nine
+    #     MIBs from IANA/IEEE, and a job that fails or loses its runner
+    #     leaves its outputs empty and skips Build and Test, so an
+    #     inequality would pass a run that built and tested nothing.  Never
+    #     non_doc 'false' alone either: paths-filter reports doc 'false',
+    #     non_doc 'false' for a change list with no files (the first push
+    #     of a branch at a commit already on master); the decide step
+    #     builds that, and the verdict judges it in full;
     #   * mergify: doc-path-filter 'skipped' AND event pull_request AND actor
     #     mergify[bot], the exact condition of doc-path-filter's own `if:`.
     # Whether mergify backports must build before this check becomes
     # required is left to that change (BLO-35428 item 16).
+    #
+    # Build-LTTng is here because it left Build's matrix so as not to delay
+    # Test (BLO-35428): no other job needs it, so without this entry an
+    # LTTng build failure would be a red job this verdict never saw.
     #
     # Documentation-HTML is here because a doc-only run is not a run that
     # builds nothing: it builds the HTML docs, and that job is the only
@@ -1226,7 +1347,7 @@ jobs:
     # review gate runs there (review-gate.yml).
     runs-on: arc-light
     if: ${{ always() }}
-    needs: [doc-path-filter, Build, Unit-Test, Test, Documentation-HTML]
+    needs: [doc-path-filter, Build, Build-LTTng, Unit-Test, Test, Documentation-HTML]
     name: CI-Verdict
     timeout-minutes: 10
     steps:

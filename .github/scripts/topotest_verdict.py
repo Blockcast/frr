@@ -19,34 +19,41 @@
 # two cases where the workflow deliberately builds no image, and each is
 # matched exactly, never by exclusion:
 #
-#   * doc-only:  doc-path-filter.result == 'success' AND its outputs are
-#                exactly doc 'true', non_doc 'false'.  NOT `non_doc !=
-#                'true'`: a filter job that failed, was cancelled, or lost
-#                its runner (arc-default pods are preemptible; one was
-#                preempted in run 35776450503) before writing outputs leaves
-#                them empty, Build/Test are then skipped, and an inequality
-#                test would pass a run that built and tested nothing.  And
-#                NOT non_doc 'false' alone: dorny/paths-filter sets every
-#                filter to `files.length > 0` (v4 main.ts exportResults), so
-#                a change list with no files at all -- the first push of a
-#                branch at a commit already on master, which it diffs
-#                against the merge base -- is doc 'false', non_doc 'false'.
-#                That run changed nothing that says it may skip anything, so
-#                it is red, not exempt.  (Under today's filter, `['**',
-#                '!doc/**']` with the default 'some' quantifier, '**' alone
-#                matches doc/ files too, so non_doc is 'true' on every
-#                non-empty change list: doc-only master commit a851033021
-#                still ran every Build and Test, run 32434420008.  Empty was
-#                therefore the only way to reach this exemption.)
+#   * doc-only:  doc-path-filter.result == 'success' AND its build output
+#                is the string 'false' AND its raw paths-filter
+#                classification is exactly doc 'true', non_doc 'false' (the
+#                only case its "Decide whether this run builds" step writes
+#                build=false for; re-checked here so a drift in that step
+#                cannot exempt anything else).  NOT `build != 'true'`: a
+#                filter job that failed, was cancelled, or lost its runner
+#                (arc-default pods are preemptible; one was preempted in run
+#                35776450503) before writing outputs leaves them empty,
+#                Build/Test are then skipped, and an inequality test would
+#                pass a run that built and tested nothing.  And NOT non_doc
+#                'false' alone: dorny/paths-filter sets every filter to
+#                `files.length > 0` (v4 main.ts exportResults), so a change
+#                list with no files at all -- the first push of a branch at
+#                a commit already on master, which it diffs against the
+#                merge base -- is doc 'false', non_doc 'false'.  The decide
+#                step builds that, and a build=false claim over it is red
+#                here.  (Under today's filter, `['**', '!doc/**']` with the
+#                default 'some' quantifier, '**' alone matches doc/ files
+#                too, so non_doc is 'true' on every non-empty change list:
+#                doc-only master commit a851033021 still ran every Build and
+#                Test, run 32434420008.)
 #   * mergify:   doc-path-filter.result == 'skipped' AND the event is
 #                pull_request AND the actor is mergify[bot] -- the exact
 #                condition doc-path-filter's own `if:` skips on.
 #
-# Both exemptions additionally require Build, Unit-Test and Test to be
-# 'skipped'; if any ran, the exemption does not describe this run.  Every
-# other combination goes through the full checks:
+# Both exemptions additionally require Build, Build-LTTng, Unit-Test and
+# Test to be 'skipped'; if any ran, the exemption does not describe this
+# run.  build == 'true' (including a filter that errored: it defaults to
+# building everything) and every other combination go through the full
+# checks:
 #
-#   * Build, Unit-Test and Test are each 'success';
+#   * Build, Build-LTTng, Unit-Test and Test are each 'success'.
+#     Build-LTTng is not needed by any other job (BLO-35428 moved it off
+#     the Test gate), so this is the one place its failure counts;
 #   * per platform, all N plan artifacts are present and complete, their
 #     plans are pairwise disjoint, their universe.txt files are identical,
 #     and the plans' union is that universe;
@@ -77,7 +84,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from topotest_coverage import normalize, split_id  # noqa: E402
 
 FILTER_JOB = "doc-path-filter"
-REQUIRED_JOBS = ("Build", "Unit-Test", "Test")
+REQUIRED_JOBS = ("Build", "Build-LTTng", "Unit-Test", "Test")
 # Needed by the verdict, but conditional: it runs only when doc/ changed.
 DOCS_JOB = "Documentation-HTML"
 MERGIFY_ACTOR = "mergify[bot]"
@@ -124,6 +131,7 @@ def job_rules(needs, event_name, actor, required=REQUIRED_JOBS):
     outputs = filt.get("outputs")
     if not isinstance(outputs, dict):
         outputs = {}
+    build = outputs.get("build")
     doc = outputs.get("doc")
     non_doc = outputs.get("non_doc")
     others = {job: needs[job]["result"] for job in required}
@@ -144,31 +152,32 @@ def job_rules(needs, event_name, actor, required=REQUIRED_JOBS):
         # Documentation-HTML needs the filter, so it is skipped with it.
         docs_want = "skipped"
     elif result == "success":
-        for name, value in (("non_doc", non_doc), ("doc", doc)):
-            if value not in ("true", "false"):
+        if build == "false":
+            if doc != "true" or non_doc != "false":
                 return [
-                    "{} succeeded but its {} output is {!r}, neither 'true' "
-                    "nor 'false'; cannot tell whether this run had to build "
-                    "and test".format(FILTER_JOB, name, value)
+                    "{} says build 'false' but classified the change as doc "
+                    "{!r}, non_doc {!r}, not exactly doc-only ('true', "
+                    "'false'); refusing to exempt a run from building".format(
+                        FILTER_JOB, doc, non_doc
+                    )
                 ], None
-        if non_doc == "false":
-            if doc != "true":
-                return [
-                    "{} succeeded but classified the change as doc 'false', "
-                    "non_doc 'false': paths-filter found no changed file at "
-                    "all (e.g. the first push of a branch at a commit already "
-                    "on master), which is not a doc-only change; nothing says "
-                    "this run may skip its build and tests".format(FILTER_JOB)
-                ], None
-            exempt = "doc-only change ({} doc == 'true', non_doc == 'false')".format(
-                FILTER_JOB
+            exempt = (
+                "doc-only change ({} build == 'false', doc == 'true', "
+                "non_doc == 'false')".format(FILTER_JOB)
             )
+        elif build != "true":
+            return [
+                "{} succeeded but its build output is {!r}, neither 'true' "
+                "nor 'false'; cannot tell whether this run had to build and "
+                "test".format(FILTER_JOB, build)
+            ], None
+        # Documentation-HTML's `if:` reads the raw doc output.
         docs_want = "success" if doc == "true" else "skipped"
     else:
         return [
-            "{} concluded {!r} (non_doc {!r}): a filter that did not succeed "
+            "{} concluded {!r} (build {!r}): a filter that did not succeed "
             "cannot exempt anything, and the jobs behind it did not run".format(
-                FILTER_JOB, result, non_doc
+                FILTER_JOB, result, build
             )
         ], None
 
@@ -383,8 +392,8 @@ def main(argv=None):
         print("CI-Verdict: green by exemption: " + exempt)
     else:
         print(
-            "CI-Verdict: green: Build, Unit-Test and every Test shard succeeded, "
-            "and the shards covered the collection exactly once."
+            "CI-Verdict: green: Build, Build-LTTng, Unit-Test and every Test "
+            "shard succeeded, and the shards covered the collection exactly once."
         )
     return 0
 
