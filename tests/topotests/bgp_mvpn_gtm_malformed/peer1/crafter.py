@@ -55,6 +55,39 @@ site in main() carries the matching label.
       "the receiver processed the whole stream and rejected it", not "the
       receiver has not reached that UPDATE yet".
 
+PHASE 2 (fires when the test touches its trigger file, then sentinel Z2). Every
+case here was advertised ACCEPTABLY in phase 1 and is now re-advertised in a
+form the receiver must reject, which is the only way to tell "rejected and
+withdrew the earlier copy" from "rejected and stranded it":
+
+  P1. Type-3 (STRAND_T3) re-sent WITHOUT its PMSI Tunnel attribute -- same
+      NLRI, attribute removed, so RFC 4271 Section 9 makes it a replacement
+      route and the earlier copy MUST be gone.
+  P2. Type-1 (STRAND_T1_ORIGINATOR) re-sent WITHOUT PMSI -- same, for the
+      Type-1 gate and its separate RIB-AFI selection.
+  P3. Type-5 (RDKEEP) re-sent with RD 1 for the SAME (S,G) -- a DIFFERENT
+      NLRI, so the earlier RD-0 route MUST SURVIVE. This is the regression
+      guard for the deliberate RD exception: our RIB key drops the RD, so a
+      reject that withdrew here would silently delete a valid route.
+  Z2. Phase-2 sentinel.
+
+PHASE 3 (on trigger) re-advertises the two routes phase 2 got withdrawn, this
+time WELL-FORMED again:
+
+  R1/R2. Type-3 and Type-1 with their PMSI Tunnel attribute back -- both MUST
+      reappear. A path marked for delete is not reaped until the work queue
+      drains, so a re-advertisement that lands first has to resurrect it
+      (bgp_path_info_restore). Without that the attrhash_cmp fast path hands
+      back a doomed path and the route is black-holed: the peer's adj-rib-out
+      still says "advertised", so it never re-sends.
+  Z3. Phase-3 sentinel.
+
+PHASE 4 (on trigger) exercises the REAL withdraw path, which nothing else in
+the tree covers -- every other MP_UNREACH here carries zero NLRI:
+
+  W1. MP_UNREACH carrying the Type-3 NLRI by key -- must remove it.
+  Z4. Phase-4 sentinel.
+
 WARNING: case H is the ONLY case whose AS_PATH may contain 65001. The test
 asserts the neighbour's aspathLoop denial counter is exactly 1, which catches
 double-counting; a second looping case would have to update that assertion.
@@ -63,9 +96,10 @@ The positive control is essential: it proves the crafted NLRI encoding and
 the AF negotiation are correct, so that "route absent" for B and C means the
 reject logic fired, not that the whole path is broken.
 
-Usage: crafter.py <peer_ip> <local_as> <local_id>
+Usage: crafter.py <peer_ip> <local_as> <local_id> [trigger_dir]
 """
 
+import os
 import select
 import socket
 import struct
@@ -141,7 +175,26 @@ LOOP_GRP = "232.50.50.1"      # valid SSM/RD 0, but AS_PATH contains 65001
 FOREIGN_SRC = "10.50.50.2"
 FOREIGN_GRP = "232.50.50.2"   # valid SSM/RD 0, AS_PATH = 65010 only -> install
 SENTINEL_SRC = "10.70.70.1"
-SENTINEL_GRP = "232.70.70.1"  # last UPDATE on the wire; see case Z above
+SENTINEL_GRP = "232.70.70.1"  # last UPDATE of phase 1; see case Z above
+
+# Phase-2 (see below): routes advertised well-formed in phase 1, then RE-sent
+# in a way that must be rejected. They prove a reject either withdraws the
+# earlier copy or deliberately leaves it alone.
+STRAND_T3_SRC = "10.90.90.1"
+STRAND_T3_GRP = "232.90.90.1"   # Type-3 with PMSI, then re-sent without it
+STRAND_T1_ORIGINATOR = "10.0.0.7"  # Type-1 with PMSI, then re-sent without it
+RDKEEP_SRC = "10.91.91.1"
+RDKEEP_GRP = "232.91.91.1"      # Type-5 RD 0, then RD 1 for the SAME (S,G)
+SENTINEL2_SRC = "10.92.92.1"
+SENTINEL2_GRP = "232.92.92.1"   # last UPDATE of phase 2
+SENTINEL3_SRC = "10.93.93.1"
+SENTINEL3_GRP = "232.93.93.1"   # last UPDATE of phase 3
+SENTINEL4_SRC = "10.94.94.1"
+SENTINEL4_GRP = "232.94.94.1"   # last UPDATE of phase 4
+# Phases 2-4 fire when the TEST touches a trigger file, not on a timer. A timer
+# would race the test: whichever ran first would decide whether the phase-1
+# state was still observable, and a lost race reports as "route not installed",
+# indistinguishable from a real parse regression.
 RECEIVER_AS = 65001
 FOREIGN_AS = 65010
 AS_SEQUENCE = 2
@@ -289,14 +342,17 @@ def build_mvpn_update(
     return MARKER + struct.pack("!HB", 19 + len(payload), BGP_UPDATE) + payload
 
 
-def build_empty_mp_unreach():
-    """UPDATE with an MP_UNREACH_NLRI carrying AFI+SAFI only (no NLRI).
+def build_mp_unreach(nlri=b""):
+    """UPDATE with an MP_UNREACH_NLRI carrying AFI+SAFI and optional NLRI.
+
+    With nlri empty this is the zero-length withdraw that used to crash the
+    receiver. With NLRI bytes it is an ordinary withdraw by key.
 
     The attribute value is exactly 3 bytes, so the MVPN parser sees a
     zero-length NLRI. This is the crash-on-empty-withdraw (stream_new(0))
     case the fix guards.
     """
-    mp_unreach_val = struct.pack("!HB", AFI_IP, SAFI_MCAST_VPN)  # 3 bytes, no NLRI
+    mp_unreach_val = struct.pack("!HB", AFI_IP, SAFI_MCAST_VPN) + nlri
     attrs = struct.pack("!BBB", 0x80, 15, len(mp_unreach_val)) + mp_unreach_val
     payload = struct.pack("!H", 0) + struct.pack("!H", len(attrs)) + attrs
     return MARKER + struct.pack("!HB", 19 + len(payload), BGP_UPDATE) + payload
@@ -358,9 +414,10 @@ def handshake(peer_ip, local_as, router_id):
 
 
 def main():
-    if len(sys.argv) != 4:
-        print("Usage: crafter.py <peer_ip> <local_as> <local_id>")
+    if len(sys.argv) not in (4, 5):
+        print("Usage: crafter.py <peer_ip> <local_as> <local_id> [trigger_dir]")
         sys.exit(1)
+    trigger_dir = sys.argv[4] if len(sys.argv) == 5 else None
     peer_ip = sys.argv[1]
     local_as = int(sys.argv[2])
     local_id = sys.argv[3]
@@ -551,8 +608,28 @@ def main():
         )
     )
     # F: empty MP_UNREACH -- must not crash the receiver.
-    sock.sendall(build_empty_mp_unreach())
-    # Z: sentinel, always last. Tests that assert an earlier case was REJECTED
+    sock.sendall(build_mp_unreach())
+    # Phase-1 halves of the phase-2 probes: all three must INSTALL here.
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type3_nlri(zero_rd, STRAND_T3_SRC, STRAND_T3_GRP, TYPE3_ORIGINATOR),
+            include_pmsi=True,
+            pmsi_label=SELECTIVE_LABEL,
+        )
+    )
+    sock.sendall(
+        build_mvpn_update(
+            local_id,
+            _type1_nlri(zero_rd, STRAND_T1_ORIGINATOR),
+            include_pmsi=True,
+            pmsi_label=SELECTIVE_LABEL,
+        )
+    )
+    sock.sendall(
+        build_mvpn_update(local_id, _type5_nlri(zero_rd, RDKEEP_SRC, RDKEEP_GRP))
+    )
+    # Z: phase-1 sentinel (later phases add their own). Tests that assert an earlier case was REJECTED
     # gate on this one being installed, which proves the receiver consumed the
     # whole stream rather than merely the first few UPDATEs.
     sock.sendall(
@@ -562,8 +639,71 @@ def main():
 
     # Keepalive loop so the session stays up for the test to observe steady state.
     # Exits cleanly (0) on teardown -- the peer socket is torn down under us.
+    # Keepalive loop. Each later phase fires once, when the test touches its
+    # trigger file, so the test controls ordering and nothing races a sleep.
+    def _fired(name):
+        return trigger_dir and os.path.exists(os.path.join(trigger_dir, name))
+
+    def _send_phase(num, messages):
+        """Send one phase with a longer timeout than the 1 s keepalive poll.
+
+        A socket.timeout inside sendall is an OSError that gives no indication
+        of how many bytes went out, so a mid-UPDATE timeout would desynchronise
+        the stream and the receiver would reset the session -- taking every
+        other test in the suite with it."""
+        sock.settimeout(10)
+        try:
+            for m in messages:
+                sock.sendall(m)
+            print("phase {} sent".format(num), flush=True)
+            return True
+        except OSError as exc:
+            print("phase {} send failed: {}".format(num, exc), flush=True)
+            return False
+        finally:
+            sock.settimeout(1)
+
+    done = set()
     sock.settimeout(1)
     while True:
+        if 2 not in done and _fired("phase2"):
+            if not _send_phase(2, [
+                # P1: same Type-3 NLRI, PMSI removed -> must withdraw.
+                build_mvpn_update(local_id, _type3_nlri(zero_rd, STRAND_T3_SRC,
+                                                        STRAND_T3_GRP, TYPE3_ORIGINATOR)),
+                # P2: same Type-1 NLRI, PMSI removed -> must withdraw.
+                build_mvpn_update(local_id, _type1_nlri(zero_rd, STRAND_T1_ORIGINATOR)),
+                # P3: DIFFERENT NLRI (RD 1) for an installed (S,G) -> must NOT touch it.
+                build_mvpn_update(local_id, _type5_nlri(nonzero_rd, RDKEEP_SRC, RDKEEP_GRP)),
+                build_mvpn_update(local_id, _type5_nlri(zero_rd, SENTINEL2_SRC,
+                                                        SENTINEL2_GRP)),
+            ]):
+                break
+            done.add(2)
+        if 3 not in done and _fired("phase3"):
+            if not _send_phase(3, [
+                # R1/R2: the same two NLRI, well-formed again -> must come back.
+                build_mvpn_update(local_id,
+                                  _type3_nlri(zero_rd, STRAND_T3_SRC, STRAND_T3_GRP,
+                                              TYPE3_ORIGINATOR),
+                                  include_pmsi=True, pmsi_label=SELECTIVE_LABEL),
+                build_mvpn_update(local_id, _type1_nlri(zero_rd, STRAND_T1_ORIGINATOR),
+                                  include_pmsi=True, pmsi_label=SELECTIVE_LABEL),
+                build_mvpn_update(local_id, _type5_nlri(zero_rd, SENTINEL3_SRC,
+                                                        SENTINEL3_GRP)),
+            ]):
+                break
+            done.add(3)
+        if 4 not in done and _fired("phase4"):
+            if not _send_phase(4, [
+                # W1: a REAL withdraw, by NLRI key.
+                build_mp_unreach(_type3_nlri(zero_rd, STRAND_T3_SRC, STRAND_T3_GRP,
+                                             TYPE3_ORIGINATOR)),
+                build_mvpn_update(local_id, _type5_nlri(zero_rd, SENTINEL4_SRC,
+                                                        SENTINEL4_GRP)),
+            ]):
+                break
+            done.add(4)
         try:
             mt, _ = recv_msg(sock)
             if mt == BGP_KEEPALIVE:
