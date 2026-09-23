@@ -7,7 +7,9 @@ collection exactly once -- or in the two deliberately build-less cases, each
 matched exactly.  A filter job that failed, was cancelled or lost its runner
 (empty outputs) must be red, because the jobs behind it were skipped and
 nothing was built or tested (critic blocker: the first draft passed on
-`non_doc != 'true'`).
+`non_doc != 'true'`).  An empty change list (doc and non_doc both
+'false') is not doc-only, and Documentation-HTML must succeed whenever doc/
+changed, doc-only runs included (review findings on this branch).
 
 Stdlib only, no network.
 
@@ -49,17 +51,36 @@ COLLECTED_IDS = [
 ]
 
 
-def needs(filt="success", non_doc="true", outputs=True, **results):
-    """toJSON(needs) as GitHub renders it; results override Build etc."""
+_DERIVE = object()
+
+
+def needs(filt="success", non_doc="true", doc=_DERIVE, outputs=True, **results):
+    """toJSON(needs) as GitHub renders it; results override Build etc.
+
+    The filter's doc output defaults to the doc-only classification when
+    non_doc is 'false' and to a code-only change otherwise; None leaves it
+    out.  Documentation-HTML defaults to what its `if:` makes it: 'success'
+    when the filter succeeded with doc 'true', 'skipped' otherwise.
+    """
+    if doc is _DERIVE:
+        doc = "true" if non_doc == "false" else "false"
     filter_entry = {"result": filt, "outputs": {}}
-    if outputs and non_doc is not None:
-        filter_entry["outputs"] = {"doc": "false", "non_doc": non_doc}
+    if outputs:
+        o = {"doc": doc, "non_doc": non_doc}
+        filter_entry["outputs"] = {k: v for k, v in o.items() if v is not None}
     n = {"doc-path-filter": filter_entry}
     for job in verdict.REQUIRED_JOBS:
         n[job] = {
             "result": results.get(job.replace("-", "_"), "success"),
             "outputs": {},
         }
+    docs_ran = filt == "success" and outputs and doc == "true"
+    n[verdict.DOCS_JOB] = {
+        "result": results.get(
+            "Documentation_HTML", "success" if docs_ran else "skipped"
+        ),
+        "outputs": {},
+    }
     return n
 
 
@@ -247,6 +268,85 @@ class TestFilterJob(Base):
         n = needs(non_doc="false", Build="failure", Unit_Test="skipped", Test="skipped")
         self.assertRed(n, why="did not skip")
 
+    def test_empty_change_list_is_red_not_doc_only(self):
+        """Review finding: paths-filter says doc 'false', non_doc 'false' when
+        it found no changed file (first push of a branch at a commit already
+        on master).  Nothing was built or tested; that is not an exemption."""
+        n = needs(
+            non_doc="false",
+            doc="false",
+            Build="skipped",
+            Unit_Test="skipped",
+            Test="skipped",
+        )
+        self.assertRed(n, why="found no changed file")
+        self.assertNotIn("green", self.out)
+
+    def test_doc_output_is_compared_exactly(self):
+        for value in ("True", "TRUE", "", "1", None):
+            with self.subTest(doc=value):
+                n = needs(
+                    non_doc="false",
+                    doc=value,
+                    Build="skipped",
+                    Unit_Test="skipped",
+                    Test="skipped",
+                    Documentation_HTML="success",
+                )
+                self.assertRed(n)
+
+
+class TestDocsJob(Base):
+    """Review finding: the docs build is the one job a doc-only run builds.
+
+    It was outside the verdict, so a broken Sphinx build left CI-Verdict
+    green -- on a doc-only run usually before the docs job had finished, and
+    on a mixed run with every other job green.
+    """
+
+    DOC_ONLY = dict(
+        non_doc="false", Build="skipped", Unit_Test="skipped", Test="skipped"
+    )
+
+    def test_doc_only_needs_the_docs_build_to_succeed(self):
+        self.assertGreen(needs(**self.DOC_ONLY))
+        for result in ("failure", "cancelled", "skipped"):
+            with self.subTest(docs=result):
+                n = needs(Documentation_HTML=result, **self.DOC_ONLY)
+                self.assertRed(n, why="Documentation-HTML concluded")
+                self.assertEqual(
+                    self.out.count("::error title=CI-Verdict::"), 1, self.out
+                )
+
+    def test_mixed_change_with_docs_failed_is_red(self):
+        n = needs(doc="true", Documentation_HTML="failure")
+        self.assertRed(n, why="Documentation-HTML concluded 'failure'")
+        self.assertEqual(self.out.count("::error title=CI-Verdict::"), 1, self.out)
+
+    def test_mixed_change_with_docs_green_is_green(self):
+        self.assertGreen(needs(doc="true"))
+
+    def test_docs_ran_on_a_code_only_change_is_red(self):
+        """doc 'false' makes its `if:` false; anything but skipped is drift."""
+        n = needs(doc="false", Documentation_HTML="success")
+        self.assertRed(n, why="should have been 'skipped'")
+
+    def test_mergify_with_docs_ran_is_red(self):
+        n = needs(
+            filt="skipped",
+            outputs=False,
+            Build="skipped",
+            Unit_Test="skipped",
+            Test="skipped",
+            Documentation_HTML="failure",
+        )
+        self.assertRed(n, event="pull_request", actor="mergify[bot]")
+
+    def test_docs_missing_from_needs_is_red(self):
+        n = needs(**self.DOC_ONLY)
+        del n[verdict.DOCS_JOB]
+        self.assertRed(n, why="needs.Documentation-HTML is missing")
+
     def test_mergify_backport_is_green(self):
         n = needs(
             filt="skipped",
@@ -409,7 +509,26 @@ class TestWorkflowWiring(unittest.TestCase):
         self.assertIsNotNone(m)
         listed = [x.strip() for x in m.group(1).split(",")]
         self.assertEqual(
-            sorted(listed), sorted([verdict.FILTER_JOB] + list(verdict.REQUIRED_JOBS))
+            sorted(listed),
+            sorted(
+                [verdict.FILTER_JOB] + list(verdict.REQUIRED_JOBS) + [verdict.DOCS_JOB]
+            ),
+        )
+
+    def test_docs_job_runs_exactly_when_the_verdict_expects_it(self):
+        """The verdict wants the docs job iff the filter said doc 'true'."""
+        m = re.search(
+            r"\n  "
+            + re.escape(verdict.DOCS_JOB)
+            + r":\n(.*?)(?=\n  [A-Za-z][\w-]*:\n)",
+            self.workflow,
+            re.S,
+        )
+        self.assertIsNotNone(m)
+        self.assertRegex(m.group(1), r"(?m)^    needs: doc-path-filter$")
+        self.assertRegex(
+            m.group(1),
+            r"(?m)^    if: \$\{\{ needs\.doc-path-filter\.outputs\.doc == 'true' \}\}$",
         )
 
     def test_mergify_exemption_mirrors_the_filter_jobs_own_if(self):

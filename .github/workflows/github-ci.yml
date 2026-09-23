@@ -1197,17 +1197,28 @@ jobs:
     # .github/scripts/topotest_verdict.py (its header has the rules) fails
     # closed: the only two ways to pass without a green Build, Unit-Test and
     # every Test shard are the two cases this workflow deliberately builds
-    # nothing, each matched exactly --
-    #   * doc-only: doc-path-filter concluded 'success' AND non_doc is the
-    #     string 'false'.  NOT `non_doc != 'true'`: doc-path-filter runs on
-    #     the preemptible `default` pool (a pod was preempted there in run
-    #     35776450503), and a filter that fails or loses its runner leaves
-    #     non_doc empty and skips Build and Test, so an inequality would
-    #     pass a run that built and tested nothing;
+    # no image, each matched exactly --
+    #   * doc-only: doc-path-filter concluded 'success' AND its outputs are
+    #     exactly doc 'true', non_doc 'false'.  NOT `non_doc != 'true'`:
+    #     doc-path-filter runs on the preemptible `default` pool (a pod was
+    #     preempted there in run 35776450503), and a filter that fails or
+    #     loses its runner leaves its outputs empty and skips Build and
+    #     Test, so an inequality would pass a run that built and tested
+    #     nothing.  NOT non_doc 'false' alone either: paths-filter reports
+    #     doc 'false', non_doc 'false' for a change list with no files (the
+    #     first push of a branch at a commit already on master), and that
+    #     is red, not doc-only;
     #   * mergify: doc-path-filter 'skipped' AND event pull_request AND actor
     #     mergify[bot], the exact condition of doc-path-filter's own `if:`.
     # Whether mergify backports must build before this check becomes
     # required is left to that change (BLO-35428 item 16).
+    #
+    # Documentation-HTML is here because a doc-only run is not a run that
+    # builds nothing: it builds the HTML docs, and that job is the only
+    # check on doc/.  It must be 'success' whenever the filter said doc
+    # 'true' (doc-only or mixed) and 'skipped' otherwise; without it the
+    # verdict was green over a broken docs build, usually before the docs
+    # job had even finished.
     #
     # `always()`, not `!cancelled()`: a cancelled run must read red here, not
     # skipped, because a skipped required check counts as passing.
@@ -1215,7 +1226,7 @@ jobs:
     # review gate runs there (review-gate.yml).
     runs-on: arc-light
     if: ${{ always() }}
-    needs: [doc-path-filter, Build, Unit-Test, Test]
+    needs: [doc-path-filter, Build, Unit-Test, Test, Documentation-HTML]
     name: CI-Verdict
     timeout-minutes: 10
     steps:

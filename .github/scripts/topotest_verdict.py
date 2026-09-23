@@ -16,23 +16,35 @@
 # NEEDS_JSON names an environment variable holding `toJSON(needs)`.
 #
 # FAIL CLOSED.  The only two ways to pass without the full checks are the
-# two cases where the workflow deliberately builds nothing, and each is
+# two cases where the workflow deliberately builds no image, and each is
 # matched exactly, never by exclusion:
 #
-#   * doc-only:  doc-path-filter.result == 'success' AND its non_doc output
-#                is the string 'false'.  NOT `non_doc != 'true'`: a filter
-#                job that failed, was cancelled, or lost its runner (arc-default
-#                pods are preemptible; one was preempted in run 35776450503)
-#                before writing outputs leaves non_doc empty, Build/Test are
-#                then skipped, and an inequality test would pass a run that
-#                built and tested nothing.
+#   * doc-only:  doc-path-filter.result == 'success' AND its outputs are
+#                exactly doc 'true', non_doc 'false'.  NOT `non_doc !=
+#                'true'`: a filter job that failed, was cancelled, or lost
+#                its runner (arc-default pods are preemptible; one was
+#                preempted in run 35776450503) before writing outputs leaves
+#                them empty, Build/Test are then skipped, and an inequality
+#                test would pass a run that built and tested nothing.  And
+#                NOT non_doc 'false' alone: dorny/paths-filter sets every
+#                filter to `files.length > 0` (v4 main.ts exportResults), so
+#                a change list with no files at all -- the first push of a
+#                branch at a commit already on master, which it diffs
+#                against the merge base -- is doc 'false', non_doc 'false'.
+#                That run changed nothing that says it may skip anything, so
+#                it is red, not exempt.  (Under today's filter, `['**',
+#                '!doc/**']` with the default 'some' quantifier, '**' alone
+#                matches doc/ files too, so non_doc is 'true' on every
+#                non-empty change list: doc-only master commit a851033021
+#                still ran every Build and Test, run 32434420008.  Empty was
+#                therefore the only way to reach this exemption.)
 #   * mergify:   doc-path-filter.result == 'skipped' AND the event is
 #                pull_request AND the actor is mergify[bot] -- the exact
 #                condition doc-path-filter's own `if:` skips on.
 #
-# Both exemptions additionally require every other needed job to be
-# 'skipped'; if anything ran, the exemption does not describe this run.
-# Every other combination goes through the full checks:
+# Both exemptions additionally require Build, Unit-Test and Test to be
+# 'skipped'; if any ran, the exemption does not describe this run.  Every
+# other combination goes through the full checks:
 #
 #   * Build, Unit-Test and Test are each 'success';
 #   * per platform, all N plan artifacts are present and complete, their
@@ -47,6 +59,12 @@
 #     what each shard actually executed (or carried over non-failing from the
 #     attempt it resumed), not what it was meant to.
 #
+# On every path, doc-only included, Documentation-HTML must be 'success'
+# when the filter said doc 'true' and 'skipped' otherwise.  It is the one
+# job a doc-only run does build, and the only check on doc/: leaving it out
+# made the verdict green over a broken docs build, before the docs job had
+# even finished.
+#
 # Any unreadable input is a failure, never a pass.  Every failed rule is
 # reported, not just the first.
 
@@ -60,6 +78,8 @@ from topotest_coverage import normalize, split_id  # noqa: E402
 
 FILTER_JOB = "doc-path-filter"
 REQUIRED_JOBS = ("Build", "Unit-Test", "Test")
+# Needed by the verdict, but conditional: it runs only when doc/ changed.
+DOCS_JOB = "Documentation-HTML"
 MERGIFY_ACTOR = "mergify[bot]"
 PLAN_FILES = (
     "shard.txt",
@@ -85,10 +105,11 @@ def job_rules(needs, event_name, actor, required=REQUIRED_JOBS):
     """Return (problems, exempt_reason).
 
     exempt_reason is a string when the run is one of the two no-build cases
-    and every other job was skipped; the caller then skips the plan checks.
+    and every required job was skipped; the caller then skips the plan
+    checks.  Documentation-HTML is judged on every path.
     """
     problems = []
-    for job in (FILTER_JOB,) + tuple(required):
+    for job in (FILTER_JOB,) + tuple(required) + (DOCS_JOB,):
         entry = needs.get(job)
         if not isinstance(entry, dict) or not isinstance(entry.get("result"), str):
             problems.append(
@@ -101,8 +122,12 @@ def job_rules(needs, event_name, actor, required=REQUIRED_JOBS):
     filt = needs[FILTER_JOB]
     result = filt["result"]
     outputs = filt.get("outputs")
-    non_doc = outputs.get("non_doc") if isinstance(outputs, dict) else None
+    if not isinstance(outputs, dict):
+        outputs = {}
+    doc = outputs.get("doc")
+    non_doc = outputs.get("non_doc")
     others = {job: needs[job]["result"] for job in required}
+    docs = needs[DOCS_JOB]["result"]
 
     exempt = None
     if result == "skipped":
@@ -116,15 +141,29 @@ def job_rules(needs, event_name, actor, required=REQUIRED_JOBS):
                 "(event {!r}, actor {!r}); nothing says this run may skip its "
                 "build and tests".format(FILTER_JOB, event_name, actor)
             ], None
+        # Documentation-HTML needs the filter, so it is skipped with it.
+        docs_want = "skipped"
     elif result == "success":
+        for name, value in (("non_doc", non_doc), ("doc", doc)):
+            if value not in ("true", "false"):
+                return [
+                    "{} succeeded but its {} output is {!r}, neither 'true' "
+                    "nor 'false'; cannot tell whether this run had to build "
+                    "and test".format(FILTER_JOB, name, value)
+                ], None
         if non_doc == "false":
-            exempt = "doc-only change ({} non_doc == 'false')".format(FILTER_JOB)
-        elif non_doc != "true":
-            return [
-                "{} succeeded but its non_doc output is {!r}, neither 'true' "
-                "nor 'false'; cannot tell whether this run had to build and "
-                "test".format(FILTER_JOB, non_doc)
-            ], None
+            if doc != "true":
+                return [
+                    "{} succeeded but classified the change as doc 'false', "
+                    "non_doc 'false': paths-filter found no changed file at "
+                    "all (e.g. the first push of a branch at a commit already "
+                    "on master), which is not a doc-only change; nothing says "
+                    "this run may skip its build and tests".format(FILTER_JOB)
+                ], None
+            exempt = "doc-only change ({} doc == 'true', non_doc == 'false')".format(
+                FILTER_JOB
+            )
+        docs_want = "success" if doc == "true" else "skipped"
     else:
         return [
             "{} concluded {!r} (non_doc {!r}): a filter that did not succeed "
@@ -136,7 +175,7 @@ def job_rules(needs, event_name, actor, required=REQUIRED_JOBS):
     if exempt is not None:
         ran = {job: r for job, r in others.items() if r != "skipped"}
         if ran:
-            return [
+            problems.append(
                 "exemption '{}' claimed, but {} did not skip; the exemption "
                 "does not describe this run".format(
                     exempt,
@@ -144,13 +183,29 @@ def job_rules(needs, event_name, actor, required=REQUIRED_JOBS):
                         "{} is {!r}".format(j, r) for j, r in sorted(ran.items())
                     ),
                 )
-            ], None
-        return [], exempt
+            )
+    else:
+        for job, r in others.items():
+            if r != "success":
+                problems.append("{} concluded {!r}, not 'success'".format(job, r))
 
-    for job, r in others.items():
-        if r != "success":
-            problems.append("{} concluded {!r}, not 'success'".format(job, r))
-    return problems, None
+    if docs != docs_want:
+        if docs_want == "success":
+            problems.append(
+                "{} concluded {!r}, not 'success': doc/ changed (doc == "
+                "'true'), so the HTML docs build is part of what this run had "
+                "to build".format(DOCS_JOB, docs)
+            )
+        else:
+            problems.append(
+                "{} concluded {!r}, but nothing in this run says doc/ changed "
+                "(it should have been 'skipped'); the verdict's picture of "
+                "this run is wrong".format(DOCS_JOB, docs)
+            )
+
+    if problems:
+        return problems, None
+    return [], exempt
 
 
 def plan_rules(plans_dir, platform, shards):
