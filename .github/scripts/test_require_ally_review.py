@@ -849,6 +849,61 @@ class TestDistinctReviewerHeadBinding(unittest.TestCase):
         )
         self.assertEqual(state, "pending")
 
+    def test_edited_authorization_comment_is_rejected_loudly(self):
+        # The rejection must surface in the log the way the deferral path's
+        # IGNORED line does: the override is the last head-scoped lever before
+        # the blanket label, and the natural repair (fixing a typo in the SHA)
+        # is exactly what edits the comment. Name the comment, the author, both
+        # timestamps and the remedy so the maintainer knows to post anew.
+        edited = comment(override_body(HEAD), login=HUMAN,
+                         updated="2026-07-27T12:00:00Z")
+        edited["id"] = 4242
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            state, _ = decide(
+                reviews=[self._approve("")],
+                comments=[edited],
+                author="app/allyblockcast",
+                trusted={HUMAN},
+            )
+        self.assertEqual(state, "pending")
+        out = buf.getvalue()
+        self.assertIn("review-gate-override: IGNORED an override line on comment 4242 by %s" % HUMAN, out)
+        self.assertIn("created 2026-07-27T10:00:00Z, updated 2026-07-27T12:00:00Z", out)
+        self.assertIn("Post a NEW comment instead.", out)
+
+    def test_unedited_authorization_comment_prints_no_override_diagnostic(self):
+        # The loud path fires only for an override-bearing comment that was
+        # edited; an unedited override, or an edited comment carrying no
+        # override line, must not spam the log.
+        unrelated_edited = comment("just chatting", login=HUMAN,
+                                   updated="2026-07-27T12:00:00Z")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            state, _ = decide(
+                reviews=[self._approve("")],
+                comments=[comment(override_body(HEAD), login=HUMAN), unrelated_edited],
+                author="app/allyblockcast",
+                trusted={HUMAN},
+            )
+        self.assertEqual(state, "success")
+        self.assertNotIn("review-gate-override: IGNORED", buf.getvalue())
+
+    def test_authorization_comment_with_no_edit_timestamp_does_not_bind(self):
+        # Mirror of test_a_comment_with_no_edit_timestamp_cannot_authorize on
+        # the deferral path: "I could not read the edit timestamp" must fail
+        # closed for overrides too, and every default fixture now carries
+        # updated_at, so pin the contract directly.
+        row = comment(override_body(HEAD), login=HUMAN)
+        del row["updated_at"]
+        state, _ = decide(
+            reviews=[self._approve("")],
+            comments=[row],
+            author="app/allyblockcast",
+            trusted={HUMAN},
+        )
+        self.assertEqual(state, "pending")
+
     def test_authorization_by_a_different_login_does_not_bind(self):
         # The approver must bind their own approval; a third party's
         # authorization comment is not evidence of what THIS reviewer saw.
