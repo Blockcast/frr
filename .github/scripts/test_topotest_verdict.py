@@ -63,24 +63,33 @@ _DERIVE = object()
 
 
 def needs(
-    filt="success", build="true", doc=_DERIVE, non_doc=_DERIVE, outputs=True, **results
+    filt="success",
+    build="true",
+    doc=_DERIVE,
+    non_doc=_DERIVE,
+    docs=_DERIVE,
+    outputs=True,
+    **results
 ):
     """toJSON(needs) as GitHub renders it; results override Build etc.
 
-    doc-path-filter's outputs: `build` as its decide step writes it, and the
-    raw paths-filter classification, which by default is doc-only when build
-    is 'false' and a code change otherwise.  None leaves a key out.
+    doc-path-filter's outputs: `build` and `docs` as its decide step writes
+    them, and the raw paths-filter classification, which by default is
+    doc-only when build is 'false' and a code change otherwise; docs is
+    'false' exactly when doc is 'false'.  None leaves a key out.
     Documentation-HTML defaults to what its `if:` makes it: 'success' when
-    the filter succeeded with doc 'true', 'skipped' otherwise.
+    the filter succeeded with docs 'true', 'skipped' otherwise.
     """
     doc_only = build == "false"
     if doc is _DERIVE:
         doc = "true" if doc_only else "false"
     if non_doc is _DERIVE:
         non_doc = "false" if doc_only else "true"
+    if docs is _DERIVE:
+        docs = "false" if doc == "false" else "true"
     filter_entry = {"result": filt, "outputs": {}}
     if outputs:
-        o = {"build": build, "doc": doc, "non_doc": non_doc}
+        o = {"build": build, "doc": doc, "non_doc": non_doc, "docs": docs}
         filter_entry["outputs"] = {k: v for k, v in o.items() if v is not None}
     n = {"doc-path-filter": filter_entry}
     for job in verdict.REQUIRED_JOBS:
@@ -88,7 +97,7 @@ def needs(
             "result": results.get(job.replace("-", "_"), "success"),
             "outputs": {},
         }
-    docs_ran = filt == "success" and outputs and doc == "true"
+    docs_ran = filt == "success" and outputs and docs == "true"
     n[verdict.DOCS_JOB] = {
         "result": results.get(
             "Documentation_HTML", "success" if docs_ran else "skipped"
@@ -446,6 +455,36 @@ class TestDocsJob(Base):
         del n[verdict.DOCS_JOB]
         self.assertRed(n, why="needs.Documentation-HTML is missing")
 
+    def test_filter_that_could_not_decide_must_build_the_docs(self):
+        """Review finding: paths-filter errored (continue-on-error), so doc
+        was empty and a docs job keyed on it was skipped while
+        doc-path-filter concluded 'success' -- all green, docs never built.
+        The decide step now writes docs=true there, so a skip is red."""
+        undecided = dict(build="true", doc="", non_doc="")
+        self.assertGreen(needs(**undecided))
+        self.assertRed(
+            needs(Documentation_HTML="skipped", **undecided),
+            why="Documentation-HTML concluded 'skipped'",
+        )
+        self.assertRed(
+            needs(docs="false", Documentation_HTML="skipped", **undecided),
+            why="says docs 'false'",
+        )
+
+    def test_docs_output_is_compared_exactly(self):
+        for value in ("", None, "True", "FALSE", "false ", "1"):
+            with self.subTest(docs=value):
+                self.assertRed(
+                    needs(docs=value, Documentation_HTML="skipped"),
+                    why="docs output is",
+                )
+
+    def test_docs_false_needs_the_raw_doc_false(self):
+        for doc in ("true", "", None, "False"):
+            with self.subTest(doc=doc):
+                n = needs(doc=doc, docs="false", Documentation_HTML="skipped")
+                self.assertRed(n, why="says docs 'false'")
+
 
 class TestNeedsInput(Base):
     def test_unset_env_is_red(self):
@@ -581,7 +620,7 @@ class TestWorkflowWiring(unittest.TestCase):
         )
 
     def test_docs_job_runs_exactly_when_the_verdict_expects_it(self):
-        """The verdict wants the docs job iff the filter said doc 'true'."""
+        """The verdict wants the docs job iff the decided docs is 'true'."""
         m = re.search(
             r"\n  "
             + re.escape(verdict.DOCS_JOB)
@@ -593,7 +632,8 @@ class TestWorkflowWiring(unittest.TestCase):
         self.assertRegex(m.group(1), r"(?m)^    needs: doc-path-filter$")
         self.assertRegex(
             m.group(1),
-            r"(?m)^    if: \$\{\{ needs\.doc-path-filter\.outputs\.doc == 'true' \}\}$",
+            r"(?m)^    if: \$\{\{ needs\.doc-path-filter\.outputs\.docs "
+            r"== 'true' \}\}$",
         )
 
     def test_mergify_exemption_mirrors_the_filter_jobs_own_if(self):
@@ -714,6 +754,19 @@ class TestGateWiring(unittest.TestCase):
             self.filter, r"(?m)^      build: \$\{\{ steps\.decide\.outputs\.build \}\}$"
         )
 
+    def test_nothing_is_gated_on_the_raw_doc_output(self):
+        """Review finding: continue-on-error leaves the raw doc output empty
+        on a filter error, so a job keyed on it is silently skipped.  Only
+        the decided `docs` output may skip the docs build."""
+        for line in self.workflow.splitlines():
+            if re.match(r"^\s*if:", line):
+                self.assertNotRegex(line, r"outputs\.doc(?!s)\b", line)
+
+    def test_filter_outputs_docs_from_its_decide_step(self):
+        self.assertRegex(
+            self.filter, r"(?m)^      docs: \$\{\{ steps\.decide\.outputs\.docs \}\}$"
+        )
+
     def test_a_paths_filter_error_cannot_fail_or_decide(self):
         (filt,) = [s for s in _steps(self.filter) if "dorny/paths-filter@" in s]
         self.assertRegex(filt, r"(?m)^        id: filter$")
@@ -807,7 +860,9 @@ class TestBuildDecisionStep(unittest.TestCase):
     So the script is lifted out of github-ci.yml and executed the way
     GitHub runs a `shell: bash` step, over every classification the filter
     can hand it.  build=false for anything but a successful, exactly
-    doc-only classification would let a code change skip Build.
+    doc-only classification would let a code change skip Build, and
+    docs=false for anything but a successful doc 'false' would let a filter
+    error skip the docs build.
     """
 
     @classmethod
@@ -826,7 +881,8 @@ class TestBuildDecisionStep(unittest.TestCase):
         cls.script = "\n".join(body).strip() + "\n"
         cls.bash = shutil.which("bash")
 
-    def decide(self, **env):
+    def outputs(self, **env):
+        """Run the step; return what it wrote to GITHUB_OUTPUT, as a dict."""
         self.assertIsNotNone(self.bash, "bash is required to run the step")
         with tempfile.TemporaryDirectory() as tmp:
             script = os.path.join(tmp, "step.sh")
@@ -848,12 +904,20 @@ class TestBuildDecisionStep(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             with open(out) as f:
                 written = [line for line in f.read().splitlines() if line]
-        self.assertEqual(len(written), 1, written)
+        self.assertEqual(len(written), 2, written)
         self.assertRegex(written[0], r"^build=(true|false)$")
-        return written[0].split("=", 1)[1]
+        self.assertRegex(written[1], r"^docs=(true|false)$")
+        return dict(line.split("=", 1) for line in written)
+
+    def decide(self, **env):
+        return self.outputs(**env)["build"]
+
+    def docs(self, **env):
+        return self.outputs(**env)["docs"]
 
     def test_script_takes_its_inputs_from_env_only(self):
         self.assertIn('echo "build=${build}" >> "${GITHUB_OUTPUT}"', self.script)
+        self.assertIn('echo "docs=${docs}" >> "${GITHUB_OUTPUT}"', self.script)
         self.assertNotIn("${{", self.script)
 
     def test_only_a_successful_doc_only_classification_skips_the_build(self):
@@ -886,6 +950,36 @@ class TestBuildDecisionStep(unittest.TestCase):
     def test_unset_inputs_build(self):
         self.assertEqual(self.decide(), "true")
         self.assertEqual(self.decide(DOC="true", NON_DOC="false"), "true")
+
+    def test_only_a_successful_doc_false_skips_the_docs(self):
+        for non_doc in ("true", "false"):  # code only; empty change list
+            with self.subTest(non_doc=non_doc):
+                self.assertEqual(
+                    self.docs(FILTER_OUTCOME="success", DOC="false", NON_DOC=non_doc),
+                    "false",
+                )
+
+    def test_everything_else_builds_the_docs(self):
+        """Review finding: an errored filter step must not skip the docs."""
+        cases = (
+            ("success", "true", "false"),  # doc only
+            ("success", "true", "true"),  # doc + code
+            ("failure", "false", "true"),  # errored, yet wrote outputs
+            ("failure", "", ""),  # errored before writing outputs
+            ("cancelled", "", ""),
+            ("skipped", "", ""),
+            ("", "false", "true"),
+            ("success", "", ""),
+            ("success", "False", "true"),
+            ("success", "false ", "true"),
+        )
+        for outcome, doc, non_doc in cases:
+            with self.subTest(outcome=outcome, doc=doc, non_doc=non_doc):
+                self.assertEqual(
+                    self.docs(FILTER_OUTCOME=outcome, DOC=doc, NON_DOC=non_doc),
+                    "true",
+                )
+        self.assertEqual(self.docs(), "true")
 
 
 if __name__ == "__main__":

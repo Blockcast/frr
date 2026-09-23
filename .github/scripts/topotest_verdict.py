@@ -67,10 +67,14 @@
 #     attempt it resumed), not what it was meant to.
 #
 # On every path, doc-only included, Documentation-HTML must be 'success'
-# when the filter said doc 'true' and 'skipped' otherwise.  It is the one
-# job a doc-only run does build, and the only check on doc/: leaving it out
-# made the verdict green over a broken docs build, before the docs job had
-# even finished.
+# when doc-path-filter's decided docs output is 'true' and 'skipped' when it
+# is 'false' (or the filter was skipped for mergify).  It is the one job a
+# doc-only run does build, and the only check on doc/: leaving it out made
+# the verdict green over a broken docs build, before the docs job had even
+# finished.  docs 'false' is re-checked against the raw doc 'false', and
+# anything but 'true'/'false' is red: the docs job used to key on the raw
+# doc output, which a paths-filter error (continue-on-error) leaves empty,
+# so it was skipped while this job concluded 'success'.
 #
 # Any unreadable input is a failure, never a pass.  Every failed rule is
 # reported, not just the first.
@@ -171,8 +175,23 @@ def job_rules(needs, event_name, actor, required=REQUIRED_JOBS):
                 "nor 'false'; cannot tell whether this run had to build and "
                 "test".format(FILTER_JOB, build)
             ], None
-        # Documentation-HTML's `if:` reads the raw doc output.
-        docs_want = "success" if doc == "true" else "skipped"
+        # Documentation-HTML's `if:` reads the decided docs output, which
+        # the decide step makes 'false' only for a successful filter step
+        # that said doc 'false'; re-checked here like build 'false' is.
+        docs_decided = outputs.get("docs")
+        if docs_decided not in ("true", "false"):
+            return [
+                "{} succeeded but its docs output is {!r}, neither 'true' "
+                "nor 'false'; cannot tell whether this run had to build the "
+                "HTML docs".format(FILTER_JOB, docs_decided)
+            ], None
+        if docs_decided == "false" and doc != "false":
+            return [
+                "{} says docs 'false' but its raw classification is doc {!r}, "
+                "not exactly 'false'; refusing to exempt a run from building "
+                "its docs".format(FILTER_JOB, doc)
+            ], None
+        docs_want = "success" if docs_decided == "true" else "skipped"
     else:
         return [
             "{} concluded {!r} (build {!r}): a filter that did not succeed "
@@ -201,9 +220,9 @@ def job_rules(needs, event_name, actor, required=REQUIRED_JOBS):
     if docs != docs_want:
         if docs_want == "success":
             problems.append(
-                "{} concluded {!r}, not 'success': doc/ changed (doc == "
-                "'true'), so the HTML docs build is part of what this run had "
-                "to build".format(DOCS_JOB, docs)
+                "{} concluded {!r}, not 'success': doc/ changed, or the "
+                "filter could not tell (docs == 'true'), so the HTML docs "
+                "build is part of what this run had to build".format(DOCS_JOB, docs)
             )
         else:
             problems.append(

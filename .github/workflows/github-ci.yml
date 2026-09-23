@@ -52,6 +52,15 @@ jobs:
   # is skipped and CI-Verdict is red: it passes a build-less run only on this
   # job's 'success' with build 'false' and that exact doc-only classification
   # (topotest_verdict.py).
+  #
+  # The same step writes `docs`, which Documentation-HTML keys on, by the
+  # same rule turned around: 'false' only when the filter step succeeded AND
+  # said doc == 'false'; a filter error or missing outputs give 'true'.
+  # Keying the docs job on the raw doc output instead let the
+  # continue-on-error above hide a filter error from it: doc was empty, the
+  # docs job was skipped (neutral), this job still concluded 'success', and
+  # a PR whose docs were never built showed all green.  CI-Verdict requires
+  # Documentation-HTML 'success' exactly when docs is 'true'.
   doc-path-filter:
     if: ${{ github.event_name != 'pull_request' || github.actor != 'mergify[bot]' }}
     runs-on: default
@@ -65,6 +74,7 @@ jobs:
       doc: ${{ steps.filter.outputs.doc }}
       non_doc: ${{ steps.filter.outputs.non_doc }}
       build: ${{ steps.decide.outputs.build }}
+      docs: ${{ steps.decide.outputs.docs }}
     steps:
       - name: Checkout
         # BLO-35428: pull requests skip this full-history checkout (2.48 min
@@ -92,8 +102,9 @@ jobs:
               - '**'
               - '!doc/**'
       - name: Decide whether this run builds
-        # The filter's results go through env, never spliced into the script
-        # (test_topotest_verdict.py runs this script over every case).
+        # ...and whether it builds the HTML docs.  The filter's results go
+        # through env, never spliced into the script (test_topotest_verdict.py
+        # runs this script over every case).
         id: decide
         env:
           FILTER_OUTCOME: ${{ steps.filter.outcome }}
@@ -105,8 +116,13 @@ jobs:
           if [ "${FILTER_OUTCOME:-}" = success ] && [ "${DOC:-}" = true ] && [ "${NON_DOC:-}" = false ]; then
             build=false
           fi
-          echo "paths-filter outcome=${FILTER_OUTCOME:-<none>} doc=${DOC:-<empty>} non_doc=${NON_DOC:-<empty>} -> build=${build}"
+          docs=true
+          if [ "${FILTER_OUTCOME:-}" = success ] && [ "${DOC:-}" = false ]; then
+            docs=false
+          fi
+          echo "paths-filter outcome=${FILTER_OUTCOME:-<none>} doc=${DOC:-<empty>} non_doc=${NON_DOC:-<empty>} -> build=${build} docs=${docs}"
           echo "build=${build}" >> "${GITHUB_OUTPUT}"
+          echo "docs=${docs}" >> "${GITHUB_OUTPUT}"
       - name: Ensure local MIB cache directory exists
         if: ${{ steps.decide.outputs.build == 'true' }}
         run: mkdir -p docker/ubuntu-ci/mib-cache
@@ -154,7 +170,8 @@ jobs:
 
   Documentation-HTML:
     needs: doc-path-filter
-    if: ${{ needs.doc-path-filter.outputs.doc == 'true' }}
+    # The decided `docs` output, never the raw doc: see doc-path-filter.
+    if: ${{ needs.doc-path-filter.outputs.docs == 'true' }}
     runs-on: default
     name: HTML documentation (user + developer)
     timeout-minutes: 20
@@ -1336,10 +1353,11 @@ jobs:
     #
     # Documentation-HTML is here because a doc-only run is not a run that
     # builds nothing: it builds the HTML docs, and that job is the only
-    # check on doc/.  It must be 'success' whenever the filter said doc
-    # 'true' (doc-only or mixed) and 'skipped' otherwise; without it the
-    # verdict was green over a broken docs build, usually before the docs
-    # job had even finished.
+    # check on doc/.  It must be 'success' whenever doc-path-filter's
+    # decided docs output is 'true' (doc/ changed, or the filter could not
+    # tell) and 'skipped' when it is 'false', which is re-checked against
+    # the raw doc 'false'; without it the verdict was green over a broken
+    # docs build, usually before the docs job had even finished.
     #
     # `always()`, not `!cancelled()`: a cancelled run must read red here, not
     # skipped, because a skipped required check counts as passing.
