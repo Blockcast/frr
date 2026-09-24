@@ -32,7 +32,11 @@ _SPEC.loader.exec_module(gate)
 
 HEAD = "79eb5909f56c8e55a14339a1662adaeea4ac863f"
 OTHER = "5b91d5289c7cdb9c91016f101dc1581cbe7bd8a5"
-ALLY = ["allyblockcast[bot]", "app/allyblockcast", "allyblockcast"]
+# Matches the workflow's ALLY_REVIEWER_LOGINS. The bare `allyblockcast` User
+# seat lives in gate.DEFAULT_AUTHOR_ONLY_LOGINS instead (BLO-18965); the
+# fixtures below that model it still exercise its BLOCKING evidence, which is
+# read across login spellings -- see TestAuthorOnlyLogins.
+ALLY = ["allyblockcast[bot]", "app/allyblockcast"]
 HUMAN = "kkroo"
 OVERRIDE = "review-gate-override"
 
@@ -83,7 +87,8 @@ def override_body(sha):
 
 
 def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=None,
-           deferrals=None):
+           deferrals=None, author_only=None):
+    extra = {} if author_only is None else {"author_only_logins": author_only}
     return gate.decide(
         reviews=list(reviews),
         comments=list(comments),
@@ -94,6 +99,7 @@ def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=
         override_label=OVERRIDE,
         permission_trusted_logins=trusted or set(),
         deferrals=dict(deferrals or {}),
+        **extra,
     )
 
 
@@ -1435,9 +1441,9 @@ class TestUserSeatCannotProvidePositiveEvidence(unittest.TestCase):
     gate also accepted that User's reviews as positive Ally evidence, ONE User
     review would satisfy BOTH controls while the required App review is
     absent. Positive evidence therefore requires `user.type == "Bot"` (the
-    App seat); blocking evidence stays identity-agnostic (dropping a User-seat
-    CHANGES_REQUESTED would be fail-open); and the User seat keeps its
-    separate, permission-checked DISTINCT-REVIEWER role on App-authored PRs.
+    App seat); and blocking evidence stays identity-agnostic (dropping a
+    User-seat CHANGES_REQUESTED would be fail-open). Since BLO-18965 the User
+    seat has no DISTINCT-REVIEWER role either -- see TestAuthorOnlyLogins.
     """
 
     def _user_review(self, state, body=None, **kw):
@@ -1501,9 +1507,8 @@ class TestUserSeatCannotProvidePositiveEvidence(unittest.TestCase):
         # approval CAN now clear an App-authored PR (see TestSuccessExclusivity
         # and TestSelfReview), but the shared `allyblockcast` User seat is
         # still Ally's own identity (BLO-24056: 661 App-authored approvals
-        # org-wide), not an independent reviewer -- it must stay excluded
-        # even though it structurally qualifies as "distinct" for the
-        # CHANGES_REQUESTED-still-binds property.
+        # org-wide), not an independent reviewer -- and since BLO-18965 an
+        # author credential that is never "distinct" at all.
         state, _ = decide(
             reviews=[review("APPROVED", login="allyblockcast", utype="User",
                             at="2026-07-27T11:00:00Z")],
@@ -3649,3 +3654,188 @@ class TestFindingIdentityCollisions(unittest.TestCase):
             self._cid(afa3c88_important_1),
             "a reworded finding sharing an id would mean identity is too loose",
         )
+
+
+class TestAuthorOnlyLogins(unittest.TestCase):
+    """BLO-18926/BLO-18965: the bare `allyblockcast` User seat is an author
+    credential several agents commit through, not a reviewer. It must never be
+    a distinct reviewer, an approver, an override binder or a deferral author.
+
+    Dropping it from ALLY_REVIEWER_LOGINS alone would PROMOTE it -- the
+    distinct-identity test admits a login merely for being absent from the Ally
+    set -- so the exclusion is keyed on PR_AUTHOR_ONLY_LOGINS, and the cases
+    below that use an Ally list NOT covering the seat pin that it holds without
+    help from Ally-set membership. Its blocking evidence still binds (see
+    TestUserSeatCannotProvidePositiveEvidence), and the App's normalized bare
+    login is still the App.
+    """
+
+    SEAT = "allyblockcast"
+
+    def _seat(self, state, **kw):
+        kw.setdefault("at", "2026-07-27T11:00:00Z")
+        return review(state, login=self.SEAT, utype="User", assoc="MEMBER", **kw)
+
+    def _human(self, state, **kw):
+        kw.setdefault("at", "2026-07-27T12:00:00Z")
+        return review(state, login=HUMAN, utype="User", assoc="MEMBER", **kw)
+
+    def test_write_trusted_seat_approval_does_not_clear_an_app_authored_pr(self):
+        # Write is granted on purpose: without it the assertion would hold for
+        # the wrong reason (the permission check, not the identity demotion).
+        state, _ = decide(
+            reviews=[self._seat("APPROVED")], author=APP_AUTHOR, trusted={self.SEAT}
+        )
+        self.assertEqual(state, "pending")
+
+    def test_seat_is_never_a_distinct_reviewer_even_to_object(self):
+        # A write-trusted seat's CHANGES_REQUESTED is not a distinct reviewer's
+        # veto: the seat is not a reviewer at all, so the trusted human's
+        # attested approval is the only distinct verdict on this head.
+        state, desc = decide(
+            reviews=[self._seat("CHANGES_REQUESTED"), self._human("APPROVED")],
+            author=APP_AUTHOR,
+            trusted={self.SEAT, HUMAN},
+        )
+        self.assertEqual(state, "success", desc)
+        self.assertIn(HUMAN, desc)
+
+    def test_emptying_the_author_only_set_reopens_the_seat_as_a_reviewer(self):
+        # Pins WHY the separate list is load-bearing: with it emptied, the same
+        # rows let the seat bind as a distinct reviewer again.
+        state, _ = decide(
+            reviews=[self._seat("CHANGES_REQUESTED"), self._human("APPROVED")],
+            author=APP_AUTHOR,
+            trusted={self.SEAT, HUMAN},
+            author_only=[],
+        )
+        self.assertEqual(state, "failure")
+
+    def test_seat_blocking_findings_still_fail_closed(self):
+        # The negative control for the case above: demoting the seat's trust
+        # must not drop its machine-readable blocking evidence.
+        state, _ = decide(
+            reviews=[
+                self._seat("COMMENTED", body=attest(HEAD, "### Critical Issues (1)\n")),
+                self._human("APPROVED"),
+            ],
+            author=APP_AUTHOR,
+            trusted={self.SEAT, HUMAN},
+        )
+        self.assertEqual(state, "failure")
+
+    def test_normalized_app_login_is_still_the_app(self):
+        # Ally's Important finding on frr#43 @ bd5b9bc0: REST may render the
+        # App as bare `allyblockcast` with type Bot. That is the App, not the
+        # author credential, and its exact-head APPROVED still clears.
+        state, _ = decide(reviews=[review("APPROVED", login=self.SEAT, utype="Bot")])
+        self.assertEqual(state, "success")
+
+    def test_stale_config_naming_the_seat_as_ally_still_denies_it_trust(self):
+        # Author-only wins over Ally membership, so a workflow that still lists
+        # the seat in ALLY_REVIEWER_LOGINS cannot hand it back reviewer standing.
+        for reviews, expected in (
+            ([self._seat("APPROVED")], "pending"),
+            ([self._seat("CHANGES_REQUESTED"), self._human("APPROVED")], "success"),
+        ):
+            state, _ = gate.decide(
+                reviews=reviews,
+                comments=[],
+                head_sha=HEAD,
+                ally_logins=ALLY + [self.SEAT],
+                pr_author_login=APP_AUTHOR,
+                labels=[],
+                override_label=OVERRIDE,
+                permission_trusted_logins={self.SEAT, HUMAN},
+            )
+            self.assertEqual(state, expected)
+
+    def test_seat_is_never_a_distinct_reviewer_candidate(self):
+        # Keeps the collaborator-permission lookup off the seat entirely.
+        got = gate.distinct_reviewer_candidate_logins(
+            [self._seat("APPROVED"), self._human("APPROVED")],
+            HEAD,
+            ["other-reviewer[bot]"],
+            APP_AUTHOR,
+        )
+        self.assertEqual(got, {HUMAN})
+
+    def test_seat_cannot_bind_an_override_attestation(self):
+        got = gate.override_attestation_logins(
+            [
+                comment(override_body(HEAD), login="AllyBlockcast", utype="User"),
+                comment(override_body(HEAD), login=HUMAN, utype="User"),
+            ],
+            HEAD,
+        )
+        self.assertEqual(got, {HUMAN})
+
+    def test_seat_cannot_author_a_deferral_whatever_the_ally_list_says(self):
+        # Neither the Ally list nor the PR author may cover the seat here, or
+        # the refusal would come from those guards instead of this one.
+        visibility = gate.finding_id_visibility(
+            [review("COMMENTED", body=finding_body(HEAD, [FINDING_A]))], [], ALLY
+        )
+        got = gate.trusted_deferrals(
+            [defer_comment(FINDING_A, login=self.SEAT)],
+            ally_logins=["other-reviewer[bot]"],
+            collaborator_permissions={self.SEAT: "admin"},
+            finding_visibility=visibility,
+            pr_author_login=HUMAN,
+        )
+        self.assertEqual(got, {})
+
+    def test_pr_authored_by_the_seat_is_a_self_review(self):
+        self.assertTrue(
+            gate.is_self_review_author(self.SEAT, ["other-reviewer[bot]"], [self.SEAT])
+        )
+        state, _ = decide(reviews=[review("APPROVED")], author=self.SEAT)
+        self.assertEqual(state, "pending")
+
+    SEAT_NAME = "agent-seat"
+
+    def _run_main(self, pr_author, reviews):
+        """main() with every permission candidate granted write, and a custom
+        author-only name so the defaults cannot mask missing plumbing."""
+        event = {"pull_request": {"number": 7, "head": {"sha": HEAD}},
+                 "repository": {"full_name": "Blockcast/frr"}}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+        self.addCleanup(os.unlink, handle.name)
+        pull = {"number": 7, "state": "open", "draft": False, "head": {"sha": HEAD},
+                "user": {"login": pr_author}, "labels": []}
+        looked_up, statuses = [], []
+
+        def trust_everyone(api, owner, repo, token, candidates):
+            looked_up.extend(candidates)
+            return set(candidates)
+
+        env = {"GITHUB_EVENT_PATH": handle.name, "GITHUB_REPOSITORY": "Blockcast/frr",
+               "GITHUB_TOKEN": "t", "PR_AUTHOR_ONLY_LOGINS": self.SEAT_NAME}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "_request", return_value=pull), \
+                mock.patch.object(gate, "set_commit_status",
+                                  side_effect=lambda *a, **k: statuses.append(a[5])), \
+                mock.patch.object(gate, "fetch_paginated",
+                                  side_effect=lambda api, path, token:
+                                  reviews if path.endswith("/reviews") else []), \
+                mock.patch.object(gate, "fetch_trusted_permission_logins",
+                                  side_effect=trust_everyone), \
+                mock.patch.object(gate, "enrich_reviews_with_edit_times"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gate.main()
+        return looked_up, statuses[-1]
+
+    def test_main_never_looks_up_or_trusts_the_named_seat(self):
+        looked_up, state = self._run_main(
+            APP_AUTHOR, [review("APPROVED", login=self.SEAT_NAME, utype="User")]
+        )
+        self.assertNotIn(self.SEAT_NAME, looked_up)
+        self.assertEqual(state, "pending")
+
+    def test_main_treats_a_pr_by_the_named_seat_as_a_self_review(self):
+        # Reaches decide()'s own copy of the list: an App approval clears an
+        # ordinary PR, so it only stays pending if decide() knows the author is
+        # an author credential.
+        _, state = self._run_main(self.SEAT_NAME, [review("APPROVED")])
+        self.assertEqual(state, "pending")

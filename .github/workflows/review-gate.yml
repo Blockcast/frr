@@ -119,7 +119,13 @@ jobs:
       - name: Require Ally review on current head
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          ALLY_REVIEWER_LOGINS: allyblockcast[bot],app/allyblockcast,allyblockcast
+          ALLY_REVIEWER_LOGINS: allyblockcast[bot],app/allyblockcast
+          # The bare `allyblockcast` User seat is an author credential, not a
+          # reviewer. Dropping it from ALLY_REVIEWER_LOGINS alone does not
+          # demote it -- the gate would then read it as an ordinary distinct
+          # reviewer. It has to be named here to lose reviewer standing; its
+          # blocking evidence still binds (BLO-18926/BLO-18965).
+          PR_AUTHOR_ONLY_LOGINS: allyblockcast
           STATUS_TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # Via env rather than inlined into the run block: never interpolate
           # event data straight into a shell command.
