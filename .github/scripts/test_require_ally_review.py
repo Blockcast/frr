@@ -3661,13 +3661,13 @@ class TestAuthorOnlyLogins(unittest.TestCase):
     credential several agents commit through, not a reviewer. It must never be
     a distinct reviewer, an approver, an override binder or a deferral author.
 
-    Dropping it from ALLY_REVIEWER_LOGINS alone would PROMOTE it -- the
-    distinct-identity test admits a login merely for being absent from the Ally
-    set -- so the exclusion is keyed on PR_AUTHOR_ONLY_LOGINS, and the cases
-    below that use an Ally list NOT covering the seat pin that it holds without
-    help from Ally-set membership. Its blocking evidence still binds (see
+    The exclusion is keyed on PR_AUTHOR_ONLY_LOGINS, and the cases below that
+    use an Ally list NOT covering the seat pin that it holds without help from
+    Ally-set membership. Its machine-readable blocking findings still bind (see
     TestUserSeatCannotProvidePositiveEvidence), and the App's normalized bare
-    login is still the App.
+    login is still the App. On an App-authored PR its bare formal
+    CHANGES_REQUESTED no longer vetoes -- pinned by
+    test_seat_is_never_a_distinct_reviewer_even_to_object.
     """
 
     SEAT = "allyblockcast"
@@ -3749,6 +3749,17 @@ class TestAuthorOnlyLogins(unittest.TestCase):
                 permission_trusted_logins={self.SEAT, HUMAN},
             )
             self.assertEqual(state, expected)
+
+    def test_seat_is_excluded_from_the_distinct_path_in_any_casing(self):
+        # The exclusion withholds trust, so it must be case-insensitive (GitHub
+        # logins are); a raw compare would let `AllyBlockcast` through.
+        seat = review("APPROVED", login="AllyBlockcast", utype="User",
+                      assoc="MEMBER", at="2026-07-27T11:00:00Z")
+        got = gate.distinct_reviewer_candidate_logins(
+            [seat, self._human("APPROVED")], HEAD, ["other-reviewer[bot]"], APP_AUTHOR,
+            author_only_logins=[self.SEAT],
+        )
+        self.assertEqual(got, {HUMAN})
 
     def test_seat_is_never_a_distinct_reviewer_candidate(self):
         # Keeps the collaborator-permission lookup off the seat entirely.

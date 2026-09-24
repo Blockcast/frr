@@ -34,20 +34,24 @@ import urllib.request
 # DEFAULT_AUTHOR_ONLY_LOGINS.
 #
 # Ally EVIDENCE is still read across every spelling of these identities
-# (login_matches_any), so two properties pinned before this split survive it:
-# the App's normalized bare login (`allyblockcast`, type Bot) is still the App,
-# and the User seat's BLOCKING evidence still binds -- dropping it would be
-# fail-open. Positive evidence was already App-seat-only (type Bot). What the
-# split removes is every TRUST grant: the seat can no longer be a distinct
-# reviewer, bind an override, or author a deferral (BLO-18926/BLO-18965).
+# (login_matches_any), so the App's normalized bare login (`allyblockcast`,
+# type Bot) is still the App, and the User seat's machine-readable blocking
+# findings still fail closed on every PR. Positive evidence was already
+# App-seat-only (type Bot). What the split removes is every TRUST grant: the
+# seat can no longer be a distinct reviewer, bind an override, or author a
+# deferral (BLO-18926/BLO-18965). One consequence is deliberate: on a PR the
+# App authored, the seat's bare formal CHANGES_REQUESTED is a self-review
+# signal like any other, so it no longer vetoes -- only its body findings do.
+# (Production-neutral: the seat holds `read`, so that veto never bound.)
 DEFAULT_ALLY_LOGINS = ["allyblockcast[bot]", "app/allyblockcast"]
 
-# Identities that act on PRs but are never reviewers. Dropping a login from
-# DEFAULT_ALLY_LOGINS alone is a regression, not a fix: the distinct-reviewer
-# test admits any login merely for being absent from the Ally set, so a bare
-# removal would PROMOTE it to an ordinary trusted reviewer. Both changes only
-# make sense together. Matched with login_matches_any, never a raw compare:
-# this list WITHHOLDS trust, and GitHub logins are case-insensitive.
+# Identities that act on PRs but are never reviewers. This list, not the Ally
+# list, is what demotes the seat: every Ally-membership test uses
+# login_matches_any, under which the bare seat is a spelling of
+# `allyblockcast[bot]`, so leaving it out of DEFAULT_ALLY_LOGINS is cosmetic.
+# Naming it here is what strips its distinct-reviewer standing and its
+# override and deferral trust. Matched with login_matches_any, never a raw
+# compare: this list WITHHOLDS trust, and GitHub logins are case-insensitive.
 DEFAULT_AUTHOR_ONLY_LOGINS = ["allyblockcast"]
 
 # author_association on a review is computed relative to the *requesting
@@ -1405,7 +1409,9 @@ def review_signals_for_head(
         # identity-agnostic below -- dropping a User-seat CHANGES_REQUESTED
         # or blocking count would be fail-open. That is ALL the User seat
         # still does: since BLO-18965 it is an author credential, never a
-        # distinct reviewer (see is_distinct_reviewer).
+        # distinct reviewer (see is_distinct_reviewer). On a self-review the
+        # demotion below applies to the seat too, so there only its
+        # machine-readable blocking findings bind, not a bare formal state.
         is_app_seat = user.get("type") == "Bot"
         # Round 2 of the #47 review: signals carry the SEAT alongside the
         # login. GitHub REST may normalize the App login to the same string
