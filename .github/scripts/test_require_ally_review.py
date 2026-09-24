@@ -417,7 +417,12 @@ class TestCommitIdIsNotProofOfCoverage(unittest.TestCase):
 class TestPermissionLookupIsAuthoritative(unittest.TestCase):
     """When the collaborator-permission lookup COMPLETES it is the answer, and a
     lookup that errored leaves the login untrusted -- there is no
-    author_association fallback in either case."""
+    author_association fallback in either case.
+
+    decide() no longer sees the lookup at all: it takes the already-resolved
+    trusted set. So the errored-lookup rule is pinned where it now lives, in
+    fetch_trusted_permission_logins, and decide() is pinned only on ignoring
+    association."""
 
     def test_read_only_collaborator_cannot_clear_a_self_review_pr(self):
         # Association says COLLABORATOR, but the lookup resolved and did not
@@ -436,16 +441,20 @@ class TestPermissionLookupIsAuthoritative(unittest.TestCase):
         """A lookup that errored is UNTRUSTED, not an invitation to fall back
         to author_association: COLLABORATOR can mean read or triage, so a
         transient API failure would otherwise let a read-only account clear an
-        Ally-authored PR."""
-        state, _ = decide(
-            reviews=[
-                review("APPROVED", login=HUMAN, utype="User", assoc="MEMBER",
-                       at="2026-07-27T11:00:00Z")
-            ],
-            author="app/allyblockcast",
-            trusted=set(),
-        )
-        self.assertEqual(state, "pending")
+        Ally-authored PR.
+
+        Two logins, so a function that simply returned set() cannot pass: the
+        one whose lookup resolved to write must still be trusted. 401 is not
+        retried by _request(), so it raises on the first call."""
+        with mock.patch.object(gate.time, "sleep"), mock.patch.object(
+            gate.urllib.request,
+            "urlopen",
+            side_effect=[_http_error(401), _FakeResponse({"permission": "write"})],
+        ):
+            trusted = gate.fetch_trusted_permission_logins(
+                "https://api", "Blockcast", "frr", "t", ["erroring", "writer"]
+            )
+        self.assertEqual(trusted, {"writer"})
 
 
 class TestConflictingReviewers(unittest.TestCase):

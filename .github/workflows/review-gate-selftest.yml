@@ -16,8 +16,11 @@ name: review-gate-selftest
 #
 # Unlike the gate, this runs from the PULL REQUEST's code, because the point is
 # to validate the proposed change to the checker. It is a plain `pull_request`
-# (not `pull_request_target`) with read-only permissions and no secrets, so
-# executing PR-authored code here carries no write-scoped credentials.
+# (not `pull_request_target`), and the lookup step below does hand PR-authored
+# code a credential: the job's `github.token`, capped by the workflow-level
+# `permissions: contents: read`. That cap is the whole safety argument, so it
+# must NOT be widened while this job runs PR code -- in particular, do not add
+# `administration: read` to fix a 403 on the collaborator-permission lookup.
 
 on:
   pull_request:
