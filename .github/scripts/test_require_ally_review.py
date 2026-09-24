@@ -1052,12 +1052,12 @@ class TestStalePayloadOrchestration(unittest.TestCase):
         self.assertNotIn(HEAD, {sha for sha, _ in statuses})
 
     def test_settled_pr_resolves_the_early_claim(self):
-        # Round 2: a delayed event whose payload still said open earns the
-        # early claim, then the refetch says merged/closed AT THE SAME HEAD.
-        # A silent return would strand a required context yellow forever on a
-        # commit that reached the base branch -- nothing re-evaluates a
-        # settled PR. The claim must resolve to success (the PR cannot merge
-        # again, so the context gates nothing).
+        # A delayed event whose payload still said open earns the early claim,
+        # then the refetch says merged/closed AT THE SAME HEAD. The claim is
+        # resolved -- with a reason -- but never to success: the status is
+        # keyed by SHA, so a green would also clear any other open PR at this
+        # head with no review evidence. A settled PR is not gated by it, and a
+        # PR sharing the head overwrites it on its own evaluation.
         _, statuses = self._run_main(
             payload_draft=False,
             refetched={
@@ -1071,7 +1071,7 @@ class TestStalePayloadOrchestration(unittest.TestCase):
         )
         self.assertEqual(
             statuses,
-            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "success")],
+            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "pending")],
         )
 
     def test_draft_pr_same_head_keeps_the_claim_failclosed(self):
