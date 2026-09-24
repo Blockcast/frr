@@ -2501,6 +2501,15 @@ def _read_bounded_response(response, attempt_deadline, max_bytes=None):
             )
         chunk = read1(REQUEST_READ_CHUNK_BYTES)
         if not chunk:
+            # read1() returns b"" at a FIN even when Content-Length promised
+            # more, unlike read(), which raises IncompleteRead via _safe_read.
+            # A leftover `length` is that shortfall; raise it so _request()'s
+            # HTTPException arm retries a truncated body instead of handing a
+            # partial one to json.loads(). Chunked framing (length None) and a
+            # complete identity body (length 0) fall through.
+            shortfall = getattr(response, "length", None)
+            if shortfall:
+                raise http.client.IncompleteRead(b"".join(chunks), shortfall)
             return b"".join(chunks)
         total += len(chunk)
         if total > max_bytes:
@@ -2526,6 +2535,10 @@ def _request(url, token, method="GET", payload=None):
             with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 # The fixed-clock tests script monotonic() call-by-call and
                 # pin both sequences exactly.
+                # Deliberately NOT clamped to the retry budget, unlike the error
+                # body in _http_error_diagnostics(): a slow read that completes
+                # still returns data here, so clamping would turn slow successes
+                # into failures, while a truncated error body costs only log text.
                 attempt_deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
                 body = _read_bounded_response(response, attempt_deadline)
                 return json.loads(body) if body else None

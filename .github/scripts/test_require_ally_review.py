@@ -2687,6 +2687,24 @@ class TestBoundedReadOverRealSocket(unittest.TestCase):
         )
         self.assertEqual(json.loads(read), {"ok": True})
 
+    def test_a_truncated_content_length_body_raises_incomplete_read(self):
+        """read1() returns b"" at a FIN whatever Content-Length promised, so the
+        loop must raise the shortfall itself. IncompleteRead is an
+        HTTPException, which _request() retries as transient (pinned in
+        TestTransientRetry); returning the partial body instead would reach
+        json.loads() and escape the retry loop as a ValueError."""
+        for sent in (b'{"ok":true', b""):
+            with self.subTest(sent=sent):
+                response = self._real_response(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n" + sent
+                )
+                with self.assertRaises(http.client.IncompleteRead) as caught:
+                    gate._read_bounded_response(
+                        response, attempt_deadline=gate.time.monotonic() + 60
+                    )
+                self.assertEqual(caught.exception.partial, sent)
+                self.assertEqual(caught.exception.expected, 50 - len(sent))
+
     def test_a_real_chunked_body_reads_to_completion_without_a_deadline_hit(self):
         """read1()'s one-chunk-per-call loop must still reassemble the whole
         body -- the fix must not turn a slow-but-fine response into a failure."""
