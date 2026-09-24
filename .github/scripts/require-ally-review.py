@@ -30,17 +30,16 @@ import urllib.parse
 import urllib.request
 
 DEFAULT_ALLY_LOGINS = ["allyblockcast[bot]", "app/allyblockcast", "allyblockcast"]
-TRUSTED_REVIEWER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 # author_association on a review is computed relative to the *requesting
 # token's* visibility of org membership, not the reviewer's actual repo
 # access. The workflow's default GITHUB_TOKEN carries no `members:read` scope,
 # so a genuine org MEMBER can be reported as the lower CONTRIBUTOR association
-# even though the same reviewer shows MEMBER to a personal PAT -- causing the
-# gate to intermittently reject a valid distinct-reviewer approval. The
+# even though the same reviewer shows MEMBER to a personal PAT. The
 # collaborator-permission endpoint reflects the reviewer's actual repo-level
-# grant directly and is not requester-view-dependent, so it is the primary
-# trust signal; association stays a fallback for when that lookup itself fails.
+# grant directly and is not requester-view-dependent, so it is the ONLY trust
+# signal. A lookup that errors leaves the login untrusted; there is no
+# author_association fallback because COLLABORATOR can mean read or triage.
 TRUSTED_COLLABORATOR_PERMISSIONS = {"admin", "maintain", "write"}
 
 STATUS_CONTEXT = os.environ.get("STATUS_CONTEXT") or "review/ally-complete"
@@ -1692,18 +1691,15 @@ def distinct_reviewer_signals_for_head(
     ally_logins,
     pr_author_login,
     permission_trusted_logins,
-    permission_resolved_logins=None,
     head_authorized_logins=None,
 ):
     ally = set(ally_logins)
-    permission_resolved_logins = permission_resolved_logins or set()
     head_authorized_logins = head_authorized_logins or set()
     signals = []
 
     for review in reviews:
         user = review.get("user") or {}
         login = user.get("login")
-        association = str(review.get("author_association") or "")
 
         # A reviewer counts as "distinct" from the PR author when its login
         # differs AND it is a genuinely separate actor. Two cases qualify:
@@ -2117,7 +2113,6 @@ def decide(
     labels,
     override_label,
     permission_trusted_logins=None,
-    permission_resolved_logins=None,
     deferrals=None,
 ):
     """Pure decision core: returns (state, description).
@@ -2131,10 +2126,6 @@ def decide(
     and the counterfactual below is skipped entirely.
     """
     permission_trusted_logins = permission_trusted_logins or set()
-    # A login cannot be trusted without its lookup having completed, so treat
-    # trusted as implying resolved. Keeps the authoritative-lookup rule correct
-    # even if a caller supplies only the trusted set.
-    permission_resolved_logins = (permission_resolved_logins or set()) | permission_trusted_logins
     deferrals = deferrals or {}
     ally = set(ally_logins)
     is_self_review = isinstance(pr_author_login, str) and pr_author_login in ally
@@ -2177,7 +2168,6 @@ def decide(
             ally_logins,
             pr_author_login,
             permission_trusted_logins,
-            permission_resolved_logins,
             head_authorized_logins=override_attestation_logins(comments, head_sha),
         )
         if is_self_review
@@ -2667,30 +2657,30 @@ def fetch_collaborator_permission(api_base_url, owner, repo, username, token):
 
 
 def fetch_trusted_permission_logins(api_base_url, owner, repo, token, candidate_logins):
-    """Return (trusted, resolved).
+    """Return the candidate logins whose repo permission is write/maintain/admin.
 
-    `resolved` is the set of logins whose lookup actually COMPLETED -- including
-    a 404 "not a collaborator", which is a real answer of "no permission". Only
-    a login missing from `resolved` (the lookup itself errored) falls back to
-    author_association; otherwise the lookup is authoritative, so a read-only
-    collaborator cannot be rescued by a COLLABORATOR association.
+    The lookup is authoritative in both directions: a 404 "not a collaborator"
+    is a real answer of "no permission", and a lookup that ERRORS leaves the
+    login untrusted too. There is deliberately no author_association fallback --
+    association is requester-view-dependent and COLLABORATOR can mean read or
+    triage, so falling back on a transient API/auth/rate-limit failure would let
+    an account without write access clear an Ally-authored PR. An unresolved
+    lookup therefore leaves the gate pending, which is the safe direction.
     """
     trusted = set()
-    resolved = set()
     for login in candidate_logins:
         try:
             permission = fetch_collaborator_permission(api_base_url, owner, repo, login, token)
             print("collaborator-permission: %s -> %s" % (login, permission or "(not a collaborator)"))
-            resolved.add(login)
             if permission in TRUSTED_COLLABORATOR_PERMISSIONS:
                 trusted.add(login)
         except Exception as error:  # noqa: BLE001 - non-fatal by design
             print(
-                "collaborator-permission: lookup failed for %s, falling back to "
-                "author_association: %s" % (login, error),
+                "collaborator-permission: lookup failed for %s; treating as untrusted: %s"
+                % (login, error),
                 file=sys.stderr,
             )
-    return trusted, resolved
+    return trusted
 
 
 def fetch_collaborator_permission_map(api_base_url, owner, repo, token, candidate_logins):
@@ -2698,17 +2688,17 @@ def fetch_collaborator_permission_map(api_base_url, owner, repo, token, candidat
 
     Distinct from fetch_trusted_permission_logins, which answers the boolean
     "is this login in TRUSTED_COLLABORATOR_PERMISSIONS". The deferral path needs
-    the TIER itself, because it accepts a narrower set
-    (DEFERRAL_TRUSTED_PERMISSIONS = admin only) and because refusing loudly
-    means naming which tier the author actually holds.
+    the TIER itself because it accepts a narrower set
+    (DEFERRAL_TRUSTED_PERMISSIONS = admin only) and refusing loudly means
+    naming which tier the author actually holds.
 
     A login whose lookup ERRORED is absent from the map, which
-    trusted_deferrals reads as "no permission" and refuses. There is
-    deliberately no author_association fallback here: association is
-    requester-view-dependent and is a fallback for GRANTING the write-tier trust
-    the rest of this file needs, whereas this path is the only lever that turns
-    a red required status green -- an unresolved input must not become a
-    permissive default for it.
+    trusted_deferrals reads as "no permission" and refuses -- the same
+    fail-closed rule as fetch_trusted_permission_logins. What is distinct here
+    is only the shape: this returns the TIER, because deferral trust is
+    admin-only and refusing loudly means naming the tier the author holds.
+    This path can turn a red required status green, so an unresolved input
+    must never become a permissive default.
     """
     permissions = {}
     for login in candidate_logins:
@@ -3088,7 +3078,6 @@ def main():
                 labels.append(name)
 
     permission_trusted_logins = set()
-    permission_resolved_logins = set()
     # Two independent reasons to resolve write permission: clearing a
     # self-authored PR via a distinct reviewer, and authorizing a head-bound
     # override. Resolve both candidate sets in one pass -- an override author
@@ -3106,10 +3095,9 @@ def main():
     if override_label and override_label in labels:
         candidates |= override_attestation_logins(comments, head_sha)
     if candidates:
-        (
-            permission_trusted_logins,
-            permission_resolved_logins,
-        ) = fetch_trusted_permission_logins(api_base_url, owner, repo, token, sorted(candidates))
+        permission_trusted_logins = fetch_trusted_permission_logins(
+            api_base_url, owner, repo, token, sorted(candidates)
+        )
 
     # --- Per-finding deferrals (BLO-22676 / BLO-27578) ---------------------
     #
@@ -3149,7 +3137,6 @@ def main():
         labels=labels,
         override_label=override_label,
         permission_trusted_logins=permission_trusted_logins,
-        permission_resolved_logins=permission_resolved_logins,
         deferrals=deferrals,
     )
 

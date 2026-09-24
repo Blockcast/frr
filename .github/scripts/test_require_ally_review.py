@@ -83,7 +83,7 @@ def override_body(sha):
 
 
 def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=None,
-           resolved=None, deferrals=None):
+           deferrals=None):
     return gate.decide(
         reviews=list(reviews),
         comments=list(comments),
@@ -93,7 +93,6 @@ def decide(reviews=(), comments=(), head=HEAD, author=HUMAN, labels=(), trusted=
         labels=list(labels),
         override_label=OVERRIDE,
         permission_trusted_logins=trusted or set(),
-        permission_resolved_logins=resolved or set(),
         deferrals=dict(deferrals or {}),
     )
 
@@ -231,7 +230,7 @@ class TestSelfReview(unittest.TestCase):
         self.assertEqual(state, "failure")
 
     def test_distinct_human_approval_clears_a_self_review_pr(self):
-        """Branch 8 — trusted via author_association fallback."""
+        """Branch 8 — trusted via the authoritative permission lookup."""
         state, desc = decide(
             reviews=[
                 review("APPROVED", login="app/allyblockcast", at="2026-07-27T09:00:00Z"),
@@ -419,8 +418,14 @@ class TestCommitIdIsNotProofOfCoverage(unittest.TestCase):
 
 
 class TestPermissionLookupIsAuthoritative(unittest.TestCase):
-    """When the collaborator-permission lookup COMPLETES it is the answer;
-    author_association is only a fallback for a lookup that errored."""
+    """When the collaborator-permission lookup COMPLETES it is the answer, and a
+    lookup that errored leaves the login untrusted -- there is no
+    author_association fallback in either case.
+
+    decide() no longer sees the lookup at all: it takes the already-resolved
+    trusted set. So the errored-lookup rule is pinned where it now lives, in
+    fetch_trusted_permission_logins, and decide() is pinned only on ignoring
+    association."""
 
     def test_read_only_collaborator_cannot_clear_a_self_review_pr(self):
         # Association says COLLABORATOR, but the lookup resolved and did not
@@ -432,7 +437,6 @@ class TestPermissionLookupIsAuthoritative(unittest.TestCase):
             ],
             author="app/allyblockcast",
             trusted=set(),
-            resolved={HUMAN},
         )
         self.assertEqual(state, "pending")
 
@@ -440,17 +444,20 @@ class TestPermissionLookupIsAuthoritative(unittest.TestCase):
         """A lookup that errored is UNTRUSTED, not an invitation to fall back
         to author_association: COLLABORATOR can mean read or triage, so a
         transient API failure would otherwise let a read-only account clear an
-        Ally-authored PR."""
-        state, _ = decide(
-            reviews=[
-                review("APPROVED", login=HUMAN, utype="User", assoc="MEMBER",
-                       at="2026-07-27T11:00:00Z")
-            ],
-            author="app/allyblockcast",
-            trusted=set(),
-            resolved=set(),
-        )
-        self.assertEqual(state, "pending")
+        Ally-authored PR.
+
+        Two logins, so a function that simply returned set() cannot pass: the
+        one whose lookup resolved to write must still be trusted. 401 is not
+        retried by _request(), so it raises on the first call."""
+        with mock.patch.object(gate.time, "sleep"), mock.patch.object(
+            gate.urllib.request,
+            "urlopen",
+            side_effect=[_http_error(401), _FakeResponse({"permission": "write"})],
+        ):
+            trusted = gate.fetch_trusted_permission_logins(
+                "https://api", "Blockcast", "frr", "t", ["erroring", "writer"]
+            )
+        self.assertEqual(trusted, {"writer"})
 
 
 class TestConflictingReviewers(unittest.TestCase):

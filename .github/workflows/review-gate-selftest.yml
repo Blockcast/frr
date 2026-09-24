@@ -16,8 +16,11 @@ name: review-gate-selftest
 #
 # Unlike the gate, this runs from the PULL REQUEST's code, because the point is
 # to validate the proposed change to the checker. It is a plain `pull_request`
-# (not `pull_request_target`) with read-only permissions and no secrets, so
-# executing PR-authored code here carries no write-scoped credentials.
+# (not `pull_request_target`), and the lookup step below does hand PR-authored
+# code a credential: the job's `github.token`, capped by the workflow-level
+# `permissions: contents: read`. That cap is the whole safety argument, so it
+# must NOT be widened while this job runs PR code -- in particular, do not add
+# `administration: read` to fix a 403 on the collaborator-permission lookup.
 
 on:
   pull_request:
@@ -62,3 +65,26 @@ jobs:
       - name: Run gate decision-logic tests
         # -v so a regression names the exact protected branch it broke.
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+
+      - name: Collaborator-permission lookup resolves on the workflow token
+        # The gate's only trust signal is GET /repos/{owner}/{repo}/collaborators/{login}/permission
+        # on github.token. Exercise the real token/endpoint pair here so a credential that cannot
+        # perform the lookup fails this job loudly instead of leaving review/ally-complete pending
+        # with no working override. A 404 ("not a collaborator", e.g. a bot actor) is an
+        # authoritative answer and passes; 401/403/5xx raise and fail the step.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util, os
+          spec = importlib.util.spec_from_file_location("gate", ".github/scripts/require-ally-review.py")
+          gate = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(gate)
+          owner, repo = os.environ["GITHUB_REPOSITORY"].split("/", 1)
+          actor = os.environ["GITHUB_ACTOR"]
+          permission = gate.fetch_collaborator_permission(
+              os.environ.get("GITHUB_API_URL", "https://api.github.com"),
+              owner, repo, actor, os.environ["GITHUB_TOKEN"],
+          )
+          print("collaborator-permission: %s -> %s" % (actor, permission or "(not a collaborator)"))
+          PY
