@@ -2382,6 +2382,12 @@ REQUEST_MAX_ATTEMPTS = 4
 REQUEST_TIMEOUT_SECONDS = 20.0
 REQUEST_RETRY_BUDGET_SECONDS = 45.0
 REQUEST_BACKOFF_SECONDS = 1.0
+REQUEST_READ_CHUNK_BYTES = 65536
+REQUEST_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+# Error bodies are only ever truncated into a 500-char log line, so they get a
+# far tighter cap than a real API response: there is no legitimate reason to
+# accept megabytes of an error we are about to summarise in half a kilobyte.
+REQUEST_ERROR_BODY_MAX_BYTES = 64 * 1024
 
 
 def _retry_backoff_seconds(attempt):
@@ -2389,21 +2395,54 @@ def _retry_backoff_seconds(attempt):
     return REQUEST_BACKOFF_SECONDS * (2 ** (attempt - 1))
 
 
-def _http_error_diagnostics(error):
-    """Best-effort snapshot of a 4xx HTTPError: body + rate-limit headers.
+def _http_error_diagnostics(error, budget_deadline=None):
+    """Best-effort snapshot of a 4xx/5xx HTTPError: body + rate-limit headers.
 
     _request() used to raise straight off `error.code` with nothing else
     logged, so a rate-limited 403 and a genuine permission 403 were
     indistinguishable from the job log -- this class of failure was
     otherwise unreadable (BLO-20820). Kept permanently, not just for the
     retry decision below.
+
+    The body is read through _read_bounded_response(), NOT error.read().
+    HTTPError proxies attribute access to the underlying HTTPResponse, so a
+    bare error.read() is the same unbounded, uncapped read that function
+    exists to eliminate -- and it is worse here than on the success path,
+    because _request() calls this BEFORE it can classify the error and
+    schedule a retry. A peer trickling an error body would therefore stall
+    the retry loop itself, defeating REQUEST_TIMEOUT_SECONDS and
+    REQUEST_RETRY_BUDGET_SECONDS together.
+
+    Diagnostics are best-effort by contract, so a body that cannot be read
+    within the deadline degrades to a marker naming the reason rather than
+    propagating. That is safe for the retry decision specifically because
+    every signal _request() classifies on -- Retry-After, X-RateLimit-* --
+    comes from the HEADERS, which are already fully received by the time an
+    HTTPError exists. Losing the body costs log detail, never correctness.
+
+    `budget_deadline` is _request()'s REQUEST_RETRY_BUDGET_SECONDS deadline.
+    The read is clamped to it as well as to REQUEST_TIMEOUT_SECONDS: this runs
+    BEFORE _request() consults the budget, so a fresh per-attempt deadline
+    alone would let every retry spend up to a full timeout here first, and a
+    trickling 5xx could hold the required check pending ~2x the budget.
     """
-    try:
-        body = error.read()
-        body_text = body.decode("utf-8", "replace")[:500] if body else ""
-    except Exception:
-        body_text = "<body unreadable>"
     headers = error.headers or {}
+    read_deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+    if budget_deadline is not None:
+        read_deadline = min(read_deadline, budget_deadline)
+    try:
+        body = _read_bounded_response(
+            error,
+            read_deadline,
+            max_bytes=REQUEST_ERROR_BODY_MAX_BYTES,
+        )
+        body_text = body.decode("utf-8", "replace")[:500] if body else ""
+    except (TimeoutError, ValueError, TypeError, OSError, http.client.HTTPException) as exc:
+        # Exactly what a bounded read of a damaged or hostile body can raise:
+        # _read_bounded_response()'s own three, socket errors, and protocol
+        # damage such as IncompleteRead. Anything else is a bug in this file
+        # and must surface rather than be logged as an unreadable body.
+        body_text = "<body unreadable: %s>" % type(exc).__name__
     return {
         "body": body_text,
         "retry_after": headers.get("Retry-After"),
@@ -2429,6 +2468,77 @@ def _rate_limit_wait_seconds(diagnostics):
     return None
 
 
+def _read_bounded_response(response, attempt_deadline, max_bytes=None):
+    """Read a response body without letting a trickling peer stall past
+    REQUEST_TIMEOUT_SECONDS.
+
+    Used for BOTH the success path and the HTTPError body in
+    _http_error_diagnostics(); `response` need only expose read1(). An
+    HTTPError qualifies, because it proxies attribute access to the
+    HTTPResponse underneath it.
+
+    `max_bytes` defaults to REQUEST_MAX_RESPONSE_BYTES; callers reading
+    something that is only ever summarised (an error body) pass a tighter cap.
+
+    A bare response.read() blocks until EOF with no aggregate bound -- see the
+    module comment above REQUEST_MAX_ATTEMPTS. Reading in chunks and checking
+    a wall-clock deadline before each one bounds the read even though we
+    cannot forcibly interrupt a recv() already in flight. The size cap is
+    defense in depth: every response here is small JSON, so a body over the
+    cap is itself a signal something is wrong, not a peer to keep reading.
+
+    read1(), NOT read(), is what makes the deadline check land often enough to
+    matter. HTTPResponse.read(amt) is specified to return `amt` bytes, so it
+    loops internally until it has them: on a chunked body CPython goes read ->
+    _read_chunked -> _safe_read(chunk_left) per chunk, and on an
+    identity-encoded body straight to BufferedReader.read(amt), which also
+    loops. Either way ONE call spans arbitrarily many recv()s, each of which
+    independently resets the socket's idle timeout -- so a peer trickling a
+    byte at a time inside REQUEST_TIMEOUT_SECONDS could hold a single read()
+    open past both bounds and the deadline below would never be scheduled.
+    read1(n) performs at most one underlying receive (at most one chunk when
+    chunked, modulo the bounded chunk-header line), which is exactly the
+    one-recv-per-deadline-check the bound needs to be real.
+    """
+    read1 = getattr(response, "read1", None)
+    if read1 is None:
+        # Fail closed and loudly. Falling back to read() here would silently
+        # restore the unbounded-read hazard this function exists to remove,
+        # and it would do so invisibly -- every test would still pass.
+        raise TypeError(
+            "%s has no read1(); refusing to fall back to read(), which can span "
+            "many recv() calls and defeat the REQUEST_TIMEOUT_SECONDS bound"
+            % type(response).__name__
+        )
+    if max_bytes is None:
+        max_bytes = REQUEST_MAX_RESPONSE_BYTES
+    chunks = []
+    total = 0
+    while True:
+        if time.monotonic() >= attempt_deadline:
+            raise TimeoutError(
+                "response read exceeded REQUEST_TIMEOUT_SECONDS (trickling peer)"
+            )
+        chunk = read1(REQUEST_READ_CHUNK_BYTES)
+        if not chunk:
+            # read1() returns b"" at a FIN even when Content-Length promised
+            # more, unlike read(), which raises IncompleteRead via _safe_read.
+            # A leftover `length` is that shortfall; raise it so _request()'s
+            # HTTPException arm retries a truncated body instead of handing a
+            # partial one to json.loads(). Chunked framing (length None) and a
+            # complete identity body (length 0) fall through.
+            shortfall = getattr(response, "length", None)
+            if shortfall:
+                raise http.client.IncompleteRead(b"".join(chunks), shortfall)
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(
+                "GitHub API response exceeded %d bytes" % max_bytes
+            )
+        chunks.append(chunk)
+
+
 def _request(url, token, method="GET", payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -2443,11 +2553,18 @@ def _request(url, token, method="GET", payload=None):
         explicit_backoff = None
         try:
             with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                body = response.read()
+                # The fixed-clock tests script monotonic() call-by-call and
+                # pin both sequences exactly.
+                # Deliberately NOT clamped to the retry budget, unlike the error
+                # body in _http_error_diagnostics(): a slow read that completes
+                # still returns data here, so clamping would turn slow successes
+                # into failures, while a truncated error body costs only log text.
+                attempt_deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+                body = _read_bounded_response(response, attempt_deadline)
                 return json.loads(body) if body else None
         except urllib.error.HTTPError as error:
             # HTTPError subclasses URLError, so this arm MUST precede the next.
-            diagnostics = _http_error_diagnostics(error)
+            diagnostics = _http_error_diagnostics(error, deadline)
             print(
                 "GitHub API %s %s -> HTTP %d: %s "
                 "(retry-after=%s x-ratelimit-remaining=%s x-ratelimit-reset=%s)"
