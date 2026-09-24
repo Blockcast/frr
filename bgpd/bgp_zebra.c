@@ -59,6 +59,7 @@
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_ted.h"
 #include "bgpd/bgp_mvpn.h"
+#include "bgpd/bgp_mvpn_events.h"
 #include "bgpd/bgp_dimt.h"
 
 /* All information about zebra. */
@@ -3477,6 +3478,22 @@ static int bgp_zebra_process_mvpn_sg(ZAPI_CALLBACK_ARGS)
 	switch (sg.role) {
 	case ZAPI_MVPN_SG_JOIN:
 		bgp_mvpn_source_tree_join_set(bgp, &sg.src, &sg.grp, negate);
+		/*
+		 * Additive forwarding events, after the RIB work and after the
+		 * install/origin_change record it emits -- a readiness record
+		 * annotates an entitlement interval, so the interval has to
+		 * exist on the stream first.
+		 *
+		 * Only on ADD.  A DEL's forwarding byte describes a path being
+		 * torn down, and the withdraw path closes any open readiness
+		 * interval itself with reason "withdraw", which is what
+		 * guarantees the forwarding_lost precedes the withdraw. Calling
+		 * this on DEL would either duplicate that or race its ordering.
+		 */
+		if (!negate)
+			bgp_mvpn_event_forwarding_update(bgp, &sg.src, &sg.grp, sg.forwarding,
+							 sg.fwd_reason, sg.fwd_ifindex,
+							 sg.fwd_oif);
 		break;
 	case ZAPI_MVPN_SG_SOURCE:
 		bgp_mvpn_source_active_set(bgp, &sg.src, &sg.grp, negate);

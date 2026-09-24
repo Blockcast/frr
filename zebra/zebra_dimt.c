@@ -376,6 +376,13 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 				}
 				entry->ctx.owner_session = ctx.owner_session;
 				if (entry->state == ZEBRA_DIMT_INSTALLED) {
+					if (!zebra_dimt_tunnel_resolve_ifindex(entry)) {
+						zebra_dimt_notify(
+							&ctx, entry->vrf_id, 0,
+							ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+						zebra_dimt_tunnel_forget(entry);
+						return;
+					}
 					zebra_dimt_notify(
 						&entry->ctx, entry->vrf_id,
 						entry->ifindex,

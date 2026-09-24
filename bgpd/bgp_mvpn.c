@@ -32,6 +32,7 @@
 #include "bgpd/bgp_mvpn.h"
 #include "bgpd/bgp_mvpn_events.h"
 #include "bgpd/bgp_zebra.h"
+#include "bgpd/bgp_dimt.h"
 
 /* Bit-length key covering the whole mvpn_addr (route_type, C-S, C-G). Padding
  * inside the struct is memset-zeroed on build, so the radix key is stable.
@@ -172,6 +173,32 @@ static void bgp_mvpn_put_ipaddr(struct stream *s, const struct ipaddr *a)
 		stream_put(s, &a->ipaddr_v4, IPV4_MAX_BYTELEN);
 }
 
+static uint8_t bgp_mvpn_ipaddr_len(const struct ipaddr *a)
+{
+	return IS_IPADDR_V6(a) ? IPV6_MAX_BYTELEN : IPV4_MAX_BYTELEN;
+}
+
+static uint8_t bgp_mvpn_caddr_len(const struct ipaddr *a)
+{
+	return 1 + bgp_mvpn_ipaddr_len(a);
+}
+
+static uint8_t bgp_mvpn_type3_spec_len(const struct mvpn_addr *m)
+{
+	return 8 + bgp_mvpn_caddr_len(&m->src) +
+	       bgp_mvpn_caddr_len(&m->grp) +
+	       bgp_mvpn_ipaddr_len(&m->originator);
+}
+
+static bool bgp_mvpn_type3_length_valid(uint8_t length)
+{
+	return length == BGP_MVPN_TYPE3_V4_SPEC_LEN ||
+	       length == BGP_MVPN_TYPE3_V4_SPEC_LEN +
+			 IPV6_MAX_BYTELEN - IPV4_MAX_BYTELEN ||
+	       length == BGP_MVPN_TYPE3_V6_V4_SPEC_LEN ||
+	       length == BGP_MVPN_TYPE3_V6_SPEC_LEN;
+}
+
 static void bgp_mvpn_put_type3_body(struct stream *s, const struct mvpn_addr *m)
 {
 	stream_put(s, NULL, 8); /* RD = 0 (GTM) */
@@ -253,13 +280,13 @@ static void bgp_mvpn_encode_type3(struct stream *s, const struct prefix *p, bool
 				  uint32_t addpath_tx_id)
 {
 	const struct mvpn_addr *m = &p->u.prefix_mvpn;
-	bool v6 = IS_IPADDR_V6(&m->src);
+	uint8_t length = bgp_mvpn_type3_spec_len(m);
 
 	if (addpath_capable)
 		stream_putl(s, addpath_tx_id);
 
 	stream_putc(s, BGP_MVPN_ROUTE_TYPE_S_PMSI_AD);
-	stream_putc(s, v6 ? BGP_MVPN_TYPE3_V6_SPEC_LEN : BGP_MVPN_TYPE3_V4_SPEC_LEN);
+	stream_putc(s, length);
 	bgp_mvpn_put_type3_body(s, m);
 }
 
@@ -267,15 +294,17 @@ static void bgp_mvpn_encode_type4(struct stream *s, const struct prefix *p, bool
 				  uint32_t addpath_tx_id)
 {
 	const struct mvpn_addr *m = &p->u.prefix_mvpn;
-	bool v6 = IS_IPADDR_V6(&m->src);
+	uint8_t key_length = bgp_mvpn_type3_spec_len(m);
+	uint8_t length = 2 + key_length +
+			 bgp_mvpn_ipaddr_len(&m->leaf_originator);
 
 	if (addpath_capable)
 		stream_putl(s, addpath_tx_id);
 
 	stream_putc(s, BGP_MVPN_ROUTE_TYPE_LEAF_AD);
-	stream_putc(s, v6 ? BGP_MVPN_TYPE4_V6_SPEC_LEN : BGP_MVPN_TYPE4_V4_SPEC_LEN);
+	stream_putc(s, length);
 	stream_putc(s, BGP_MVPN_ROUTE_TYPE_S_PMSI_AD);
-	stream_putc(s, v6 ? BGP_MVPN_TYPE3_V6_SPEC_LEN : BGP_MVPN_TYPE3_V4_SPEC_LEN);
+	stream_putc(s, key_length);
 	bgp_mvpn_put_type3_body(s, m);
 	bgp_mvpn_put_ipaddr(s, &m->leaf_originator);
 }
@@ -325,6 +354,14 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, afi_t afi
 	dest = bgp_afi_node_get(bgp->rib[afi][SAFI_MCAST_VPN], afi, SAFI_MCAST_VPN,
 				(const struct prefix *)p, NULL);
 
+	/*
+	 * Interns the caller's attr directly -- never a modified copy. The
+	 * receive path marks that attr as its own parsed_attr, so this feeds
+	 * bgp_attr_intern()'s reuse cache across the NLRI of one UPDATE, and
+	 * the unintern calls below must clear the cache rather than leave it
+	 * pointing at an attr whose last reference they just dropped (the same
+	 * pairing bgp_update() uses).
+	 */
 	attr_new = bgp_attr_intern(attr);
 
 	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
@@ -332,12 +369,32 @@ static void bgp_mvpn_route_install(struct bgp *bgp, struct peer *peer, afi_t afi
 			break;
 
 	if (pi) {
-		if (attrhash_cmp(pi->attr, attr_new)) {
+		/*
+		 * A path marked for delete is not gone yet: bgp_mvpn_route_remove()
+		 * only sets BGP_PATH_REMOVED and schedules bgp_process(), and the
+		 * reap happens later on the work queue. If the peer re-advertises the
+		 * NLRI before that drains -- trivially easy now that an ordinary
+		 * rejected UPDATE removes (a Type-3 whose PMSI attribute comes and
+		 * goes, say) -- we must resurrect the path rather than hand back a
+		 * doomed one.
+		 *
+		 * Both branches below were unsafe without this. The attrhash_cmp
+		 * early return would leave BGP_PATH_REMOVED set and return, so the
+		 * route was reaped moments later and the peer, whose adj-rib-out
+		 * still says "advertised", never re-sent it: silently black-holed
+		 * until a route refresh. The reuse branch below would swap in the new
+		 * attribute while the path stayed REMOVED and !VALID, with the same
+		 * outcome. bgp_update() handles exactly this at its "flapped quicker
+		 * than processing" case; this is the same fix.
+		 */
+		if (CHECK_FLAG(pi->flags, BGP_PATH_REMOVED))
+			bgp_path_info_restore(dest, pi);
+		else if (attrhash_cmp(pi->attr, attr_new)) {
 			bgp_dest_unlock_node(dest);
-			bgp_attr_unintern(&attr_new);
+			bgp_attr_unintern_clear_reuse(attr, &attr_new);
 			return;
 		}
-		bgp_attr_unintern(&pi->attr);
+		bgp_attr_unintern_clear_reuse(attr, &pi->attr);
 		pi->attr = attr_new;
 		pi->uptime = monotime(NULL);
 		bgp_path_info_set_flag(dest, pi, BGP_PATH_ATTR_CHANGED);
@@ -442,25 +499,24 @@ stream_failure:
  */
 static int bgp_mvpn_parse_sg_body(struct peer *peer, struct stream *data, uint8_t route_type,
 				  uint8_t length, uint8_t rd[8], struct ipaddr *src,
-				  struct ipaddr *grp, uint32_t *source_as)
+				  struct ipaddr *grp, uint32_t *source_as,
+				  bool *trailing_v6)
 {
 	bool type7 = route_type == BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN;
 	bool type3 = route_type == BGP_MVPN_ROUTE_TYPE_S_PMSI_AD;
-	uint8_t v4_spec_len = type7   ? BGP_MVPN_TYPE7_V4_SPEC_LEN
-			      : type3 ? BGP_MVPN_TYPE3_V4_SPEC_LEN
-				      : BGP_MVPN_TYPE5_V4_SPEC_LEN;
-	uint8_t v6_spec_len = type7   ? BGP_MVPN_TYPE7_V6_SPEC_LEN
-			      : type3 ? BGP_MVPN_TYPE3_V6_SPEC_LEN
-				      : BGP_MVPN_TYPE5_V6_SPEC_LEN;
+	size_t body_start = stream_get_getp(data);
+	size_t body_end = body_start + length;
 	uint8_t src_len;
 	uint8_t grp_len;
+	size_t trailing;
+	uint8_t minimum_length = type7 ? BGP_MVPN_TYPE7_V4_SPEC_LEN
+				       : type3 ? BGP_MVPN_TYPE3_V4_SPEC_LEN
+					       : BGP_MVPN_TYPE5_V4_SPEC_LEN;
 
-	if (length != v4_spec_len && length != v6_spec_len) {
-		flog_err(EC_BGP_UPDATE_RCV,
-			 "%s [Error] MVPN Type-%u bad length %u (expected %u or %u)", peer->host,
-			 route_type, length, v4_spec_len, v6_spec_len);
-		return BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
-	}
+	if (trailing_v6)
+		*trailing_v6 = false;
+	if (length < minimum_length)
+		goto bad_length;
 
 	/* RD (8 octets): read for validation after the body is fully consumed
 	 * (GTM requires RD == 0). */
@@ -470,6 +526,8 @@ static int bgp_mvpn_parse_sg_body(struct peer *peer, struct stream *data, uint8_
 		STREAM_GETL(data, *source_as);
 
 	STREAM_GETC(data, src_len);
+	if (stream_get_getp(data) + PSIZE(src_len) > body_end)
+		goto bad_length;
 	switch (bgp_mvpn_read_caddr(data, src, src_len)) {
 	case MVPN_CADDR_OK:
 		break;
@@ -481,7 +539,11 @@ static int bgp_mvpn_parse_sg_body(struct peer *peer, struct stream *data, uint8_
 		return BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
 	}
 
+	if (stream_get_getp(data) >= body_end)
+		goto bad_length;
 	STREAM_GETC(data, grp_len);
+	if (stream_get_getp(data) + PSIZE(grp_len) > body_end)
+		goto bad_length;
 	switch (bgp_mvpn_read_caddr(data, grp, grp_len)) {
 	case MVPN_CADDR_OK:
 		break;
@@ -493,16 +555,29 @@ static int bgp_mvpn_parse_sg_body(struct peer *peer, struct stream *data, uint8_
 		return BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
 	}
 
-	/* C-S and C-G share a family, and the route Length must match it. */
-	if (src_len != grp_len ||
-	    length != (src_len == IPV6_MAX_BITLEN ? v6_spec_len : v4_spec_len)) {
+	if (src_len != grp_len) {
 		flog_err(EC_BGP_UPDATE_RCV,
 			 "%s [Error] MVPN Type-%u addr family/length mismatch (src %u grp %u len %u)",
 			 peer->host, route_type, src_len, grp_len, length);
 		return BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
 	}
 
-	return BGP_NLRI_PARSE_OK;
+	trailing = body_end - stream_get_getp(data);
+	if (type3 && (trailing == IPV4_MAX_BYTELEN ||
+		      trailing == IPV6_MAX_BYTELEN)) {
+		if (trailing_v6)
+			*trailing_v6 = trailing == IPV6_MAX_BYTELEN;
+		return BGP_NLRI_PARSE_OK;
+	}
+	if (!type3 && trailing == 0)
+		return BGP_NLRI_PARSE_OK;
+
+bad_length:
+	flog_err(EC_BGP_UPDATE_RCV,
+		 "%s [Error] MVPN Type-%u body does not match advertised length %u",
+		 peer->host, route_type, length);
+	return BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
+
 stream_failure:
 	return -1;
 }
@@ -566,6 +641,37 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 	stream_put(data, packet->nlri, packet->length);
 
 	addpath_capable = bgp_addpath_encode_rx(peer, packet->afi, packet->safi);
+
+	/*
+	 * Mark the packet attr as the NLRI-scoped parsed attr, exactly as
+	 * bgp_nlri_parse_ip() does, before any NLRI is installed.
+	 *
+	 * bgp_attr_owns_extra() calls an attr's extra CALLER-OWNED when it has
+	 * one, its refcnt is 0, and its attr_intern_reuse.parsed_attr is not
+	 * itself -- all three true of an unmarked packet attr. bgp_attr_intern()
+	 * then either steals attr->extra on a hash miss (bgp_attr_hash_alloc
+	 * takes the pointer and NULLs it on the caller) or frees it on a hash
+	 * hit (bgp_attr_extra_discard). Every NLRI in this MP_REACH shares this
+	 * one attr, so unmarked, the first install stripped the PMSI Tunnel
+	 * info from all the NLRI behind it and each later Type-1/Type-3 was
+	 * dropped for want of an Ingress-Replication PMSI Tunnel.
+	 *
+	 * Marked, bgp_attr_hash_alloc() duplicates the extra instead and the
+	 * discard is skipped, so ownership stays here and bgp_update_receive()
+	 * releases it exactly once via bgp_attr_unintern_sub(). The mark also
+	 * arms the reuse cache, sparing an attribute hash lookup per NLRI after
+	 * the first.
+	 *
+	 * Safe only while this parser never mutates attr between NLRI, which it
+	 * does not: bgp_mvpn_route_install() interns this pointer itself rather
+	 * than a modified copy. A future change that interns a copy must anchor
+	 * that copy to this attr the way bgp_update() does, or it will steal the
+	 * shared extra through the copy.
+	 */
+	if (attr) {
+		memset(&attr->attr_intern_reuse, 0, sizeof(attr->attr_intern_reuse));
+		attr->attr_intern_reuse.parsed_attr = attr;
+	}
 
 	/*
 	 * A NULL attr on the reachable path is BGP's treat-as-withdraw signal
@@ -632,15 +738,21 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			break;
 
 		case BGP_MVPN_ROUTE_TYPE_S_PMSI_AD: {
-			bool v6 = length == BGP_MVPN_TYPE3_V6_SPEC_LEN;
+			bool originator_v6;
+			size_t nlri_end = stream_get_getp(data) + length;
 
 			ret = bgp_mvpn_parse_sg_body(peer, data, route_type, length, rd, &src,
-						     &grp, &source_as);
+						     &grp, &source_as, &originator_v6);
 			if (ret == -1)
 				goto stream_failure;
-			if (ret != BGP_NLRI_PARSE_OK)
-				goto done;
-			ret = bgp_mvpn_read_originator(data, &originator, v6);
+			if (ret != BGP_NLRI_PARSE_OK) {
+				/* The outer length was checked above, so discard only this
+				 * malformed NLRI and preserve the following route boundary. */
+				stream_set_getp(data, nlri_end);
+				ret = BGP_NLRI_PARSE_OK;
+				continue;
+			}
+			ret = bgp_mvpn_read_originator(data, &originator, originator_v6);
 			if (ret != BGP_NLRI_PARSE_OK)
 				goto stream_failure;
 			bgp_mvpn_build_prefix_type3(&p, &src, &grp, &originator);
@@ -650,42 +762,56 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		case BGP_MVPN_ROUTE_TYPE_LEAF_AD: {
 			uint8_t key_type;
 			uint8_t key_length;
-			bool v6;
+			bool originator_v6;
+			bool leaf_v6;
+			uint8_t leaf_length;
+			size_t nlri_end = stream_get_getp(data) + length;
 
-			if (length != BGP_MVPN_TYPE4_V4_SPEC_LEN &&
-			    length != BGP_MVPN_TYPE4_V6_SPEC_LEN) {
+			if (length < 2) {
 				flog_err(EC_BGP_UPDATE_RCV,
-					 "%s [Error] MVPN Type-4 bad length %u (expected %u or %u)",
-					 peer->host, length, BGP_MVPN_TYPE4_V4_SPEC_LEN,
-					 BGP_MVPN_TYPE4_V6_SPEC_LEN);
+					 "%s [Error] MVPN Type-4 bad length %u",
+					 peer->host, length);
 				ret = BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
 				goto done;
 			}
-
-			v6 = length == BGP_MVPN_TYPE4_V6_SPEC_LEN;
 			STREAM_GETC(data, key_type);
 			STREAM_GETC(data, key_length);
 			if (key_type != BGP_MVPN_ROUTE_TYPE_S_PMSI_AD ||
-			    key_length != (v6 ? BGP_MVPN_TYPE3_V6_SPEC_LEN
-					      : BGP_MVPN_TYPE3_V4_SPEC_LEN)) {
+			    key_length > length - 2 ||
+			    !bgp_mvpn_type3_length_valid(key_length)) {
 				flog_err(EC_BGP_UPDATE_RCV,
 					 "%s [Error] MVPN Type-4 malformed S-PMSI route key (type %u length %u)",
 					 peer->host, key_type, key_length);
 				/* The outer Type-4 length is valid, so its boundary is
 				 * trustworthy even though the embedded route key is not.
 				 * Discard this NLRI without resetting the BGP session. */
-				stream_forward_getp(data, length - 2);
+				stream_set_getp(data, nlri_end);
 				continue;
 			}
 
 			ret = bgp_mvpn_parse_sg_body(peer, data, key_type, key_length, rd, &src,
-						     &grp, &source_as);
+						     &grp, &source_as, &originator_v6);
 			if (ret == -1)
 				goto stream_failure;
-			if (ret != BGP_NLRI_PARSE_OK)
-				goto done;
-			if (bgp_mvpn_read_originator(data, &originator, v6) != BGP_NLRI_PARSE_OK ||
-			    bgp_mvpn_read_originator(data, &leaf_originator, v6) !=
+			if (ret != BGP_NLRI_PARSE_OK) {
+				stream_set_getp(data, nlri_end);
+				ret = BGP_NLRI_PARSE_OK;
+				continue;
+			}
+			leaf_length = length - 2 - key_length;
+			if (leaf_length != IPV4_MAX_BYTELEN &&
+			    leaf_length != IPV6_MAX_BYTELEN) {
+				flog_err(EC_BGP_UPDATE_RCV,
+					 "%s [Error] MVPN Type-4 bad leaf originator length %u",
+					 peer->host, leaf_length);
+				stream_set_getp(data, nlri_end);
+				ret = BGP_NLRI_PARSE_OK;
+				continue;
+			}
+			leaf_v6 = leaf_length == IPV6_MAX_BYTELEN;
+			if (bgp_mvpn_read_originator(data, &originator, originator_v6) !=
+				    BGP_NLRI_PARSE_OK ||
+			    bgp_mvpn_read_originator(data, &leaf_originator, leaf_v6) !=
 				    BGP_NLRI_PARSE_OK)
 				goto stream_failure;
 			bgp_mvpn_build_prefix_type4(&p, &src, &grp, &originator, &leaf_originator);
@@ -695,7 +821,7 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		case BGP_MVPN_ROUTE_TYPE_SOURCE_ACTIVE:
 		case BGP_MVPN_ROUTE_TYPE_SOURCE_TREE_JOIN:
 			ret = bgp_mvpn_parse_sg_body(peer, data, route_type, length, rd, &src,
-						     &grp, &source_as);
+						     &grp, &source_as, NULL);
 			if (ret == -1)
 				goto stream_failure;
 			if (ret != BGP_NLRI_PARSE_OK)
@@ -721,11 +847,54 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		 * to install without letting a misbehaving peer weaponize a
 		 * session reset. getp is already at the next NLRI here.
 		 */
+		/*
+		 * WITHDRAW-OR-SKIP: the rule every semantic reject below follows.
+		 *
+		 * RFC 4271 Section 9 makes a replacement route carrying the SAME NLRI
+		 * an implicit withdraw of the previous advertisement. So a reject must
+		 * ask one question: is the NLRI we are rejecting the same NLRI as one
+		 * we already hold from this peer?
+		 *
+		 *   same NLRI, different attributes -> it IS a replacement. Drop our
+		 *       copy (bgp_mvpn_route_remove), or we strand a route the peer
+		 *       has already superseded.
+		 *   different NLRI                  -> it is NOT a replacement. Skip
+		 *       it and leave our copy alone.
+		 *
+		 * Careful: our RIB key (struct prefix_mvpn) is a LOSSY projection of
+		 * the RFC 6514 NLRI -- it drops the Route Distinguisher, because GTM
+		 * mandates RD 0 (RFC 7716). Two distinct on-the-wire NLRI, RD 0 and
+		 * RD 1 for one (S,G), therefore collide on one key. The RD reject just
+		 * below is what keeps that projection safe: it is the reason a
+		 * non-zero RD can never occupy the key. The reject and the RD-free key
+		 * are a matched pair; do not remove or relax either alone.
+		 *
+		 * Per site:
+		 *   non-zero RD   SKIP     -- different NLRI (the RD differs). Removing
+		 *                             would delete the peer's legitimate RD-0
+		 *                             route for the same (S,G).
+		 *   non-SSM group SKIP     -- the group IS in the key, so any colliding
+		 *                             route has the same group, is also non-SSM
+		 *                             and could never have installed. Removing
+		 *                             would be a no-op; skipping says so.
+		 *   reflected T-1 WITHDRAW -- same NLRI. Normally nothing is installed,
+		 *                             but after our router-id becomes a value
+		 *                             the peer already advertised, its formerly
+		 *                             valid Type-1 turns "reflected" and would
+		 *                             otherwise sit beside our own forever.
+		 *   missing PMSI  WITHDRAW -- same NLRI, attribute removed. This is the
+		 *                             textbook replacement route: the peer has
+		 *                             told us the tunnel binding is gone.
+		 *
+		 * (Not RFC 7606 treat-as-withdraw: that covers MALFORMED attributes.
+		 * A Type-3 with no PMSI Tunnel attribute is well-formed and merely
+		 * unusable under RFC 6514 Section 5.)
+		 */
 		if (!mvpn_rd_is_zero(rd)) {
 			flog_err(EC_BGP_UPDATE_RCV,
 				 "%s [Error] MVPN Type-%u non-zero RD under GTM (RFC 7716); dropping route",
 				 peer->host, route_type);
-			continue;
+			continue; /* SKIP: different NLRI -- see WITHDRAW-OR-SKIP above */
 		}
 
 		if (route_type == BGP_MVPN_ROUTE_TYPE_S_PMSI_AD ||
@@ -739,6 +908,118 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 				flog_err(EC_BGP_UPDATE_RCV,
 					 "%s [Error] MVPN Type-%u group %pIA outside SSM range (232.0.0.0/8 or ff3x::/32); dropping route",
 					 peer->host, route_type, &grp);
+				/* SKIP: a colliding key carries this same non-SSM group and
+				 * so could never have installed. See WITHDRAW-OR-SKIP. */
+				continue;
+			}
+		}
+
+		/* Type-1's plane is the AF the NLRI arrived on (RFC 6515 permits a
+		 * v4 originator inside the IPv6 AF); Type-5/7 key off the C-S/C-G
+		 * family, which the length checks above already tied to the body.
+		 * Needed from here on: the AS-path loop check below withdraws by it.
+		 */
+		afi_t rib_afi = (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI)
+					? packet->afi
+					: bgp_mvpn_prefix_afi(&p);
+
+		/*
+		 * Reflected-local Type-1 is checked BEFORE the AS-path loop test
+		 * below, and the order is load-bearing.
+		 *
+		 * Our own Type-1 coming back to us over eBGP necessarily carries our
+		 * AS in its AS_PATH, so the loop check would reject it first and this
+		 * more specific diagnostic would never be emitted -- the check would
+		 * be dead code in every eBGP topology, and only reachable for iBGP
+		 * reflection where AS_PATH is not prepended. Both checks reject, so
+		 * routing is unaffected either way, but "reflects the local
+		 * originator" tells an operator what actually happened and
+		 * "as-path contains our own AS" does not.
+		 *
+		 * Found by bgp_mvpn_v6_join_leave, whose r1/r2 (AS 65001) reflect
+		 * through r3 (AS 65003) and which counts this exact log line.
+		 */
+		if (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI && !is_withdraw &&
+		    peer != peer->bgp->peer_self && IS_IPADDR_V4(&p.prefix.src) &&
+		    p.prefix.src.ipaddr_v4.s_addr == peer->bgp->router_id.s_addr) {
+			flog_err(EC_BGP_UPDATE_RCV,
+				 "%s [Error] MVPN Type-1 reflects the local originator; dropping duplicate",
+				 peer->host);
+			/* WITHDRAW: same NLRI. Steady state has nothing installed here,
+			 * but if our router-id has just become a value this peer already
+			 * advertised, its previously valid Type-1 is now "reflected" and
+			 * would sit beside our own until the session drops. The removal
+			 * is scoped to (peer, BGP_ROUTE_NORMAL), so our self-originated
+			 * copy is never touched. */
+			bgp_mvpn_route_remove(peer->bgp, peer, rib_afi, &p, BGP_ROUTE_NORMAL);
+			continue;
+		}
+
+		/*
+		 * AS-path loop detection. This parser installs straight into the
+		 * MCAST-VPN RIB through bgp_mvpn_route_install() and never passes
+		 * through bgp_update(), so it inherits none of bgp_update()'s inbound
+		 * checks. Without this one an eBGP peer's copy of OUR OWN route is
+		 * accepted, re-advertised back with our AS prepended again, and the
+		 * two speakers ping-pong every MCAST-VPN route indefinitely. Observed
+		 * on a live PE<->PoP session: an AS_PATH of 486 alternating ASNs in
+		 * 1,950 bytes, ~9 UPDATEs/s in each direction while otherwise idle.
+		 *
+		 * Runs the same three checks bgp_update() runs, in its order and with
+		 * its reason text -- change_local_as, then the local AS, then the
+		 * confederation id -- honouring the neighbour's allowas-in count.
+		 * Every arm denies, so the order only picks which reason is logged
+		 * when several match; keeping bgp_update()'s means an MVPN denial and
+		 * a unicast denial of the same AS_PATH log the same reason (which is
+		 * also why the change_local_as and bgp->as arms share one string, as
+		 * they do there). It deliberately does NOT implement bgp_update()'s
+		 * allowas-in route-map gating or "allowas-in origin": `neighbor ...
+		 * allowas-in` has no MVPN address-family form (bgp_vty.c installs it
+		 * for unicast/multicast/labeled/VPN/EVPN only), so allowas_in here is
+		 * always 0 and those refinements have nothing to refine. Wire them up
+		 * alongside the command if it ever gains one.
+		 *
+		 * Installs only: a withdraw must remove the NLRI by key whatever
+		 * attributes accompany it (an MP_UNREACH can share an UPDATE with
+		 * attributes), and the NULL-attr treat-as-withdraw case is already
+		 * folded into is_withdraw, which is why attr is known non-NULL here.
+		 * A denied install is an implicit withdraw (RFC 4271 Section 9) -- the
+		 * peer has replaced what it told us before -- so drop any copy we
+		 * still hold instead of stranding it, as bgp_update()'s filtered:
+		 * path does via bgp_rib_remove().
+		 */
+		if (!is_withdraw) {
+			int allowas_in = peer->allowas_in[packet->afi][SAFI_MCAST_VPN];
+			int32_t local_as_loops = 0;
+			const char *reason = NULL;
+
+			if (peer->change_local_as) {
+				if (CHECK_FLAG(peer->af_flags[packet->afi][SAFI_MCAST_VPN],
+					       PEER_FLAG_ALLOWAS_IN))
+					local_as_loops = allowas_in;
+				else if (!CHECK_FLAG(peer->flags, PEER_FLAG_LOCAL_AS_NO_PREPEND))
+					local_as_loops = 1;
+			}
+
+			if (peer->change_local_as &&
+			    aspath_loop_check(attr->aspath, peer->change_local_as) >
+				    local_as_loops)
+				reason = "as-path contains our own AS";
+			else if (aspath_loop_check(attr->aspath, peer->bgp->as) > allowas_in)
+				reason = "as-path contains our own AS";
+			else if (CHECK_FLAG(peer->bgp->config, BGP_CONFIG_CONFEDERATION) &&
+				 aspath_loop_check_confed(attr->aspath, peer->bgp->confed_id) >
+					 allowas_in)
+				reason = "as-path contains our own confed AS";
+
+			if (reason) {
+				peer->stat_pfx_aspath_loop++;
+				if (bgp_debug_update(peer, (struct prefix *)&p, NULL, 1))
+					zlog_debug("%s MVPN Type-%u %pFX -- DENIED due to: %s; as-path %s",
+						   peer->host, route_type, (struct prefix *)&p,
+						   reason, aspath_print(attr->aspath));
+				bgp_mvpn_route_remove(peer->bgp, peer, rib_afi, &p,
+						      BGP_ROUTE_NORMAL);
 				continue;
 			}
 		}
@@ -754,6 +1035,10 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			flog_err(EC_BGP_UPDATE_RCV,
 				 "%s [Error] MVPN Type-1 without Ingress-Replication PMSI Tunnel; dropping route",
 				 peer->host);
+			/* WITHDRAW: same NLRI, PMSI attribute gone. The peer is telling
+			 * us it is no longer an ingress-replication leaf; keeping the
+			 * old copy would keep replicating to it. */
+			bgp_mvpn_route_remove(peer->bgp, peer, rib_afi, &p, BGP_ROUTE_NORMAL);
 			continue;
 		}
 
@@ -765,16 +1050,12 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			flog_err(EC_BGP_UPDATE_RCV,
 				 "%s [Error] MVPN Type-3 without Ingress-Replication PMSI Tunnel; dropping route",
 				 peer->host);
+			/* WITHDRAW: same NLRI, PMSI attribute gone. Stranding this one
+			 * leaves a selective-tunnel binding installed that still feeds
+			 * bgp_mvpn_leaf_from_type3_set() long after the peer dropped it. */
+			bgp_mvpn_route_remove(peer->bgp, peer, rib_afi, &p, BGP_ROUTE_NORMAL);
 			continue;
 		}
-
-		/* Type-1's plane is the AF the NLRI arrived on (RFC 6515 permits a
-		 * v4 originator inside the IPv6 AF); Type-5/7 key off the C-S/C-G
-		 * family, which the length checks above already tied to the body.
-		 */
-		afi_t rib_afi = (route_type == BGP_MVPN_ROUTE_TYPE_INTRA_AS_IPMSI)
-					? packet->afi
-					: bgp_mvpn_prefix_afi(&p);
 
 		if (is_withdraw)
 			bgp_mvpn_route_remove(peer->bgp, peer, rib_afi, &p, BGP_ROUTE_NORMAL);
@@ -784,12 +1065,23 @@ int bgp_nlri_parse_mvpn(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 	}
 
 done:
+	/*
+	 * Reset the attr_intern_reuse cache, mirroring bgp_nlri_parse_ip():
+	 * leave no parsed_attr/interned pointer behind in the caller's attr,
+	 * which outlives this call. bgp_nlri_parse_ip() resets on its normal
+	 * exit only; both exits here do, including the truncation path below.
+	 */
+	if (attr)
+		memset(&attr->attr_intern_reuse, 0, sizeof(attr->attr_intern_reuse));
 	stream_free(data);
 	return ret;
 
 stream_failure:
 	flog_err(EC_BGP_UPDATE_RCV, "%s [Error] MVPN NLRI parse error (truncated NLRI of size %u)",
 		 peer->host, packet->length);
+	/* Reuse cache reset, as at done: above. */
+	if (attr)
+		memset(&attr->attr_intern_reuse, 0, sizeof(attr->attr_intern_reuse));
 	stream_free(data);
 	return BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
 }
@@ -1133,6 +1425,61 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 }
 
 /*
+ * Attestation-only UMH resolver: the DIMT Upstream Multicast Hop carried by
+ * ECOMMUNITY_UMH (0x80) on the selected source route, IPv4 only.
+ *
+ * This is deliberately NOT folded into bgp_mvpn_resolve_from_ecommunity(),
+ * whose value becomes the RFC 7716 upstream-node-identifying Route Target via
+ * bgp_mvpn_attach_ip_rt() and therefore decides which PE imports the
+ * C-multicast join. 0x0b names an MVPN PE identity; 0x80 names a
+ * PIM-Light/AMT-relay tunnel endpoint (bgp_dimt.c). They are different objects
+ * and in our own topotest fixture they hold different addresses, so feeding
+ * 0x80 to the RT would retarget the join. The two lanes stay separate: the RT
+ * lane is untouched, and only the settlement event's attested origin moves.
+ *
+ * The contrast with bgp_mvpn_resolve_from_lcommunity(), which DOES override the
+ * RT, is not a precedent for sharing: that large community re-encodes the same
+ * object (its data2 is "the upstream PE's IPv4 address"), so overriding keeps
+ * the RT naming the same thing. 0x80 does not.
+ *
+ * Selection differs too: 0x80 is chosen by highest la_pref (a preference the
+ * DIMT encoding defines), while the RT lane's ecommunity_lookup() is a
+ * first-match with no preference notion -- another reason one function cannot
+ * serve both.
+ *
+ * IPv4 only, per the BLO-29578 Q4 ruling: SessionLease.lc_umh_origin is
+ * "<sourceAS>:1:<UMH-u32>", a u32, so a 16-byte UMH has no representation in
+ * the settlement contract. IPv6 attestation is tracked separately (BLO-29651).
+ * AFI_IP here selects the 8-byte EC list, independent of the C-S family -- a v6
+ * C-S route may still carry an IPv4 UMH.
+ *
+ * *attested is overwritten only when a valid tuple is present; otherwise it is
+ * left untouched, so the caller's RT-lane value stands as the fallback and
+ * events that are correct today do not change.
+ */
+static void bgp_mvpn_resolve_attested_umh(struct bgp_path_info *pi, struct in_addr *attested)
+{
+	struct ipaddr umh = {};
+	uint8_t umh_type;
+	uint8_t preference;
+
+	if (!bgp_dimt_umh_from_path(pi, AFI_IP, &umh, &umh_type, &preference))
+		return;
+
+	/* AFI_IP always tags v4; reject anything else rather than trusting a
+	 * future change to that contract to keep a 16-byte value out of a u32. */
+	if (!IS_IPADDR_V4(&umh))
+		return;
+
+	if (BGP_DEBUG(zebra, ZEBRA) && attested->s_addr != INADDR_ANY &&
+	    attested->s_addr != umh.ipaddr_v4.s_addr)
+		zlog_debug("MVPN UMH attestation (0x80 %pI4, type %u pref %u) disagrees with the RFC 7716 RT lane (%pI4); RT unchanged, event reports the attested origin",
+			   &umh.ipaddr_v4, umh_type, preference, attested);
+
+	*attested = umh.ipaddr_v4;
+}
+
+/*
  * Resolve the RFC 6514 Section 5 communities (Source AS, upstream PE) for a
  * pimd-driven Type-7 from the unicast route toward C-S, in one longest-match
  * lookup, reading the selected (best) path only.
@@ -1149,14 +1496,28 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
  * With "bgp mvpn umh-large-community" configured the UMH large community is
  * tried first; the extended communities are the fallback whenever no valid
  * tuple is present (and the only encoding when the knob is unset).
+ *
+ * *attested (optional) receives the settlement attestation lane's UMH off that
+ * same selected path -- the DIMT 0x80 EC when present, otherwise whatever the
+ * RT lane resolved. Taking it from the same path preserves the one-path
+ * invariant above. Pass NULL when only the RT lane is wanted.
  */
-static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipaddr *src,
-					       uint32_t *source_as, struct in_addr *upstream)
+/*
+ * The selected (best) BGP path of the unicast route toward C-S, by longest
+ * match. On a hit the returned dest is LOCKED and the caller must
+ * bgp_dest_unlock_node() it; on a miss *dest_out is NULL and there is nothing
+ * to unlock.
+ */
+static struct bgp_path_info *bgp_mvpn_source_route_best_path(struct bgp *bgp,
+							     const struct ipaddr *src,
+							     struct bgp_dest **dest_out)
 {
 	struct prefix psrc = {};
 	afi_t afi = IS_IPADDR_V6(src) ? AFI_IP6 : AFI_IP;
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
+
+	*dest_out = NULL;
 
 	if (IS_IPADDR_V6(src)) {
 		psrc.family = AF_INET6;
@@ -1170,13 +1531,46 @@ static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipa
 
 	dest = bgp_node_match(bgp->rib[afi][SAFI_UNICAST], &psrc);
 	if (!dest)
-		return;
+		return NULL;
+
+	*dest_out = dest;
 
 	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
 		if (CHECK_FLAG(pi->flags, BGP_PATH_SELECTED))
 			break;
 
-	if (pi && pi->type == ZEBRA_ROUTE_BGP) {
+	return (pi && pi->type == ZEBRA_ROUTE_BGP) ? pi : NULL;
+}
+
+/*
+ * Overwrite *attested with the DIMT 0x80 UMH from the unicast route toward
+ * C-S, if that route's selected path carries one.
+ *
+ * *attested is NEVER cleared: when no 0x80 tuple is present the caller's value
+ * stands untouched. Each caller therefore owns its own fallback -- the join
+ * origination path seeds the RT-lane value, the re-emit path seeds the
+ * installed Type-7's RT -- and neither can silently acquire the other's.
+ */
+static void bgp_mvpn_attest_umh_from_source_route(struct bgp *bgp, const struct ipaddr *src,
+						  struct in_addr *attested)
+{
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi = bgp_mvpn_source_route_best_path(bgp, src, &dest);
+
+	if (pi)
+		bgp_mvpn_resolve_attested_umh(pi, attested);
+
+	if (dest)
+		bgp_dest_unlock_node(dest);
+}
+
+static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipaddr *src,
+					       uint32_t *source_as, struct in_addr *upstream)
+{
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi = bgp_mvpn_source_route_best_path(bgp, src, &dest);
+
+	if (pi) {
 		uint32_t ec_as = 0;
 		struct in_addr ec_umh = { .s_addr = INADDR_ANY };
 
@@ -1194,7 +1588,8 @@ static void bgp_mvpn_resolve_from_source_route(struct bgp *bgp, const struct ipa
 		}
 	}
 
-	bgp_dest_unlock_node(dest);
+	if (dest)
+		bgp_dest_unlock_node(dest);
 }
 
 /*
@@ -1693,6 +2088,10 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 	struct attr attr;
 	uint32_t source_as = 0;
 	struct in_addr umh = { .s_addr = INADDR_ANY };
+	/* Settlement attestation lane. Assigned from the RT lane's final value
+	 * below, then moved only by a DIMT 0x80 EC; deliberately kept out of the
+	 * RT computation. See bgp_mvpn_resolve_attested_umh(). */
+	struct in_addr attested_umh = { .s_addr = INADDR_ANY };
 
 	if (negate) {
 		/* Withdraw removes by (C-S, C-G) ignoring the Source AS.  It is
@@ -1751,12 +2150,21 @@ int bgp_mvpn_source_tree_join_set(struct bgp *bgp, const struct ipaddr *src,
 		zlog_debug("MVPN Type-7 (%pIA, %pIA): no upstream PE resolved; originating without upstream RT",
 			   src, grp);
 
+	/* The attestation lane starts from the RT lane's final value -- including
+	 * the Source Active next-hop arm above and the "no source route at all"
+	 * case -- and only a 0x80 EC moves it. An event that carries an origin
+	 * today therefore carries the same one after this change; only a
+	 * DIMT-steered join sees a different value, which is the defect being
+	 * fixed. */
+	attested_umh = umh;
+	bgp_mvpn_attest_umh_from_source_route(bgp, src, &attested_umh);
+
 	bgp_mvpn_route_install(bgp, bgp->peer_self, bgp_mvpn_prefix_afi(&p), &p, &attr,
 			       BGP_ROUTE_STATIC);
 	bgp_mvpn_selective_join_set(bgp, src, grp, false);
 	/* Settlement consumers must never observe an install/origin change before
 	 * the corresponding Type-7 and selective-route RIB mutations are visible. */
-	bgp_mvpn_event_join_resolved(bgp, src, grp, source_as, umh);
+	bgp_mvpn_event_join_resolved(bgp, src, grp, source_as, attested_umh);
 
 	bgp_attr_flush(&attr);
 	aspath_unintern(&attr.aspath);
@@ -1779,6 +2187,7 @@ void bgp_mvpn_reemit_local_joins(struct bgp *bgp)
 				(const struct prefix_mvpn *)bgp_dest_get_prefix(dest);
 			struct bgp_path_info *pi;
 			struct in_addr umh = { .s_addr = INADDR_ANY };
+			struct in_addr attested_umh = { .s_addr = INADDR_ANY };
 			uint32_t ignored_source_as = 0;
 
 			if (p->family != AF_MVPN ||
@@ -1796,8 +2205,21 @@ void bgp_mvpn_reemit_local_joins(struct bgp *bgp)
 			/* The installed Type-7's upstream-node RT is the event's UMH.
 			 * Source AS comes from the NLRI key, not from an optional EC. */
 			bgp_mvpn_resolve_from_ecommunity(pi, &ignored_source_as, &umh);
+
+			/* Attestation lane: bgp_mvpn_attach_ip_rt() replaced the
+			 * Type-7's entire EC set with the RT, so the 0x80 EC is
+			 * not on THIS path -- it lives on the unicast route
+			 * toward C-S. Re-resolve from there so a re-emit reports
+			 * the same attested origin the original install did,
+			 * rather than silently downgrading to the RT. Seeded
+			 * with the installed Type-7's own RT, so a source route
+			 * that is gone or carries no 0x80 keeps today's value. */
+			attested_umh = umh;
+			bgp_mvpn_attest_umh_from_source_route(bgp, &p->prefix.src,
+							      &attested_umh);
+
 			bgp_mvpn_event_join_resolved(bgp, &p->prefix.src, &p->prefix.grp,
-						     p->prefix.source_as, umh);
+						     p->prefix.source_as, attested_umh);
 		}
 	}
 }
@@ -1923,8 +2345,22 @@ void bgp_mvpn_show_routes(struct vty *vty, struct bgp *bgp, afi_t afi, bool use_
 			continue;
 
 		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
-			bool self = (pi->peer == bgp->peer_self);
-			struct ecommunity *ecom = bgp_attr_get_ecommunity(pi->attr);
+			bool self;
+			struct ecommunity *ecom;
+
+			/*
+			 * Skip paths already marked for delete. Removal is two-stage --
+			 * bgp_mvpn_route_remove() sets BGP_PATH_REMOVED and clears
+			 * BGP_PATH_VALID, and the reap happens later on the work queue --
+			 * so without this an operator (and every topotest) sees withdrawn
+			 * MCAST-VPN routes for as long as that queue takes to drain.
+			 * bgp_show_table() filters the same way for the unicast RIBs.
+			 */
+			if (CHECK_FLAG(pi->flags, BGP_PATH_REMOVED))
+				continue;
+
+			self = (pi->peer == bgp->peer_self);
+			ecom = bgp_attr_get_ecommunity(pi->attr);
 			/* ecommunity_str() lazily builds and caches the display
 			 * string (RFC 7716 Section 2.8.2 group-address RT on
 			 * Type-5, and any RT a later route type carries). */

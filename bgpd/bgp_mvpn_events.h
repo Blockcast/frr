@@ -27,6 +27,8 @@
 #include "prefix.h"
 #include "ipaddr.h"
 #include "buffer.h"
+/* ifindex_t, for the proven-forwarding oif carried on forwarding_ready. */
+#include "if.h"
 
 #include "bgpd/bgpd.h"
 
@@ -78,6 +80,67 @@ extern void bgp_mvpn_event_join_resolved(struct bgp *bgp, const struct ipaddr *s
  */
 extern void bgp_mvpn_event_withdrawn(struct bgp *bgp, const struct ipaddr *src,
 				     const struct ipaddr *grp);
+
+/*
+ * Called from bgp_zebra_process_mvpn_sg() after the join-role RIB work, with
+ * the proven-forwarding state and cause pimd put on the ZAPI message.
+ *
+ * Emits the two ADDITIVE event types of the DIMT Tunnel-Provider Contract v1
+ * rev 2 (D4).  Neither is independently payable; both reuse the record
+ * envelope and route identity of the entitlement interval that contains them,
+ * so a readiness record joins to that interval by (source, group,
+ * route_version).
+ *
+ *   - not-ready -> FWD_READY   -> emit "forwarding_ready"
+ *   - FWD_READY -> not-ready   -> emit "forwarding_lost" with a reason
+ *   - no edge                  -> no-op
+ *
+ * Edge-triggered on purpose, and that is what gives the contract its
+ * exactly-once cardinality on both edges: pimd re-ADDs on every event that
+ * could plausibly have moved readiness, so a level-triggered emitter would
+ * emit a duplicate `forwarding_ready` per redundant re-announce.
+ *
+ * `forwarding_lost` is NEVER emitted for a join that never reported ready --
+ * D3 "Failed" -- because there is no readiness interval to close.
+ *
+ * Deliberately does NOT touch install / withdraw / origin_change: their
+ * timing, trigger and shape are unchanged and ungated (D4).  Forwarding
+ * failure does not close the entitlement interval.
+ */
+extern void bgp_mvpn_event_forwarding_update(struct bgp *bgp, const struct ipaddr *src,
+					     const struct ipaddr *grp, uint8_t forwarding,
+					     uint8_t fwd_reason, ifindex_t fwd_ifindex,
+					     const char *fwd_oif);
+
+/*
+ * Reconcile emitted per-leaf state against the Type-4 (Leaf A-D) routes in the
+ * MVPN RIB, emitting "leaf_install" / "leaf_withdraw" for the difference.
+ *
+ * A join event is per (C-S, C-G) and describes this PE's own upstream
+ * interest; a leaf event is one level deeper and names a receiving PE, so that
+ * a root doing ingress replication can bill each leaf separately. The leaf
+ * identity is the Type-4 leaf_originator, already in the RIB key.
+ *
+ * Only routes learned from a peer are emitted: our own Type-4 carries
+ * bgp->router_id (this router advertising itself as a leaf) and billing it
+ * would invoice the root for its own delivery.
+ *
+ * Safe and cheap to call on any MVPN RIB change. The walk is a full diff, so
+ * it is idempotent and self-correcting: a trigger that fails to fire costs
+ * latency until the next call, never a wrong or duplicated bill.
+ */
+extern void bgp_mvpn_events_reconcile_leaves(struct bgp *bgp);
+
+/*
+ * Coalescing front door for the above: schedules one reconcile on the event
+ * loop instead of walking inline. Call this from route-processing paths.
+ *
+ * The walk is a full scan of both MVPN RIBs, so running it inline per update
+ * turned a burst of N arriving leaves into N full scans -- O(N^2) on the main
+ * route-processing path, worst in exactly the deployments large enough to want
+ * per-leaf settlement. Repeated calls while one is pending are free.
+ */
+extern void bgp_mvpn_events_schedule_leaf_reconcile(struct bgp *bgp);
 
 /* `bgp mvpn event-socket ...` running-config emission. This instance-wide
  * command must be written from BGP_NODE before any address-family block. */

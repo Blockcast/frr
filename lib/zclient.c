@@ -4201,6 +4201,12 @@ int zapi_mvpn_sg_encode(struct stream *s, int cmd, vrf_id_t vrf_id,
 	stream_put_ipaddr(s, &sg->src);
 	stream_put_ipaddr(s, &sg->grp);
 	stream_putc(s, sg->role);
+	stream_putc(s, sg->forwarding);
+	stream_putc(s, sg->fwd_reason);
+	/* Only meaningful on READY, but always encoded so the additive block
+	 * stays fixed-shape and the decoder needs no conditional framing. */
+	stream_putl(s, sg->fwd_ifindex);
+	stream_put(s, sg->fwd_oif, sizeof(sg->fwd_oif));
 
 	/* Put length at the first point of the stream. */
 	stream_putw_at(s, 0, stream_get_endp(s));
@@ -4215,6 +4221,77 @@ int zapi_mvpn_sg_decode(struct stream *s, struct zapi_mvpn_sg *sg)
 	STREAM_GET_IPADDR(s, &sg->src);
 	STREAM_GET_IPADDR(s, &sg->grp);
 	STREAM_GETC(s, sg->role);
+
+	/*
+	 * `forwarding` is additive.  A peer built before it simply stops the
+	 * message after `role`; memset() above already left the field at
+	 * ZAPI_MVPN_SG_FWD_PENDING, which is the fail-closed reading.
+	 */
+	if (STREAM_READABLE(s) >= 1)
+		STREAM_GETC(s, sg->forwarding);
+
+	/*
+	 * An unrecognised value is clamped to the same fail-closed reading as
+	 * an absent byte rather than rejected.  Returning -1 here would fail
+	 * the whole decode and discard src/grp/role too, so the day a fourth
+	 * enum zapi_mvpn_sg_forwarding member is added, every older peer would
+	 * stop processing MVPN SG messages entirely -- a strictly worse
+	 * outcome than the mixed-version case this additive framing exists to
+	 * survive.
+	 */
+	if (sg->forwarding > ZAPI_MVPN_SG_FWD_FAILED)
+		sg->forwarding = ZAPI_MVPN_SG_FWD_PENDING;
+
+	/*
+	 * `fwd_reason` is additive behind `forwarding`, same discipline: a peer
+	 * built before it stops after the state byte and memset() leaves
+	 * REASON_UNSPECIFIED, which bgpd renders as the reason string "unknown"
+	 * rather than guessing a specific cause.
+	 *
+	 * Clamped rather than rejected for the reason given above.  Note the
+	 * clamp target is UNSPECIFIED, not any real cause: a decoder that
+	 * silently renamed an unknown future cause into an existing one would
+	 * put a wrong-but-plausible reason into a settlement record, which is
+	 * worse than admitting the cause is unknown.
+	 */
+	if (STREAM_READABLE(s) >= 1)
+		STREAM_GETC(s, sg->fwd_reason);
+
+	if (sg->fwd_reason > ZAPI_MVPN_SG_FWD_REASON_ANTI_RECURSION_REFUSED)
+		sg->fwd_reason = ZAPI_MVPN_SG_FWD_REASON_UNSPECIFIED;
+
+	/*
+	 * READY carries no cause.  Normalising here keeps the invariant in one
+	 * place instead of asking every consumer to ignore a stale byte.
+	 */
+	if (sg->forwarding == ZAPI_MVPN_SG_FWD_READY)
+		sg->fwd_reason = ZAPI_MVPN_SG_FWD_REASON_UNSPECIFIED;
+
+	/*
+	 * The oif block is additive behind the cause byte, and is read as one
+	 * unit: a sender that carries the ifindex carries the name too.
+	 *
+	 * Both sides of the comparison stay size_t.  STREAM_READABLE() is
+	 * unsigned (endp - getp), so casting the right side to a signed type
+	 * would make this a -Wsign-compare error under -Werror.
+	 */
+	if (STREAM_READABLE(s) >= sizeof(uint32_t) + sizeof(sg->fwd_oif)) {
+		STREAM_GETL(s, sg->fwd_ifindex);
+		STREAM_GET(sg->fwd_oif, s, sizeof(sg->fwd_oif));
+		/* Never trust a peer to have NUL-terminated it. */
+		sg->fwd_oif[sizeof(sg->fwd_oif) - 1] = '\0';
+	}
+
+	/*
+	 * A non-READY verdict has no proven oif.  Clearing here means a
+	 * consumer cannot accidentally attribute a stale netdev to a lost
+	 * path, and it makes the mixed-version case identical to the
+	 * matched-version one.
+	 */
+	if (sg->forwarding != ZAPI_MVPN_SG_FWD_READY) {
+		sg->fwd_ifindex = 0;
+		sg->fwd_oif[0] = '\0';
+	}
 
 	return 0;
 

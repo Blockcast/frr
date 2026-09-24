@@ -9,7 +9,10 @@
 # pimd and pim6d (`ip pim` + `ip pim light`, `ipv6 pim` + `ipv6 pim
 # light`), so that adding a PE<->PoP pair needs nothing beyond listing
 # the peer's overlay address.  Pure control plane: packets never touch
-# this script.
+# this script.  Overlay identity and transport endpoints are separate:
+# by default the outer endpoint remains the overlay address, while an
+# endpoints file can retarget GRE onto a managed interconnect without
+# changing device names, inner addresses, or BGP UMH values.
 #
 # Peer list is REGISTRY-DRIVEN (a flat file rendered by site tooling /
 # mconfig), not derived from FRR state: the UMH mapping arrives over BGP,
@@ -59,9 +62,18 @@
 # links) and is warned about loudly, as is an MTU that overflows the
 # outer path to the peer.
 #
+# Managed-underlay cutover:
+#   --endpoints-file (or DIMT_ENDPOINTS_FILE) names a rendered file with
+#   "<overlay-ipv4> <underlay-ipv4>" rows for self and every desired peer.
+#   The mapping is all-or-nothing and validated before tunnel state is
+#   touched.  UCI/mconfig should render the file, then run both ends in the
+#   same cutover window.  Omitting the knob preserves the tailnet/overlay
+#   endpoint behavior for rollback.
+#
 # Usage:
 #   dimt-reconcile.sh --self 100.64.0.40 [--peers-file /etc/dimt/peers]
 #                     [--peers 100.64.0.47,...] [--mtu 1388] [--port 6637]
+#                     [--endpoints-file /etc/dimt/underlay-endpoints]
 #                     [--no-frr] [--dry-run] [--watch SECONDS]
 #                     [--allow-empty]
 
@@ -70,6 +82,7 @@ set -u
 SELF="${DIMT_SELF:-}"
 PEERS_FILE="${DIMT_PEERS_FILE:-/etc/dimt/peers}"
 PEERS_INLINE=""
+ENDPOINTS_FILE="${DIMT_ENDPOINTS_FILE:-}"
 FOU_PORT="${DIMT_FOU_PORT:-6637}"
 MTU="${DIMT_MTU:-1388}"
 PREFIX="dimt-"
@@ -102,6 +115,7 @@ while [ $# -gt 0 ]; do
 	--self) SELF="$2"; shift 2 ;;
 	--peers-file) PEERS_FILE="$2"; shift 2 ;;
 	--peers) PEERS_INLINE="$2"; shift 2 ;;
+	--endpoints-file) ENDPOINTS_FILE="$2"; shift 2 ;;
 	--mtu) MTU="$2"; shift 2 ;;
 	--port) FOU_PORT="$2"; shift 2 ;;
 	--no-frr) DO_FRR=0; shift ;;
@@ -153,6 +167,46 @@ peers() {
 		[ -n "$PEERS_INLINE" ] && echo "$PEERS_INLINE" | tr ',' '\n'
 		[ -r "$PEERS_FILE" ] && sed 's/#.*//' "$PEERS_FILE"
 	} | tr -d ' \t\r' | grep . | sort -u
+}
+
+# Resolve an overlay identity to its GRE transport endpoint.  Keeping this
+# separate from inner_of()/inner6_of()/dev_of() is the core cutover invariant:
+# transport changes must not alter the UMH resolution key.
+endpoint_of() {
+	if [ -z "$ENDPOINTS_FILE" ]; then
+		echo "$1"
+		return 0
+	fi
+	awk -v overlay="$1" '
+		/^[ \t]*#/ || NF < 2 { next }
+		$1 == overlay { print $2; found = 1; exit }
+		END { exit found ? 0 : 1 }
+	' "$ENDPOINTS_FILE"
+}
+
+# An endpoint-map cutover must be atomic.  Refuse before ensure_fou(), the GRE
+# capability probe, endpoint-drift deletion, or GC if any desired identity is
+# absent or malformed.
+validate_endpoints() {
+	[ -n "$ENDPOINTS_FILE" ] || return 0
+	[ -r "$ENDPOINTS_FILE" ] || {
+		log "ERROR: endpoints file $ENDPOINTS_FILE missing/unreadable; refusing cutover"
+		return 1
+	}
+	for overlay in "$SELF" $(peers); do
+		endpoint=$(endpoint_of "$overlay") || {
+			log "ERROR: no managed underlay endpoint for overlay $overlay; refusing cutover"
+			return 1
+		}
+		if ! echo "$endpoint" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' ||
+			! echo "$endpoint" | awk -F. '{
+				for (i = 1; i <= 4; i++)
+					if ($i < 0 || $i > 255) exit 1
+			}'; then
+			log "ERROR: invalid managed underlay endpoint '$endpoint' for overlay $overlay; refusing cutover"
+			return 1
+		fi
+	done
 }
 
 ensure_fou() {
@@ -270,6 +324,8 @@ frr_iface() { # <dev> <add|del>
 
 ensure_peer() { # <peer-overlay>
 	peer="$1"
+	self_endpoint=$(endpoint_of "$SELF") || return 1
+	peer_endpoint=$(endpoint_of "$peer") || return 1
 	dev=$(dev_of "$peer")
 	self_in=$(inner_of "$SELF")
 	peer_in=$(inner_of "$peer")
@@ -280,7 +336,7 @@ ensure_peer() { # <peer-overlay>
 	# to the peer, or near-MTU multicast fragments/blackholes (the
 	# DF-multicast trap).  Read-only, best-effort: unknown route or
 	# unparsable output just skips the check.
-	out_dev=$(ip route get "$peer" 2>/dev/null |
+	out_dev=$(ip route get "$peer_endpoint" 2>/dev/null |
 		sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)
 	if [ -n "$out_dev" ]; then
 		out_mtu=$(ip link show "$out_dev" 2>/dev/null |
@@ -313,7 +369,7 @@ ensure_peer() { # <peer-overlay>
 	if [ "$gone" = 0 ] && ip link show "$dev" >/dev/null 2>&1; then
 		cur=$(ip -d link show "$dev" 2>/dev/null)
 		case "$cur" in
-		*"local $SELF "*"remote $peer"* | *"remote $peer "*"local $SELF"*) : ;;
+		*"local $self_endpoint "*"remote $peer_endpoint"* | *"remote $peer_endpoint "*"local $self_endpoint"*) : ;;
 		*)
 			log "$dev endpoints drifted; recreating"
 			frr_iface "$dev" del
@@ -325,9 +381,9 @@ ensure_peer() { # <peer-overlay>
 
 	created=0
 	if [ "$gone" = 1 ] || ! ip link show "$dev" >/dev/null 2>&1; then
-		run ip link add "$dev" type gre local "$SELF" remote "$peer" \
+		run ip link add "$dev" type gre local "$self_endpoint" remote "$peer_endpoint" \
 			ttl 64 encap fou encap-sport auto encap-dport "$FOU_PORT" || return 1
-		log "created $dev ($SELF -> $peer)"
+		log "created $dev ($self_endpoint -> $peer_endpoint; overlay $SELF -> $peer)"
 		created=1
 	fi
 
@@ -422,6 +478,8 @@ reconcile() {
 			"refusing to reconcile (would remove every tunnel)"
 		return 1
 	fi
+
+	validate_endpoints || return 1
 
 	# No FOU receive binding means every inbound GRE-in-FOU packet is
 	# dropped -- proceeding would migrate the netdevs onto a receive

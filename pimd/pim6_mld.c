@@ -87,18 +87,6 @@ static const pim_addr gm_dummy_untracked = {
 };
 /* clang-format on */
 
-#define IPV6_MULTICAST_SCOPE_LINK 2
-
-static inline uint8_t in6_multicast_scope(const pim_addr *addr)
-{
-	return addr->s6_addr[1] & 0xf;
-}
-
-bool in6_multicast_nofwd(const pim_addr *addr)
-{
-	return in6_multicast_scope(addr) <= IPV6_MULTICAST_SCOPE_LINK;
-}
-
 /*
  * (S,G) -> subscriber,(S,G)
  */
@@ -110,7 +98,7 @@ static int gm_packet_sg_cmp(const struct gm_packet_sg *a,
 
 	s_a = gm_packet_sg2state(a);
 	s_b = gm_packet_sg2state(b);
-	return IPV6_ADDR_CMP(&s_a->subscriber->addr, &s_b->subscriber->addr);
+	return pim_addr_cmp(s_a->subscriber->addr, s_b->subscriber->addr);
 }
 
 DECLARE_RBTREE_UNIQ(gm_packet_sg_subs, struct gm_packet_sg, subs_itm,
@@ -149,7 +137,7 @@ static struct gm_packet_sg *gm_packet_sg_find(struct gm_sg *sg,
 static int gm_grp_pending_cmp(const struct gm_grp_pending *a,
 			      const struct gm_grp_pending *b)
 {
-	return IPV6_ADDR_CMP(&a->grp, &b->grp);
+	return pim_addr_cmp(a->grp, b->grp);
 }
 
 DECLARE_RBTREE_UNIQ(gm_grp_pends, struct gm_grp_pending, itm,
@@ -165,7 +153,7 @@ static int gm_gsq_pending_cmp(const struct gm_gsq_pending *a,
 	if (a->s_bit != b->s_bit)
 		return numcmp(a->s_bit, b->s_bit);
 
-	return IPV6_ADDR_CMP(&a->grp, &b->grp);
+	return pim_addr_cmp(a->grp, b->grp);
 }
 
 static uint32_t gm_gsq_pending_hash(const struct gm_gsq_pending *a)
@@ -316,7 +304,7 @@ DECLARE_DLIST(gm_packets, struct gm_packet_state, pkt_itm);
 static int gm_subscriber_cmp(const struct gm_subscriber *a,
 			     const struct gm_subscriber *b)
 {
-	return IPV6_ADDR_CMP(&a->addr, &b->addr);
+	return pim_addr_cmp(a->addr, b->addr);
 }
 
 static uint32_t gm_subscriber_hash(const struct gm_subscriber *a)
@@ -498,7 +486,7 @@ static void gm_sg_update(struct gm_sg *sg, bool has_expired)
 			sg->query_sbit = false;
 			/* Trigger the specific queries only for querier. */
 			if (!pim_ifp->gmp_immediate_leave &&
-			    IPV6_ADDR_SAME(&gm_ifp->querier, &pim_ifp->ll_lowest)) {
+			    !pim_addr_cmp(gm_ifp->querier, pim_ifp->ll_lowest)) {
 				sg->n_query = gm_ifp->cur_lmqc;
 				gm_trigger_specific(sg);
 			}
@@ -507,7 +495,7 @@ static void gm_sg_update(struct gm_sg *sg, bool has_expired)
 	prev = sg->state;
 	sg->state = desired;
 
-	if (in6_multicast_nofwd(&sg->sgaddr.grp) || gm_ifp->stopping)
+	if (pim_addr_nofwd(sg->sgaddr.grp) || gm_ifp->stopping)
 		new_join = false;
 	else
 		new_join = gm_sg_state_want_join(desired);
@@ -1521,7 +1509,7 @@ static void gm_bump_querier(struct gm_if *gm_ifp)
 
 	if (pim_addr_is_any(pim_ifp->ll_lowest))
 		return;
-	if (!IPV6_ADDR_SAME(&gm_ifp->querier, &pim_ifp->ll_lowest))
+	if (pim_addr_cmp(gm_ifp->querier, pim_ifp->ll_lowest))
 		return;
 
 	gm_ifp->n_startup = gm_ifp->cur_qrv;
@@ -1594,7 +1582,7 @@ static void gm_handle_query(struct gm_if *gm_ifp,
 	 * can mess up querier election as well as cause us to terminate
 	 * traffic (since after a unicast query no reports will be coming in)
 	 */
-	if (!IPV6_ADDR_SAME(pkt_dst, &gm_all_hosts)) {
+	if (pim_addr_cmp(*pkt_dst, gm_all_hosts)) {
 		if (pim_addr_is_any(hdr->grp)) {
 			zlog_warn(
 				log_pkt_src(
@@ -1604,7 +1592,7 @@ static void gm_handle_query(struct gm_if *gm_ifp,
 			return;
 		}
 
-		if (!IPV6_ADDR_SAME(&hdr->grp, pkt_dst)) {
+		if (pim_addr_cmp(hdr->grp, *pkt_dst)) {
 			gm_ifp->stats.rx_drop_dstaddr++;
 			zlog_warn(
 				log_pkt_src(
@@ -1614,7 +1602,26 @@ static void gm_handle_query(struct gm_if *gm_ifp,
 		}
 	}
 
-	if (IPV6_ADDR_CMP(&pkt_src->sin6_addr, &gm_ifp->querier) < 0) {
+	/* An MLDv1 querier is not eligible to win the election on an MLDv2
+	 * interface.  RFC 3810 Section 8.3.1 leaves falling back to MLDv1 to
+	 * administrative configuration; yielding here would stop our MLDv2
+	 * queries and hand the link to a router that cannot carry source
+	 * lists, silently degrading SSM.  Count and warn instead.  Hosts that
+	 * hear its queries still fall back (Section 8.2.1), which only
+	 * configuring that router for MLDv2 can prevent.
+	 */
+	if (len == sizeof(struct mld_v1_pkt) &&
+	    gm_ifp->cur_version == GM_MLDV2) {
+		if (general_query)
+			gm_ifp->stats.rx_query_old_general++;
+		else
+			gm_ifp->stats.rx_query_old_group++;
+		zlog_warn(log_pkt_src(
+			"MLDv1 query ignored for querier election on an MLDv2 interface; configure every router on this link for MLDv2"));
+		return;
+	}
+
+	if (pim_addr_cmp(pkt_src->sin6_addr, gm_ifp->querier) < 0) {
 		if (PIM_DEBUG_GM_EVENTS)
 			zlog_debug(
 				log_pkt_src("replacing elected querier %pPA"),
@@ -1642,7 +1649,7 @@ static void gm_handle_query(struct gm_if *gm_ifp,
 			timers.qrv, timers.max_resp_ms, timers.qqic_ms,
 			&timers.expire_wait);
 
-	if (IPV6_ADDR_CMP(&pkt_src->sin6_addr, &pim_ifp->ll_lowest) < 0) {
+	if (pim_addr_cmp(pkt_src->sin6_addr, pim_ifp->ll_lowest) < 0) {
 		unsigned int other_ms;
 
 		/* Use the other querier robustness value */
@@ -2416,7 +2423,7 @@ static void gm_update_ll(struct interface *ifp)
 	bool was_querier;
 
 	was_querier =
-		!IPV6_ADDR_CMP(&gm_ifp->cur_ll_lowest, &gm_ifp->querier) &&
+		!pim_addr_cmp(gm_ifp->cur_ll_lowest, gm_ifp->querier) &&
 		!pim_addr_is_any(gm_ifp->querier);
 
 	gm_ifp->cur_ll_lowest = pim_ifp->ll_lowest;
@@ -2434,7 +2441,7 @@ static void gm_update_ll(struct interface *ifp)
 	if (was_querier)
 		zlog_info(log_ifp("new link-local %pPA while querier"),
 			  &gm_ifp->cur_ll_lowest);
-	else if (IPV6_ADDR_CMP(&gm_ifp->cur_ll_lowest, &gm_ifp->querier) < 0 ||
+	else if (pim_addr_cmp(gm_ifp->cur_ll_lowest, gm_ifp->querier) < 0 ||
 		 pim_addr_is_any(gm_ifp->querier)) {
 		zlog_info(log_ifp("new link-local %pPA, becoming querier"),
 			  &gm_ifp->cur_ll_lowest);
@@ -2473,7 +2480,7 @@ void gm_ifp_update(struct interface *ifp)
 	}
 
 	gm_ifp = pim_ifp->mld;
-	if (IPV6_ADDR_CMP(&pim_ifp->ll_lowest, &gm_ifp->cur_ll_lowest))
+	if (pim_addr_cmp(pim_ifp->ll_lowest, gm_ifp->cur_ll_lowest))
 		gm_update_ll(ifp);
 
 	unsigned int cfg_query_intv = pim_ifp->gm_default_query_interval * 1000;
@@ -2566,7 +2573,7 @@ static void gm_show_if_one_detail(struct vty *vty, struct interface *ifp)
 		return;
 	}
 
-	querier = IPV6_ADDR_SAME(&gm_ifp->querier, &pim_ifp->ll_lowest);
+	querier = !pim_addr_cmp(gm_ifp->querier, pim_ifp->ll_lowest);
 
 	vty_out(vty, "Interface %s: MLD running\n", ifp->name);
 	vty_out(vty, "  Uptime:                  %pTVMs\n", &gm_ifp->started);
@@ -2610,7 +2617,7 @@ static void gm_show_if_one(struct vty *vty, struct interface *ifp,
 
 	assume(js_if || tt);
 
-	querier = IPV6_ADDR_SAME(&gm_ifp->querier, &pim_ifp->ll_lowest);
+	querier = !pim_addr_cmp(gm_ifp->querier, pim_ifp->ll_lowest);
 
 	if (js_if) {
 		json_object_string_add(js_if, "name", ifp->name);

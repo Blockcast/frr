@@ -1,0 +1,87 @@
+name: Build + push blockcast/frr GTM image
+
+# Builds the Blockcast GTM fork image (harbor.blockcast.net/blockcast/frr:gtm-<shortsha>)
+# from a caller-specified ref and pushes it to Harbor. See BLO-23408: before this
+# workflow existed, the only build path for this image was manual, on the
+# frr-mvpn-builder Proxmox VM.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Blockcast/frr git ref to build (branch, tag, or full SHA)'
+        required: true
+        default: master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gtm-image-build-${{ github.event.inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: harbor.blockcast.net
+  IMAGE: harbor.blockcast.net/blockcast/frr
+
+jobs:
+  build:
+    # This workflow only ever exists in the Blockcast fork, but the fork syncs
+    # some workflow files from upstream frrouting/frr — mirror the belt-and-braces
+    # gate docker-daily-master.yml uses so a sync can never make this fire upstream.
+    if: github.repository == 'Blockcast/frr'
+    runs-on: arc-dind
+    steps:
+      - name: Checkout requested ref
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Resolve build metadata
+        id: vars
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "full_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date +'%Y%m%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/alpine/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:gtm-${{ steps.vars.outputs.sha }}
+          build-args: PKGVER=${{ steps.vars.outputs.date }}
+          platforms: linux/amd64
+
+      - name: Record digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: gtm-${{ steps.vars.outputs.sha }}
+          REQUESTED_REF: ${{ inputs.ref }}
+          RESOLVED_SHA: ${{ steps.vars.outputs.full_sha }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE}:${TAG}@${DIGEST}"
+          {
+            echo "### GTM FRR image built"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| requested ref | \`${REQUESTED_REF}\` |"
+            echo "| resolved commit | \`${RESOLVED_SHA}\` |"
+            echo "| image | \`${image}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '::notice::pushed %s\n' "$image"

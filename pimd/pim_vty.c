@@ -30,6 +30,7 @@
 #include "pim_bfd.h"
 #include "pim_bsm.h"
 #include "pim_vxlan.h"
+#include "pim_dimt.h"
 #include "pim_nht.h"
 #include "pim6_mld.h"
 

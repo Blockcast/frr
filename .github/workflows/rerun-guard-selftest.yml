@@ -1,0 +1,80 @@
+name: rerun-guard-selftest
+
+# The serial-rerun coverage guard decides whether a failing topotest run may
+# report success, so its decision logic is unit-tested.  The tests live in
+# their own workflow rather than as a step inside the topotest job for the
+# reason review-gate-selftest.yml learned the hard way: a self-test wired into
+# the job it protects can abort that job before it reports anything, which
+# recreates the silent hole the guard exists to close.  It also means the
+# logic is verifiable in seconds instead of behind a 2.5-hour topotest run.
+#
+# This runs from the PULL REQUEST's code, because the point is to validate the
+# proposed change to the guard.  Plain `pull_request` (not
+# `pull_request_target`) with read-only permissions and no secrets, so
+# executing PR-authored code here carries no write-scoped credentials.
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/verify_rerun_coverage.py'
+      - '.github/scripts/test_verify_rerun_coverage.py'
+      - '.github/scripts/topotest_coverage.py'
+      - '.github/scripts/test_topotest_coverage.py'
+      - '.github/scripts/topotest_resume.py'
+      - '.github/scripts/test_topotest_resume.py'
+      - '.github/scripts/topotest_shards.py'
+      - '.github/scripts/test_topotest_shards.py'
+      - '.github/scripts/topotest_durations.py'
+      - '.github/scripts/test_topotest_durations.py'
+      - '.github/scripts/topotest_verdict.py'
+      - '.github/scripts/test_topotest_verdict.py'
+      - '.github/topotest-durations.json'
+      - 'tests/topotests/pytest.ini'
+      - '.github/workflows/github-ci.yml'
+      - '.github/workflows/rerun-guard-selftest.yml'
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - '.github/scripts/verify_rerun_coverage.py'
+      - '.github/scripts/test_verify_rerun_coverage.py'
+      - '.github/scripts/topotest_coverage.py'
+      - '.github/scripts/test_topotest_coverage.py'
+      - '.github/scripts/topotest_resume.py'
+      - '.github/scripts/test_topotest_resume.py'
+      - '.github/scripts/topotest_shards.py'
+      - '.github/scripts/test_topotest_shards.py'
+      - '.github/scripts/topotest_durations.py'
+      - '.github/scripts/test_topotest_durations.py'
+      - '.github/scripts/topotest_verdict.py'
+      - '.github/scripts/test_topotest_verdict.py'
+      - '.github/topotest-durations.json'
+      - 'tests/topotests/pytest.ini'
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: Rerun coverage guard self-test
+    runs-on: default
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Run rerun-coverage decision-logic tests
+        # -v so a regression names the exact property it broke.
+        run: |
+          python3 -m unittest discover -s .github/scripts \
+            -p 'test_verify_rerun_coverage.py' -v
+
+      - name: Run topotest coverage and resume decision-logic tests
+        # BLO-35428: the parallel-run coverage check, the "Re-run failed
+        # jobs" resume decision, the shard planner (over the real tree, so a
+        # pytest.ini norecursedirs change re-runs it), the duration table
+        # builder and CI-Verdict's fail-closed rules, plus their wiring into
+        # github-ci.yml.
+        run: |
+          python3 -m unittest discover -s .github/scripts \
+            -p 'test_topotest_*.py' -v

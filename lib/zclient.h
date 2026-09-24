@@ -701,10 +701,83 @@ enum zapi_mvpn_sg_role {
 	ZAPI_MVPN_SG_SOURCE = 1,
 };
 
+/*
+ * Proven-forwarding state for an (S,G), aggregated by pimd and relayed to
+ * bgpd on the same message as the role.  pimd is the single authority: it is
+ * the only daemon that observes all three preconditions (tunnel netlink ack,
+ * RPF pin, kernel MFC admission).  Putting readiness on this message rather
+ * than inventing a channel makes restart replay correct for free, since
+ * ZEBRA_MVPN_SG_REPLAY already re-derives from pimd's own state.
+ *
+ * Additive: the byte is appended after `role`, and the decoder tolerates its
+ * absence so a peer built before this field still interoperates (an old
+ * sender is read as FWD_PENDING, which is the fail-closed default).
+ */
+enum zapi_mvpn_sg_forwarding {
+	/* join known; forwarding NOT proven */
+	ZAPI_MVPN_SG_FWD_PENDING = 0,
+	/* tunnel ack'd AND RPF pinned AND MFC admitted with the DIMT vif */
+	ZAPI_MVPN_SG_FWD_READY = 1,
+	/* a required step failed */
+	ZAPI_MVPN_SG_FWD_FAILED = 2,
+};
+
+/*
+ * Why a non-READY state needs a cause byte of its own.
+ *
+ * pim_dimt_forwarding_state() is an aggregator: five distinct failure causes
+ * that the settlement contract names separately -- tunnel_fail_install,
+ * tunnel_removed, mfc_evicted, rpf_unpinned, anti_recursion_refused -- all
+ * collapse into FWD_PENDING or FWD_FAILED on the wire.  bgpd is the daemon
+ * that has to emit `forwarding_lost` with a *stable enum reason* (DIMT
+ * Tunnel-Provider Contract v1 rev 2, D4), and it cannot recover which cause
+ * applied from the state byte alone: "the tunnel went away" and "the kernel
+ * evicted the MFC entry" are both FWD_PENDING.
+ *
+ * So the cause travels with the state, from the only daemon that knows it.
+ * bgpd maps these onto the contract's reason strings 1:1; it never invents
+ * one.  The two remaining contract reasons -- `withdraw` and `origin_change`
+ * -- are bgpd-side lifecycle facts and are set by bgpd itself, never sent
+ * here.
+ *
+ * Additive, same discipline as `forwarding`: appended after that byte, and an
+ * old sender that stops the message early is read as REASON_UNSPECIFIED.
+ * bgpd renders that as the reason string "unknown" rather than guessing a
+ * specific cause -- an append-only addition to the contract enum, which the
+ * contract permits (adding is allowed; renaming or repurposing is not).
+ */
+enum zapi_mvpn_sg_fwd_reason {
+	/* forwarding is READY, or the sender predates this field */
+	ZAPI_MVPN_SG_FWD_REASON_UNSPECIFIED = 0,
+	/* tunnel install was refused or errored (includes zebra's
+	 * anti-recursion refusal surfacing as PIM_DIMT_TUNNEL_FAILED) */
+	ZAPI_MVPN_SG_FWD_REASON_TUNNEL_FAIL_INSTALL = 1,
+	/* the tunnel is gone or tearing down: no mapping, no tunnel object,
+	 * or a state other than INSTALLED/FAILED */
+	ZAPI_MVPN_SG_FWD_REASON_TUNNEL_REMOVED = 2,
+	/* kernel MFC entry absent, or its incoming vif is no longer the DIMT
+	 * vif -- kernel acceptance withdrawn */
+	ZAPI_MVPN_SG_FWD_REASON_MFC_EVICTED = 3,
+	/* RPF is no longer pinned onto the tunnel netdev */
+	ZAPI_MVPN_SG_FWD_REASON_RPF_UNPINNED = 4,
+	/* zebra refused the tunnel to avoid recursive encapsulation */
+	ZAPI_MVPN_SG_FWD_REASON_ANTI_RECURSION_REFUSED = 5,
+};
+
 struct zapi_mvpn_sg {
 	struct ipaddr src;
 	struct ipaddr grp;
-	uint8_t role; /* enum zapi_mvpn_sg_role */
+	uint8_t role;	    /* enum zapi_mvpn_sg_role */
+	uint8_t forwarding; /* enum zapi_mvpn_sg_forwarding */
+	uint8_t fwd_reason; /* enum zapi_mvpn_sg_fwd_reason */
+	/*
+	 * The DIMT netdev carrying the traffic, which the contract's
+	 * `forwarding_ready` record shape names and only pimd resolves.  Set
+	 * only when forwarding == FWD_READY; zeroed / empty otherwise, since a
+	 * non-READY verdict has no proven oif to report.
+	 */
+	ifindex_t fwd_ifindex;
+	char fwd_oif[IFNAMSIZ];
 };
 
 /*

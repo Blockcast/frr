@@ -1576,6 +1576,27 @@ static inline void pim_mroute_copy(struct channel_oil *out,
 /* This function must not be called directly 0
  * use pim_upstream_mroute_add or pim_static_mroute_add instead
  */
+/* Kernel MFC admission is a readiness conjunct that nothing else
+ * re-evaluates.  c_oil->installed can change with no accompanying interface
+ * event -- a transient MFC drop under a surviving upstream is exactly that
+ * window, and the "MFC already installed before this upcall; resyncing"
+ * warning in this file asserts the window is real.  Without a hook on both
+ * edges, pim_dimt_forwarding_state() would compute FWD_PENDING while bgpd
+ * still holds the last announced FWD_READY, and no other event would correct
+ * it.
+ *
+ * pim_gtm_forwarding_update() is edge-triggered: it returns immediately when
+ * GTM is disabled, when the route was never announced, and when the computed
+ * state is unchanged, so hooking both edges costs nothing on the common path.
+ */
+static void pim_mroute_gtm_admission_changed(struct pim_instance *pim,
+					     struct channel_oil *c_oil)
+{
+	/* Routes with no upstream are never GTM-announced. */
+	if (c_oil->up)
+		pim_gtm_forwarding_update(pim, c_oil->up);
+}
+
 static int pim_mroute_add(struct channel_oil *c_oil, const char *name)
 {
 	struct pim_instance *pim = c_oil->pim;
@@ -1642,6 +1663,7 @@ static int pim_mroute_add(struct channel_oil *c_oil, const char *name)
 	if (!c_oil->installed) {
 		c_oil->installed = 1;
 		c_oil->mroute_creation = pim_time_monotonic_sec();
+		pim_mroute_gtm_admission_changed(pim, c_oil);
 	}
 
 	return 0;
@@ -1826,6 +1848,7 @@ int pim_mroute_del(struct channel_oil *c_oil, const char *name)
 
 	// Reset kernel installed flag
 	c_oil->installed = 0;
+	pim_mroute_gtm_admission_changed(pim, c_oil);
 
 	return 0;
 }

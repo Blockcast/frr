@@ -11,6 +11,13 @@ on:
       - 'ci/**'
 
 # Cancel older in-progress runs for the same ref to save runners.
+#
+# This applies to master too, and deliberately so: nothing in this workflow
+# writes the buildcache (see the `cache-from` comment on the Build job), so
+# cancelling a master run can no longer strand the cache. Do not add a
+# `cache-to` here to "make master useful" -- that is precisely the coupling
+# that kept the cache stale for 8-18 days at a stretch. Cache writes belong in
+# buildcache-seed.yml, which is never cancelled.
 concurrency:
   group: github-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -25,23 +32,68 @@ defaults:
 
 jobs:
   # Classify changes: doc/ vs everything else (skip Docker build/tests when only doc/ changed).
+  #
+  # BLO-35428: this job also populates the shared MIB cache, which used to be
+  # a separate Prepare-MIB-Cache job between it and Build.  That job cost the
+  # gate 3.0 min created->done at the median, with a queue p90 of 42.6 min,
+  # for a ~0.5-min run.  Build and Build-LTTng `needs:` this job, so the
+  # population still completes (the actions/cache save included, a post
+  # step) before either restores the cache, and the Dockerfile's
+  # `COPY docker/ubuntu-ci/` (Dockerfile:122, whose layer hashes mib-cache,
+  # restored on the 24.04 legs) stays warm.
+  #
+  # Nothing may skip a build because the classifier could not decide.  The
+  # "Decide whether this run builds" step writes `build`, the one output
+  # Build, Build-LTTng and the MIB steps key on.  It is 'false' only when the
+  # filter step itself succeeded AND classified the change as doc-only
+  # (doc == 'true', non_doc == 'false'); a filter error, missing outputs or an
+  # empty change list all give 'true': build and test everything.  If this
+  # job fails outright (a preempted pod, a MIB fetch out of retries), Build
+  # is skipped and CI-Verdict is red: it passes a build-less run only on this
+  # job's 'success' with build 'false' and that exact doc-only classification
+  # (topotest_verdict.py).
+  #
+  # The same step writes `docs`, which Documentation-HTML keys on, by the
+  # same rule turned around: 'false' only when the filter step succeeded AND
+  # said doc == 'false'; a filter error or missing outputs give 'true'.
+  # Keying the docs job on the raw doc output instead let the
+  # continue-on-error above hide a filter error from it: doc was empty, the
+  # docs job was skipped (neutral), this job still concluded 'success', and
+  # a PR whose docs were never built showed all green.  CI-Verdict requires
+  # Documentation-HTML 'success' exactly when docs is 'true'.
   doc-path-filter:
     if: ${{ github.event_name != 'pull_request' || github.actor != 'mergify[bot]' }}
     runs-on: default
     name: Documentation path filter
+    # The folded MIB population's budget (Prepare-MIB-Cache's 20).
+    timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: read
     outputs:
       doc: ${{ steps.filter.outputs.doc }}
       non_doc: ${{ steps.filter.outputs.non_doc }}
+      build: ${{ steps.decide.outputs.build }}
+      docs: ${{ steps.decide.outputs.docs }}
     steps:
       - name: Checkout
+        # BLO-35428: pull requests skip this full-history checkout (2.48 min
+        # at the median).  For a pull_request event dorny/paths-filter lists
+        # the changed files through the REST API with its `token` input,
+        # which defaults to the job token (hence `pull-requests: read`
+        # above), and reads no working tree, so a PR's classification is the
+        # same with or without it.  push and workflow_dispatch diff with git
+        # and keep the checkout.  The MIB steps below need none: they only
+        # write docker/ubuntu-ci/mib-cache under the workspace.
+        if: ${{ github.event_name != 'pull_request' }}
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - uses: dorny/paths-filter@v4
         id: filter
+        # A filter that errors must not decide anything: the next step turns
+        # any outcome but 'success' into build=true.
+        continue-on-error: true
         with:
           filters: |
             doc:
@@ -49,26 +101,39 @@ jobs:
             non_doc:
               - '**'
               - '!doc/**'
-
-  Prepare-MIB-Cache:
-    needs: doc-path-filter
-    if: ${{ needs.doc-path-filter.outputs.non_doc == 'true' }}
-    runs-on: default
-    name: Prepare shared MIB cache
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 1
+      - name: Decide whether this run builds
+        # ...and whether it builds the HTML docs.  The filter's results go
+        # through env, never spliced into the script (test_topotest_verdict.py
+        # runs this script over every case).
+        id: decide
+        env:
+          FILTER_OUTCOME: ${{ steps.filter.outcome }}
+          DOC: ${{ steps.filter.outputs.doc }}
+          NON_DOC: ${{ steps.filter.outputs.non_doc }}
+        run: |
+          set -euo pipefail
+          build=true
+          if [ "${FILTER_OUTCOME:-}" = success ] && [ "${DOC:-}" = true ] && [ "${NON_DOC:-}" = false ]; then
+            build=false
+          fi
+          docs=true
+          if [ "${FILTER_OUTCOME:-}" = success ] && [ "${DOC:-}" = false ]; then
+            docs=false
+          fi
+          echo "paths-filter outcome=${FILTER_OUTCOME:-<none>} doc=${DOC:-<empty>} non_doc=${NON_DOC:-<empty>} -> build=${build} docs=${docs}"
+          echo "build=${build}" >> "${GITHUB_OUTPUT}"
+          echo "docs=${docs}" >> "${GITHUB_OUTPUT}"
       - name: Ensure local MIB cache directory exists
+        if: ${{ steps.decide.outputs.build == 'true' }}
         run: mkdir -p docker/ubuntu-ci/mib-cache
       - name: Restore cached MIB files
+        if: ${{ steps.decide.outputs.build == 'true' }}
         uses: actions/cache@v5
         with:
           path: docker/ubuntu-ci/mib-cache
           key: mib-cache-v1-ubuntu24
       - name: Populate missing MIB cache files
+        if: ${{ steps.decide.outputs.build == 'true' }}
         run: |
           set -euo pipefail
           fetch_to_cache() {
@@ -105,7 +170,8 @@ jobs:
 
   Documentation-HTML:
     needs: doc-path-filter
-    if: ${{ needs.doc-path-filter.outputs.doc == 'true' }}
+    # The decided `docs` output, never the raw doc: see doc-path-filter.
+    if: ${{ needs.doc-path-filter.outputs.docs == 'true' }}
     runs-on: default
     name: HTML documentation (user + developer)
     timeout-minutes: 20
@@ -142,17 +208,21 @@ jobs:
 
   Build:
     runs-on: default
-    needs: Prepare-MIB-Cache
+    needs: doc-path-filter
+    # `build`, never the raw non_doc: see the comment on doc-path-filter.
+    if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
     name: ${{ matrix.cfg.name }}
     # Guardrail in case a build leg hangs.
     #
-    # PRs read cache but never write it, so a warm PR build is fast and 45m is a
-    # tight, useful bound -- it is what surfaced the shared-cache defect instead
-    # of hiding it behind a slow green. Only master writes `cache-to`, and any
-    # change to the Dockerfile's shared layers makes that first master build cold
-    # by definition. Giving the cache-seeding build room avoids a deadlock where
-    # the seeding run times out, never publishes cache, and leaves every
-    # subsequent PR cold.
+    # Every run here reads cache and none writes it, so a warm build is fast and
+    # 45m is a tight, useful bound on PRs -- it is what surfaced the
+    # shared-cache defect instead of hiding it behind a slow green.
+    #
+    # master keeps more headroom because a merge that changes the Dockerfile's
+    # shared layers builds cold here by definition: buildcache-seed.yml has not
+    # re-seeded that commit's layers yet (its push trigger runs in parallel with
+    # this one, not before it). 90m keeps the merge from failing on a timeout
+    # while the cache is catching up.
     timeout-minutes: ${{ github.ref == 'refs/heads/master' && 90 || 45 }}
     strategy:
       # Keep all matrix legs running so we get full failure signal.
@@ -164,9 +234,156 @@ jobs:
         # two 24.04 legs shared one, each overwrote the other's registry manifest
         # on master and every PR build of the loser missed cache and rebuilt the
         # whole image, blowing the 45m timeout.
+        #
+        # The LTTng leg is its own job, Build-LTTng, so that it no longer
+        # gates Test and Unit-Test (BLO-35428); see there.  `lttng: 'false'`
+        # is spelled out because no row here sets it any more, and actionlint
+        # types `matrix.cfg` off these rows: the build step's (shared with
+        # Build-LTTng) `matrix.cfg.lttng || 'false'` would otherwise read an
+        # undefined property.  The build arg is ENABLE_LTTNG=false either way.
         cfg:
-        -  { rel: '22.04', name: 'Ubuntu 22.04 amd64 Build',       platform: 'amd64_u22' }
-        -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 Build',       platform: 'amd64_u24' }
+        -  { rel: '22.04', name: 'Ubuntu 22.04 amd64 Build',       platform: 'amd64_u22', lttng: 'false' }
+        -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 Build',       platform: 'amd64_u24', lttng: 'false' }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Ensure local MIB cache directory exists
+        run: mkdir -p docker/ubuntu-ci/mib-cache
+      - name: Restore cached MIB files
+        if: ${{ matrix.cfg.rel == '24.04' }}
+        uses: actions/cache/restore@v5
+        with:
+          path: docker/ubuntu-ci/mib-cache
+          key: mib-cache-v1-ubuntu24
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: registry.blockcast.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Build docker image (cached)
+        uses: docker/build-push-action@v6
+        env:
+          # Temporary diagnostic to make Buildx cache behavior visible in job summary.
+          DOCKER_BUILD_SUMMARY: true
+        with:
+          context: .
+          file: docker/ubuntu-ci/Dockerfile
+          build-args: |
+            UBUNTU_VERSION=${{ matrix.cfg.rel }}
+            ENABLE_LTTNG=${{ matrix.cfg.lttng || 'false' }}
+            FRR_SOURCE_REV=${{ github.sha }}
+          # One exporter: a registry image, which `Unit-Test` and `Test` both
+          # pull.  Moving them off Actions artifact storage deleted a 5-43 min
+          # variance term for the same bytes (BLO-29817).
+          #
+          # BLO-35428: until then a second, `type=docker` tar exporter fed
+          # `Test` through a `<platform>-image` artifact.  Once `Test` pulled
+          # from Harbor nothing downloaded that artifact (no workflow in
+          # .github/workflows names it), yet every leg still paid for it: the
+          # upload step's 3.3 min and the 0.7-min tarball send, at the median.
+          # Both are gone.
+          #
+          # The tag lives under the same `cache/frr-ci` repository the buildcache
+          # already writes (buildcache-seed.yml), so this needs no registry scope
+          # that is not already exercised on every master push. The `img-` prefix
+          # keeps it out of the `-buildcache` tag namespace that
+          # buildcache_freshness.py asserts on.
+          #
+          # The exporter carries its full registry name inline, and there is
+          # deliberately no `tags:` input.  `tags:` becomes a global `--tag`
+          # that buildx applies to every exporter; an unqualified
+          # `frr-<platform>` there resolves to docker.io/library/frr-<platform>
+          # and fails with `insufficient_scope` (run 34682460908, all three
+          # legs).  `Unit-Test` and `Test` re-tag the pulled image as
+          # `frr-<platform>` themselves.
+          outputs: |
+            type=image,name=registry.blockcast.net/cache/frr-ci:img-${{ github.sha }}-${{ matrix.cfg.platform }},push=true
+          # Harbor connectivity is intentionally required for heavy image builds.
+          #
+          # Read-only, on every ref including master. `cache-to` deliberately
+          # lives in buildcache-seed.yml instead, because this workflow sets
+          # `cancel-in-progress: true` on a group keyed only on `github.ref`:
+          # when master was the sole cache writer it was also the most
+          # cancellable run, so a second master push killed the write. Measured
+          # over 44 master push runs (2026-07-02 -> 2026-08-21), 23 were
+          # cancelled, 16 of them provably by the next master push. See
+          # buildcache-seed.yml for the full reasoning and why exempting master
+          # from cancellation was rejected instead.
+          #
+          # Keeping exactly one writer also avoids the concurrent-writer hazard
+          # the matrix comment above records: two runs exporting to one
+          # registry cache ref overwrite each other's manifest.
+          cache-from: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.platform }}-buildcache
+      - name: Clear any previous results
+        # So if all jobs are re-run then all tests will be re-run.
+        #
+        # BLO-35428: one seed per Test shard, because each shard resumes from
+        # its own test-results-<platform>-s<k> artifact.  The loop below, the
+        # "Save cleared previous results (shard k)" steps, the Test matrix's
+        # `shard:` list, Test's TOPOTEST_SHARDS and CI-Verdict's --shards must
+        # all agree; test_topotest_shards.py pins them together.  A shard with
+        # no seed would, on "Re-run all jobs", resume from the previous
+        # attempt's results instead of re-running its whole plan.
+        run: |
+          rm -rf test-results-${{ matrix.cfg.platform }}*
+          for k in 1 2; do
+            mkdir -p test-results-${{ matrix.cfg.platform }}-s${k}
+            touch test-results-${{ matrix.cfg.platform }}-s${k}/cleared-results.txt
+          done
+      - name: Save cleared previous results (shard 1)
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ matrix.cfg.platform }}-s1
+          path: test-results-${{ matrix.cfg.platform }}-s1
+          overwrite: true
+          retention-days: 14
+          if-no-files-found: error
+      - name: Save cleared previous results (shard 2)
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ matrix.cfg.platform }}-s2
+          path: test-results-${{ matrix.cfg.platform }}-s2
+          overwrite: true
+          retention-days: 14
+          if-no-files-found: error
+      - name: Cleanup
+        if: ${{ always() }}
+        run: rm -rf test-results-${{ matrix.cfg.platform }}*
+
+  Build-LTTng:
+    # BLO-35428: the LTTng image is built on every run but consumed by
+    # nothing -- Unit-Test and Test cover amd64_u22 and amd64_u24 only -- so
+    # all it contributes is the signal that the `--enable-lttng` build and
+    # the image's `make check` (Dockerfile:286) still pass.  As a Build
+    # matrix leg it held Test and Unit-Test until it finished: it delayed
+    # the Build gate in 16 of 39 runs, by up to 47.1 min.  As its own job it
+    # runs alongside Test instead, and CI-Verdict needs it and requires it
+    # to be 'success', so an LTTng failure still turns the run red.
+    #
+    # Its steps are a COPY of Build's first five: keep them in lockstep.
+    # They differ only in `outputs: type=cacheonly` (no image to push:
+    # nothing pulls one) and in having no seed, upload or cleanup steps
+    # (no Test shard reads an LTTng result).  test_buildcache_freshness.py
+    # fails on any other drift, and checks this matrix together with
+    # Build's against buildcache-seed.yml's.
+    runs-on: default
+    needs: doc-path-filter
+    if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
+    name: ${{ matrix.cfg.name }}
+    # Same guardrail, and same reasoning, as Build.
+    timeout-minutes: ${{ github.ref == 'refs/heads/master' && 90 || 45 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # One entry, as a flow mapping, so the matrix parser in
+        # test_buildcache_freshness.py reads it exactly as it reads Build's.
+        cfg:
         -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 LTTng Build', platform: 'amd64_u24_lttng', lttng: 'true' }
 
     steps:
@@ -198,49 +415,57 @@ jobs:
         with:
           context: .
           file: docker/ubuntu-ci/Dockerfile
-          tags: frr-${{ matrix.cfg.platform }}
           build-args: |
             UBUNTU_VERSION=${{ matrix.cfg.rel }}
             ENABLE_LTTNG=${{ matrix.cfg.lttng || 'false' }}
             FRR_SOURCE_REV=${{ github.sha }}
-          # Keep existing test flow: export as docker image tar artifact.
-          outputs: type=docker,dest=/tmp/frr-${{ matrix.cfg.platform }}.tar
-          # Harbor connectivity is intentionally required for heavy image builds.
+          # Build and discard: the build is the signal, and no job pulls an
+          # LTTng image.  Read-only cache, as in Build (see its comment).
+          outputs: type=cacheonly
           cache-from: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.platform }}-buildcache
-          cache-to: ${{ github.ref == 'refs/heads/master' && format('type=registry,ref=registry.blockcast.net/cache/frr-ci:{0}-buildcache,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=3', matrix.cfg.platform) || '' }}
-      - name: Upload docker image artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.cfg.platform }}-image
-          path: /tmp/frr-${{ matrix.cfg.platform }}.tar
-          # Docker images are intermediate CI artifacts; keep for a short period.
-          retention-days: 7
-          if-no-files-found: error
-      - name: Clear any previous results
-        # So if all jobs are re-run then all tests will be re-run
-        run: |
-          rm -rf test-results-${{ matrix.cfg.platform }}*
-          mkdir -p test-results-${{ matrix.cfg.platform }}
-          touch test-results-${{ matrix.cfg.platform }}/cleared-results.txt
-      - name: Save cleared previous results
-        uses: actions/upload-artifact@v7
-        with:
-          name: test-results-${{ matrix.cfg.platform }}
-          path: test-results-${{ matrix.cfg.platform }}
-          overwrite: true
-          retention-days: 14
-          if-no-files-found: error
-      - name: Cleanup
-        if: ${{ always() }}
-        run: rm -rf test-results-${{ matrix.cfg.platform }}* /tmp/frr-${{ matrix.cfg.platform }}.tar
 
   Unit-Test:
     runs-on: default
     needs: Build
+    # BLO-35428: one lost Build leg must not skip the other platform.  With
+    # the default `success()` a failed Build leg skipped every Unit-Test and
+    # Test job of BOTH platforms (run 35776450503, attempt 1: the 22.04 leg
+    # failed 3.5 min in and the finished 24.04 image went untested).  Now the
+    # failed platform's jobs fail in 1-2 min at the 3-attempt `docker pull`
+    # below (or, on a re-run, test the image an earlier attempt of the same
+    # commit pushed) and the other platform runs; either way CI-Verdict
+    # still requires Build to be 'success'.  Skipped Build (doc-only, or
+    # doc-path-filter failed) still skips this job.
+    if: ${{ !cancelled() && needs.Build.result != 'skipped' }}
     name: ${{ matrix.cfg.name }}
-    timeout-minutes: 20
+    # Derived, not rounded (BLO-29817 AC3).
+    #
+    # The work inside this job is hard-bounded: `make check` runs under
+    # `timeout 15m --kill-after=1m`, so 16 min is the worst case no matter how
+    # the suite grows. The only unbounded term was fetching the image, and the
+    # 20-minute cap here was NOT a slow-job problem -- across runs 34458773163
+    # / 34457085145 / 33977047139 the "Fetch docker image artifact" step
+    # consumed 19.8 of the 20 minutes on its own and `Run unit tests` never
+    # started. Median fetch was ~27 min, i.e. the old cap was unsatisfiable in
+    # the median case and passed only when the fetch landed in the fastest
+    # ~20%, matching the observed 3-success/7-cancelled rate.
+    #
+    # Replacing that artifact round-trip with a registry pull (below) is what
+    # makes a finite cap meaningful again. 16 (bounded inner work) + 14 (pull
+    # budget) = 30. The pull budget is a ceiling, not a measurement -- there is
+    # no pull-time data for this lane yet, by construction. Re-derive it from
+    # the "Fetch docker image" step across the first 5 post-merge runs and
+    # tighten; if pulls land where the buildcache reads do, this should come
+    # down a lot.
+    #
+    # Note this is NOT the `Test` lane's "just raise the cap" move, which was
+    # tried and regressed inside 16 days: there the suite itself is unbounded
+    # and grew past any cap. Here the suite is capped from the inside and the
+    # variance term is being deleted rather than budgeted for.
+    timeout-minutes: 30
     env:
       UNIT_TEST_CONTAINER: frr-${{ matrix.cfg.platform }}-unit-${{ github.run_id }}-${{ github.run_attempt }}
+      UNIT_TEST_IMAGE: registry.blockcast.net/cache/frr-ci:img-${{ github.sha }}-${{ matrix.cfg.platform }}
     strategy:
       fail-fast: false
       matrix:
@@ -248,14 +473,29 @@ jobs:
         -  { name: 'Ubuntu 22.04 amd64 Unit Test', platform: 'amd64_u22' }
         -  { name: 'Ubuntu 24.04 amd64 Unit Test', platform: 'amd64_u24' }
     steps:
-      - name: Fetch docker image artifact
-        uses: actions/download-artifact@v7
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
         with:
-          name: ${{ matrix.cfg.platform }}-image
-          path: /tmp
-      - name: Load docker image
-        run: docker load --input /tmp/frr-${{ matrix.cfg.platform }}.tar
+          registry: registry.blockcast.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Fetch docker image
+        id: fetch_image
+        # Tagged on `github.sha`, not `github.run_id`, so a --failed-only re-run
+        # of just this job still resolves after Build is skipped.
+        run: |
+          set -euo pipefail
+          # BLO-34778: a transient registry error must not burn the whole lane;
+          # three attempts with a short back-off, then fail loudly.
+          for attempt in 1 2 3; do
+            docker pull "${UNIT_TEST_IMAGE}" && break
+            [ "${attempt}" -eq 3 ] && { echo "::error::docker pull ${UNIT_TEST_IMAGE} failed after 3 attempts" >&2; exit 1; }
+            echo "::warning::docker pull ${UNIT_TEST_IMAGE} attempt ${attempt}/3 failed; retrying"
+            sleep $((attempt * 10))
+          done
+          docker tag "${UNIT_TEST_IMAGE}" frr-${{ matrix.cfg.platform }}
       - name: Run unit tests
+        id: unit_tests
         run: |
           set -euo pipefail
           timeout --signal=TERM --kill-after=1m 15m \
@@ -269,6 +509,27 @@ jobs:
               if [ ! -s tests/tests.xml ]; then
                 echo "ERROR: make check did not produce tests/tests.xml" >&2
                 exit 125
+              fi
+              # tests/topotests/lib/ is collected by NEITHER pytest runner:
+              # tests/pytest.ini sets norecursedirs=topotests, which hides it
+              # from the "make check" run above, and tests/topotests/pytest.ini
+              # lists lib in norecursedirs, which hides it from the topotest
+              # job.  Unit tests living there therefore run nowhere unless the
+              # path is named explicitly -- norecursedirs governs directory
+              # recursion, not an explicit file argument -- so without this
+              # step the file reads as coverage while providing none.
+              # --noconftest keeps the munet/topogen machinery in
+              # tests/topotests/conftest.py out of a pure unit test that needs
+              # neither it nor root.
+              PYTHONPATH=~/frr/tests/topotests \
+                python3 -m pytest -q --noconftest -p no:cacheprovider \
+                  tests/topotests/lib/test_kernel_state.py
+              lib_status=$?
+              # Exit 5 ("no tests collected") also lands here, so a future
+              # change that stops collecting the file fails this job rather
+              # than passing silently.
+              if [ "${status}" -eq 0 ]; then
+                status="${lib_status}"
               fi
               touch /tmp/frr-unit-test-report-ready
               exit "${status}"
@@ -292,44 +553,260 @@ jobs:
         with:
           name: unit-test-results-${{ matrix.cfg.platform }}
           path: unit-test-results-${{ matrix.cfg.platform }}/tests.xml
+          # Artifacts are run-scoped across attempts (BLO-35428: attempt 2 of
+          # run 35409722977 downloaded an artifact attempt 1 uploaded), so a
+          # re-run leg re-uploading this name 409s without overwrite.
+          overwrite: true
           retention-days: 14
           if-no-files-found: error
       - name: Cleanup
         if: ${{ always() }}
         run: |
-          rm -rf unit-test-results-${{ matrix.cfg.platform }} /tmp/frr-${{ matrix.cfg.platform }}.tar
+          rm -rf unit-test-results-${{ matrix.cfg.platform }}
           docker rm -f "${UNIT_TEST_CONTAINER}" || true
+      - name: Report why this job ended
+        # BLO-29817 AC2, for this lane. A `timeout-minutes` kill is reported by
+        # GitHub as `cancelled`, indistinguishable at a glance from a human
+        # cancel or a `cancel-in-progress` eviction -- both routine in this
+        # repo. Say it explicitly instead.
+        #
+        # This lane needs none of the elapsed-time machinery the `Test` lane
+        # carries, because the work here is bounded from the inside: `make
+        # check` runs under `timeout 15m`, so it can only ever FAIL on time,
+        # never hang to the cap. A `cancelled` job therefore attributes off
+        # which step was still in flight, with no clock involved.
+        #
+        # Guarded on `always()` + `job.status` rather than `cancelled()`, to
+        # match the `Test` lane: that guard is the one observed to actually run
+        # inside the post-cap grace window on this runner pool. Betting on
+        # `cancelled()` firing for a *timeout* kill is the same assumption that
+        # made this class of failure invisible in the first place.
+        if: ${{ always() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          FETCH_OUTCOME: ${{ steps.fetch_image.outcome }}
+          TESTS_OUTCOME: ${{ steps.unit_tests.outcome }}
+        run: |
+          set -uo pipefail
+          [ "${JOB_STATUS}" = "cancelled" ] || exit 0
+          if [ -z "${TESTS_OUTCOME}" ] || [ "${TESTS_OUTCOME}" = "skipped" ]; then
+            echo "::error title=BLO-29817 cap kill on image fetch::Job hit its \`timeout-minutes\` while \"Fetch docker image\" was still running (outcome=${FETCH_OUTCOME:-in-flight}); no unit test ever executed. This is NOT a human cancel and NOT a concurrency eviction. The registry pull is over budget -- re-derive the cap against the measured pull time rather than re-running. Ref BLO-29817."
+          else
+            echo "::error title=BLO-29817 cap kill after tests started::Job hit its \`timeout-minutes\` with \"Run unit tests\" at outcome=${TESTS_OUTCOME}. \`make check\` is capped at 15m internally, so this is tail/upload overrun rather than a slow suite. NOT a human cancel. Ref BLO-29817."
+          fi
 
   Test:
-    runs-on: default
+    # BLO-21606: moved off arc-default — this ~43min Docker-heavy lane is the
+    # same long/CPU-heavy shape BLO-19140 moved off arc-default for NOP after
+    # mid-job runner loss under pool oversubscription. arc-e2e shares
+    # arc-default's pod template (Docker/NET_ADMIN/KVM) but is capacity-capped.
+    runs-on: arc-e2e
     needs: Build
-    name: ${{ matrix.cfg.name }}
+    # BLO-35428: as for Unit-Test -- one lost Build leg no longer skips the
+    # other platform's shards (run 35776450503); CI-Verdict still requires
+    # Build to be 'success'.
+    if: ${{ !cancelled() && needs.Build.result != 'skipped' }}
+    name: ${{ matrix.cfg.name }} (shard ${{ matrix.shard }}/2)
     # Topotest runs can be long; still cap runtime for stuck jobs.
-    timeout-minutes: 180
+    #
+    # BLO-29817: this was 180, which sat *inside* the lane's own distribution
+    # rather than outside it, so the cap fired on runs whose tests had already
+    # finished.  Measured over 28 matrix legs across 20 `github-ci` runs
+    # (2026-08-19 .. 2026-08-22):
+    #
+    #   suite ("Run topotests" step), n=24  min 127.6  median 143.4  p100 174.5
+    #   job overhead (total - suite),  n=24  min   4.3  median   9.3  p100  21.9
+    #
+    # Overhead is dominated by "Fetch docker image artifact", which alone
+    # ranged 1.3 .. 19.5 min -- variance that has nothing to do with the tests.
+    # Those two p100s compose to 174.5 + 21.9 = 196.4 min, i.e. the old 180
+    # cap was 16.4 min BELOW the worst case it had to survive.  Three legs were
+    # duly killed at 181.0/181.0/182.2 min; in two of them the suite had
+    # already PASSED and the cap landed in the artifact-upload tail.
+    #
+    # The suite p100 above is uncensored: all 24 observed "Run topotests" steps
+    # reached a natural conclusion, so 174.5 is a real maximum and not a
+    # cap-truncated one.
+    #
+    # 240 is therefore the composed p100 (196.4) plus 43.6 min, i.e. 1.22x,
+    # which leaves 65.5 min for overhead == 3.0x the worst tail ever recorded.
+    # Not chosen for roundness: 200 (1.02x) would be re-tripped by a single slow
+    # artifact fetch, and 210 (1.6x overhead budget) still leaves under one
+    # spare fetch.  Not larger, because a genuinely wedged job must not hold a
+    # capacity-capped arc-e2e slot for longer than necessary -- 240 keeps that
+    # bound at 4h while clearing the measured distribution.
+    #
+    # 2026-09-12: 240 was itself re-tripped -- 6 cap kills at 241..248 min in
+    # the 12 runs after it landed, 3 of them with the suite still incomplete.
+    # Both terms had grown, but they are not equally fixable: the overhead p100
+    # went 21.9 -> 43.0 min (+120%) entirely inside "Fetch docker image
+    # artifact", which moved a ~1 GiB tar through Actions artifact storage and
+    # measured 5..43 min for the same bytes.  5 of the 6 kills had a fetch >=34
+    # min.  That step is now a `docker pull` off Harbor instead (below), which
+    # measured 2.0 and 4.3 min on the two `Unit-Test` legs of run 34688739805
+    # -- the same image, the same registry, pulled minutes apart.
+    #
+    # The cap is deliberately NOT changed.  Raising it is the move that was
+    # already tried here and regressed inside 16 days; what had actually eroded
+    # was the 65.5 min this derivation set aside for overhead, and deleting the
+    # artifact round-trip returns ~36-40 min of it to the suite.  A cap change
+    # would also need TOPOTEST_JOB_CAP_MIN re-mirrored below for no gain.
+    #
+    # BLO-35428: each job is now one shard of its platform's tree (see
+    # `strategy`).  At the 207-min 24.04 suite regime a shard session is
+    # about 207/2 x 1.006 = 104.1 min, so a shard job lands around 105-120
+    # min against this cap, which ends the cap-kill class (85.5 of 164.8 Test
+    # runner-hours, 52%) except for a hang longer than about 2 hours.  The cap
+    # and TOPOTEST_JOB_CAP_MIN are deliberately left at 240 until 24 shard
+    # legs have been measured with the recipe below; its test("amd64 Test")
+    # still matches the "(shard k/2)" job names.
+    #
+    # Re-derive with:
+    #   gh api "repos/Blockcast/frr/actions/runs/$RID/jobs?per_page=100" | jq -r \
+    #     '.jobs[]|select(.name|test("amd64 Test"))|"\(.name) \(.conclusion) \(((.completed_at|fromdate)-(.started_at|fromdate))/60|floor)min"'
+    timeout-minutes: 240
+    env:
+      # Pushed by Build's image exporter. Tagged on `github.sha`, not
+      # `github.run_id`, so a --failed-only re-run of just this job still
+      # resolves after Build is skipped.
+      TEST_IMAGE: registry.blockcast.net/cache/frr-ci:img-${{ github.sha }}-${{ matrix.cfg.platform }}
+      # nproc-based sizing launched 120 pytest workers per matrix leg and
+      # wedged a 64 GiB runner node under concurrent legs (PR #55). 5 was then
+      # sized as 2.5x arc-e2e's 2-CPU DinD sidecar cap, but that cap does not
+      # bound it: the nested topotest container is NOT inside the dind
+      # sidecar's cgroup (BLO-34281, onprem-k8s arc/dind-cgroup-accounting.md).
+      # dind used 126.4 CPU-s over a whole 3h35m leg (pod
+      # arc-e2e-ssnb2-runner-gzqh6, run 35744612980), and the `docker run`
+      # below passes no --cpus/--memory/--pids-limit. So 5 is a self-imposed
+      # per-node load bound, nothing more. Keep it until the container has
+      # real resource bounds (BLO-35428 capacity levers); the footprint
+      # sampler in "Run topotests" records what one leg actually uses.
+      TOPOTEST_WORKERS: "5"
+      # BLO-29817: must mirror `timeout-minutes` above (a job cannot read its
+      # own cap at runtime).  Used only to report headroom and to attribute a
+      # cap kill in the job summary; if the two drift the summary says so
+      # instead of silently misreporting.
+      TOPOTEST_JOB_CAP_MIN: "240"
+      # BLO-35428: this job runs shard TOPOTEST_SHARD of TOPOTEST_SHARDS.
+      # TOPOTEST_SHARDS must equal the length of the matrix `shard:` list,
+      # the number of cleared seeds Build uploads, and CI-Verdict's --shards
+      # (pinned by test_topotest_shards.py).  RESULT_ID names everything
+      # per-shard: the test-results artifact and dirs, the plan and stats
+      # artifacts, and the container, so two shards of one platform can
+      # never read or overwrite each other's results.  The image tag
+      # frr-<platform> is per platform and deliberately unchanged.
+      TOPOTEST_SHARDS: "2"
+      TOPOTEST_SHARD: ${{ matrix.shard }}
+      RESULT_ID: ${{ matrix.cfg.platform }}-s${{ matrix.shard }}
     strategy:
-      # Keep running remaining platforms when one leg fails.
+      # Keep running remaining shards when one fails.
       fail-fast: false
+      # BLO-35428: each platform's tree is split into TOPOTEST_SHARDS shards
+      # by .github/scripts/topotest_shards.py: LPT over the per-file medians
+      # in .github/topotest-durations.json, built from the initial junits of
+      # runs 35709500854 (22.04, slow), 35480015782 (22.04, fast) and
+      # 35409722977 (24.04).  Simulated with xdist 3.8.0's actual loadfile
+      # policy (one file per worker, the next handed over once a worker has
+      # <=2 tests pending; xdist/scheduler/loadscope.py), 5 workers, the
+      # worst of the 2 shards takes 87.0 / 62.0 / 69.0 min of session on
+      # those three junits, against 171.2 / 123.6 / 137.5 min unsharded.
+      #
+      # max-parallel is the rollback knob, and it starts at 2, not 4.  With 2,
+      # no more frr containers run at once than the two concurrent legs did
+      # before sharding -- and legs from different runs already co-locate at
+      # -n5 without a wedge (runners vlhgz/x77mr on k8s-paperclip-9,
+      # 2026-09-20/21; the 2026-08-09 wedge was two legs at ~120 workers
+      # each, PR #55) -- so the Test segment stays about two shard sessions long;
+      # what sharding buys at 2 is that no single job carries a whole suite
+      # towards the 240 cap.  4 would halve the segment again, but per-test
+      # time with 4 concurrent frr containers on the saturated hypervisors
+      # (pve2/pve3, 79-84% busy, 12-29% steal) is unmeasured, and the
+      # containers have no resource bounds (see TOPOTEST_WORKERS).  Raising
+      # to 4 is therefore gated on 5 runs of topotest-stats-* footprint data:
+      # peak and mean CPU per shard, times 4, against pve2/pve3 idle threads
+      # over the same window.
+      #
+      # Rollback, keyed on outcomes:
+      #   * at 4: back to 2 if the median shard pytest session (its "in Ns")
+      #     over 5 runs exceeds 1.15x its platform's projection above (22.04:
+      #     87.0 min, the slow run; 24.04: 69.0 min, from a single junit, so
+      #     provisional);
+      #   * at 2: to 1 (the shards run one at a time) if any shard's "Run
+      #     topotests" step exceeds 229 min -- the 240 cap less the 11.3 min
+      #     of measured fixed per-leg overhead.
+      # Leg-window PSI above 0.4 or steal above 0.25 (the measured cap-kill
+      # band) is an early warning only.  The frr CI lane checks after each of
+      # the first 5 runs:
+      #   gh api "repos/Blockcast/frr/actions/runs/$RID/jobs?per_page=100" | jq -r \
+      #     '.jobs[]|select(.name|test("amd64 Test [(]shard"))|.name as $n|.steps[]|select(.name=="Run topotests")|
+      #      "\($n) \(.conclusion) \(((.completed_at|fromdate)-(.started_at|fromdate))/60|floor)min"'
+      max-parallel: 2
       matrix:
         cfg:
         -  { rel: '22.04', name: 'Ubuntu 22.04 amd64 Test', platform: 'amd64_u22' }
         -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 Test', platform: 'amd64_u24' }
+        # Must list 1..TOPOTEST_SHARDS (pinned by test_topotest_shards.py).
+        shard: [1, 2]
     steps:
+      - name: Record lane start
+        # BLO-29817: the runtime-vs-cap report at the end of this job needs a
+        # start reference, and no context exposes the job's own start time.
+        # First step in the job, so this trails "Set up job"/"Set up runner" by
+        # only a few seconds.
+        run: echo "TOPOTEST_LANE_START_EPOCH=$(date +%s)" >> "${GITHUB_ENV}"
       - name: Checkout
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
-      - name: Fetch docker image artifact
-        uses: actions/download-artifact@v7
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
         with:
-          name: ${{ matrix.cfg.platform }}-image
-          path: /tmp
+          registry: registry.blockcast.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Fetch docker image
+        # Replaces a `download-artifact` + `docker load` round-trip that
+        # measured 5..43 min for the same bytes and caused 5 of the 6 cap kills
+        # at 241..248 min -- see the timeout-minutes derivation above.
+        # Build's tar exporter and `<platform>-image` upload, which nothing
+        # downloaded after this change, are deleted (BLO-35428).
+        run: |
+          set -euo pipefail
+          # BLO-34778: a transient registry error must not burn the whole lane;
+          # three attempts with a short back-off, then fail loudly.
+          for attempt in 1 2 3; do
+            docker pull "${TEST_IMAGE}" && break
+            [ "${attempt}" -eq 3 ] && { echo "::error::docker pull ${TEST_IMAGE} failed after 3 attempts" >&2; exit 1; }
+            echo "::warning::docker pull ${TEST_IMAGE} attempt ${attempt}/3 failed; retrying"
+            sleep $((attempt * 10))
+          done
+          docker tag "${TEST_IMAGE}" frr-${{ matrix.cfg.platform }}
       - name: Fetch previous results
+        # The seed artifact is (re-)created by Build's "Clear any previous
+        # results" step. A --failed-only re-run of just this job skips Build,
+        # so the seed from a prior attempt is never recreated and this
+        # download 404s. Tolerate that: topotest_resume.py treats a missing
+        # download as "run the whole tree" (BLO-21652).
+        #
+        # BLO-35428: downloaded to `prev-results`, NOT test-results-<id>.
+        # "Run topotests" does `rm -rf test-results-<id>*` before its run, and
+        # upload-artifact nests a failed leg's artifact one level deeper
+        # (test-results-<id>/{test-results-<id>,test-results-<id>-initial}/,
+        # read off run 35709500854's artifact), so the old
+        # test-results-<id>/topotests.xml probe missed exactly the legs that
+        # had failures and "Re-run failed jobs" re-ran the whole tree.  <id>
+        # is RESULT_ID: each shard resumes from its own artifact only.
         if: ${{ github.run_attempt > 1 }}
+        continue-on-error: true
         uses: actions/download-artifact@v7
         with:
-          name: test-results-${{ matrix.cfg.platform }}
-          path: test-results-${{ matrix.cfg.platform }}
+          name: test-results-${{ matrix.cfg.platform }}-s${{ matrix.shard }}
+          path: prev-results
       - name: Run topotests
+        # BLO-29817: `id` lets the runtime report below distinguish "the cap
+        # killed the suite mid-run" from "the suite finished and the cap killed
+        # the artifact tail".
+        id: topotests
         run: |
           # Fail fast on command errors, undefined vars, and pipeline failures.
           set -euo pipefail
@@ -348,7 +825,6 @@ jobs:
           sudo modprobe vrf || true
           sudo modprobe mpls-iptunnel
           sudo modprobe mpls-router
-          docker load --input /tmp/frr-${{ matrix.cfg.platform }}.tar
 
           ADD_DOCKER_ENV=""
           if ! grep CONFIG_IP_MROUTE_MULTIPLE_TABLES=y /boot/config*; then
@@ -356,30 +832,217 @@ jobs:
           fi
           echo "ADD_DOCKER_ENV: ${ADD_DOCKER_ENV}"
 
-          if [ -f test-results-${{ matrix.cfg.platform }}/topotests.xml ]; then
-            ./tests/topotests/analyze.py -r test-results-${{ matrix.cfg.platform }}
-            ls -l test-results-${{ matrix.cfg.platform }}/topotests.xml
-            run_tests=$(./tests/topotests/analyze.py -r test-results-${{ matrix.cfg.platform }}| cut -f1 -d: | sort -u)
-          else
-            echo "No test results dir"
-            run_tests=""
+          # BLO-35428: collect the whole tree first, in the same privileged
+          # image the run uses, so what the run produced can be checked
+          # against what exists rather than against itself.  A collection
+          # failure fails the step here: a module that cannot be collected can
+          # be neither run nor accounted for.  -p no:warnings and the
+          # anchored grep keep indented warnings-summary lines out of the
+          # expected set, where they would be IDs that can never match.
+          # Collection measured 48-94 s inside the run (jobs 105814256640 /
+          # 101386930609); the elapsed time below records it on its own.
+          #
+          # PYTEST_XDIST_MODE=no is required, not cosmetic.  conftest.py's
+          # pytest_configure returns under --collect-only (:631-632) before
+          # it sets PYTEST_XDIST_MODE (:635), and pytest_terminal_summary,
+          # which pytest still calls at the end of a collect-only session,
+          # reads os.environ["PYTEST_XDIST_MODE"] with no default (:953).
+          # Without it every collect exits 1 on a KeyError after printing
+          # the node IDs (reproduced locally, outside the image, with CI's
+          # pytest 9.1.1 on this tree's conftest: rc=1; with the variable,
+          # rc=0 and the same IDs; test_topotest_resume.py re-runs that
+          # where pytest is installed), so both legs would be red on every
+          # run, before any topotest.  Nothing else sets it: the image has
+          # no ENV for it and the munet hooks that set it are not loaded.
+          # `sudo -E` carries it, as it carries TOPOTEST_WORKERS.
+          # Not --no-summary, which also passes: it drops the ERRORS section
+          # that names a module that failed to collect, which is what the
+          # tail below is for.  The rc gate stays exact: rc=1 here is an
+          # uncaught exception, and tolerating it would accept any crash of
+          # the collecting process, not just this one.
+          collect_start=$(date +%s)
+          collect_rc=0
+          timeout 15m docker run --rm --init --privileged ${ADD_DOCKER_ENV} -e PYTEST_XDIST_MODE=no -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
+            bash -c 'cd ~/frr/tests/topotests && sudo -E pytest --collect-only -q -p no:cacheprovider -p no:warnings "$@"' pytest-collect \
+            > "${RUNNER_TEMP}/collect.out" || collect_rc=$?
+          echo "collect-only rc=${collect_rc} after $(( $(date +%s) - collect_start ))s"
+          if [ "${collect_rc}" -ne 0 ]; then
+            tail -n 100 "${RUNNER_TEMP}/collect.out" >&2
+            echo "::error title=Topotest collection failed::pytest --collect-only exited ${collect_rc} (124 = the 15m timeout); nothing can be run or accounted for." >&2
+            exit 1
           fi
-          rm -rf test-results-${{ matrix.cfg.platform }}* /tmp/topotests
+          grep -E '^[^[:space:]]+::' "${RUNNER_TEMP}/collect.out" | LC_ALL=C sort -u > "${RUNNER_TEMP}/collected-all.txt"
+          cut -d: -f1 "${RUNNER_TEMP}/collected-all.txt" | LC_ALL=C sort -u > "${RUNNER_TEMP}/collected-files.txt"
+          echo "collected $(wc -l < "${RUNNER_TEMP}/collected-all.txt") node IDs in $(wc -l < "${RUNNER_TEMP}/collected-files.txt") files"
 
-          echo RUN_TESTS: $run_tests
-          if docker run --init -i --privileged --name frr-${{ matrix.cfg.platform }}-cont ${ADD_DOCKER_ENV} -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
-            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest -n$(($(nproc) * 5 / 2)) --dist=loadfile '$run_tests; then
+          # BLO-35428 sharding.  This shard's plan: its LPT share of the tree
+          # topotest_shards.py enumerates, longest file first.  Captured by
+          # command substitution, not fed to mapfile through a process
+          # substitution, so a crash of the helper after partial output still
+          # fails this step (the same hazard as the rerun harvest below).
+          # The plan artifact written here is what CI-Verdict checks the
+          # shards against: plan.txt (this shard), universe.txt (every
+          # enumerated file), collected-files.txt / collected-ids.txt (what
+          # pytest collected, whole tree) and, only once the coverage check
+          # below has passed, accounted.txt.
+          plan_dir="${RUNNER_TEMP}/plan"
+          rm -rf "${plan_dir}"
+          mkdir -p "${plan_dir}"
+          echo "platform=${{ matrix.cfg.platform }} shard=${TOPOTEST_SHARD} shards=${TOPOTEST_SHARDS}" > "${plan_dir}/shard.txt"
+          shard_raw=$(python3 .github/scripts/topotest_shards.py list --shards "${TOPOTEST_SHARDS}" --index "${TOPOTEST_SHARD}" \
+            --universe-out "${plan_dir}/universe.txt")
+          mapfile -t shard_files < <(printf '%s' "${shard_raw}")
+          [ ${#shard_files[@]} -gt 0 ] || { echo '::error::empty shard plan refused (an empty array would run the whole tree)' >&2; exit 1; }
+          printf '%s\n' "${shard_files[@]}" > "${plan_dir}/plan.txt"
+          cp "${RUNNER_TEMP}/collected-files.txt" "${plan_dir}/collected-files.txt"
+          cp "${RUNNER_TEMP}/collected-all.txt" "${plan_dir}/collected-ids.txt"
+
+          # A collected file that the enumeration does not know is in no
+          # shard's plan, so no shard would run it.  CI-Verdict catches that
+          # too; failing here names it an hour earlier.  grep exits 1 when it
+          # selects nothing, which is the good case; 2 is an error.
+          unplanned=$(grep -Fvx -f "${plan_dir}/universe.txt" "${RUNNER_TEMP}/collected-files.txt") || [ $? -eq 1 ]
+          if [ -n "${unplanned}" ]; then
+            echo "::error title=Collected file in no shard::pytest collected files topotest_shards.py did not enumerate: ${unplanned//$'\n'/ }" >&2
+            exit 1
+          fi
+          # This shard's scope: its plan, in plan order, restricted to files
+          # pytest collected, and the collected IDs of those files.  A planned
+          # file that collects nothing (a module-level skip) cannot be handed
+          # to pytest as a run target the coverage check would accept.
+          grep -Fx -f "${RUNNER_TEMP}/collected-files.txt" "${plan_dir}/plan.txt" > "${RUNNER_TEMP}/shard-universe.txt" || [ $? -eq 1 ]
+          [ -s "${RUNNER_TEMP}/shard-universe.txt" ] || { echo '::error::no file of this shard plan was collected' >&2; exit 1; }
+          uncollected=$(grep -Fvx -f "${RUNNER_TEMP}/collected-files.txt" "${plan_dir}/plan.txt") || [ $? -eq 1 ]
+          [ -z "${uncollected}" ] || echo "::notice title=Planned but not collected::${uncollected//$'\n'/ }"
+          awk -F'::' 'NR == FNR { keep[$0] = 1; next } ($1 in keep)' \
+            "${RUNNER_TEMP}/shard-universe.txt" "${RUNNER_TEMP}/collected-all.txt" > "${RUNNER_TEMP}/collected-shard.txt"
+          echo "shard ${TOPOTEST_SHARD}/${TOPOTEST_SHARDS}: ${#shard_files[@]} planned, $(wc -l < "${RUNNER_TEMP}/shard-universe.txt") collected files, $(wc -l < "${RUNNER_TEMP}/collected-shard.txt") node IDs"
+
+          # BLO-35428: what this attempt runs.  topotest_resume.py prints the
+          # files that still failed in this shard's previous attempt, or the
+          # shard's whole scope whenever that artifact cannot justify a
+          # narrower list (missing, cleared seed, partial junit, nothing left
+          # failing).  Captured by command substitution FIRST, as the rerun
+          # harvest below is: feeding mapfile straight from a process
+          # substitution of the helper would hide its exit status from
+          # `set -e`, so a crash after partial output would silently narrow
+          # the run.  printf '%s' (no trailing newline) so an empty capture
+          # yields zero elements, which the next line refuses.
+          run_tests_raw=$(python3 .github/scripts/topotest_resume.py --prev prev-results --id "${RESULT_ID}" \
+            --collected "${RUNNER_TEMP}/collected-shard.txt" --universe "${RUNNER_TEMP}/shard-universe.txt" \
+            --prior-out "${RUNNER_TEMP}/prior-used.txt")
+          mapfile -t run_tests < <(printf '%s' "${run_tests_raw}")
+          [ ${#run_tests[@]} -gt 0 ] || { echo '::error::empty run list refused (an empty array would run the whole tree)' >&2; exit 1; }
+          printf '%s\n' "${run_tests[@]}" > "${RUNNER_TEMP}/run-list.txt"
+          # The junit(s) a resume was based on, in overlay order; none on a
+          # full run.  With none, the run list must BE this shard's plan (its
+          # collected part, in plan order), byte for byte: a narrowed first
+          # attempt would otherwise produce a junit that is complete for what
+          # it ran and looks green.
+          prior_args=()
+          while IFS= read -r prior; do prior_args+=(--prior "${prior}"); done < "${RUNNER_TEMP}/prior-used.txt"
+          if [ ${#prior_args[@]} -eq 0 ] && ! cmp -s "${RUNNER_TEMP}/run-list.txt" "${RUNNER_TEMP}/shard-universe.txt"; then
+            echo "::error title=Run list is not the plan::no usable prior results, yet the run list differs from this shard's plan" >&2
+            diff "${RUNNER_TEMP}/shard-universe.txt" "${RUNNER_TEMP}/run-list.txt" | head -n 50 >&2 || true
+            exit 1
+          fi
+          rm -rf "test-results-${RESULT_ID}"* /tmp/topotests
+
+          echo "RUN_TESTS (${#run_tests[@]} of $(wc -l < "${RUNNER_TEMP}/shard-universe.txt") files in this shard): ${run_tests[*]}"
+          [[ "${TOPOTEST_WORKERS}" =~ ^[1-9][0-9]*$ ]]
+
+          # BLO-35428 footprint sampler -- measurement only, nothing gates on
+          # it.  The container is not inside the DinD sidecar's cgroup and has
+          # no resource bounds (see TOPOTEST_WORKERS), so this is the only
+          # record of one leg's real CPU/mem/pids; it feeds the capacity work.
+          # It runs in the background and can never fail this step: its exit
+          # status is never waited on, errexit is off inside it, and the EXIT
+          # trap kills it.  The first sample goes to this log with stderr
+          # intact, so a blind sampler (docker stats erroring, or reading 0
+          # for a container outside its cgroup view) shows up here and in
+          # "Check topotest footprint samples" instead of as a silently empty
+          # artifact.  After it the loop re-points its output at the log file
+          # so it no longer holds this step's output pipes.
+          stats_log="${RUNNER_TEMP}/topotest-stats.log"
+          : > "${stats_log}"
+          (
+            set +e +o pipefail
+            sleep 30 > /dev/null 2>&1
+            ts=$(date -u +%FT%TZ)
+            docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} pids={{.PIDs}}' 2>&1 \
+              | sed "s/^/${ts} /" | tee -a "${stats_log}" | sed 's/^/topotest footprint, first sample: /'
+            exec >> "${stats_log}" 2>&1 < /dev/null
+            while sleep 30; do
+              docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} pids={{.PIDs}}' 2>&1 \
+                | sed "s/^/$(date -u +%FT%TZ) /"
+            done
+          ) &
+          STATS_PID=$!
+          trap 'kill "${STATS_PID}" 2>/dev/null || true' EXIT
+
+          # As in the serial rerun below, the selected tests go through "$@"
+          # rather than being glued onto the `bash -c` string: appending an
+          # unquoted list there delivers only its first word to pytest and
+          # turns the rest into positional parameters of the -c script, which
+          # would silently narrow a targeted rerun to a single file.
+          # The list is carried in a mapfile array so that one array element is
+          # exactly one run-list record; expanding a scalar unquoted would
+          # re-split those records on spaces and glob them, which the full node
+          # IDs below make reachable.
+          #
+          # BLO-35428: --no-loadscope-reorder makes xdist hand files out in
+          # the order given, i.e. the plan's longest-first order.  Without it
+          # xdist 3.8.0 (the image's version) re-sorts loadfile units by test
+          # COUNT, descending (xdist/scheduler/loadscope.py:374-379, default
+          # on at plugin.py:131-134; LoadFileScheduling inherits schedule()),
+          # which put the longest file, route_scale/test_route_scale2.py (5
+          # tests), 90th of shard 1's 324.  Checked against pytest 9.1.1 +
+          # xdist 3.8.0 with -n1: args c,a,d,b ran d,b,c,a by default and
+          # c,a,d,b with the flag.  Replayed on the three initial junits the
+          # re-sort costs only 0.0-0.1 min of worst-shard time, so the flag
+          # is about the plan meaning what it says, not the headline.  A
+          # future xdist without the flag exits 4, which the rc gate below
+          # treats as an incomplete run, never a pass.
+          #
+          # BLO-35428 rc gate: pytest's rc is inspected, not just "non-zero".
+          # 0 and 1 are the only codes after which the junit describes a
+          # finished session; anything else means it is partial, and the
+          # failed-only rerun below could only re-verify the failures that
+          # partial junit happened to record.
+          par_rc=0
+          docker run --init -i --privileged --name "frr-${RESULT_ID}-cont" ${ADD_DOCKER_ENV} \
+            -e TOPOTEST_WORKERS="${TOPOTEST_WORKERS}" -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
+            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest -n"${TOPOTEST_WORKERS}" --dist=loadfile --no-loadscope-reorder "$@"' pytest-run "${run_tests[@]}" || par_rc=$?
+          echo "parallel pytest rc=${par_rc}"
+          case "${par_rc}" in
+            0|1) ;;
+            *) echo "::error title=Topotest run incomplete::parallel pytest exited ${par_rc} (2 interrupted/xdist max-crashed-workers, 3 internal error, 4 usage, 5 nothing collected, >=125 docker). Its junit is partial; a failed-only rerun cannot certify it." >&2; exit 1 ;;
+          esac
+          docker cp "frr-${RESULT_ID}-cont":/tmp/topotests/topotests.xml "${RUNNER_TEMP}/parallel.xml" || { echo '::error::parallel run produced no topotests.xml' >&2; exit 1; }
+          # Every collected test must be accounted for: by this attempt's junit
+          # if it was in the run list, otherwise by a NON-failing result in the
+          # prior attempt it resumed from.  With no prior, this attempt alone
+          # must account for this shard's whole collection.
+          # Scoped to this shard's collected IDs; on success it writes the
+          # IDs it certified into the plan artifact, which is how CI-Verdict
+          # checks that the shards between them accounted for the whole
+          # collection.
+          python3 .github/scripts/topotest_coverage.py --collected "${RUNNER_TEMP}/collected-shard.txt" \
+            --run-list "${RUNNER_TEMP}/run-list.txt" --results "${RUNNER_TEMP}/parallel.xml" \
+            --accounted-out "${plan_dir}/accounted.txt" \
+            ${prior_args[@]+"${prior_args[@]}"}
+          if [ "${par_rc}" -eq 0 ]; then
             echo "All tests passed."
             exit 0
           fi
 
           # Grab the results from the container
-          if ! ./tests/topotests/analyze.py -Ar test-results-${{ matrix.cfg.platform }} -C frr-${{ matrix.cfg.platform }}-cont; then
-            if [ ! -d test-results-${{ matrix.cfg.platform }} ]; then
+          if ! ./tests/topotests/analyze.py -Ar "test-results-${RESULT_ID}" -C "frr-${RESULT_ID}-cont"; then
+            if [ ! -d "test-results-${RESULT_ID}" ]; then
               echo "ERROR: Basic failure in docker run, no test results directory available." >&2
               exit 1;
             fi
-            if [ ! -f test-results-${{ matrix.cfg.platform }}/topotests.xml ]; then
+            if [ ! -f "test-results-${RESULT_ID}"/topotests.xml ]; then
             # In this case we may be missing topotests.xml
               echo "ERROR: No topotests.xml available perhaps docker run aborted?" >&2
               exit 1;
@@ -388,52 +1051,345 @@ jobs:
           fi
 
           # Save some information useful for debugging
-          cp /boot/config* test-results-${{ matrix.cfg.platform }}/
-          sysctl -a > test-results-${{ matrix.cfg.platform }}/sysctl.out 2> /dev/null
+          cp /boot/config* "test-results-${RESULT_ID}"/
+          sysctl -a > "test-results-${RESULT_ID}"/sysctl.out 2> /dev/null
 
           # Now get the failed tests (if any) from the archived results directory.
-          rerun_tests=$(./tests/topotests/analyze.py -r test-results-${{ matrix.cfg.platform }} | cut -f1 -d: | sort -u)
-          if [ -z "$rerun_tests" ]; then
+          # Keep the FULL pytest node IDs (file.py::test_name).  The previous
+          # `cut -f1 -d:` truncated them to bare file paths, discarding the only
+          # information that makes it possible to check afterwards that the
+          # rerun re-ran the tests that actually failed.
+          #
+          # Read them into an array rather than a scalar: analyze.py emits one
+          # node ID per line, and only an array preserves that framing.  A
+          # scalar expanded unquoted re-splits on spaces and is glob-expanded,
+          # so a parametrized ID -- `test_x[a b]`, which `cut` used to strip --
+          # would arrive at pytest as two unknown IDs instead of one real one.
+          # The capture stays a command substitution so that `set -e` still
+          # aborts the step when analyze.py fails; feeding mapfile directly
+          # from a process substitution would silently drop that.
+          rerun_tests_raw=$(./tests/topotests/analyze.py -r "test-results-${RESULT_ID}" | sort -u)
+          mapfile -t rerun_tests < <(printf '%s' "${rerun_tests_raw}")
+          if [ ${#rerun_tests[@]} -eq 0 ]; then
             echo "ERROR: Parallel pytest run failed but no failures found in topotests.xml." >&2
             exit 1
           fi
 
           echo "ERROR: Some tests failed during parallel run, rerunning serially." >&2
-          echo RERUN_TESTS: $rerun_tests >&2
-          docker stop frr-${{ matrix.cfg.platform }}-cont
-          docker rm frr-${{ matrix.cfg.platform }}-cont
+          echo "RERUN_TESTS: ${rerun_tests[*]}" >&2
+          docker stop "frr-${RESULT_ID}-cont"
+          docker rm "frr-${RESULT_ID}-cont"
 
-          mv test-results-${{ matrix.cfg.platform }} test-results-${{ matrix.cfg.platform }}-initial
-          if docker run --init -i --privileged --name frr-${{ matrix.cfg.platform }}-cont ${ADD_DOCKER_ENV} -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
-            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest '$rerun_tests; then
-            echo "All rerun tests passed."
-            exit 0
+          mv "test-results-${RESULT_ID}" "test-results-${RESULT_ID}-initial"
+
+          # Pass the test IDs as real positional arguments consumed by "$@",
+          # NOT by concatenating them onto the `bash -c` script string.
+          # Appending an unquoted word list to `bash -c 'cmd '$list` hands only
+          # the FIRST word to cmd; every later word becomes $0, $1, ... of the
+          # -c script and is silently discarded.  In run 32421578651 that fed
+          # pytest one of the two failing files -- the other never reached it,
+          # so pytest collected 5 tests, passed them, exited 0, and the step
+          # reported success over three real failures.
+          rerun_rc=0
+          docker run --init -i --privileged --name "frr-${RESULT_ID}-cont" ${ADD_DOCKER_ENV} -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
+            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest "$@"' pytest-rerun "${rerun_tests[@]}" || rerun_rc=$?
+
+          # pytest's exit code only claims "everything I collected passed",
+          # which is strictly weaker than "every test we named passed".  A
+          # target that collects nothing -- renamed, uncollectable, or never
+          # delivered to pytest at all -- yields 0 items and exit 0.  Verify
+          # coverage against the harvested IDs before believing that 0.
+          printf '%s\n' "${rerun_tests[@]}" > /tmp/rerun-expected.txt
+          rerun_xml=/tmp/rerun-results.xml
+          rm -f "${rerun_xml}"
+          if ! docker cp "frr-${RESULT_ID}-cont":/tmp/topotests/topotests.xml "${rerun_xml}"; then
+            echo "ERROR: the rerun produced no topotests.xml, so which tests ran cannot be verified." >&2
+            exit 1
           fi
-          echo "Some rerun tests still failed."
-          exit 1
+          if ! python3 .github/scripts/verify_rerun_coverage.py \
+                 --expected /tmp/rerun-expected.txt --results "${rerun_xml}"; then
+            exit 1
+          fi
+
+          if [ "${rerun_rc}" -ne 0 ]; then
+            echo "Some rerun tests still failed."
+            exit 1
+          fi
+          echo "All rerun tests passed."
+          exit 0
       - name: Gather results
         if: ${{ always() }}
         run: |
-          if [ ! -d test-results-${{ matrix.cfg.platform }} ]; then
-            if ! ./tests/topotests/analyze.py -Ar test-results-${{ matrix.cfg.platform }} -C frr-${{ matrix.cfg.platform }}-cont; then
+          if [ ! -d "test-results-${RESULT_ID}" ]; then
+            if ! ./tests/topotests/analyze.py -Ar "test-results-${RESULT_ID}" -C "frr-${RESULT_ID}-cont"; then
               echo "ERROR: gathering results produced an error, perhaps due earlier run cancellation." >&2
             fi
           fi
+          # BLO-35428: pin the artifact layout.  upload-artifact roots an
+          # artifact at the least common ancestor of the paths that exist, so
+          # a clean leg (one dir) uploaded flat and a leg with failures (two
+          # dirs) uploaded nested, and the resume probe could not tell where
+          # topotests.xml was.  Both dirs now always exist, so the layout is
+          # always test-results-<p>/ + test-results-<p>-initial/.  The marker
+          # is NOT a dotfile: upload-artifact drops hidden files by default.
+          mkdir -p "test-results-${RESULT_ID}" "test-results-${RESULT_ID}-initial"
+          echo "attempt ${GITHUB_RUN_ATTEMPT}" > "test-results-${RESULT_ID}"/layout.txt
+          cp "test-results-${RESULT_ID}"/layout.txt "test-results-${RESULT_ID}-initial"/layout.txt
       - name: Upload test results
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: test-results-${{ matrix.cfg.platform }}
+          name: test-results-${{ matrix.cfg.platform }}-s${{ matrix.shard }}
           path: |
-            test-results-${{ matrix.cfg.platform }}
-            test-results-${{ matrix.cfg.platform }}-initial
+            test-results-${{ matrix.cfg.platform }}-s${{ matrix.shard }}
+            test-results-${{ matrix.cfg.platform }}-s${{ matrix.shard }}-initial
           overwrite: true
           # Keep test artifacts longer to aid flaky test/debug investigations.
           retention-days: 14
           if-no-files-found: warn
+      - name: Upload topotest shard plan
+        # BLO-35428: CI-Verdict's input.  NOT continue-on-error: a shard
+        # whose plan did not upload cannot be shown to have covered its part
+        # of the tree, and must be red here as well as in the verdict.
+        # overwrite so "Re-run failed jobs" replaces attempt 1's plan (and
+        # its accounted.txt) instead of 409ing on the name.
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: topotest-plan-${{ matrix.cfg.platform }}-s${{ matrix.shard }}
+          path: ${{ runner.temp }}/plan
+          overwrite: true
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Upload topotest footprint samples
+        # BLO-35428, measurement only: a SEPARATE artifact so the
+        # test-results layout the resume path reads is untouched.
+        # continue-on-error so a measurement can never turn a leg red, and
+        # overwrite so a "Re-run failed jobs" attempt does not 409 on the
+        # name attempt 1 already used (artifacts are run-scoped across
+        # attempts: attempt 2 of run 35409722977 downloaded the
+        # test-results-amd64_u22 artifact attempt 1 uploaded).
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: topotest-stats-${{ matrix.cfg.platform }}-s${{ matrix.shard }}
+          path: ${{ runner.temp }}/topotest-stats.log
+          overwrite: true
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Check topotest footprint samples
+        # BLO-35428: the sampler reads `docker stats` from inside DinD for a
+        # container that lands outside the sidecar's cgroup, so it may read
+        # nothing or zeros without anyone noticing.  Flag that here, where it
+        # is visible.  continue-on-error: it marks this step, never the leg.
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          log="${RUNNER_TEMP}/topotest-stats.log"
+          cont="frr-${RESULT_ID}-cont"
+          if [ ! -s "${log}" ]; then
+            echo "::warning title=Footprint sampler recorded nothing::${log} is missing or empty; this leg's CPU/mem/pids footprint is unknown."
+            exit 1
+          fi
+          first=$(grep -m1 -F " ${cont} " "${log}" || true)
+          echo "first sample of ${cont}: ${first:-<none>}"
+          awk -v c="${cont}" '$2 == c {
+              n++; v = $3; sub(/^cpu=/, "", v); sub(/%$/, "", v); if (v + 0 > cpu) cpu = v + 0
+              p = $NF; sub(/^pids=/, "", p); if (p + 0 > pids) pids = p + 0
+            } END { printf "samples=%d peak_cpu=%.2f%% peak_pids=%d\n", n, cpu, pids }' "${log}"
+          if [ -z "${first}" ] || [[ "${first}" =~ cpu=0(\.0+)?% ]] || [[ "${first}" =~ pids=0$ ]]; then
+            echo "::warning title=Footprint sampler looks blind::first sample of ${cont} is missing or reads 0% CPU / 0 pids; the topotest-stats artifact cannot be trusted as a footprint for this leg."
+            exit 1
+          fi
       - name: Cleanup
         if: ${{ always() }}
         run: |
-          rm -rf test-results-${{ matrix.cfg.platform }}* /tmp/frr-${{ matrix.cfg.platform }}.tar
-          docker stop frr-${{ matrix.cfg.platform }}-cont || true
-          docker rm frr-${{ matrix.cfg.platform }}-cont || true
+          rm -rf "test-results-${RESULT_ID}"* prev-results
+          docker stop "frr-${RESULT_ID}-cont" || true
+          docker rm "frr-${RESULT_ID}-cont" || true
+      - name: Report lane runtime and attribute any cap kill
+        # BLO-29817: a `timeout-minutes` kill is reported by GitHub as
+        # `cancelled`, which is indistinguishable from a human pressing cancel
+        # or a `cancel-in-progress` concurrency eviction -- both routine here.
+        # Three separate investigations on BLO-29523 read that `cancelled` and
+        # did not recognise it as a timeout.  So say it explicitly.
+        #
+        # This step runs LAST on purpose: in two of the three observed kills the
+        # suite had already finished and the cap landed during "Upload test
+        # results", so a report placed before the upload would have seen healthy
+        # headroom and missed the kill entirely.  Cancellation still lets
+        # `always()` steps run -- in all three kills the upload, cleanup and
+        # post steps completed after the cap fired -- and this step is pure
+        # bash, so it lands inside that grace window.
+        if: ${{ always() }}
+        env:
+          SUITE_CONCLUSION: ${{ steps.topotests.conclusion }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -uo pipefail
+          summary="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+          cap="${TOPOTEST_JOB_CAP_MIN}"
+
+          # Keep the mirrored cap honest against the real `timeout-minutes`.
+          # Scoped to the `Test:` job's own block: latch on the job key, and
+          # bail at the next key at that indent so a later job's cap can never
+          # be read as this one's.  Advisory only -- a formatting change to the
+          # workflow must not be able to fail the topotest lane.
+          configured=$(awk '
+            /^  Test:$/       { f=1; next }
+            f && /^  [^ #]/   { exit }
+            f && /^    timeout-minutes:/ { print $2; exit }
+          ' .github/workflows/github-ci.yml 2>/dev/null || true)
+          if [ -z "${configured}" ]; then
+            echo "::warning title=BLO-29817 cap mirror uncheckable::could not read timeout-minutes out of the Test job; headroom below assumes TOPOTEST_JOB_CAP_MIN=${cap}"
+          elif [ "${configured}" != "${cap}" ]; then
+            echo "::error title=BLO-29817 cap mirror drift::TOPOTEST_JOB_CAP_MIN=${cap} but timeout-minutes=${configured}; headroom figures below are unreliable until they match"
+            cap="${configured}"
+          fi
+
+          if [ -z "${TOPOTEST_LANE_START_EPOCH:-}" ]; then
+            echo "::warning title=BLO-29817::lane start was never recorded; cannot attribute runtime"
+            exit 0
+          fi
+          elapsed=$(( ( $(date +%s) - TOPOTEST_LANE_START_EPOCH ) / 60 ))
+          headroom=$(( cap - elapsed ))
+
+          # How close to the cap a *cancelled* job must land before the cap --
+          # rather than a human or the concurrency group -- is the explanation.
+          # The three observed kills overshot by 1.0/1.0/2.2 min, so 5 covers
+          # them with margin; it is not applied to jobs that were not cancelled.
+          near=5
+
+          {
+            echo "### ${{ matrix.cfg.name }} (shard ${TOPOTEST_SHARD}/${TOPOTEST_SHARDS}) — lane runtime"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| elapsed | **${elapsed} min** |"
+            echo "| cap (\`timeout-minutes\`) | ${cap} min |"
+            echo "| headroom | **${headroom} min** |"
+            echo "| suite step | \`${SUITE_CONCLUSION:-not-reached}\` |"
+            echo "| job status | \`${JOB_STATUS}\` |"
+            echo
+          } >> "${summary}"
+
+          # Cancellation is the necessary condition, headroom only the
+          # discriminator.  A cap kill and an external cancel are BOTH stamped
+          # `cancelled` by GitHub and are told apart by how close to the cap
+          # they landed -- but a job that reached a conclusion of its own was by
+          # definition not killed, however little headroom it had left.  Gating
+          # on JOB_STATUS first is what stops a merely-slow *successful* leg
+          # (one landing inside `near` on its own steam -- 176/180 min has
+          # already happened once) from being reported as a timeout kill.
+          if [ "${JOB_STATUS}" = "cancelled" ]; then
+            if [ "${headroom}" -gt "${near}" ]; then
+              # Far from the cap, so this really was external.
+              echo "Cancelled externally (human or \`cancel-in-progress\`) at ${elapsed} min, ${headroom} min clear of the ${cap}-minute cap — **not** a timeout." >> "${summary}"
+              echo "::notice title=External cancel::Cancelled at ${elapsed}/${cap} min with ${headroom} min of headroom — not a timeout."
+              exit 0
+            fi
+            case "${SUITE_CONCLUSION}" in
+              success|failure)
+                # The false-cancel case this ticket exists for: the tests
+                # finished and reported, then the cap killed the tail.
+                echo "**:stopwatch: KILLED BY THE JOB TIMEOUT — and the tests had already finished (\`${SUITE_CONCLUSION}\`).**" >> "${summary}"
+                echo "" >> "${summary}"
+                echo "This job was **not** cancelled by a person and **not** evicted by concurrency. The suite ran to completion; the ${cap}-minute cap fired during the artifact/cleanup tail, so GitHub stamped the job \`cancelled\` and the rollup went red over a result that was actually \`${SUITE_CONCLUSION}\`. Do **not** just raise \`timeout-minutes\` — that was tried twice here (180 -> 240) and was re-consumed within 16 days both times. Find the overhead and delete it; see the derivation above. Ref BLO-29817." >> "${summary}"
+                echo "::error title=Job timeout (tests already ${SUITE_CONCLUSION})::Cap kill at ${elapsed}/${cap} min during the post-suite tail — NOT a human cancel or concurrency eviction. Tests concluded ${SUITE_CONCLUSION}. See BLO-29817."
+                ;;
+              *)
+                echo "**:stopwatch: KILLED BY THE JOB TIMEOUT while the suite was still running.**" >> "${summary}"
+                echo "" >> "${summary}"
+                echo "Not a human cancel and not a concurrency eviction: elapsed ${elapsed} min against a ${cap}-minute cap. Either the suite genuinely regressed past its measured p100 or it is wedged. Ref BLO-29817." >> "${summary}"
+                echo "::error title=Job timeout (suite incomplete)::Cap kill at ${elapsed}/${cap} min with the suite in state '${SUITE_CONCLUSION:-not-reached}' — NOT a human cancel or concurrency eviction. See BLO-29817."
+                ;;
+            esac
+            exit 0
+          fi
+
+          # Reached its own conclusion.  Leave the headroom on the record so the
+          # cap can be re-derived from ordinary runs instead of only from
+          # failures -- and shout when a leg only just cleared the cap, because
+          # that is the signal that the derivation is going stale.
+          if [ "${headroom}" -le "${near}" ]; then
+            echo "**:warning: Finished \`${JOB_STATUS}\` with only ${headroom} min to spare** — this leg came within ${near} min of the ${cap}-minute cap without being killed. Not a timeout, but the next one may be. Re-derive the cap (BLO-29817)." >> "${summary}"
+            echo "::warning title=Topotest lane nearly hit the cap::Finished ${JOB_STATUS} at ${elapsed}/${cap} min — ${headroom} min spare. NOT a timeout kill, but re-derive the cap (BLO-29817)."
+          elif [ "${headroom}" -le 20 ]; then
+            echo "::warning title=Low topotest headroom::Finished at ${elapsed}/${cap} min — only ${headroom} min spare. Re-check the cap derivation (BLO-29817)."
+          fi
+
+  CI-Verdict:
+    # BLO-35428: one stable check for "this run built and tested what it
+    # had to".  Sharding turns Test into one check per shard, and a shard
+    # that is skipped, or never uploads its plan, is not red on its own --
+    # GitHub renders a skipped job as neutral.  This job reads every gating
+    # job's result plus each shard's plan artifact, and
+    # .github/scripts/topotest_verdict.py (its header has the rules) fails
+    # closed: the only two ways to pass without a green Build, Build-LTTng,
+    # Unit-Test and every Test shard are the two cases this workflow
+    # deliberately builds no image, each matched exactly --
+    #   * doc-only: doc-path-filter concluded 'success' AND its build output
+    #     is the string 'false' AND the raw classification is doc 'true',
+    #     non_doc 'false'.  Never an inequality such as `build != 'true'`:
+    #     doc-path-filter runs on the preemptible `default` pool (a pod was
+    #     preempted there in run 35776450503) and now also fetches nine
+    #     MIBs from IANA/IEEE, and a job that fails or loses its runner
+    #     leaves its outputs empty and skips Build and Test, so an
+    #     inequality would pass a run that built and tested nothing.  Never
+    #     non_doc 'false' alone either: paths-filter reports doc 'false',
+    #     non_doc 'false' for a change list with no files (the first push
+    #     of a branch at a commit already on master); the decide step
+    #     builds that, and the verdict judges it in full;
+    #   * mergify: doc-path-filter 'skipped' AND event pull_request AND actor
+    #     mergify[bot], the exact condition of doc-path-filter's own `if:`.
+    # Whether mergify backports must build before this check becomes
+    # required is left to that change (BLO-35428 item 16).
+    #
+    # Build-LTTng is here because it left Build's matrix so as not to delay
+    # Test (BLO-35428): no other job needs it, so without this entry an
+    # LTTng build failure would be a red job this verdict never saw.
+    #
+    # Documentation-HTML is here because a doc-only run is not a run that
+    # builds nothing: it builds the HTML docs, and that job is the only
+    # check on doc/.  It must be 'success' whenever doc-path-filter's
+    # decided docs output is 'true' (doc/ changed, or the filter could not
+    # tell) and 'skipped' when it is 'false', which is re-checked against
+    # the raw doc 'false'; without it the verdict was green over a broken
+    # docs build, usually before the docs job had even finished.
+    #
+    # `always()`, not `!cancelled()`: a cancelled run must read red here, not
+    # skipped, because a skipped required check counts as passing.
+    # arc-light: checkout plus one stdlib Python script, the same shape the
+    # review gate runs there (review-gate.yml).
+    runs-on: arc-light
+    if: ${{ always() }}
+    needs: [doc-path-filter, Build, Build-LTTng, Unit-Test, Test, Documentation-HTML]
+    name: CI-Verdict
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Download topotest shard plans
+        # continue-on-error: on a doc-only or mergify run there are no plans,
+        # and whether plans are required is the script's decision, not this
+        # step's.  A missing plan on a run that needed one is red there.
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          pattern: topotest-plan-*
+          path: plans
+      - name: Judge the run
+        # --shards must equal Test's TOPOTEST_SHARDS and --platforms its
+        # matrix platforms (pinned by test_topotest_shards.py).  needs and
+        # the actor go through env, never spliced into the script.
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          python3 .github/scripts/topotest_verdict.py --needs-env NEEDS_JSON --plans plans \
+            --shards 2 --platforms amd64_u22,amd64_u24 --event-name "${EVENT_NAME}" --actor "${ACTOR}"

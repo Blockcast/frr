@@ -293,14 +293,38 @@ keyword at the end.
    address.  Cannot be combined with ``ipv6 pim passive``.  Instead of a
    static route, the RPF may be steered by a BGP-learned Upstream Multicast
    Hop mapping (``set extcommunity umh`` in bgpd); see
-   :clicmd:`show ipv6 pim dimt umh [json]`.
+   :clicmd:`show ipv6 pim [vrf NAME] dimt umh [json]`.
 
-.. clicmd:: show ipv6 pim dimt umh [json]
+.. clicmd:: show ipv6 pim [vrf NAME] dimt umh [json]
 
    Display the bgpd-learned DIMT Upstream Multicast Hop mappings: for each
    IPv6 source prefix, the UMH address joins are sent toward, its type
    (``pim`` or ``amt-relay``), its preference, and the PIM Light interface
    the (S,G) RPF is pinned to.
+
+   ``PinSource`` reports which resolver chose that interface, and ``Shadowed``
+   (``shadowedInterface`` in JSON) names a covering PIM Light interface that
+   did not get the pin.  Both take the same values and carry the same meaning
+   as they do for IPv4, and are enumerated once, there:
+   :clicmd:`show ip pim [vrf NAME] dimt umh [json]`.  The list is deliberately
+   not repeated on this page -- an inline copy is what left it documenting a
+   closed set that no longer held.
+
+   Not every value in that list is reachable here.  A DIMT tunnel only exists
+   for a UMH that has an explicit ``dimt tunnel-endpoint`` row, and that
+   command is registered only by *pimd* and keys the row on an IPv4 UMH
+   address -- so *pim6d* has no tunnel for any UMH, and the tunnel-derived pin
+   values cannot occur for IPv6.  An IPv6 pin therefore resolves only through
+   a covering PIM Light interface, or not at all.
+
+   This is also why the IPv4 page's remedy for the terminal ``tunnel-failed``
+   pin state -- read ``show ip pim [vrf NAME] dimt tunnel [json]`` -- is not
+   linked here: that command belongs to *pimd*, and there is no
+   ``show ipv6 pim ... dimt tunnel`` because there is no IPv6 tunnel state for
+   it to report.  An IPv6-only operator cannot reach that pin state and needs
+   no command to diagnose it.  Should IPv6 tunnel endpoints ever be
+   configurable, that is the point at which this paragraph, the reader
+   commands and this remedy all have to be revisited together.
 
 .. clicmd:: ipv6 pim bsm
 
