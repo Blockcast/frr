@@ -23,6 +23,14 @@ is one underlay hop away and nothing ever answers r2's joins:
      without a Prune(S,G), so the old UMH kept forwarding into it for its
      full 210 s J/P holdtime.
 
+and one the fixes for 2 and 3 exposed (lab F1/F2):
+
+  4. A DIMT move overwrote the upstream's RPF without taking it off the old
+     UMH neighbor's J/P aggregation list.  That list exists as soon as the
+     UMH sends r2 any J/P (a PIM Light neighbor is created for it), so the
+     old UMH kept getting periodic Join(S,G) after the prune -- and once the
+     upstream was freed, a Join built from freed memory.
+
 Topology:
 
     h1 --s2-- r1 --s1-- r3 --s3-- r2 --s4 (receiver stub)
@@ -73,6 +81,11 @@ pytestmark = [pytest.mark.bgpd, pytest.mark.pimd]
 SOURCE = "10.10.10.10"
 GROUP = "232.1.1.10"
 SRC_PREFIX = "10.10.10.0/24"
+
+# A second (S,G) whose prefix r1 maps to UMH_A permanently: it keeps tunnel A
+# (and the UMH neighbor r2 holds on it) alive while SOURCE steers away.
+SOURCE2 = "10.10.11.10"
+GROUP2 = "232.1.1.11"
 
 # UMH -> (r1 terminating netdev, r1 outer address, r2 inner-local)
 UMH_A = "10.99.0.1"
@@ -190,34 +203,34 @@ def tunnel_ifname(router, umh):
     return entry["interface"]
 
 
-def r1_join_state(ifname):
+def r1_join_state(ifname, source=SOURCE, group=GROUP):
     """r1's ifchannel state for the (S,G) on `ifname`, or None if absent."""
     r1 = get_topogen().gears["r1"]
     output = json.loads(r1.vtysh_cmd("show ip pim join json"))
-    row = output.get(ifname, {}).get(GROUP, {}).get(SOURCE)
+    row = output.get(ifname, {}).get(group, {}).get(source)
     return row.get("channelJoinName") if row else None
 
 
-def check_r1_joined(ifname):
-    state = r1_join_state(ifname)
+def check_r1_joined(ifname, source=SOURCE, group=GROUP):
+    state = r1_join_state(ifname, source, group)
     if state != "JOIN":
         return "r1 has no Join({},{}) on {} (state {})".format(
-            SOURCE, GROUP, ifname, state
+            source, group, ifname, state
         )
     return None
 
 
-def check_r1_not_joined(ifname):
-    state = r1_join_state(ifname)
+def check_r1_not_joined(ifname, source=SOURCE, group=GROUP):
+    state = r1_join_state(ifname, source, group)
     if state == "JOIN":
-        return "r1 still holds Join({},{}) on {}".format(SOURCE, GROUP, ifname)
+        return "r1 still holds Join({},{}) on {}".format(source, group, ifname)
     return None
 
 
-def set_static_group(router, present):
+def set_static_group(router, present, source=SOURCE, group=GROUP):
     router.vtysh_cmd(
         "conf t\ninterface r2-eth1\n{}ip igmp static-group {} {}".format(
-            "" if present else "no ", GROUP, SOURCE
+            "" if present else "no ", group, source
         )
     )
 
@@ -314,15 +327,17 @@ class JPCapture:
         self.router.run("rm -f {}".format(self.path))
         return self.packets
 
-    def matching(self, kind, umh):
-        """J/Ps carrying a join/prune for SOURCE toward UMH `umh`'s outer."""
+    def matching(self, kind, umh, source=SOURCE, group=GROUP):
+        """J/Ps carrying a join/prune for (source, group) toward UMH `umh`'s
+        outer.  A J/P aggregating several groups is matched on membership
+        only, which is enough: every source here is unique to its group."""
         key = "joins" if kind == "join" else "prunes"
         return [
             p
             for p in self.packets
             if p["outer_dst"] == R1_OUTER[umh]
-            and GROUP in p["groups"]
-            and SOURCE in p[key]
+            and group in p["groups"]
+            and source in p[key]
         ]
 
 
@@ -544,6 +559,181 @@ def test_leave_prunes_before_teardown():
     capture.stop()
 
     assert_prune_before_delete(capture, monitor, UMH_A, ifname)
+
+
+# --- bug 4: stale J/P aggregation entry on the old UMH's neighbor --------
+
+# Sent from r1's namespace out gre-a, as the UMH (10.99.0.1): a PIM
+# Join/Prune with no groups, every 10 s.  All it does is make r2's pimd hold
+# a PIM Light neighbor for the UMH on its tunnel netdev (pim_pim.c creates
+# one for any J/P from an unknown router on a light interface) -- which is
+# what the lab's Prune Echoes did, and what puts r2's upstreams on that
+# neighbor's J/P aggregation list instead of their own Join Timers.
+#
+# Header: ver 2 / type 3; upstream neighbor = r2's inner (encoded unicast,
+# IPv4); reserved; 0 groups; holdtime 210.
+UMH_NEIGHBOR_INJECTOR = r"""
+import socket, struct, time
+
+def csum(b):
+    s = sum(struct.unpack("!%dH" % (len(b) // 2), b))
+    s = (s >> 16) + (s & 0xFFFF)
+    s += s >> 16
+    return ~s & 0xFFFF
+
+body = bytes([1, 0]) + socket.inet_aton("{upstream}") + bytes([0, 0]) + struct.pack("!H", 210)
+hdr = bytes([0x23, 0])
+pkt = hdr + struct.pack("!H", csum(hdr + b"\0\0" + body)) + body
+s = socket.socket(socket.AF_INET, socket.SOCK_RAW, 103)
+s.setsockopt(socket.SOL_SOCKET, 25, b"{ifname}\0")
+s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton("{local}"))
+s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
+s.bind(("{local}", 0))
+while True:
+    s.sendto(pkt, ("224.0.0.13", 0))
+    time.sleep(10)
+"""
+
+
+def check_r2_neighbor(router, ifname, address):
+    output = json.loads(router.vtysh_cmd("show ip pim neighbor json"))
+    if address not in output.get(ifname, {}):
+        return "r2 has no PIM neighbor {} on {}: {}".format(address, ifname, output)
+    return None
+
+
+def last_jp_agg_event(router, source, group, ifname, nbr):
+    """'add' or 'remove': the last change pimd logged to (S,G)'s membership
+    of neighbor `nbr`'s J/P aggregation list on `ifname`, or None."""
+    logfile = os.path.join(get_topogen().logdir, router.name, "pimd.log")
+    with open(logfile) as f:
+        log = f.read()
+    pattern = re.compile(
+        r"up \({},{}\) (add to|remove from) nbr {}/{} jp-agg-list".format(
+            re.escape(source), re.escape(group), re.escape(ifname), re.escape(nbr)
+        )
+    )
+    events = pattern.findall(log)
+    if not events:
+        return None
+    return "add" if events[-1] == "add to" else "remove"
+
+
+def assert_old_umh_stays_pruned(capture, umh, since, label):
+    """No Join(SOURCE,GROUP) toward `umh` after `since`, while the anchor
+    (SOURCE2,GROUP2) -- same UMH, same neighbor, same 60 s cadence -- WAS
+    refreshed toward it in the window: that is the positive control proving
+    the capture ran long enough to see the periodic sender."""
+    stale = [p for p in capture.matching("join", umh) if p["time"] > since]
+    assert not stale, (
+        "{}: Join({},{}) sent to UMH {} after it was pruned -- a stale J/P "
+        "aggregation entry on the old neighbor: {}".format(
+            label, SOURCE, GROUP, umh, stale
+        )
+    )
+    anchor = [
+        p
+        for p in capture.matching("join", umh, SOURCE2, GROUP2)
+        if p["time"] > since
+    ]
+    assert anchor, (
+        "{}: no periodic Join({},{}) toward {} in a {}s window either, so the "
+        "absence above proves nothing: {}".format(
+            label, SOURCE2, GROUP2, umh, PERIODIC, capture.packets
+        )
+    )
+
+
+def test_steer_leaves_no_stale_join_on_old_umh_neighbor():
+    """Bug 4: after a steer, and after the steered (S,G) is freed, the UMH
+    it left must hear no further Join(S,G).
+
+    Needs what every earlier stage lacks: a UMH neighbor on r2's tunnel
+    netdev (r1 never sends r2 a J/P on its own), a tunnel that outlives the
+    steer (SOURCE2 anchors tunnel A), and a window longer than the periodic
+    interval (the stale join rides the neighbor's 60 s J/P timer).
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    r1 = tgen.gears["r1"]
+    r2 = tgen.gears["r2"]
+
+    expect(lambda: None if umh_of_source(r2) == UMH_A else "mapping not on A",
+           count=60)
+    set_static_group(r2, True)
+    set_static_group(r2, True, SOURCE2, GROUP2)
+    expect(lambda: check_tunnel_installed(r2, UMH_A))
+    ifname_a = tunnel_ifname(r2, UMH_A)
+    expect(lambda: check_r1_joined(R1_TUNNEL[UMH_A]), count=PROMPT, wait=1)
+    expect(lambda: check_r1_joined(R1_TUNNEL[UMH_A], SOURCE2, GROUP2),
+           count=PROMPT, wait=1)
+
+    injector = r1.popen(
+        [
+            "python3",
+            "-c",
+            UMH_NEIGHBOR_INJECTOR.format(
+                ifname=R1_TUNNEL[UMH_A], local=UMH_A, upstream=R2_INNER[UMH_A]
+            ),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        expect(lambda: check_r2_neighbor(r2, ifname_a, UMH_A), count=30)
+
+        # Away and back: the pin back onto A starts SOURCE's Join Timer
+        # while the UMH neighbor exists, which is what puts it on that
+        # neighbor's aggregation list.
+        set_umh(UMH_B)
+        expect(lambda: check_r1_joined(R1_TUNNEL[UMH_B]), count=PROMPT, wait=1)
+        set_umh(UMH_A)
+        expect(lambda: check_r1_joined(R1_TUNNEL[UMH_A]), count=PROMPT, wait=1)
+        expect(lambda: check_no_tunnel(r2, UMH_B))
+
+        # Precondition, not assumption: the window this stage exists for is
+        # open.  Without it a pass would only mean the path was not reached.
+        assert last_jp_agg_event(r2, SOURCE, GROUP, ifname_a, UMH_A) == "add", (
+            "({},{}) never joined the J/P aggregation list of UMH neighbor {} "
+            "on {} -- the stale-entry path is not reachable".format(
+                SOURCE, GROUP, UMH_A, ifname_a
+            )
+        )
+
+        # Window 1: steer away with the upstream alive.
+        capture = JPCapture("stale-steer")
+        set_umh(UMH_B)
+        expect(lambda: check_r1_joined(R1_TUNNEL[UMH_B]), count=PROMPT, wait=1)
+        expect(lambda: check_r1_not_joined(R1_TUNNEL[UMH_A]), count=PROMPT, wait=1)
+        assert last_jp_agg_event(r2, SOURCE, GROUP, ifname_a, UMH_A) == "remove"
+        time.sleep(PERIODIC + 10)
+        capture.stop()
+        prunes = capture.matching("prune", UMH_A)
+        assert prunes, "no Prune({},{}) toward {}: {}".format(
+            SOURCE, GROUP, UMH_A, capture.packets
+        )
+        assert_old_umh_stays_pruned(capture, UMH_A, prunes[0]["time"], "steer")
+        assert check_r1_not_joined(R1_TUNNEL[UMH_A]) is None
+
+        # Window 2: the steered upstream is freed.  A dangling entry would
+        # now build its Join from freed memory.
+        capture = JPCapture("stale-free")
+        t_leave = time.time()
+        set_static_group(r2, False)
+        expect(lambda: check_no_tunnel(r2, UMH_B))
+        time.sleep(PERIODIC + 10)
+        capture.stop()
+        assert_old_umh_stays_pruned(capture, UMH_A, t_leave, "after free")
+        assert check_r1_not_joined(R1_TUNNEL[UMH_A]) is None
+        assert not tgen.routers_have_failure(), tgen.errors
+    finally:
+        injector.terminate()
+        injector.wait(timeout=10)
+
+    set_static_group(r2, False, SOURCE2, GROUP2)
+    expect(lambda: check_no_tunnel(r2, UMH_A))
 
 
 if __name__ == "__main__":
