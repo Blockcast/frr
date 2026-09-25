@@ -35,6 +35,9 @@ struct zebra_dimt_tunnel {
 		ZEBRA_DIMT_INSTALLED,
 		ZEBRA_DIMT_DELETING,
 		ZEBRA_DIMT_CLEANUP,
+		/* Deleting a link of ours whose outer TTL is not
+		 * ZEBRA_DIMT_TUNNEL_TTL; the create follows the delete. */
+		ZEBRA_DIMT_REPLACING,
 	} state;
 };
 
@@ -69,8 +72,13 @@ static bool zebra_dimt_owner_matches(const struct zebra_dimt_tunnel *entry,
 	       entry->ctx.owner_instance == ctx->owner_instance;
 }
 
-static bool zebra_dimt_if_matches(const struct zebra_dimt_tunnel *entry,
-				  const struct interface *ifp)
+/*
+ * Is `ifp` this tunnel's link, by name-independent identity: kind, outer
+ * endpoints, key, MTU and encapsulation?  Deliberately NOT the outer TTL --
+ * see zebra_dimt_if_matches() for the stricter test and why the two differ.
+ */
+static bool zebra_dimt_if_identity_matches(const struct zebra_dimt_tunnel *entry,
+					   const struct interface *ifp)
 {
 	const struct zapi_dimt_tunnel *tunnel = &entry->ctx.tunnel;
 	const struct zebra_if *zif = ifp->info;
@@ -98,6 +106,58 @@ static bool zebra_dimt_if_matches(const struct zebra_dimt_tunnel *entry,
 	return gre->encap_type == encap_type &&
 	       (encap_type != TUNNEL_ENCAP_FOU ||
 		gre->encap_dport == htons(tunnel->dport));
+}
+
+static bool zebra_dimt_if_ttl_matches(const struct interface *ifp)
+{
+	const struct zebra_if *zif = ifp->info;
+
+	return zif && zif->l2info.gre.ttl == ZEBRA_DIMT_TUNNEL_TTL;
+}
+
+/*
+ * Identity AND the fixed outer TTL: the test for a link that may be adopted
+ * or completed as this tunnel.
+ *
+ * TTL is split out because the two questions zebra asks of a link have
+ * different answers for a DIMT netdev built with the wrong TTL -- in practice
+ * one a pre-TTL build created with "inherit", which survives the upgrade
+ * because zebra never sweeps DIMT links:
+ *
+ *  - "may it carry this tunnel?"  No.  An inheriting tunnel sends every
+ *    link-local PIM/IGMP packet with outer TTL 1, which is precisely the
+ *    blackhole ZEBRA_DIMT_TUNNEL_TTL exists to remove.  Adopting it would
+ *    re-notify INSTALLED for a netdev that cannot signal past one hop.
+ *  - "is it ours to delete?"  Yes.  Name and endpoints say it is, and a
+ *    delete that also demanded the right TTL could never remove it.
+ *
+ * So adoption uses this function and every delete/cleanup path uses the
+ * identity-only one, and zebra_dimt_tunnel_request() REPLACES a link that
+ * passes identity but fails TTL (delete, then create) rather than refusing
+ * it: refusing would answer FAIL_INSTALL, and pimd deliberately never retries
+ * a failed tunnel on a timer, so the upgraded router would sit without the
+ * tunnel until some unrelated demand edge happened along.  An in-place
+ * RTM_NEWLINK change of the TTL was rejected as well: zebra caches GRE
+ * parameters from the notification stream, so the address phase would race
+ * the change's own notification, and rtnl changelink for gre re-derives every
+ * parameter from the request -- a second full encoding of the tunnel with
+ * none of the create path's EXCL protection.
+ */
+static bool zebra_dimt_if_matches(const struct zebra_dimt_tunnel *entry,
+				  const struct interface *ifp)
+{
+	return zebra_dimt_if_identity_matches(entry, ifp) &&
+	       zebra_dimt_if_ttl_matches(ifp);
+}
+
+/* A link that is ours but still carries the wrong TTL: never adopt it as the
+ * result of a create -- it is the stale link a REPLACING entry just deleted,
+ * seen before its RTM_DELLINK has reached zebra. */
+static bool zebra_dimt_if_stale_ttl(const struct zebra_dimt_tunnel *entry,
+				    const struct interface *ifp)
+{
+	return zebra_dimt_if_identity_matches(entry, ifp) &&
+	       !zebra_dimt_if_ttl_matches(ifp);
 }
 
 static bool zebra_dimt_prefix_matches_ipaddr(const struct prefix *prefix,
@@ -140,7 +200,7 @@ static bool zebra_dimt_tunnel_resolve_ifindex(struct zebra_dimt_tunnel *entry)
 		return false;
 	ifp = if_lookup_by_index(entry->ifindex, entry->vrf_id);
 	if (!ifp || strcmp(entry->ctx.ifname, ifp->name) != 0 ||
-	    !zebra_dimt_if_matches(entry, ifp)) {
+	    !zebra_dimt_if_identity_matches(entry, ifp)) {
 		entry->ifindex = 0;
 		return false;
 	}
@@ -205,7 +265,7 @@ void zebra_dimt_tunnel_if_update(struct interface *ifp)
 		    strcmp(entry->ctx.ifname, ifp->name) != 0)
 			continue;
 		if (entry->state == ZEBRA_DIMT_CLEANUP && !entry->ifindex &&
-		    zebra_dimt_if_matches(entry, ifp)) {
+		    zebra_dimt_if_identity_matches(entry, ifp)) {
 			/* An uncertain create left this entry as a cleanup
 			 * tombstone and the link did survive in the kernel.
 			 * Adopt it and tear it down. */
@@ -214,6 +274,8 @@ void zebra_dimt_tunnel_if_update(struct interface *ifp)
 			break;
 		}
 		if (entry->state != ZEBRA_DIMT_ADDING)
+			break;
+		if (zebra_dimt_if_stale_ttl(entry, ifp))
 			break;
 		entry->ifindex = ifp->ifindex;
 		if (entry->create_acked &&
@@ -410,6 +472,25 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 		entry->state = ZEBRA_DIMT_ADDING;
 		listnode_add(zrouter.dimt_tunnels, entry);
 		ifp = if_lookup_by_name(ctx.ifname, entry->vrf_id);
+		if (ifp && zebra_dimt_if_stale_ttl(entry, ifp)) {
+			/* Ours, but built with the wrong outer TTL: replace
+			 * it (see zebra_dimt_if_matches()).  The delete is
+			 * bound to the stale link's ifindex like any other;
+			 * entry->ifindex stays 0 so neither its if_del nor a
+			 * late notification for it is mistaken for the new
+			 * link. */
+			entry->ctx.phase = ZEBRA_DIMT_TUNNEL_DELETE;
+			entry->ctx.delete_ifindex = ifp->ifindex;
+			entry->state = ZEBRA_DIMT_REPLACING;
+			if (dplane_dimt_tunnel_del(entry->vrf_id,
+						   &entry->ctx) ==
+			    ZEBRA_DPLANE_REQUEST_QUEUED)
+				return;
+			zebra_dimt_notify(&ctx, entry->vrf_id, 0,
+					  ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+			zebra_dimt_tunnel_forget(entry);
+			return;
+		}
 		if (ifp && zebra_dimt_if_matches(entry, ifp)) {
 			entry->ifindex = ifp->ifindex;
 			if (zebra_dimt_if_address_matches(entry, ifp)) {
@@ -498,6 +579,31 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 	bool cleanup;
 
 	entry = zebra_dimt_tunnel_lookup(vrf_id, ctx->tunnel.tunnel_id);
+
+	if (!add && entry && entry->state == ZEBRA_DIMT_REPLACING) {
+		/* The stale-TTL link is gone (or was already gone: the
+		 * worker answers a delete for a vanished link with success).
+		 * Build the replacement through the ordinary create path.
+		 * A failed delete -- explicit or unconfirmed -- leaves the
+		 * old link in place, so an EXCL create could only collide
+		 * with it: report the failure and forget the entry, and the
+		 * next ADD re-runs the replacement from scratch. */
+		if (success) {
+			entry->ifindex = 0;
+			entry->ctx.delete_ifindex = 0;
+			entry->ctx.phase = ZEBRA_DIMT_TUNNEL_CREATE;
+			entry->state = ZEBRA_DIMT_ADDING;
+			if (dplane_dimt_tunnel_add(entry->vrf_id,
+						   &entry->ctx) ==
+			    ZEBRA_DPLANE_REQUEST_QUEUED)
+				return;
+		}
+		zebra_dimt_notify(&entry->ctx, vrf_id, 0,
+				  ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+		zebra_dimt_tunnel_forget(entry);
+		return;
+	}
+
 	cleanup = entry && entry->state == ZEBRA_DIMT_CLEANUP;
 	if (!add && cleanup)
 		entry->cleanup_pending = false;
@@ -508,7 +614,11 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 
 		entry->create_acked = true;
 		ifp = if_lookup_by_name(ctx->ifname, vrf_id);
-		if (ifp)
+		/* After a replacement the name may still resolve to the
+		 * deleted stale-TTL link until its RTM_DELLINK is processed;
+		 * the new link's RTM_NEWLINK follows it in kernel order and
+		 * zebra_dimt_tunnel_if_update() adopts it then. */
+		if (ifp && !zebra_dimt_if_stale_ttl(entry, ifp))
 			entry->ifindex = ifp->ifindex;
 		if (!entry->ifindex ||
 		    zebra_dimt_tunnel_address(entry) ==
@@ -531,7 +641,7 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 				  ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
 		entry->state = ZEBRA_DIMT_CLEANUP;
 		ifp = if_lookup_by_name(ctx->ifname, vrf_id);
-		if (ifp && zebra_dimt_if_matches(entry, ifp))
+		if (ifp && zebra_dimt_if_identity_matches(entry, ifp))
 			entry->ifindex = ifp->ifindex;
 		/* Keep the entry even when nothing can be cleaned yet;
 		 * zebra_dimt_tunnel_if_update() reconciles a link that only

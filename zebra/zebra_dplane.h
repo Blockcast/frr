@@ -109,6 +109,19 @@ enum zebra_dplane_startup_notifications {
 	ZEBRA_DPLANE_FINISHED_READING,
 };
 
+/*
+ * Outer TTL (gre) / hop limit (ip6gre) of every DIMT netdev.
+ *
+ * Fixed, never "inherit" (0).  PIM and IGMP control packets are link-local
+ * with an inner TTL of 1, and an inheriting tunnel copies that onto the outer
+ * header, so every Join/Prune and IGMP report dies at the first router of a
+ * multi-hop underlay -- a silent blackhole that a one-hop lab never shows.
+ * 64 is the Linux default (IPDEFTTL, and iproute2's ip6gre hoplimit default),
+ * so data-plane packets see the same outer TTL any host-originated packet
+ * would.
+ */
+#define ZEBRA_DIMT_TUNNEL_TTL 64
+
 struct zebra_dimt_tunnel_ctx {
 	struct zapi_dimt_tunnel tunnel;
 	uint8_t owner_proto;
