@@ -270,6 +270,13 @@ struct pim_upstream {
 	 * real edge rather than on every reconcile pass. */
 	uint8_t gtm_forwarding;
 
+	/* DIMT moved this (S,G)'s RPF onto a new pin and the triggered
+	 * Join(S,G) toward it has not gone out yet -- typically because the
+	 * DIMT netdev was pinned on its INSTALLED notify, before its inner
+	 * address (and so its PIM socket) existed.  Flushed from the pin path
+	 * once the socket is usable; see pim_dimt_join_flush(). */
+	bool dimt_join_pending;
+
 	int ref_count;
 
 	struct pim_rpf rpf;

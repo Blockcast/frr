@@ -372,6 +372,66 @@ static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
 	return pin.ifp;
 }
 
+/* ------------------------------------------------------------------------
+ * Triggered Join on DIMT RPF moves
+ *
+ * STATIC_IIF makes pim_rpf_update() a no-op for a pinned upstream, and with
+ * it the whole RFC 7761 4.5.7 "RPF'(S,G) changes" path: nothing sends
+ * Join(S,G) toward the new RPF'.  An upstream already in Joined state
+ * therefore sat silent on a new pin until its periodic Join Timer fired --
+ * up to t_periodic (60 s) of blackhole on every tunnel bring-up and every
+ * steer, while the old UMH's copies were RPF-dropped.  The helpers below
+ * restore the triggered join for the moves DIMT itself makes.
+ * ------------------------------------------------------------------------
+ */
+
+/* Can a Join/Prune leave on `ifp` right now?  A DIMT netdev is pinned on its
+ * INSTALLED notify, before zebra's inner address has come back round as a
+ * connected route, and pim_if_addr_add() only opens the PIM socket once that
+ * address lands.  Sending before then fails in sendmsg (fd -1) and is simply
+ * lost, which is why a join that cannot go out yet is left pending instead. */
+static bool pim_dimt_jp_sendable(const struct interface *ifp)
+{
+	const struct pim_interface *pim_ifp;
+
+	if (!ifp || !if_is_operative(ifp))
+		return false;
+	pim_ifp = ifp->info;
+	return pim_ifp && pim_ifp->pim_enable && pim_ifp->pim_sock_fd >= 0 &&
+	       !pim_addr_is_any(pim_ifp->primary_address);
+}
+
+/* Send the Join(S,G) a pin move owes the new RPF', if it can go out now.
+ *
+ * Only in Joined state: a NotJoined upstream owes no join, and the
+ * NotJoined -> Joined transition in pim_upstream_switch() sends its own.  The
+ * pending mark survives until a join is actually handed to a usable socket,
+ * so the pin path's socket-ready re-entry (pim_if_addr_add() ->
+ * pim_dimt_iface_up() -> the unchanged-pin branch below) completes it.  A
+ * duplicate Join is harmless -- it is a refresh -- whereas a missing one costs
+ * a full t_periodic of blackhole, so every doubt resolves toward sending. */
+static void pim_dimt_join_flush(struct pim_upstream *up)
+{
+	struct interface *ifp = up->rpf.source_nexthop.interface;
+
+	if (!up->dimt_join_pending || up->join_state != PIM_UPSTREAM_JOINED)
+		return;
+	if (!pim_dimt_jp_sendable(ifp) || pim_addr_is_any(up->rpf.rpf_addr))
+		return;
+
+	up->dimt_join_pending = false;
+
+	if (PIM_DEBUG_PIM_TRACE)
+		zlog_debug("DIMT: triggered Join%s toward %pPAs on %s",
+			   up->sg_str, &up->rpf.rpf_addr, ifp->name);
+
+	pim_upstream_send_join(up);
+	/* Restart the periodic timer from this join, per 4.5.7: the next
+	 * refresh is due t_periodic after the triggered one, not after
+	 * whatever the old RPF' was last sent. */
+	join_timer_start(up);
+}
+
 /* Pin an upstream's RPF onto the light interface facing its UMH.
  * Mirrors pim_vxlan's orig-mroute handling: fill_static_iif() resets
  * rpf_addr, so the UMH must be written after it; the STATIC_IIF flag
@@ -381,6 +441,8 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 				  struct pim_dimt_umh *umh,
 				  struct interface *ifp)
 {
+	enum pim_upstream_state old_state;
+
 	if (PIM_UPSTREAM_FLAG_TEST_STATIC_IIF(up->flags) &&
 	    up->rpf.source_nexthop.interface == ifp &&
 	    !pim_addr_cmp(up->rpf.rpf_addr, umh->umh)) {
@@ -401,6 +463,13 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 		if (up->channel_oil)
 			pim_upstream_mroute_iif_update(up->channel_oil,
 						       __func__);
+		/* The same ordering hazard strands the triggered join: the
+		 * pin was made before the netdev had a PIM socket, so the join
+		 * it owed could not go out.  This branch is where the socket
+		 * becoming usable arrives (pim_if_addr_add() opens it, then
+		 * calls pim_dimt_iface_up()), so finish it here rather than
+		 * leaving it to the 60 s periodic timer. */
+		pim_dimt_join_flush(up);
 		return;
 	}
 
@@ -417,7 +486,19 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 	pim_upstream_update_use_rpt(up, false /*update_mroute*/);
 	if (up->channel_oil)
 		pim_upstream_mroute_iif_update(up->channel_oil, __func__);
+
+	/* A NotJoined -> Joined edge sends its own join from
+	 * pim_upstream_switch(); only an upstream that was ALREADY Joined
+	 * owes one here, and that is the case the pin used to leave to the
+	 * periodic timer.  If the switch's join could not go out (no socket
+	 * yet) it was lost, so the mark stays set for the flush to redo. */
+	old_state = up->join_state;
+	up->dimt_join_pending = true;
 	pim_upstream_update_join_desired(pim, up);
+	if (old_state != PIM_UPSTREAM_JOINED &&
+	    up->join_state == PIM_UPSTREAM_JOINED && pim_dimt_jp_sendable(ifp))
+		up->dimt_join_pending = false;
+	pim_dimt_join_flush(up);
 }
 
 /* Undo a pin (mapping removed): return the upstream to normal RPF
@@ -431,6 +512,8 @@ static void pim_dimt_upstream_unpin(struct pim_instance *pim,
 
 	if (PIM_DEBUG_PIM_TRACE)
 		zlog_debug("DIMT: unpinning %s RPF", up->sg_str);
+
+	up->dimt_join_pending = false;
 
 	PIM_UPSTREAM_FLAG_UNSET_SRC_DIMT(up->flags);
 	PIM_UPSTREAM_FLAG_UNSET_STATIC_IIF(up->flags);
