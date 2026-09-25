@@ -85,6 +85,11 @@ PEERS_INLINE=""
 ENDPOINTS_FILE="${DIMT_ENDPOINTS_FILE:-}"
 FOU_PORT="${DIMT_FOU_PORT:-6637}"
 MTU="${DIMT_MTU:-1388}"
+# `dimt-` is a SHARED namespace, not ours: zebra/pimd name their own
+# on-demand tunnels dimt-%08x.  PREFIX selects the namespace; gc_stale()
+# matches the narrower set of names this script actually creates.  Adding
+# another script-owned dimt-* device means widening that pattern too, or
+# the device leaks forever.
 PREFIX="dimt-"
 DO_FRR=1
 DRY=0
@@ -454,8 +459,19 @@ ensure_peer() { # <peer-overlay>
 
 gc_stale() {
 	want="$1"
+	# Scope GC to the names THIS script derives.  `dimt-` is a shared
+	# namespace: zebra/pimd build their own on-demand tunnels as
+	# dimt-%08x of the tunnel id (pim_dimt.c, zebra_dimt.c), and they
+	# are not in our peer list by construction.  Sweeping every dimt-*
+	# deleted them every cycle while zebra rebuilt them -- two owners
+	# fighting forever on any host running both.  Ours are dev_of()'s
+	# dimt-<o3>-<o4> plus a leaked gre_probe device; the two shapes
+	# cannot collide (hex ids carry no '-').  Anything else under the
+	# prefix belongs to someone else: leave it alone.
 	ip -o link show 2>/dev/null | awk -F': ' '{ print $2 }' |
-		sed 's/@.*//' | grep "^$PREFIX" | while read -r dev; do
+		sed 's/@.*//' |
+		grep -E "^$PREFIX([0-9]{1,3}-[0-9]{1,3}|probe0)$" |
+		while read -r dev; do
 		case " $want " in
 		*" $dev "*) : ;;
 		*)
