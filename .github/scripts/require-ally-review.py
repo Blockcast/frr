@@ -3117,13 +3117,19 @@ def main():
 
     if pull_request.get("state") and pull_request.get("state") != "open":
         # A delayed event can arrive after merge/close; there is no head left
-        # to gate. The early claim (if any) must not be left stranded: a
-        # settled PR gets no future evaluation, so a lingering `pending`
-        # would sit yellow forever. `success` is safe here -- the PR cannot
-        # merge again, so the context gates nothing.
+        # to gate. The early claim (if any) is resolved to a NON-authorizing
+        # state, never `success`: a commit status is keyed by SHA repo-wide,
+        # not by PR, so a green here also greens any OTHER open PR at this
+        # same head (stacked, duplicated, close-and-recreate) with no review
+        # evidence at all -- and the concurrency group is per PR number, so
+        # nothing serializes this write against that PR's own run. `pending`
+        # on a settled PR's commit blocks nothing that can still merge through
+        # this PR, and any other PR at this head overwrites it with its own
+        # verdict on its next evaluation (fail-closed, self-healing), exactly
+        # as the draft branch below reasons.
         print("PR #%s is %s; nothing to gate." % (pull_number, pull_request["state"]))
         resolve_early_claim(
-            "success", "PR is %s; nothing to gate." % pull_request["state"]
+            "pending", "PR is %s; this context no longer gates it." % pull_request["state"]
         )
         return
 
