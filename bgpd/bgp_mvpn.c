@@ -1198,37 +1198,6 @@ static void bgp_mvpn_resolve_from_ecommunity(struct bgp_path_info *pi, uint32_t 
  * the first valid one -- the lowest tuple -- wins deterministically; any
  * further matching tuples are logged and ignored.
  */
-/*
- * True when the segment aspath_get_last_as() ultimately reads from is a
- * confederation sequence -- i.e. the origin it reports is a confederation-local
- * member ASN rather than a globally meaningful one.
- *
- * This mirrors that function's iteration exactly: it walks every segment and
- * overwrites its answer from ANY sequence type, so the winner is simply the
- * last non-empty AS_SEQUENCE or AS_CONFED_SEQUENCE. Counting hops is not
- * enough -- "AS_SEQUENCE [65010] AS_CONFED_SEQUENCE [65003]" has a nonzero hop
- * count yet still resolves to the confederation member 65003. RFC 5065 puts
- * confederation segments leftmost, so that ordering is malformed, but
- * bgp_attr_aspath_check() only enforces shape for eBGP peers and a plain iBGP
- * peer can put it on the wire.
- */
-static bool bgp_mvpn_origin_is_confed(struct aspath *aspath)
-{
-	struct assegment *seg;
-	bool confed = false;
-
-	for (seg = aspath ? aspath->segments : NULL; seg; seg = seg->next) {
-		if (seg->length == 0)
-			continue;
-		if (seg->type == AS_SEQUENCE)
-			confed = false;
-		else if (seg->type == AS_CONFED_SEQUENCE)
-			confed = true;
-	}
-
-	return confed;
-}
-
 static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_info *pi,
 					     uint32_t *source_as, struct in_addr *upstream)
 {
@@ -1246,78 +1215,23 @@ static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_in
 
 	/*
 	 * Resolve the origin AS -- and first decide whether it is knowable at
-	 * all.
+	 * all. aspath_origin_as() owns that judgement (AS_SET / AS 0 /
+	 * confederation-member origins are all unusable); it is shared with the
+	 * DIMT UMH extended-community trust gate in bgp_dimt.c so the two
+	 * border-scoping checks cannot drift apart.
 	 *
-	 * An AS_SET/AS_CONFED_SET is an aggregate of routes with several
-	 * origins, so RFC 4271 leaves such a path with no single origin.
-	 * aspath_get_last_as() cannot express that: it returns the last member
-	 * of the last *sequence* segment and skips set segments outright, so
-	 * it reports
-	 *
-	 *   65010 {65002,65003}  -> 65010, the AGGREGATOR -- the leftmost AS,
-	 *                           not an origin. Trusting a GA of 65010 here
-	 *                           would let any AS that merely aggregates a
-	 *                           route claim a UMH for an origin it only
-	 *                           transits.
-	 *   {65002,65003}        -> 0, as does a bare AS_CONFED_SET.
-	 *
-	 * So gate on aspath_check_as_sets(): a set-bearing path is
-	 * origin-ambiguous and no tuple on it is trustworthy. Deliberately not
-	 * aspath_count_hops() -- that counts an AS_SET as one hop but an
-	 * AS_CONFED_SET as zero, leaving a bare AS_CONFED_SET
-	 * indistinguishable from an empty path.
-	 *
-	 * The local-AS substitution then keys on the AS_PATH being STRUCTURALLY
-	 * empty, not on the origin lookup returning 0. Those are different
-	 * things: AS 0 is an encodable value, not merely an absence sentinel,
-	 * so AS_SEQUENCE [0] and AS_CONFED_SEQUENCE [0] are non-empty paths
-	 * that aspath_get_last_as() also reports as 0 while
-	 * aspath_check_as_sets() says false. Keying on the lookup would let
-	 * either shape claim "originated locally" and honour a tuple forged
-	 * with GA == our own AS. bgp_attr_aspath_check() only rejects AS 0 for
-	 * eBGP peers, so both shapes survive parse on a plain iBGP session.
-	 * A non-empty path carrying AS 0 anywhere is therefore treated as
-	 * origin-ambiguous in its own right.
-	 *
-	 * An empty AS_PATH means the route never crossed an AS boundary, so
-	 * the local AS genuinely is its origin and a tuple stamped GA == our
-	 * AS is legitimate. peer->sort is only a belt-and-braces second gate
-	 * here -- it describes who advertised the route, not where it came
-	 * from -- and an empty AS_PATH is malformed over eBGP anyway (RFC 7606
-	 * treat-as-withdraw at parse).
-	 *
-	 * NB: aspath_check_as_zero() dereferences aspath->segments with no
-	 * NULL guard of its own, so the !path_is_empty short-circuit below is
-	 * load-bearing rather than cosmetic.
-	 *
-	 * Confederations are the third way the origin fails to be globally
-	 * meaningful. aspath_get_last_as() reads AS_CONFED_SEQUENCE as
-	 * readily as AS_SEQUENCE, but a confederation member-AS number is
-	 * local to that confederation (RFC 5065, typically a private ASN) and
-	 * is NOT the globally scoped Source AS a UMH tuple's Global
-	 * Administrator claims to be. A path that still carries a real
-	 * AS_SEQUENCE is fine -- "(64512 64513) 65010" resolves to 65010,
-	 * because the lookup takes the last sequence segment. The bad case is
-	 * a path whose sequence content is ENTIRELY confederation, where the
-	 * lookup yields a member ASN.
-	 *
-	 * Hop counting is NOT sufficient to detect that: a mixed path such as
-	 * "AS_SEQUENCE [65010] AS_CONFED_SEQUENCE [65003]" has a nonzero hop
-	 * count, yet the lookup still lands on the confederation member 65003.
-	 * bgp_mvpn_origin_is_confed() therefore asks the precise question --
-	 * is the segment the lookup actually resolves from a confederation
-	 * one -- which covers both the confederation-only path and the mixed
-	 * trailing case.
+	 * The local-AS substitution stays here because it is caller policy, not
+	 * AS_PATH parsing: an empty AS_PATH means the route never crossed an AS
+	 * boundary, so the local AS genuinely is its origin and a tuple stamped
+	 * GA == our AS is legitimate. It keys on the path being STRUCTURALLY
+	 * empty, never on the lookup returning 0 -- see aspath_origin_as().
+	 * peer->sort is only a belt-and-braces second gate here (it describes
+	 * who advertised the route, not where it came from), and an empty
+	 * AS_PATH is malformed over eBGP anyway (RFC 7606 treat-as-withdraw at
+	 * parse).
 	 */
-	path_is_empty = (aspath == NULL || aspath->segments == NULL);
-	if (aspath_check_as_sets(aspath))
-		ambiguous_reason = "AS_PATH bears an AS_SET";
-	else if (!path_is_empty && aspath_check_as_zero(aspath))
-		ambiguous_reason = "AS_PATH carries AS 0";
-	else if (!path_is_empty && bgp_mvpn_origin_is_confed(aspath))
-		ambiguous_reason = "AS_PATH origin is a confederation member AS";
+	origin_as = aspath_origin_as(aspath, &ambiguous_reason, &path_is_empty);
 	origin_ambiguous = (ambiguous_reason != NULL);
-	origin_as = aspath_get_last_as(aspath);
 	if (!origin_ambiguous && path_is_empty &&
 	    (pi->peer == bgp->peer_self || pi->peer->sort == BGP_PEER_IBGP))
 		origin_as = bgp->as;

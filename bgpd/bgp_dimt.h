@@ -28,9 +28,26 @@ extern int bgp_dimt_umh_replay(ZAPI_CALLBACK_ARGS);
  * chooses the list it wants rather than inheriting the prefix's family.
  *
  * Returns true and fills a family-tagged umh/umh_type/preference on match.
+ *
+ * Returns false -- and counts the refusal against the peer -- when the path
+ * carries a UMH the sending neighbour is not entitled to set; see
+ * bgp_dimt_peer_is_trusted().
  */
 extern bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
 				   struct ipaddr *umh, uint8_t *umh_type,
 				   uint8_t *preference);
+
+/*
+ * May this path's UMH steer where we join? True for a locally originated
+ * route, or one from a `dimt-trusted` neighbour whose AS the route's origin
+ * authorises. On false, *why is a short reason for the caller's log.
+ *
+ * Exported for the UMH LARGE community lane (BLO-36558): an LC-UMH that
+ * bypassed this gate would be an untrusted peer's refused EC accepted under a
+ * different encoding, on the same route, with the same effect. One
+ * implementation, one owner -- do not re-derive the rule.
+ */
+extern bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi,
+				     const char **why);
 
 #endif /* _FRR_BGP_DIMT_H */

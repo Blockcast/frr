@@ -4542,6 +4542,48 @@ driven by these routes is not yet implemented.
    facing the UMH -- no per-source static route is needed. Among multiple
    UMH communities on one route the highest preference wins.
 
+   A *received* UMH community is only honoured from a neighbor marked
+   :clicmd:`neighbor PEER dimt-trusted`; see there for why the default is to
+   ignore it.
+
+.. clicmd:: neighbor PEER dimt-trusted
+
+   Honour the DIMT Upstream Multicast Hop extended community (sub-type
+   ``0x80``) received from this neighbor. **Default: off** -- an unmarked
+   neighbor's UMH community is ignored, and the refusal is counted per peer
+   (``DIMT UMH rejected`` in :clicmd:`show bgp neighbors`, ``dimtUmhRejected``
+   under ``prefixStats`` in its JSON form) and logged at notice, throttled to
+   once a minute per peer.
+
+   The default is deny because a UMH community says "send your join toward
+   this address", so any speaker that can attach one to a route you accept
+   decides where a stream is pulled from. Without this knob a transit AS, or
+   an IX route server, could attach a UMH to a prefix it merely carries and
+   redirect your join.
+
+   Marking a neighbor trusted is necessary but not sufficient: the route's
+   origin AS must also authorise the claim, mirroring the trust rule the UMH
+   *large* community already applies (see
+   :clicmd:`bgp mvpn umh-large-community`). A route whose AS_PATH bears an
+   AS_SET, carries AS 0, or resolves to a confederation member AS has no
+   usable origin and its UMH is refused. For an **eBGP** neighbor the origin
+   AS must equal that neighbor's AS: a trusted peer may claim a UMH for
+   prefixes it originates, not for a third party's prefix it only transits.
+   For an **iBGP** neighbor the claim is accepted, since marking an internal
+   neighbor trusted asserts that your own AS vets UMHs at its border -- a
+   route reflector legitimately relays an eBGP-learned route together with
+   the UMH its ingress speaker already accepted under this same rule.
+
+   Locally originated routes are always trusted: their UMH came from your own
+   route-map.
+
+   Changing this knob **resets the session**, so it takes effect on routes
+   already learned rather than only on the neighbor's next update. A route
+   refresh would not be enough: the neighbor re-sends identical attributes
+   and bgpd discards the duplicate without re-running best-path, so the knob
+   would silently fail to apply -- which for a revocation is the dangerous
+   direction. Configure it at turn-up.
+
 .. clicmd:: show bgp <ipv4|ipv6> mvpn [json]
 
    Display the MCAST-VPN table of the default BGP instance for the IPv4 or

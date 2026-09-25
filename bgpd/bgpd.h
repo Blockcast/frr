@@ -1896,6 +1896,10 @@ struct peer {
 #define PEER_FLAG_LS_LOCAL_LINK_ID  (1ULL << 49)
 #define PEER_FLAG_LS_REMOTE_LINK_ID (1ULL << 50)
 #define PEER_FLAG_EBGP_MULTIHOP	    (1ULL << 51) /* explicit ebgp-multihop config */
+/* DIMT: this neighbour's UMH extended community (0x80) may steer our PIM
+ * joins. Default OFF -- the UMH EC is ignored from every unmarked neighbour.
+ * See bgp_dimt_peer_is_trusted(). */
+#define PEER_FLAG_DIMT_TRUSTED	    (1ULL << 52)
 
 	/*
 	 *GR-Disabled mode means unset PEER_FLAG_GRACEFUL_RESTART
@@ -2093,6 +2097,14 @@ struct peer {
 	uint32_t stat_pfx_discard;  /* The number of prefixes with discarded attributes */
 	uint64_t stat_pfx_loc_rib; /* RFC7854 : Number of routes in Loc-RIB */
 	uint64_t stat_pfx_adj_rib_in; /* RFC7854 : Number of routes in Adj-RIBs-In */
+	/* DIMT UMH extended communities refused from this peer: either it is
+	 * not marked dimt-trusted, or it is but the route's origin AS does not
+	 * authorise it to claim a UMH. Counts refused ECs, not refused routes. */
+	uint64_t stat_dimt_umh_rejected;
+	/* Throttle state for the refusal log above (once a minute per peer).
+	 * "Ever logged" is its own flag because monotime() 0 is a real time. */
+	time_t dimt_umh_log_last;
+	bool dimt_umh_log_seen;
 
 	/* BGP state count */
 	uint32_t established; /* Established */
