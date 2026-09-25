@@ -1176,12 +1176,17 @@ pim_dimt_tunnel_find_by_id(struct pim_instance *pim, uint32_t tunnel_id)
  * like an invariant.  Should a row ever become configurable per-VRF, a
  * hardcoded id would address the ack to the wrong instance rather than fail,
  * which is the kind of bug that surfaces as an unexplained missing notify. */
+static bool pim_dimt_zclient_usable(void)
+{
+	return pim_zclient && pim_zclient->sock >= 0;
+}
+
 static bool pim_dimt_tunnel_send(struct pim_instance *pim,
 				 struct pim_dimt_tunnel *tun, bool add)
 {
 	struct stream *s;
 
-	if (!pim_zclient || pim_zclient->sock < 0)
+	if (!pim_dimt_zclient_usable())
 		return false;
 
 	if (PIM_DEBUG_PIM_TRACE)
@@ -1340,9 +1345,13 @@ pim_dimt_tunnel_ifp(struct pim_instance *pim,
 {
 	struct interface *ifp = NULL;
 
+	/* A stale ifindex can in principle be reused by another netdev, even
+	 * another DIMT tunnel; trust it only while it still carries this
+	 * tunnel's name, so a prune never lands on some other tunnel's
+	 * riders. */
 	if (tun->ifindex)
 		ifp = if_lookup_by_index(tun->ifindex, pim->vrf->vrf_id);
-	if (!ifp)
+	if (!ifp || strncmp(ifp->name, tun->ifname, sizeof(tun->ifname)))
 		ifp = if_lookup_by_name(tun->ifname, pim->vrf->vrf_id);
 	return ifp;
 }
@@ -1502,6 +1511,11 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 		case PIM_DIMT_TUNNEL_INSTALLED:
 		case PIM_DIMT_TUNNEL_REQUESTED:
 			tun->readd_pending = false;
+			/* No DEL can be written without zebra; pruning ahead
+			 * of it would only be undone by the rejoin below, on
+			 * every reconcile pass until zebra returns. */
+			if (!pim_dimt_zclient_usable())
+				break;
 			pim_dimt_tunnel_prune_riders(pim, tun);
 			if (pim_dimt_tunnel_send(pim, tun, false))
 				tun->state = PIM_DIMT_TUNNEL_REMOVING;
@@ -1522,13 +1536,17 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 				 * REMOVED, which frees the record on the
 				 * notify. */
 				tun->readd_pending = false;
+				/* Socket unusable: keep the record (and the
+				 * name) so the next reconnect can retry. */
+				if (!pim_dimt_zclient_usable())
+					break;
 				pim_dimt_tunnel_prune_riders(pim, tun);
 				if (pim_dimt_tunnel_send(pim, tun, false)) {
 					tun->state = PIM_DIMT_TUNNEL_REMOVING;
 					break;
 				}
-				/* Socket unusable: keep the record (and the
-				 * name) so the next reconnect can retry. */
+				/* The send failed after all: keep the record
+				 * so the next reconnect can retry. */
 				pim_dimt_tunnel_rejoin_riders(pim, tun);
 				break;
 			}
