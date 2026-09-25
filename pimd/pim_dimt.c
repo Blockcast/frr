@@ -584,6 +584,14 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 	    up->join_state == PIM_UPSTREAM_JOINED && pim_dimt_jp_sendable(ifp))
 		up->dimt_join_pending = false;
 	pim_dimt_join_flush(up);
+
+	/* The detach above may have removed the only periodic refresh this
+	 * upstream had.  If the join is still owed (no socket on the new
+	 * netdev yet), keep a Join Timer running against the new RPF' so a
+	 * socket that never comes up cannot leave a Joined upstream with no
+	 * refresh at all; the socket-ready flush restarts it anyway. */
+	if (up->dimt_join_pending && up->join_state == PIM_UPSTREAM_JOINED)
+		join_timer_start(up);
 }
 
 /* Undo a pin (mapping removed): return the upstream to normal RPF
