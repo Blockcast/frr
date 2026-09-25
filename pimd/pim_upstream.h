@@ -407,6 +407,7 @@ void pim_upstream_init(struct pim_instance *pim);
 void pim_upstream_terminate(struct pim_instance *pim);
 
 void join_timer_start(struct pim_upstream *up);
+void pim_upstream_join_timer_defer(struct pim_upstream *up);
 void staterefresh_timer_start(struct pim_upstream *up);
 void graft_timer_start(struct pim_upstream *up);
 void prune_timer_start(struct pim_upstream *up);
