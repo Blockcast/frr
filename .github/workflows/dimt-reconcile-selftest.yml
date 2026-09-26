@@ -32,7 +32,13 @@ permissions:
 jobs:
   selftest:
     name: dimt-reconcile self-test
-    runs-on: default
+    # arc-light, not `default`: this job is two shell-script runs that finish in
+    # seconds, and `default` is the chronically-saturated build pool (BLO-20032,
+    # BLO-25481).  On 2026-09-26 both of this PR's `default` jobs sat queued 3h
+    # while arc-light served a dozen frr jobs; frr's `default` queue still holds
+    # github-ci runs orphaned since 2026-07-19.  Same pool review-gate-selftest
+    # uses, for the same reason.
+    runs-on: arc-light
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -42,6 +48,10 @@ jobs:
 
       - name: Run dimt-reconcile tests under dash (OpenWrt ash proxy)
         run: |
+          # Whether this runner image gives the job root or a sudo-capable user
+          # is not guaranteed across pools, and the bare `sudo` this used to
+          # call fails outright on an image that ships none. Pick per-runner.
+          SUDO=''; [ "$(id -u)" -eq 0 ] || SUDO=sudo
           command -v dash >/dev/null 2>&1 || {
-            sudo apt-get update -qq && sudo apt-get install -y -qq dash; }
+            $SUDO apt-get update -qq && $SUDO apt-get install -y -qq dash; }
           dash tools/dimt-reconcile-test.sh
