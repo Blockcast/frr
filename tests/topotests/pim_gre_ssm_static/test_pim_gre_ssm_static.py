@@ -529,13 +529,21 @@ def test_rpf_negative_control_underlay_steals_rpf():
         try:
 
             def _rpf_off_tunnel():
-                row, error = _rpf("r2")
-                if error:
-                    return error
+                # pimd keeps an RPF row only while the upstream resolves onto
+                # a PIM-enabled interface.  r2-eth0 runs no PIM, so when the
+                # underlay path wins the row does not move to the underlay --
+                # it disappears outright.  Asserting rpfAddress ==
+                # UNDERLAY_PEER was unsatisfiable by construction.  Both an
+                # absent row and a non-tunnel row mean "RPF left the tunnel";
+                # only a surviving tunnel row is a failure.  A dead pimd is
+                # still an error, so absence can never pass vacuously, and
+                # the zero-delivery assertion below is the real control.
+                data = _json_cmd("r2", "show ip pim rpf json")
+                if data is None:
+                    return "r2: unparseable pim rpf JSON (pimd dead?)"
+                row = data.get(GROUP, {}).get(SOURCE, {})
                 if row.get("rpfInterface") == TUNNEL:
                     return "r2 RPF is still the tunnel: {}".format(row)
-                if row.get("rpfAddress") != UNDERLAY_PEER:
-                    return "r2 RPF has not moved to the underlay peer: {}".format(row)
                 return None
 
             expect(_rpf_off_tunnel)
