@@ -252,9 +252,12 @@ def test_trusted_peer_umh_pins():
     settled = _umh_rejected()
     assert settled is not None, "r2: counter unreadable after the knob"
     sleep(4)
-    assert _umh_rejected() == settled, (
+    # Bound once: re-reading it in the message would report a different sample
+    # than the one that actually failed the comparison.
+    after = _umh_rejected()
+    assert after == settled, (
         "r2 kept counting refusals while the UMH was being ACCEPTED: "
-        "{} -> {}".format(settled, _umh_rejected())
+        "{} -> {}".format(settled, after)
     )
 
 
@@ -333,11 +336,24 @@ def test_untrusting_the_peer_withdraws_the_mapping():
         """
     )
 
-    _, result = topotest.run_and_expect(_mapping_absent, None, count=60, wait=1)
+    # Anchor the absence to the RE-LEARNED route, not to the knob.  The flag
+    # carries peer_change_reset, so the session bounces and the route is
+    # transiently withdrawn -- and a withdraw DELs the mapping through the
+    # `else` arm of bgp_dimt_route_update() regardless of trust.
+    # run_and_expect() samples its predicate immediately and returns on the
+    # first success, so polling for absence here would be satisfied by that
+    # withdraw, BEFORE the re-learned route is ever evaluated under the
+    # revoked flag: a regression making revocation a no-op on re-learn would
+    # still go green.  Stages 1 and 3 order a counter check ahead of the
+    # absence check for the same reason; the counter is the wrong anchor here
+    # because the bounce is exactly what stage 2 declines to assume peer
+    # counters survive.  Wait for the route back, let pimd settle, sample once.
+    _, result = topotest.run_and_expect(_route_learned, None, count=60, wait=1)
     assert result is None, result
 
-    learned = _route_learned()
-    assert learned is None, learned
+    sleep(4)
+    absent = _mapping_absent()
+    assert absent is None, absent
 
 
 def test_memory_leak():

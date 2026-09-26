@@ -4551,7 +4551,7 @@ driven by these routes is not yet implemented.
    Honour the DIMT Upstream Multicast Hop extended community (sub-type
    ``0x80``) received from this neighbor. **Default: off** -- an unmarked
    neighbor's UMH community is ignored, and the refusal is counted per peer
-   (``DIMT UMH rejected`` in :clicmd:`show bgp neighbors`, ``dimtUmhRejected``
+   (``DIMT UMH rejected`` in ``show bgp neighbors``, ``dimtUmhRejected``
    under ``prefixStats`` in its JSON form) and logged at notice, throttled to
    once a minute per peer.
 

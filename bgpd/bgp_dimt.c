@@ -102,8 +102,18 @@ bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi, const char **why)
 
 	*why = NULL;
 
-	if (!pi || !pi->peer || !pi->peer->bgp)
+	/* *why stays NULL only here, where there is no peer to name -- see the
+	 * contract in bgp_dimt.h. A peer without a bgp instance DOES have a
+	 * name, so it gets its own reason rather than falling through to the
+	 * "no usable peer on the path" default, which would contradict the
+	 * peer named alongside it in the same log line. */
+	if (!pi || !pi->peer)
 		return false;
+
+	if (!pi->peer->bgp) {
+		*why = "peer has no BGP instance";
+		return false;
+	}
 
 	peer = pi->peer;
 
