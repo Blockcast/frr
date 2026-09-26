@@ -29,7 +29,8 @@ next one builds on:
 
   1. test_untrusted_peer_umh_is_ignored_and_counted
         r2 has NOT marked r1 trusted (the startup default).  The route is
-        learned, the mapping is absent, the counter moves.
+        learned, the mapping is absent, the counter moves -- once, and then
+        stays put while the refused route just sits in the RIB.
   2. test_trusted_peer_umh_pins
         r2 marks r1 `dimt-trusted`.  The same route now maps, and the counter
         does NOT move further.
@@ -217,6 +218,27 @@ def test_untrusted_peer_umh_is_ignored_and_counted():
     absent = _mapping_absent()
     assert absent is None, absent
 
+    # ONE ARRIVING EC IS ONE REFUSAL.  The counter is the operator's probe
+    # detector, so it has to track what the neighbor sent, not how often
+    # something on our side happened to re-read the path it sent.  Nothing
+    # new arrives while the refused route simply sits in the RIB, so the
+    # count must not move.
+    #
+    # Honest scope: this fixture has no MVPN Type-7 lane, so it cannot
+    # reproduce the specific re-read that drove the count up (join
+    # origination and the re-emit sweep both re-resolve the unicast source
+    # route).  It pins the invariant those lanes violated -- counting on
+    # read rather than on arrival -- which is what a future consumer of
+    # bgp_dimt_umh_from_path() would get wrong the same way.
+    settled = _umh_rejected()
+    assert settled is not None, "r2: counter unreadable after the refusal"
+    sleep(4)
+    after = _umh_rejected()
+    assert after == settled, (
+        "r2 kept counting refusals for an EC that arrived once and has not "
+        "been re-sent: {} -> {}".format(settled, after)
+    )
+
 
 def test_trusted_peer_umh_pins():
     """Marking the neighbor dimt-trusted honours the same EC on the same
@@ -347,13 +369,18 @@ def test_untrusting_the_peer_withdraws_the_mapping():
     # still go green.  Stages 1 and 3 order a counter check ahead of the
     # absence check for the same reason; the counter is the wrong anchor here
     # because the bounce is exactly what stage 2 declines to assume peer
-    # counters survive.  Wait for the route back, let pimd settle, sample once.
+    # counters survive.  Wait for the route back, then assert absence STAYS
+    # true across the settle window rather than sampling it once: a single
+    # sample can land before a wrongly-sent ADD reaches pimd, while repeated
+    # absence checks cannot be satisfied early by a transient the way polling
+    # for first-success can.
     _, result = topotest.run_and_expect(_route_learned, None, count=60, wait=1)
     assert result is None, result
 
-    sleep(4)
-    absent = _mapping_absent()
-    assert absent is None, absent
+    for _ in range(5):
+        sleep(1)
+        absent = _mapping_absent()
+        assert absent is None, absent
 
 
 def test_memory_leak():

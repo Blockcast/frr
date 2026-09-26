@@ -257,11 +257,14 @@ static bool bgp_dimt_umh_decode(const struct bgp_path_info *pi, afi_t afi,
  * inherits it. An attested settlement origin forged by a route server is as
  * damaging as a redirected join.
  *
- * Trust is evaluated AFTER decoding rather than as an early return, so the
- * counter moves only when a path actually carried a UMH we would otherwise
- * have honoured. An untrusted neighbour sending ordinary routes must not
- * inflate it -- and neither must one whose UMH is unusable for an unrelated
- * reason, which is why the wrong-family probe calls the decoder directly.
+ * This is a pure QUERY: it does not touch the refusal counter. Counting is
+ * bgp_dimt_umh_audit()'s job and happens once, at arrival. The two are
+ * separate because this function is called from lanes that RE-READ an
+ * already-adjudicated path -- bgp_mvpn_resolve_attested_umh() runs against the
+ * unicast source route's best path on every Type-7 origination and again for
+ * every installed Type-7 in the re-emit sweep -- so counting here would charge
+ * a fresh refusal for an EC that arrived once, driven by our own join activity
+ * rather than by the neighbour's. See the counter contract in bgpd.h.
  *
  * Exported (see bgp_dimt.h): bgp_mvpn.c's settlement-event attestation lane
  * decodes 0x80 through this function rather than duplicating the layout.
@@ -272,11 +275,40 @@ bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
 {
 	const char *why = NULL;
 
-	if (!bgp_dimt_umh_decode(pi, afi, umh, umh_type, preference))
-		return false;
+	return bgp_dimt_umh_decode(pi, afi, umh, umh_type, preference) &&
+	       bgp_dimt_peer_is_trusted(pi, &why);
+}
+
+/* Charge one refusal for a UMH EC this path carries and is not entitled to
+ * set. Arrival-time only: the caller is the loc-RIB update hook, which is the
+ * one place a path is evaluated because the NEIGHBOUR announced something.
+ * Every other consumer uses the non-counting query above.
+ *
+ * Trust is evaluated AFTER decoding rather than as an early return, so the
+ * counter moves only when a path actually carried a UMH we would otherwise
+ * have honoured; an untrusted neighbour sending ordinary routes must not
+ * inflate it.
+ *
+ * Called per EC LIST rather than per route, because the two lists have
+ * different consumers and a refusal in either is real: the pin path reads the
+ * list matching the route's family, while bgp_mvpn_resolve_attested_umh()
+ * reads the 8-byte v4 list whatever the C-S family is, so a v4 UMH riding a v6
+ * route is refused by a consumer that would otherwise have honoured it. That
+ * is also why this is not the same question as the wrong-family hint below,
+ * which asks only whether the PIN path can use it.
+ */
+static void bgp_dimt_umh_audit(const struct bgp_path_info *pi, afi_t afi)
+{
+	struct ipaddr umh = {};
+	uint8_t umh_type = 0;
+	uint8_t preference = 0;
+	const char *why = NULL;
+
+	if (!bgp_dimt_umh_decode(pi, afi, &umh, &umh_type, &preference))
+		return;
 
 	if (bgp_dimt_peer_is_trusted(pi, &why))
-		return true;
+		return;
 
 	/* pi is const, but the peer it points at is not -- the refusal is a
 	 * property of the peer, not of the path. A refusal with no peer to
@@ -284,8 +316,6 @@ bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
 	 */
 	if (pi->peer)
 		bgp_dimt_umh_refuse(pi->peer, why);
-
-	return false;
 }
 
 static void bgp_dimt_umh_send(const struct prefix *p,
@@ -333,12 +363,36 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 	uint8_t new_pref = 0;
 	bool new_has;
 
-	/* IPv4/IPv6 unicast in the default instance only. Extraction is
-	 * same-family by choice: a v4 UMH EC is read from v4 routes and a v6
-	 * UMH EC from v6 routes; a cross-family UMH EC is deliberately ignored
-	 * (BGP itself does not forbid one -- see the warn below). */
-	if ((afi != AFI_IP && afi != AFI_IP6) || safi != SAFI_UNICAST ||
-	    bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT)
+	/* IPv4/IPv6 unicast only. Extraction is same-family by choice: a v4 UMH
+	 * EC is read from v4 routes and a v6 UMH EC from v6 routes; a
+	 * cross-family UMH EC is deliberately ignored by the PIN path (BGP
+	 * itself does not forbid one -- see the warn below). */
+	if ((afi != AFI_IP && afi != AFI_IP6) || safi != SAFI_UNICAST)
+		return 0;
+
+	/* Adjudicate BEFORE the default-instance filter, and for both EC lists.
+	 *
+	 * This hook is the only point at which a path is evaluated because the
+	 * NEIGHBOUR announced something, so it is the only honest place to move
+	 * a per-peer counter -- every other consumer re-reads paths on our own
+	 * schedule. It therefore has to cover what those consumers see, which is
+	 * wider than what the pin path below uses:
+	 *
+	 *   - the MVPN settlement attestation lane runs in ANY instance, while
+	 *     the pin path is default-instance only, so counting after the
+	 *     filter would leave a VRF's refusals invisible;
+	 *   - that same lane reads the v4 list regardless of the route's family,
+	 *     so the cross-family EC the pin path cannot use is still an EC a
+	 *     consumer would otherwise have honoured.
+	 *
+	 * Auditing both lists unconditionally is also what makes the counter
+	 * match its contract in bgpd.h: refused ECs, counted once each, when
+	 * they arrive. */
+	bgp_dimt_umh_audit(new_route, AFI_IP);
+	bgp_dimt_umh_audit(new_route, AFI_IP6);
+
+	/* The pin path proper is default-instance only. */
+	if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT)
 		return 0;
 
 	p = bgp_dest_get_prefix(dest);
@@ -379,9 +433,10 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 		 * Decode-only on purpose: this asks "is there a UMH here at
 		 * all", not "may it steer us". Asking through the gated entry
 		 * point would suppress this hint for exactly the untrusted
-		 * neighbours whose operator most needs it, and would charge a
-		 * refusal for an EC that the family mismatch already made
-		 * unusable. */
+		 * neighbours whose operator most needs it. Trust for this EC
+		 * has already been adjudicated -- and charged, if it was
+		 * refused -- by the bgp_dimt_umh_audit() pass above, so there
+		 * is nothing left to decide here. */
 		if (bgp_dimt_umh_decode(new_route,
 					afi == AFI_IP ? AFI_IP6 : AFI_IP,
 					&xf_umh, &xf_type, &xf_pref))

@@ -29,9 +29,13 @@ extern int bgp_dimt_umh_replay(ZAPI_CALLBACK_ARGS);
  *
  * Returns true and fills a family-tagged umh/umh_type/preference on match.
  *
- * Returns false -- and counts the refusal against the peer -- when the path
- * carries a UMH the sending neighbour is not entitled to set; see
- * bgp_dimt_peer_is_trusted().
+ * Returns false when the path carries no UMH in that list, or carries one the
+ * sending neighbour is not entitled to set; see bgp_dimt_peer_is_trusted().
+ *
+ * This is a pure query and does NOT move the per-peer refusal counter: callers
+ * re-read already-adjudicated paths on our own schedule, so counting here
+ * would charge one arriving EC many times. Refusals are counted once, at
+ * arrival, by the loc-RIB update hook in bgp_dimt.c.
  */
 extern bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
 				   struct ipaddr *umh, uint8_t *umh_type,
