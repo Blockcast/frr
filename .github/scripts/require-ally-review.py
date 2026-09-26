@@ -2128,7 +2128,7 @@ def decide(
     permission_trusted_logins = permission_trusted_logins or set()
     deferrals = deferrals or {}
     ally = set(ally_logins)
-    is_self_review = isinstance(pr_author_login, str) and pr_author_login in ally
+    is_self_review = login_matches_any(pr_author_login, ally)
 
     # Severity-level ambiguity is resolved once, for the LIVE head, from the
     # Ally bodies that attest to it -- two same-head reports that disagree about
@@ -2225,7 +2225,9 @@ def decide(
             if reduced is not None and reduced["status"] == "failure":
                 chosen = reduced
             elif reduced is not None and reduced["status"] == "success":
-                non_ally_signals = [s for s in distinct_signals if s["author"] not in ally]
+                non_ally_signals = [
+                    s for s in distinct_signals if not login_matches_any(s["author"], ally)
+                ]
                 reduced_non_ally = reduce_distinct_reviewer_signals(non_ally_signals)
                 if reduced_non_ally is not None and reduced_non_ally["status"] == "success":
                     chosen = reduced_non_ally
@@ -3151,7 +3153,7 @@ def main():
     pull_number = pull_request["number"]
     ally_logins = parse_list(os.environ.get("ALLY_REVIEWER_LOGINS"), DEFAULT_ALLY_LOGINS)
     pr_author_login = (pull_request.get("user") or {}).get("login")
-    is_self_review = isinstance(pr_author_login, str) and pr_author_login in set(ally_logins)
+    is_self_review = login_matches_any(pr_author_login, ally_logins)
 
     # Claim the context as `pending` BEFORE the fallible reads below. Everything
     # from here on can raise (network, rate limit, malformed payload), and a

@@ -255,6 +255,30 @@ class TestSelfReview(unittest.TestCase):
         self.assertEqual(state, "success")
         self.assertIn("approved head", desc)
 
+    def test_self_review_demotion_survives_login_casing_drift(self):
+        """GitHub logins are case-insensitive and REST casing is not stable:
+        a drifted spelling of the Ally seat is still a self-review."""
+        for author in ("AllyBlockcast[bot]", "Allyblockcast", "app/AllyBlockcast"):
+            with self.subTest(author=author):
+                state, desc = decide(reviews=[review("APPROVED")], author=author)
+                self.assertEqual(state, "pending")
+                self.assertIn("write-access human", desc)
+
+    def test_drifted_ally_login_is_not_a_distinct_non_ally_approval(self):
+        """The Ally seat under another spelling must not supply the distinct
+        non-Ally approval that clears an Ally-authored PR, even when it is
+        permission-trusted."""
+        drifted = "AllyBlockcast[bot]"
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login="app/allyblockcast", at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login=drifted, at="2026-07-27T11:00:00Z"),
+            ],
+            author="app/allyblockcast",
+            trusted={drifted},
+        )
+        self.assertNotEqual(state, "success")
+
     def test_distinct_approval_trusted_via_collaborator_permission(self):
         """Branch 8 — association is CONTRIBUTOR (the visibility-gated false
         negative the original documents); permission lookup rescues it."""
