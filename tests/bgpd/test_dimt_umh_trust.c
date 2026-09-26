@@ -152,6 +152,17 @@ int main(void)
 	pi = path(&neighbor, BGP_ROUTE_AGGREGATE);
 	check("dimt-trusted iBGP neighbour, aggregate path", &pi, true);
 
+	/* eBGP, so the iBGP/CONFED short-circuit does not apply and the origin
+	 * test runs.  path() leaves pi.attr NULL, so aspath_origin_as() reports
+	 * path_is_empty with no ambiguity and the empty-AS_PATH arm refuses.
+	 * That arm is documented as unreachable over a real session -- RFC 7606
+	 * treats a malformed AS_PATH as a withdraw at parse -- which is exactly
+	 * why the topotest cannot pin its direction and this row has to.
+	 */
+	neighbor.sort = BGP_PEER_EBGP;
+	pi = path(&neighbor, BGP_ROUTE_NORMAL);
+	check("dimt-trusted eBGP neighbour, empty AS_PATH", &pi, false);
+
 	/* No peer to name: refused, and *why stays NULL by contract. */
 	pi = path(NULL, BGP_ROUTE_NORMAL);
 	check("path with no peer", &pi, false);

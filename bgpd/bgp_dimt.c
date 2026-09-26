@@ -174,14 +174,26 @@ bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi, const char **why)
 	 * bgp->rib[afi][SAFI_UNICAST] (bgp_mvpn.c:1447). The remaining four are
 	 * refused by sub_type on their own arms below -- bgp_mplsvpn.c:1417,
 	 * bgp_evpn.c:3151 and bgp_evpn_mh.c:292 (IMPORTED), bgp_route.c:9696
-	 * (AGGREGATE) -- so for three of them it is the IMPORTED arm, not the
-	 * scoping, that is load-bearing. bgp_evpn.c:3151 is why that distinction
-	 * matters: it is the only peer_self producer outside the trusted pair
-	 * that reaches UNICAST, installing into bgp_vrf->rib[afi][SAFI_UNICAST]
-	 * (bgp_evpn.c:3241, :3245) from install_evpn_route_entry_in_vrf(), for a
-	 * parent that BGP_PATH_LOCAL_IMPORT_EVPN_RT2_MACIP marks as locally
-	 * originated. That is 2 + 5 + 4 = 11 here; the twelfth is
-	 * BGP_ROUTE_NORMAL's, next paragraph.
+	 * (AGGREGATE) -- and for TWO of them it is the IMPORTED arm, not the
+	 * scoping, that is load-bearing, because those two are the only
+	 * peer_self producers outside the trusted pair that reach UNICAST:
+	 *   bgp_mplsvpn.c:1417  the VPN leak described at the top of this block.
+	 *                       vpn_leak_to_vrf_update_onevrf() fixes
+	 *                       safi = SAFI_UNICAST (bgp_mplsvpn.c:2347), takes bn
+	 *                       out of to_bgp->rib[afi][safi] (:2422), and hands
+	 *                       both to leak_update() (:2661).
+	 *   bgp_evpn.c:3151     install_evpn_route_entry_in_vrf() installs into
+	 *                       bgp_vrf->rib[afi][SAFI_UNICAST] (:3241, :3245),
+	 *                       for a parent that
+	 *                       BGP_PATH_LOCAL_IMPORT_EVPN_RT2_MACIP marks as
+	 *                       locally originated.
+	 * bgp_evpn_mh.c:292 is NOT one of them: it installs into es->route_table
+	 * (bgp_evpn_mh.c:278), which is not in bgp->rib[afi][SAFI_UNICAST], so
+	 * the scoping covers it and the IMPORTED arm there is belt-and-braces.
+	 * Do not understate this pair -- the IMPORTED arm is the only thing
+	 * between a leaked or imported path and a unicast table, and the leak is
+	 * the one bypass here already known to be real. That is 2 + 5 + 4 = 11
+	 * here; the twelfth is BGP_ROUTE_NORMAL's, next paragraph.
 	 *
 	 * BGP_ROUTE_NORMAL is deliberately NOT on the list. Its one peer_self
 	 * producer is bgp_unreach.c:922, which originates into SAFI_UNREACH, so
