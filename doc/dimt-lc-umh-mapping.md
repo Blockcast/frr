@@ -48,7 +48,7 @@ Same shape, `[0] = 0x00`, address at `[2..17]`, LA byte at `[19]`.
 | bytes | field | meaning |
 | --- | --- | --- |
 | 0-3 | Global Administrator | Source AS. Must equal the route's origin AS. |
-| 4-7 | Function | local code point, `bgp mvpn umh-large-community <fn>`; `0`/unset disables decode |
+| 4-7 | Function | local code point, set per lane (see the DIMT knob below); `0`/unset disables that lane's decode |
 | 8-11 | Parameter | UMH IPv4 address as a host-order `uint32` |
 
 There is no third u32 left over. **The LC has no room for a type or a
@@ -56,6 +56,29 @@ preference**, and a 16-byte IPv6 address has no representation in a u32
 parameter. Both facts drive the mapping below.
 
 ## The mapping
+
+### The DIMT lane has its own knob
+
+`bgp mvpn umh-large-community <function>` sets `bgp->mvpn_umh_lc_function`,
+which the MVPN decoder reads directly (`bgp_mvpn.c:1244`, `:1334`). The DIMT
+lane does **not** reuse it. It gets its own knob,
+`bgp dimt umh-large-community <function>`, stored in a separate `bgp` field
+with `0`/unset disabling DIMT LC decode, and "the knob" below means that one:
+
+- reusing the MVPN knob would make an operator who enables LC-UMH for MVPN
+  silently enable LC decode on the DIMT pin path as well, the lane BLO-36553
+  exists to gate. DIMT LC decode is its own opt-in;
+- a DIMT-only deployment should not need an `mvpn`-namespaced command;
+- the two lanes decode different objects from `Parameter`: MVPN turns it into
+  the upstream PE's Route Target, DIMT into a PIM Light tunnel endpoint (see
+  the comment on `bgp_mvpn_resolve_attested_umh()`). A deployment that wants
+  one LC to feed both lanes sets both knobs to the same value.
+
+So the shared decoder takes the function code point as an argument and reads
+neither field itself; each call site passes its own lane's knob, the same
+ownership rule as the family gate below. Changing the DIMT knob re-evaluates
+the DIMT mapping of every IPv4 unicast route, as the MVPN knob re-resolves its
+joins.
 
 ### Address — direct
 
@@ -79,7 +102,8 @@ The LC expresses no type. The default is PIM, not AMT relay, because:
   AMT relay that was never advertised as one.
 
 An LC-UMH therefore **cannot** name an AMT relay. If that is ever needed the
-carrier must use the extended community, or DIMT must define a second function
+carrier must use the extended community (which still wins with the knob set,
+see the AMT-relay exception below), or DIMT must define a second function
 code point — do not overload `Parameter`.
 
 ### Preference — default to `0`, and it is not a tiebreaker
@@ -92,14 +116,27 @@ what an EC carrying `pref 0` means.
 Preference does **not** decide LC-vs-EC. That precedence is a separate rule:
 
 > **When the knob is set, a valid LC-UMH wins over any UMH extended community
-> on the same route. The extended community is the fallback, used whenever no
-> valid LC tuple is present, and is the only encoding when the knob is unset.**
+> on the same route, except when the tuple the EC list selects (highest
+> `la_pref`) is typed `ZAPI_UMH_TYPE_AMT_RELAY`: then the EC wins. The extended
+> community is otherwise the fallback, used whenever no valid LC tuple is
+> present, and is the only encoding when the knob is unset.**
 
-This is deliberate parity with the MVPN lane
-(`bgp_mvpn_resolve_from_source_route()` tries LC first and falls back to EC) so
-that one route cannot resolve to two different upstreams depending on which
-lane reads it. The existing MVPN behaviour of logging a disagreement between
-the two encodings under `debug bgp zebra` should be carried over.
+The exception exists because the LC's PIM type is a default, not an assertion,
+while an EC typed AMT relay is an explicit one, and pimd honours it by not
+pinning: it records and displays an amt-relay mapping but never pins on it
+(`pim_dimt.c`, "Only pim-type mappings drive joins", pinned by
+`tests/topotests/pim_dimt_umh/`). Letting the LC win would turn that no-pin
+into a PIM Light join toward an AMT relay the moment the knob is set. A
+PIM-typed EC makes no claim the LC contradicts, so it still loses.
+
+The order otherwise mirrors the MVPN lane
+(`bgp_mvpn_resolve_from_source_route()` tries LC first and falls back to EC).
+The exception has no MVPN counterpart: the MVPN fallback is the RFC 6514 VRF
+Route Import EC, which carries no type. Carry over the MVPN lane's
+`debug bgp zebra` disagreement log, but compare what `0x80` actually carries,
+the address **and the type** (the MVPN log compares Source AS and address
+only). An LC overridden by an AMT-typed EC is logged even when both name the
+same address.
 
 Within the LC list, selection stays **lowest tuple wins** — large communities
 are sorted and de-duplicated at attribute parse (`lcommunity_uniq_sort`), so
@@ -165,8 +202,12 @@ adversary can put on the wire.
 ### Reject counter
 
 The LC lane today has only a once-a-minute throttled `zlog_notice`, which is
-not countable. Add a per-instance counter incremented on every rejected tuple,
-readable from `show bgp`, with the throttled log kept for detail. Counted:
+not countable. Add a per-instance counter **per lane**, incremented on every
+rejected tuple and readable from `show bgp` with the lane named, keeping the
+throttled log for detail. The shared decoder owns no counter: it returns why it
+rejected a tuple and the call site counts into its own lane's counter.
+Otherwise the four reasons below that the decoder raises for both lanes would
+land in one number with no attribution on an instance running both. Counted:
 origin-ambiguous, `GA == 0`, `GA != origin_as`, unusable UMH address, and (for
 the DIMT call site) wrong address family. A wrong `Function` is **not** a
 reject — it is an unrelated large community and must not be counted, or every
@@ -175,8 +216,15 @@ route carrying any other LC inflates the number.
 ## Test obligations
 
 - LC-only path pins the DIMT UMH, with no EC present on the route.
-- Malformed / untrusted LC is rejected **and counted**: GA mismatch, unusable
-  address, and untrusted neighbor each move the counter.
+- Malformed / untrusted LC is rejected **and counted on the DIMT lane's
+  counter**: GA mismatch, unusable address, and untrusted neighbor each move
+  the DIMT counter, while the MVPN counter, with the MVPN knob unset, stays `0`.
+- With the knob set, a v4 route carrying a valid LC-UMH and a `0x80` EC whose
+  selected tuple is `amt-relay` maps as `amt-relay` from the EC and does not
+  pin; the same route with a `pim` EC maps from the LC.
+- Setting only `bgp mvpn umh-large-community` leaves the DIMT lane EC-only, and
+  setting only `bgp dimt umh-large-community` leaves MVPN Type-7 resolution
+  unchanged.
 - `p6` and every other vector in `bgp_mvpn_gtm_umh_lc` stays green — the MVPN
   lane's v4-UMH-on-v6-route behaviour must not regress.
 - A v6 unicast route carrying an LC-UMH pins to nothing on the DIMT lane, and
