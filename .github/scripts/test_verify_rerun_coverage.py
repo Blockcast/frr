@@ -161,6 +161,94 @@ class TestCoverage(unittest.TestCase):
         self.assertIn("NEVER EXECUTED", problems[0])
 
 
+class TestUnexpectedFailureReporting(unittest.TestCase):
+    """BLO-36839: name the culprit when a whole-file rerun fails off-target.
+
+    BLO-36708 made the rerun hand pytest whole FILES, so it can now fail on a
+    test that was never in the harvested set.  The step exits 1 -- which is
+    the right verdict -- but the log only carried RERUN_TESTS/RERUN_FILES,
+    neither of which need mention the test that actually failed.  These pin
+    the diagnostic, not the verdict: nothing here may change pass/fail.
+    """
+
+    def failures(self, xml):
+        with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as f:
+            f.write(xml)
+            path = f.name
+        try:
+            return guard.parse_failures(path)
+        finally:
+            os.unlink(path)
+
+    def test_offtarget_sibling_failure_is_named(self):
+        """The motivating case: requested test passes, a sibling does not."""
+        expected = {PIM + "::test_install_then_exactly_one_forwarding_ready"}
+        failed = self.failures(
+            junit(
+                [
+                    (PIM, "test_install_then_exactly_one_forwarding_ready", "pass"),
+                    (PIM, "test_v1_only_consumer_ignores_and_advances", "failure"),
+                ]
+            )
+        )
+        outside = guard.unexpected_failures(expected, failed)
+        self.assertEqual(
+            outside, [PIM + "::test_v1_only_consumer_ignores_and_advances"]
+        )
+
+    def test_requested_failure_is_not_reported_as_unexpected(self):
+        """A test we asked about failing again is expected, not a surprise."""
+        expected = {GRPC + "::test_shutdown_checks"}
+        failed = self.failures(junit([(GRPC, "test_shutdown_checks", "failure")]))
+        self.assertEqual(guard.unexpected_failures(expected, failed), [])
+
+    def test_file_level_expectation_accounts_for_any_failure_in_that_file(self):
+        """Mirrors covers(): a bare path stands for the whole module."""
+        expected = {GRPC}
+        failed = self.failures(junit([(GRPC, "test_anything_at_all", "failure")]))
+        self.assertEqual(guard.unexpected_failures(expected, failed), [])
+
+    def test_a_different_files_failure_is_still_unexpected(self):
+        expected = {GRPC}
+        failed = self.failures(junit([(PIM, "test_x", "failure")]))
+        outside = guard.unexpected_failures(expected, failed)
+        self.assertEqual(outside, [PIM + "::test_x"])
+
+    def test_errors_count_as_failures(self):
+        """A module that errors out never reports <failure>, only <error>."""
+        expected = {GRPC + "::test_shutdown_checks"}
+        failed = self.failures(junit([(PIM, "test_x", "error")]))
+        outside = guard.unexpected_failures(expected, failed)
+        self.assertEqual(outside, [PIM + "::test_x"])
+
+    def test_passes_and_skips_are_never_reported(self):
+        expected = {GRPC + "::test_shutdown_checks"}
+        failed = self.failures(
+            junit([(PIM, "test_x", "pass"), (PIM, "test_y", "skipped")])
+        )
+        self.assertEqual(failed, set())
+        self.assertEqual(guard.unexpected_failures(expected, failed), [])
+
+    def test_clean_rerun_reports_nothing(self):
+        """The negative case: no failures means no note in the log."""
+        expected = {GRPC + "::test_shutdown_checks"}
+        failed = self.failures(junit([(GRPC, "test_shutdown_checks", "pass")]))
+        self.assertEqual(guard.unexpected_failures(expected, failed), [])
+
+    def test_reporting_does_not_alter_the_verdict(self):
+        """Diagnosability only: verify() must be unmoved by off-target failures."""
+        expected = {GRPC + "::test_shutdown_checks"}
+        executed, skipped = parse(
+            junit(
+                [
+                    (GRPC, "test_shutdown_checks", "pass"),
+                    (GRPC, "test_some_sibling", "failure"),
+                ]
+            )
+        )
+        self.assertEqual(guard.verify(expected, executed, skipped), [])
+
+
 class TestIdConstruction(unittest.TestCase):
     """Spelling must agree with analyze.py get_filtered(), or nothing matches."""
 

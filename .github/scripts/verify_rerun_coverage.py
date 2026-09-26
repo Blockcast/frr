@@ -85,6 +85,42 @@ def covers(expected, actual_ids):
     return False
 
 
+def parse_failures(path):
+    """Return the set of node IDs that FAILED or ERRORED in a junit XML file."""
+    tree = ET.parse(path)
+    failed = set()
+    for testcase in tree.iter("testcase"):
+        tid = testcase_id(testcase)
+        if tid is None:
+            continue
+        if testcase.find("failure") is not None or testcase.find("error") is not None:
+            failed.add(tid)
+    return failed
+
+
+def unexpected_failures(expected_ids, failed):
+    """Failures the harvested set does not account for, sorted.
+
+    BLO-36708 made the rerun run whole FILES rather than node IDs, because a
+    topotest module is a stateful sequence and a single node ID re-run out of
+    order fails on an assertion the parallel run never reached.  The
+    consequence (BLO-36839): the rerun can now fail on a test that was never
+    in `rerun_tests`, and the step exits 1 -- correctly -- while the log shows
+    only RERUN_TESTS/RERUN_FILES, neither of which need contain the culprit.
+    Name it, so "Some rerun tests still failed" is actionable.
+
+    A bare-file expectation accounts for every test in that file, matching
+    covers(): analyze.py emits a bare path when a whole module errors out.
+    """
+    return sorted(f for f in failed if not _accounted_for(f, expected_ids))
+
+
+def _accounted_for(failure, expected_ids):
+    if failure in expected_ids:
+        return True
+    return failure.split("::", 1)[0] in expected_ids
+
+
 def verify(expected_ids, executed, skipped):
     """Return a list of human-readable problems; empty means the rerun is trustworthy."""
     problems = []
@@ -141,6 +177,7 @@ def main():
 
     try:
         executed, skipped = parse_results(args.results)
+        failed = parse_failures(args.results)
     except (ET.ParseError, OSError) as e:
         # An unreadable or truncated results file is itself a failure to
         # verify; never let it degrade into a pass.
@@ -162,6 +199,21 @@ def main():
     # Flush before writing to stderr so the summary is not reordered ahead of
     # or behind the problem list in the interleaved CI log.
     sys.stdout.flush()
+
+    # Diagnosability, not a verdict: these do not make the rerun fail (pytest's
+    # exit code already does that), they say WHICH test the caller's
+    # "Some rerun tests still failed" is about when it is not one we asked for.
+    outside = unexpected_failures(expected_ids, failed)
+    if outside:
+        print(
+            "NOTE: the rerun also failed {} test(s) outside the harvested "
+            "failure set -- it runs whole files, so these ran as siblings of a "
+            "requested target:".format(len(outside)),
+            file=sys.stderr,
+        )
+        for f in outside:
+            print("  - " + f, file=sys.stderr)
+        sys.stderr.flush()
 
     if problems:
         print(
