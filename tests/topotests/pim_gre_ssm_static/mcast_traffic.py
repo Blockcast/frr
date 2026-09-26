@@ -74,7 +74,7 @@ def digest(seqs):
 def _iface_address(ifname):
     """The interface's primary IPv4 address, packed -- the imr_interface of
     the source-specific join.  Returns None if it has none."""
-    out = subprocess.check_output("ip -j addr show dev " + ifname, shell=True)
+    out = subprocess.check_output(["ip", "-j", "addr", "show", "dev", ifname])
     for entry in json.loads(out):
         for addr in entry.get("addr_info", []):
             if addr.get("family") == "inet":

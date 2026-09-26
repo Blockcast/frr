@@ -214,12 +214,27 @@ def _rpf(rname):
     return row, None
 
 
-def _send(count=PACKETS, interval=0.05):
+def _send(count=PACKETS, interval=0.05, receiver=None):
     """Send exactly `count` packets from h1 and wait for the sender to exit.
 
     Returns the sender's exit status.  Blocking on purpose: an assertion
     about what arrived is only meaningful once the send has finished.
+
+    Pass `receiver` whenever the caller is going to read a report: every
+    receiver is started BEFORE an expect() window it has to outlive, so a
+    slow convergence can retire it before a packet is ever sent.  Its
+    report then reads {"count": 0}, which the negative control accepts as
+    proof that delivery stopped -- a pass for entirely the wrong reason,
+    and the one site in this file where that failure is silent.  Checking
+    liveness here, at the single choke point all sends route through,
+    converts it into a named failure.
     """
+    if receiver is not None:
+        assert receiver.poll() is None, (
+            "receiver expired before traffic was sent -- its report would "
+            "read 0 packets for a reason that has nothing to do with "
+            "forwarding; raise its --timeout above the expect() window"
+        )
     tgen = get_topogen()
     helper = os.path.join(CWD, "mcast_traffic.py")
     proc = tgen.gears["h1"].popen(
@@ -239,11 +254,19 @@ def _send(count=PACKETS, interval=0.05):
     return proc.returncode
 
 
-def _start_receiver(count=PACKETS, timeout=30.0):
+def _start_receiver(count=PACKETS, timeout=90.0):
     """Start the SSM receiver on h2 and block until its join is in the kernel.
 
     Returns the Popen.  Waiting for the explicit {"event": "joined"} line
     removes the sleep-and-hope race where a slow join reads as lost packets.
+
+    The default timeout is sized to outlive the longest window a receiver
+    is ever asked to survive -- a full 60s expect() plus the send that
+    follows it -- because every caller starts its receiver FIRST (the join
+    is what creates the (S,G) whose RPF is then asserted).  It is still
+    bounded well under _receiver_report's communicate() timeout, so the
+    negative control's receiver reliably times out and PRINTS its zero
+    rather than being killed without a report.
     """
     tgen = get_topogen()
     helper = os.path.join(CWD, "mcast_traffic.py")
@@ -264,7 +287,18 @@ def _start_receiver(count=PACKETS, timeout=30.0):
         encoding="utf-8",
     )
     line = proc.stdout.readline()
-    assert '"joined"' in line, "receiver did not join: {!r}".format(line)
+    if '"joined"' not in line:
+        # Kill first, THEN drain stderr: read() blocks to EOF, and a helper
+        # that merely printed something unexpected may still be running.
+        # Without this the traceback that explains the failure (e.g.
+        # RuntimeError from _iface_address) dies unread in the pipe and the
+        # assertion reads a bare 'receiver did not join: '''.
+        proc.kill()
+        raise AssertionError(
+            "receiver did not join: {!r} (stderr={!r})".format(
+                line, proc.stderr.read()
+            )
+        )
     return proc
 
 
@@ -358,7 +392,7 @@ def test_rpf_resolves_over_the_tunnel():
     expect(_only_tunnel_path)
 
     # The receiver's join is what creates the (S,G) whose RPF we assert.
-    receiver = _start_receiver(count=1, timeout=25.0)
+    receiver = _start_receiver(count=1)
     try:
 
         def _rpf_on_tunnel():
@@ -443,7 +477,7 @@ def test_ssm_join_delivers_50_of_50_byte_exact():
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
-    receiver = _start_receiver(count=PACKETS, timeout=60.0)
+    receiver = _start_receiver(count=PACKETS)
     try:
         # RPF must be over the tunnel before the stream starts, or a slow
         # BGP convergence would read as lost packets.
@@ -457,7 +491,7 @@ def test_ssm_join_delivers_50_of_50_byte_exact():
 
         expect(_rpf_on_tunnel)
 
-        rc = _send()
+        rc = _send(receiver=receiver)
         assert rc == 0, "sender exited {}".format(rc)
 
         report = _receiver_report(receiver)
@@ -474,7 +508,13 @@ def test_ssm_join_delivers_50_of_50_byte_exact():
         "h2 received the wrong packets (loss, duplication or reorder): "
         "{}".format(report["seqs"])
     )
-    # Byte-exact: the digest covers every byte of every payload, in order.
+    # Byte-exactness is established by `corrupt == []` above: the receiver
+    # diverts into `corrupt` any packet whose bytes are not exactly
+    # payload(seq) (mcast_traffic.py:129-134), so an empty list plus the
+    # complete in-order `seqs` already pins every byte.  The digest below is
+    # a redundant third statement of that, kept as a single value worth
+    # printing in the log -- if one of these three ever has to go, delete
+    # THIS one, not `corrupt`.
     assert report["sha256"] == digest(range(PACKETS)), (
         "h2's bytes differ from what h1 sent ({} bytes/packet expected): "
         "{}".format(PAYLOAD_LEN, report)
@@ -508,24 +548,59 @@ def test_rpf_negative_control_underlay_steals_rpf():
         "  no neighbor 10.0.0.2 route-map TUNNEL-ONLY-SRC out\n"
     )
     try:
-        # Both sessions now carry the prefix...
+        # Both sessions now carry the prefix, and -- the claim this suite
+        # exists to prove -- the UNDERLAY path wins the tiebreak.
         def _both_paths():
             data = _json_cmd("r2", "show bgp ipv4 unicast {} json".format(SRC_PREFIX))
             if data is None:
                 return "r2: unparseable bgp JSON (bgpd dead?)"
-            peers = sorted(
-                str(p.get("peer", {}).get("peerId")) for p in data.get("paths", [])
-            )
+            paths = data.get("paths", [])
+            peers = sorted(str(p.get("peer", {}).get("peerId")) for p in paths)
             if peers != sorted([UNDERLAY_PEER, TUNNEL_PEER]):
                 return "r2 does not yet see both paths for {}: {}".format(
                     SRC_PREFIX, peers
                 )
+            # Positive evidence for E15, asserted at the BGP layer because
+            # that is the only layer where it is observable.  _rpf_off_tunnel
+            # below has to tolerate the RPF row VANISHING (r2-eth0 runs no
+            # PIM, so the row cannot move to the underlay), which means it
+            # can no longer distinguish "the underlay won" -- the documented
+            # mechanism -- from "the (S,G) simply went away".  Naming the
+            # winner here restores that distinction: if bestpath ever landed
+            # on the tunnel, RPF would stay put and the zero below would be
+            # measuring nothing.
+            #
+            # In PREFIX-DETAIL output `bestpath` is an OBJECT, not the bare
+            # `true` the route-table listing uses, and its mere presence does
+            # NOT mean selected: bgp_route.c:13318 also creates it carrying
+            # only bestpathFromAs for a DMED-selected (per-AS best) path.
+            # `overall` is added solely under BGP_PATH_SELECTED
+            # (bgp_route.c:13334), so that is the only field that
+            # discriminates.
+            best = [p for p in paths if (p.get("bestpath") or {}).get("overall")]
+            if len(best) != 1:
+                return "r2 has {} bestpaths for {} (expected 1): {}".format(
+                    len(best), SRC_PREFIX, paths
+                )
+            reason = best[0].get("bestpath", {}).get("selectionReason")
+            chosen = str(best[0].get("peer", {}).get("peerId"))
+            if chosen != UNDERLAY_PEER:
+                return (
+                    "r2 selected {} for {}, expected the underlay peer {} to "
+                    "win the lowest-peer-address tiebreak (reason: {})".format(
+                        chosen, SRC_PREFIX, UNDERLAY_PEER, reason
+                    )
+                )
+            # selectionReason names WHICH bestpath step decided it; logged
+            # rather than asserted so a future FRR that ties earlier fails on
+            # the peer above, with the step it actually took printed here.
+            logger.info("E15 tiebreak: %s selected, selectionReason=%r", chosen, reason)
             return None
 
         expect(_both_paths)
 
         # ...and RPF moves off the tunnel to the underlay peer.
-        receiver = _start_receiver(count=PACKETS, timeout=20.0)
+        receiver = _start_receiver(count=PACKETS)
         try:
 
             def _rpf_off_tunnel():
@@ -550,7 +625,7 @@ def test_rpf_negative_control_underlay_steals_rpf():
 
             # And delivery fails: r2-eth0 runs no PIM, so the stream has no
             # path at all.  This is the silent zero.
-            rc = _send()
+            rc = _send(receiver=receiver)
             assert rc == 0, "sender exited {}".format(rc)
             report = _receiver_report(receiver)
         finally:
@@ -581,7 +656,7 @@ def test_rpf_negative_control_underlay_steals_rpf():
             return "r2 RPF did not return to the tunnel: {}".format(row)
         return None
 
-    receiver = _start_receiver(count=1, timeout=25.0)
+    receiver = _start_receiver(count=1)
     try:
         expect(_rpf_back_on_tunnel)
     finally:
@@ -620,7 +695,7 @@ def test_tunnel_flap_under_holdtime():
 
     expect(_neighbor_back)
 
-    receiver = _start_receiver(count=PACKETS, timeout=60.0)
+    receiver = _start_receiver(count=PACKETS)
     try:
 
         def _rpf_on_tunnel():
@@ -633,7 +708,7 @@ def test_tunnel_flap_under_holdtime():
 
         expect(_rpf_on_tunnel)
 
-        rc = _send()
+        rc = _send(receiver=receiver)
         assert rc == 0, "sender exited {}".format(rc)
         report = _receiver_report(receiver)
     finally:
@@ -662,7 +737,7 @@ def test_source_netdev_delete_midstream():
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
-    receiver = _start_receiver(count=PACKETS, timeout=30.0)
+    receiver = _start_receiver(count=PACKETS)
     sender = None
     try:
         helper = os.path.join(CWD, "mcast_traffic.py")
