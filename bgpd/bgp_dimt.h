@@ -42,12 +42,16 @@ extern bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
 				   uint8_t *preference);
 
 /*
- * May this path's UMH steer where we join? True for a locally originated
- * route, or one from a `dimt-trusted` neighbour whose AS the route's origin
- * authorises. On false, *why is a short reason for the caller's log -- EXCEPT
- * when the path has no usable peer to name, where it stays NULL. A caller that
- * logs *why must tolerate that, and one that charges a per-peer counter must
- * check pi->peer first; there is nobody to charge in that case.
+ * May this path's UMH steer where we join? True for a route this speaker
+ * originated itself, or one from a `dimt-trusted` neighbour whose AS the
+ * route's origin authorises. A path re-homed onto peer_self by a VPN leak
+ * (sub_type BGP_ROUTE_IMPORTED) is NOT locally originated and is refused; the
+ * leak discards the sending neighbour while preserving the UMH, so trusting
+ * it would launder an untrusted neighbour's EC. On false, *why is a short
+ * reason for the caller's log -- EXCEPT when the path has no usable peer to
+ * name, where it stays NULL. A caller that logs *why must tolerate that, and
+ * one that charges a per-peer counter must check pi->peer first; there is
+ * nobody to charge in that case.
  *
  * Exported for the UMH LARGE community lane (BLO-36558): an LC-UMH that
  * bypassed this gate would be an untrusted peer's refused EC accepted under a

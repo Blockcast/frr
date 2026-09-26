@@ -4551,9 +4551,12 @@ driven by these routes is not yet implemented.
    Honour the DIMT Upstream Multicast Hop extended community (sub-type
    ``0x80``) received from this neighbor. **Default: off** -- an unmarked
    neighbor's UMH community is ignored, and the refusal is counted per peer
-   (``DIMT UMH rejected`` in ``show bgp neighbors``, ``dimtUmhRejected``
-   under ``prefixStats`` in its JSON form) and logged at notice, throttled to
-   once a minute per peer.
+   per refused community (``DIMT UMH rejected`` in ``show bgp neighbors``,
+   ``dimtUmhRejected`` under ``prefixStats`` in its JSON form) and logged at
+   notice, throttled to once a minute per peer. A single route carrying both
+   an IPv4 and an IPv6 UMH community therefore increments it by two, and the
+   count covers every BGP instance, not only the default one -- a VRF's
+   refusals are counted even though only the default instance pins.
 
    The default is deny because a UMH community says "send your join toward
    this address", so any speaker that can attach one to a route you accept
@@ -4579,8 +4582,13 @@ driven by these routes is not yet implemented.
    member always resolve to a member AS, and holding that against them would
    make the knob unusable inside a confederation.
 
-   Locally originated routes are always trusted: their UMH came from your own
-   route-map.
+   Routes this speaker originated itself are always trusted: their UMH came
+   from your own route-map. A route **imported from another BGP instance** is
+   not, even though it carries the local ``peer_self`` once leaked: a VPN leak
+   copies the attribute wholesale -- only route targets are stripped, not the
+   UMH -- and discards the sending neighbor, so honouring it would accept an
+   untrusted VPNv4 neighbor's UMH under a local identity. Such a UMH is
+   refused; re-originate it through a route-map if you mean to honour it.
 
    Changing this knob **resets the session**, so it takes effect on routes
    already learned rather than only on the neighbor's next update. A route

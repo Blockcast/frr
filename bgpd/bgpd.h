@@ -2100,9 +2100,12 @@ struct peer {
 	/* DIMT UMH extended communities refused from this peer: either it is
 	 * not marked dimt-trusted, or it is but the route's origin AS does not
 	 * authorise it to claim a UMH. Counts refused ECs, not refused routes:
-	 * charged once per EC list when the path arrives in the loc-RIB, never
-	 * again when a consumer re-reads that path, so this tracks what the
-	 * NEIGHBOUR sent rather than how often we happened to look. */
+	 * charged once per EC list when the path arrives in the loc-RIB, in
+	 * every instance rather than only the default one, and never again when
+	 * a consumer re-reads that path, so this tracks what the NEIGHBOUR sent
+	 * rather than how often we happened to look. Caveat: with add-path
+	 * transmit enabled a loc-RIB re-process can still re-charge it -- see
+	 * the KNOWN CEILING note in bgp_dimt.c's route-update hook. */
 	uint64_t stat_dimt_umh_rejected;
 	/* Throttle state for the refusal log above (once a minute per peer).
 	 * "Ever logged" is its own flag because monotime() 0 is a real time. */

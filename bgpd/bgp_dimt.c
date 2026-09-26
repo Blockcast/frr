@@ -117,9 +117,34 @@ bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi, const char **why)
 
 	peer = pi->peer;
 
-	/* Our own route-map put the EC there. */
-	if (peer == peer->bgp->peer_self)
+	/* Our own route-map put the EC there -- but only if we actually
+	 * originated this path, which the peer pointer alone does not tell us.
+	 * A VPN leak re-homes the path onto the TARGET instance's peer_self and
+	 * discards the origin peer: leak_update() does
+	 * info_make(..., BGP_ROUTE_IMPORTED, 0, to_bgp->peer_self, ...) in
+	 * bgp_mplsvpn.c. The attribute is copied wholesale and the only
+	 * ecommunity surgery on the way is ecommunity_strip_rts(), which
+	 * removes subtype ECOMMUNITY_ROUTE_TARGET only, so a 0x80 UMH survives
+	 * the trip intact. Trusting the peer pointer would therefore let an
+	 * untrusted VPNv4 neighbour's UMH -- correctly refused and counted
+	 * where it arrived -- re-enter a unicast table laundered as locally
+	 * originated, and be honoured by both consumers: the pin path when the
+	 * leak lands in the default instance, and the MVPN attestation lane in
+	 * any instance.
+	 *
+	 * Refuse rather than inherit. The source instance's verdict is not
+	 * carried on the path, so there is nothing to inherit even if we wanted
+	 * to; an operator who means to honour a leaked UMH can re-originate it
+	 * through a route-map, which is a decision the config then records.
+	 * Keyed on sub_type, not on a peer comparison, because BGP_ROUTE_IMPORTED
+	 * is exactly "from another bgp instance/safi" (bgp_route.h). */
+	if (peer == peer->bgp->peer_self) {
+		if (pi->sub_type == BGP_ROUTE_IMPORTED) {
+			*why = "route was imported from another BGP instance";
+			return false;
+		}
 		return true;
+	}
 
 	if (!CHECK_FLAG(peer->flags, PEER_FLAG_DIMT_TRUSTED)) {
 		*why = "neighbor is not dimt-trusted";
@@ -275,8 +300,20 @@ bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
 {
 	const char *why = NULL;
 
-	return bgp_dimt_umh_decode(pi, afi, umh, umh_type, preference) &&
-	       bgp_dimt_peer_is_trusted(pi, &why);
+	if (bgp_dimt_umh_decode(pi, afi, umh, umh_type, preference) &&
+	    bgp_dimt_peer_is_trusted(pi, &why))
+		return true;
+
+	/* Fail closed. decode() has already written a fully populated UMH
+	 * through the out-params by the time the gate refuses, so a caller that
+	 * forgot to check the return value would read an untrusted neighbour's
+	 * UMH as if it were honoured. Both current callers check, but this is
+	 * the one function whose whole job is to be the place nobody can forget
+	 * the gate, so it clears up after itself. */
+	*umh = (struct ipaddr){};
+	*umh_type = 0;
+	*preference = 0;
+	return false;
 }
 
 /* Charge one refusal for a UMH EC this path carries and is not entitled to
@@ -387,7 +424,29 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 	 *
 	 * Auditing both lists unconditionally is also what makes the counter
 	 * match its contract in bgpd.h: refused ECs, counted once each, when
-	 * they arrive. */
+	 * they arrive.
+	 *
+	 * KNOWN CEILING (BLO-36553 review, not fixed here): with add-path
+	 * transmit configured for the afi/safi, bgp_process_main_one() skips its
+	 * unchanged-bestpath early return -- the trailing
+	 * !bgp_addpath_is_addpath_used(&bgp->tx_addpath, afi, safi) clause -- so
+	 * this hook also fires on re-processes that carry no new announcement
+	 * (nexthop tracking, a peer event on a sibling path, a route-map
+	 * refresh), and each one re-charges the refusal. `clear ip bgp PREFIX`
+	 * is the same shape via BGP_NODE_USER_CLEAR.
+	 *
+	 * Two obvious fixes are both WRONG, recorded so they are not retried:
+	 *   - CHECK_FLAG(new_route->flags, BGP_PATH_ATTR_CHANGED) always reads
+	 *     false here. bgp_route.c unsets that flag on new_select a dozen
+	 *     lines BEFORE calling this hook, so gating on it would silence the
+	 *     counter permanently rather than stabilise it.
+	 *   - old_route != new_route suppresses the legitimate case too. A
+	 *     re-announce that changes attributes reuses the same
+	 *     bgp_path_info, so old == new on a genuine origin-AS change --
+	 *     which the topotest's stage 3 pins as MUST count.
+	 * Discriminating them needs the previous attr pointer, i.e. per-path
+	 * audit state that does not exist yet; that is a design decision, not a
+	 * gate tweak. */
 	bgp_dimt_umh_audit(new_route, AFI_IP);
 	bgp_dimt_umh_audit(new_route, AFI_IP6);
 
