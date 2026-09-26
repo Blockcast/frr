@@ -53,6 +53,18 @@ THE RPF TIEBREAK (E15) -- the reason this suite exists
   the underlay wins, RPF leaves the tunnel, and because r2-eth0 runs no PIM
   the stream silently delivers ZERO packets.
 
+  That fall-through only happens because r2 sets `bgp bestpath
+  compare-routerid`.  Without it, bestpath step 12 ("prefer the path
+  received first", bgp_route.c:1738) decides first, and since the tunnel
+  session has carried the prefix since setup the newer underlay path loses
+  on AGE -- selection never reaches the address tiebreak at all.
+
+  That is not merely a harness detail, it sharpens the hazard: in the
+  field, where step 12 is live, WHICH SESSION WINS IS DECIDED BY SESSION
+  ARRIVAL ORDER.  A tunnel flap that re-establishes the tunnel session
+  after the underlay one moves RPF onto the underlay and silently delivers
+  zero -- with no config change anywhere.  See r2/bgpd.conf.
+
   In lab row T1a the tunnel won that tiebreak only by accident of
   addressing.  The addressing here is chosen so the underlay wins, making
   the negative control deterministic instead of a coin flip: it proves the
