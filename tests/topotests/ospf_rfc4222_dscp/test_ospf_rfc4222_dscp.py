@@ -195,6 +195,28 @@ def _tshark_dscp_and_type(router, pcap_path):
     return res
 
 
+def _dscp_flags(router, iface, pcap_path, stimulate, settle=6):
+    """Capture OSPF on `iface` across one window while `stimulate()` runs.
+
+    Returns (hello_ok, ack_ok, low_ctrl_ok, npackets) as observed in THIS
+    window only; the caller ORs successive windows together.
+    """
+    _capture_ospf_pcap(router, iface, pcap_path)
+    topotest.sleep(2, "Setup packet capture")
+    stimulate()
+    topotest.sleep(settle, "Gathering Packets")
+    _stop_ospf_capture(router, iface, pcap_path)
+
+    hello_ok = ack_ok = low_ctrl_ok = False
+    tuples = _tshark_dscp_and_type(router, pcap_path)
+    for dscp, msg in tuples:
+        # msg: 1=Hello, 2=DB-Desc, 3=LS-Req, 4=LS-Upd, 5=LS-Ack
+        hello_ok = hello_ok or (msg == 1 and dscp == 46)
+        ack_ok = ack_ok or (msg == 5 and dscp == 46)
+        low_ctrl_ok = low_ctrl_ok or (msg in (2, 3, 4) and dscp == 40)
+    return hello_ok, ack_ok, low_ctrl_ok, len(tuples)
+
+
 def test_ospf_dscp_all_and_low_control(tgen):
     "Verify per-interface DSCP all/low-control markings on the wire"
     if not tgen.routers():
@@ -203,13 +225,18 @@ def test_ospf_dscp_all_and_low_control(tgen):
     r1 = tgen.gears["r1"]
     r2 = tgen.gears["r2"]
 
-    # Ensure adjacency is up before playing with DSCP
-    assert neighbors_full("r1"), "R1 did not reach Full with R2"
+    # Ensure adjacency is up before playing with DSCP.  WAIT rather than
+    # assert once (BLO-36708): CI reruns a failing file on its own, and this
+    # test then starts seconds after topology start rather than after
+    # test_ospf_dscp_basic has already waited for Full.
+    assert _wait_for_neighbors_full("r1", retries=30, delay=2), (
+        "R1 did not reach Full with R2"
+    )
 
     # Configure DSCP on R1:
     # - all = 46
     # - low-control = 40 (CS5, for example)
-    output = r1.vtysh_cmd(
+    r1.vtysh_cmd(
         """
 configure terminal
 interface r1-eth0
@@ -219,39 +246,47 @@ interface r1-eth0
   exit
 """
     )
-    # print("output is: {}".format(output))
 
-    # Give OSPF a moment to send some control traffic
-    # Flood: add 200 loopbacks on r1 and redistribute connected
+    # Every assertion below is "a packet of this kind flew inside the capture
+    # window", which is a race the CI hosts lose under load -- observed
+    # failing on all three of hello/ack/low-control across runs 36101674598,
+    # 36185422488 and 36196482335.  So: stimulate BOTH directions and retry.
+    #
+    #   * r1's own redistributed loopbacks make r1 flood LS-Upd  -> low-control
+    #   * r2's make r2 flood to r1, which r1 must LS-Ack         -> ack
+    #
+    # Without the r2 half there is nothing on a two-router p2p link that
+    # obliges r1 to send an Ack at all, so ack_ok was pure luck.
+    r1.vtysh_cmd("conf t\nrouter ospf\n redistribute connected\n exit")
+    r2.vtysh_cmd("conf t\nrouter ospf\n redistribute connected\n exit")
+
     pcap = os.path.join(tgen.logdir, "r1-ospf-dscp.pcap")
     logger.info("PCAP DIR: {}".format(pcap))
 
-    _capture_ospf_pcap(r1, "r1-eth0", pcap)
-    topotest.sleep(2, "Setup packet capture")
-    r1.vtysh_cmd("conf t\nrouter ospf\n redistribute connected\n exit")
-    for i in range(1, 10):
-        r1.cmd(f"ip addr add 198.51.100.{i}/32 dev lo")
-    # Capture packets on R1's interface
-    topotest.sleep(3, "Gathering Packets")
-    _stop_ospf_capture(r1, "r1-eth0", pcap)
+    hello_ok = ack_ok = low_ctrl_ok = False
+    npackets = 0
+    for rnd in range(5):
 
-    tuples = _tshark_dscp_and_type(r1, pcap)
-    assert tuples, "No OSPF packets captured on r1-eth0"
+        def stimulate(rnd=rnd):
+            for i in range(1, 10):
+                octet = rnd * 10 + i
+                r1.cmd(f"ip addr add 198.51.100.{octet}/32 dev lo")
+                r2.cmd(f"ip addr add 203.0.113.{octet}/32 dev lo")
 
-    hello_ok = False
-    low_ctrl_ok = False
-    ack_ok = False
-    # print(tuples)
+        # Hellos are cheap here (hello-interval 1), but an LSU/Ack exchange
+        # has to clear MinLSInterval, so one 8s window is not reliably
+        # enough on a loaded host.  Five of them are.
+        hello, ack, low_ctrl, seen = _dscp_flags(r1, "r1-eth0", pcap, stimulate)
+        hello_ok = hello_ok or hello
+        ack_ok = ack_ok or ack
+        low_ctrl_ok = low_ctrl_ok or low_ctrl
+        npackets += seen
+        if hello_ok and ack_ok and low_ctrl_ok:
+            break
 
-    for dscp, msg in tuples:
-        # msg: 1=Hello, 2=DB-Desc, 3=LS-Req, 4=LS-Upd, 5=LS-Ack
-        if msg == 1 and dscp == 46:
-            hello_ok = True
-        if msg == 5 and dscp == 46:
-            ack_ok = True
-        if msg in (2, 3, 4) and dscp == 40:
-            low_ctrl_ok = True
-
+    # Keep this distinguishable from the three below: zero packets across all
+    # windows means tshark or the capture is broken, not that DSCP is wrong.
+    assert npackets, "No OSPF packets captured on r1-eth0"
     assert hello_ok, "No Hello packet from R1 with DSCP 46 observed"
     assert ack_ok, "No Ack packet from R1 with DSCP 46 observed"
     assert low_ctrl_ok, "No DB-Desc/LS-Req/LS-Upd from R1 with DSCP 40 observed"
