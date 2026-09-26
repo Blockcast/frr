@@ -375,6 +375,38 @@ rc=$?
 check "c: --allow-empty exits 0" [ "$rc" -eq 0 ]
 check "c: --allow-empty GCs the stale tunnel" log_has "^ip link del dimt-9-9$"
 
+# --- (c3) coexistence: GC only touches this script's own names ---------
+# zebra/pimd name their on-demand DIMT tunnels dimt-%08x (pim_dimt.c:1027,
+# zebra_dimt.c:345).  A GC that swept every dimt-* deleted those on every
+# cycle and zebra rebuilt them, so the two owners fought forever on any
+# host running both.  GC is scoped to the names this script derives:
+# dimt-<o3>-<o4> peers, plus its own leaked dimt-probe0.
+new_state c3
+echo "dimt-0a000001 100.64.0.40 100.64.0.99 gre" >> "$FAKEIP_DIR/links"
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47 \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "c3: exits 0" [ "$rc" -eq 0 ]
+check "c3: zebra dimt-%08x tunnel survives reconcile" \
+	log_lacks "^ip link del dimt-0a000001"
+check "c3: zebra tunnel still present afterwards" \
+	grep -q "^dimt-0a000001 " "$FAKEIP_DIR/links"
+check "c3: own stale dimt-<o3>-<o4> still GC'd" \
+	log_has "^ip link del dimt-9-9$"
+
+# Leaked own probe stays in GC's reach.  Asserted under --dry-run: in a
+# real run gre_probe deletes dimt-probe0 itself before GC ever sees it.
+new_state c4
+echo "dimt-probe0 127.0.0.1 127.0.0.2 gre" >> "$FAKEIP_DIR/links"
+echo "dimt-0a000001 100.64.0.40 100.64.0.99 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47 \
+	--peers-file "$TESTDIR/no-such-file" --dry-run 2>&1)
+check "c3: leaked own dimt-probe0 still GC'd" \
+	err_has "DRY: ip link del dimt-probe0"
+check "c3: --dry-run also spares dimt-%08x" \
+	err_lacks "ip link del dimt-0a000001"
+
 # --- (d) invalid peer entry: skipped, loud, GC suppressed --------------
 new_state d
 printf 'notanip\n100.64.0.47\n' > "$TESTDIR/peers-invalid"
