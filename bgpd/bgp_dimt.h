@@ -44,14 +44,23 @@ extern bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
 /*
  * May this path's UMH steer where we join? True for a route this speaker
  * originated itself, or one from a `dimt-trusted` neighbour whose AS the
- * route's origin authorises. A path re-homed onto peer_self by a VPN leak
- * (sub_type BGP_ROUTE_IMPORTED) is NOT locally originated and is refused; the
- * leak discards the sending neighbour while preserving the UMH, so trusting
- * it would launder an untrusted neighbour's EC. On false, *why is a short
- * reason for the caller's log -- EXCEPT when the path has no usable peer to
- * name, where it stays NULL. A caller that logs *why must tolerate that, and
- * one that charges a per-peer counter must check pi->peer first; there is
- * nobody to charge in that case.
+ * route's origin authorises.
+ *
+ * "Originated itself" is an ALLOW-list of sub_types (STATIC, REDISTRIBUTE,
+ * NORMAL), not the peer_self pointer: more than one thing re-homes a path onto
+ * peer_self without this speaker having authored the attribute. A VPN leak
+ * (BGP_ROUTE_IMPORTED) discards the sending neighbour while preserving the
+ * UMH; an as-set aggregate (BGP_ROUTE_AGGREGATE) merges a component route's
+ * whole ecommunity. Both would launder an untrusted neighbour's EC. The
+ * allow-list is so that a sub_type added later fails closed here instead of
+ * inheriting trust -- the deny-list this replaced needed extending twice.
+ *
+ * On false, *why is a short reason for the caller's log -- EXCEPT when the
+ * path has no usable peer to name, where it stays NULL. A caller that logs
+ * *why must tolerate that, and one that charges a per-peer counter must check
+ * pi->peer first; there is nobody to charge in that case. A refusal on a
+ * peer_self path has a peer but no honest one to charge either -- see
+ * bgp_dimt_umh_refuse_local() in bgp_dimt.c.
  *
  * Exported for the UMH LARGE community lane (BLO-36558): an LC-UMH that
  * bypassed this gate would be an untrusted peer's refused EC accepted under a

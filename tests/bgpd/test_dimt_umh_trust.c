@@ -63,6 +63,7 @@ int main(void)
 {
 	struct bgp_path_info pi;
 	struct peer neighbor = {};
+	unsigned int st;
 
 	test_bgp.peer_self = &self_peer;
 	self_peer.bgp = &test_bgp;
@@ -70,22 +71,58 @@ int main(void)
 	neighbor.bgp = &test_bgp;
 	neighbor.as = 65001;
 
-	/* Locally originated: our own route-map attached the UMH. */
-	pi = path(&self_peer, BGP_ROUTE_STATIC);
-	check("network statement", &pi, true);
-	pi = path(&self_peer, BGP_ROUTE_REDISTRIBUTE);
-	check("redistribute", &pi, true);
-	pi = path(&self_peer, BGP_ROUTE_NORMAL);
-	check("locally originated, normal sub-type", &pi, true);
+	/* Every sub_type against peer_self, not a hand-picked handful.
+	 *
+	 * The gate allow-lists the locally-originating sub-types, so the space
+	 * above the named ones is the fail-closed arm and is asserted as such
+	 * over the whole uint8_t range that `bgp_path_info.sub_type` can hold.
+	 * A sub-type added to bgp_route.h therefore arrives here already pinned
+	 * to REFUSED, and wiring it trusted without adding a row below fails
+	 * this test rather than silently inheriting a verdict -- which is the
+	 * regression that cost two review rounds (BGP_ROUTE_IMPORTED, then
+	 * BGP_ROUTE_AGGREGATE, each found only after the deny-list shipped).
+	 *
+	 * ADDING A SUB-TYPE: add a row here with an explicit verdict, and say
+	 * in bgp_dimt.c which producer originates it. Do not delete the default
+	 * arm to make a new one pass.
+	 *
+	 * BGP_ROUTE_RFP is only defined under ENABLE_BGP_VNC; it is covered by
+	 * the default arm either way, so it needs no #ifdef here.
+	 */
+	for (st = 0; st <= UINT8_MAX; st++) {
+		char name[64];
+		bool want;
 
-	/* NOT locally originated, despite carrying peer_self.  A VPN leak
-	 * re-homes the path onto the target instance's peer_self and discards
-	 * the sending neighbour, while ecommunity_strip_rts() removes only
-	 * route targets -- so an untrusted VPNv4 neighbour's 0x80 UMH survives
-	 * into a unicast table wearing a local identity.  Trusting the peer
-	 * pointer here would honour it. */
+		switch (st) {
+		case BGP_ROUTE_STATIC:       /* `network`                  */
+		case BGP_ROUTE_REDISTRIBUTE: /* redistribution + route-map */
+		case BGP_ROUTE_NORMAL:       /* bgp_unreach.c SAFI_UNREACH */
+			want = true;
+			break;
+		default:
+			/* IMPORTED (VPN leak), AGGREGATE (as-set merges a
+			 * component's ecommunity), RFP, and anything later. */
+			want = false;
+			break;
+		}
+
+		snprintf(name, sizeof(name), "peer_self sub_type %u", st);
+		pi = path(&self_peer, (uint8_t)st);
+		check(name, &pi, want);
+	}
+
+	/* The two laundering sub-types called out by name, so a reader of this
+	 * file sees the security claim rather than only the loop's arithmetic.
+	 * A VPN leak re-homes the path onto the target instance's peer_self and
+	 * discards the sending neighbour, while ecommunity_strip_rts() removes
+	 * only route targets -- so an untrusted VPNv4 neighbour's 0x80 UMH
+	 * survives into a unicast table wearing a local identity. An as-set
+	 * aggregate merges each component's whole ecommunity, so a UMH already
+	 * refused on the component re-enters on the aggregate. */
 	pi = path(&self_peer, BGP_ROUTE_IMPORTED);
 	check("leaked from another instance", &pi, false);
+	pi = path(&self_peer, BGP_ROUTE_AGGREGATE);
+	check("as-set aggregate of a neighbour's route", &pi, false);
 
 	/* Negative control: the neighbour arms still behave, so a regression
 	 * that refused everything could not pass this file. */
@@ -99,11 +136,13 @@ int main(void)
 	check("dimt-trusted iBGP neighbour", &pi, true);
 
 	/* An iBGP neighbour is trusted on the strength of the knob, not of the
-	 * peer pointer, so the import rule must not leak across to it: a
-	 * genuinely relayed route reaches us as BGP_ROUTE_NORMAL from a real
-	 * peer and is unaffected by the check above. */
+	 * peer pointer, so the peer_self sub_type rules must not leak across to
+	 * it: a genuinely relayed route reaches us from a real peer and its
+	 * sub_type says nothing about who authored the UMH. */
 	pi = path(&neighbor, BGP_ROUTE_IMPORTED);
 	check("dimt-trusted iBGP neighbour, imported path", &pi, true);
+	pi = path(&neighbor, BGP_ROUTE_AGGREGATE);
+	check("dimt-trusted iBGP neighbour, aggregate path", &pi, true);
 
 	/* No peer to name: refused, and *why stays NULL by contract. */
 	pi = path(NULL, BGP_ROUTE_NORMAL);

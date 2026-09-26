@@ -136,14 +136,47 @@ bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi, const char **why)
 	 * carried on the path, so there is nothing to inherit even if we wanted
 	 * to; an operator who means to honour a leaked UMH can re-originate it
 	 * through a route-map, which is a decision the config then records.
-	 * Keyed on sub_type, not on a peer comparison, because BGP_ROUTE_IMPORTED
-	 * is exactly "from another bgp instance/safi" (bgp_route.h). */
+	 *
+	 * Keyed on sub_type -- "how did this path get here" -- because the peer
+	 * pointer cannot answer it. And as an ALLOW-list rather than a deny-list
+	 * of the laundering sub-types: the two partition the enum identically
+	 * today, so this is not a behaviour change, but a sub_type added later
+	 * inherits the fail-CLOSED verdict instead of the fail-open one. This
+	 * gate's deny-list needed extending twice in two review rounds
+	 * (BGP_ROUTE_IMPORTED, then BGP_ROUTE_AGGREGATE); that is the argument.
+	 *
+	 * The three trusted arms are every producer in the tree that calls
+	 * info_make() with peer_self and a locally authored attribute:
+	 *   BGP_ROUTE_STATIC        bgp_route.c, `network`
+	 *   BGP_ROUTE_REDISTRIBUTE  bgp_route.c, redistribution + its route-map
+	 *   BGP_ROUTE_NORMAL        bgp_unreach.c, fork-local SAFI_UNREACH
+	 * BGP_ROUTE_NORMAL is on that list rather than excluded as suspicious:
+	 * bgp_unreach.c originates locally under the default sub_type, so an
+	 * allow-list without it would silently refuse our own UMHs. */
 	if (peer == peer->bgp->peer_self) {
-		if (pi->sub_type == BGP_ROUTE_IMPORTED) {
+		switch (pi->sub_type) {
+		case BGP_ROUTE_STATIC:
+		case BGP_ROUTE_REDISTRIBUTE:
+		case BGP_ROUTE_NORMAL:
+			return true;
+		case BGP_ROUTE_IMPORTED:
 			*why = "route was imported from another BGP instance";
 			return false;
+		case BGP_ROUTE_AGGREGATE:
+			/* `aggregate-address ... as-set` merges each component
+			 * route's WHOLE ecommunity into the aggregate --
+			 * bgp_compute_aggregate_ecommunity() applies no sub-type
+			 * filter -- so a neighbour's 0x80 UMH, correctly refused
+			 * on the component, re-enters on the aggregate wearing
+			 * peer_self. Wider blast radius than the leak: it steers
+			 * joins for the whole aggregate, not one component. */
+			*why = "route is an aggregate, which may carry a component's UMH";
+			return false;
+		default:
+			/* BGP_ROUTE_RFP (VNC) and anything added later. */
+			*why = "route was not originated by this speaker";
+			return false;
 		}
-		return true;
 	}
 
 	if (!CHECK_FLAG(peer->flags, PEER_FLAG_DIMT_TRUSTED)) {
@@ -205,6 +238,43 @@ static void bgp_dimt_umh_refuse(struct peer *peer, const char *why)
 	zlog_notice("DIMT: UMH extended community from %s refused: %s",
 		    peer->host ? peer->host : "(unknown peer)",
 		    why ? why : "no usable peer on the path");
+}
+
+/* A refusal on a path bgpd attributes to peer_self: the path reached the
+ * loc-RIB wearing a local identity while carrying a UMH we did not author --
+ * a VPN leak, or an as-set aggregate that merged a component's ecommunity.
+ *
+ * Reported separately from bgp_dimt_umh_refuse() rather than charged to
+ * peer_self, because both halves of that function are wrong here. The counter
+ * is surfaced by `show bgp neighbors`, which structurally never walks
+ * peer_self, so a refusal charged there is written to a sink -- and this is
+ * precisely the detection signal for the bypass the trust gate exists to
+ * close. The log line names peer->host, which for peer_self is a pseudo-peer
+ * string like "Static announcement": a line reading "from Static announcement
+ * refused: route was imported from another BGP instance" names as a local
+ * announcement the exact thing it is denying is one.
+ *
+ * Prefix plus instance is what identifies a laundered path; a peer does not.
+ * Throttled on peer_self's own log state -- once a minute for the instance,
+ * matching the per-peer rate everywhere else -- so a crafted feed cannot spam
+ * it. No counter: whoever adds a surface for this should add one with a
+ * per-instance home, not borrow an unreachable per-peer field.
+ */
+static void bgp_dimt_umh_refuse_local(struct bgp *bgp,
+				      const struct bgp_path_info *pi,
+				      const char *why)
+{
+	struct peer *self = bgp->peer_self;
+	time_t now = monotime(NULL);
+
+	if (self->dimt_umh_log_seen && now - self->dimt_umh_log_last < 60)
+		return;
+
+	self->dimt_umh_log_seen = true;
+	self->dimt_umh_log_last = now;
+	zlog_notice("DIMT: UMH extended community on locally-held route %pBD in instance %s refused: %s",
+		    pi->net, bgp->name_pretty ? bgp->name_pretty : "(unnamed)",
+		    why ? why : "route was not originated by this speaker");
 }
 
 /* Decode only: pull the best UMH EC (highest preference wins) out of a path's
@@ -350,8 +420,15 @@ static void bgp_dimt_umh_audit(const struct bgp_path_info *pi, afi_t afi)
 	/* pi is const, but the peer it points at is not -- the refusal is a
 	 * property of the peer, not of the path. A refusal with no peer to
 	 * charge is still a refusal; there is just nobody to count it against.
-	 */
-	if (pi->peer)
+	 *
+	 * A path bgpd attributes to peer_self has a peer, but not one a counter
+	 * or a log line can honestly name: see bgp_dimt_umh_refuse_local(). */
+	if (!pi->peer)
+		return;
+
+	if (pi->peer->bgp && pi->peer == pi->peer->bgp->peer_self)
+		bgp_dimt_umh_refuse_local(pi->peer->bgp, pi, why);
+	else
 		bgp_dimt_umh_refuse(pi->peer, why);
 }
 

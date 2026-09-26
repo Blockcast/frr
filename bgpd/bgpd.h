@@ -2105,7 +2105,15 @@ struct peer {
 	 * a consumer re-reads that path, so this tracks what the NEIGHBOUR sent
 	 * rather than how often we happened to look. Caveat: with add-path
 	 * transmit enabled a loc-RIB re-process can still re-charge it -- see
-	 * the KNOWN CEILING note in bgp_dimt.c's route-update hook. */
+	 * the KNOWN CEILING note in bgp_dimt.c's route-update hook.
+	 *
+	 * NEVER charged against peer_self. A refusal on a path bgpd attributes
+	 * to peer_self is real -- that is the laundering case the trust gate
+	 * exists to catch -- but `show bgp neighbors` does not walk peer_self,
+	 * so counting it here would write the detection signal to a sink. Those
+	 * are logged against the prefix and the instance instead, by
+	 * bgp_dimt_umh_refuse_local(). Giving them a counter means giving them
+	 * a per-instance home, not borrowing this field. */
 	uint64_t stat_dimt_umh_rejected;
 	/* Throttle state for the refusal log above (once a minute per peer).
 	 * "Ever logged" is its own flag because monotime() 0 is a real time. */

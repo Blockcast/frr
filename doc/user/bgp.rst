@@ -4558,6 +4558,18 @@ driven by these routes is not yet implemented.
    count covers every BGP instance, not only the default one -- a VRF's
    refusals are counted even though only the default instance pins.
 
+   The counter is charged when the route arrives, not when bgpd later
+   re-reads it, so it tracks what the neighbor sent. One exception: with
+   **add-path transmit** enabled for the address family, a loc-RIB
+   re-process that carries no new announcement -- nexthop tracking, an event
+   on a sibling path, a route-map refresh, ``clear ip bgp`` for the prefix --
+   can re-charge the same refusal and re-arm the once-a-minute log. Read the
+   counter as "this neighbor is sending UMHs it is not entitled to", not as
+   an exact arrival count, where add-path is configured. A refusal on a route
+   bgpd holds locally (see the trust rules below) is logged against the
+   prefix and the BGP instance instead, and is not counted -- ``show bgp
+   neighbors`` has no entry for the local speaker to carry it.
+
    The default is deny because a UMH community says "send your join toward
    this address", so any speaker that can attach one to a route you accept
    decides where a stream is pulled from. Without this knob a transit AS, or
@@ -4583,12 +4595,33 @@ driven by these routes is not yet implemented.
    make the knob unusable inside a confederation.
 
    Routes this speaker originated itself are always trusted: their UMH came
-   from your own route-map. A route **imported from another BGP instance** is
-   not, even though it carries the local ``peer_self`` once leaked: a VPN leak
-   copies the attribute wholesale -- only route targets are stripped, not the
-   UMH -- and discards the sending neighbor, so honouring it would accept an
-   untrusted VPNv4 neighbor's UMH under a local identity. Such a UMH is
-   refused; re-originate it through a route-map if you mean to honour it.
+   from your own route-map. Specifically, routes from a ``network``
+   statement, from redistribution, and locally originated unreachability
+   routes. A route that merely *carries* the local ``peer_self`` is not
+   trusted, because two things re-home a route onto it without this speaker
+   having authored the attribute:
+
+   - A route **imported from another BGP instance**. A VPN leak copies the
+     attribute wholesale -- only route targets are stripped, not the UMH --
+     and discards the sending neighbor, so honouring it would accept an
+     untrusted VPNv4 neighbor's UMH under a local identity.
+   - An **aggregate** built with ``as-set`` (see
+     :clicmd:`aggregate-address A.B.C.D/M as-set`). ``as-set`` merges each
+     component route's extended communities into the aggregate without
+     filtering by sub-type, so a UMH refused on a component would re-enter
+     on the aggregate and steer joins for the whole aggregated prefix.
+
+   The consequence to plan for is that aggregating **your own**
+   UMH-carrying routes with ``as-set`` drops the UMH from the aggregate.
+   That is deliberate -- the aggregate cannot tell your component routes
+   from a neighbor's. Re-originate the UMH on the aggregate through a
+   route-map if you mean to honour it; the same remedy applies to a leaked
+   route.
+
+   Any other way a route acquires ``peer_self`` is refused as well. The rule
+   is an allow-list of the ways this speaker originates a route, so a route
+   source added to bgpd in future is ignored by this gate until it is
+   explicitly listed, rather than trusted by default.
 
    Changing this knob **resets the session**, so it takes effect on routes
    already learned rather than only on the neighbor's next update. A route
