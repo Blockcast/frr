@@ -145,17 +145,22 @@ bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi, const char **why)
 	 * gate's deny-list needed extending twice in two review rounds
 	 * (BGP_ROUTE_IMPORTED, then BGP_ROUTE_AGGREGATE); that is the argument.
 	 *
-	 * The two trusted arms are every producer that calls info_make() with
-	 * peer_self, a locally authored attribute, and a route that can reach a
-	 * unicast table -- which is the only table set this gate reads:
+	 * bgpd has nine producers that call info_make() with peer_self; the
+	 * enumeration below accounts for all nine, so a reader redoing it for a
+	 * new table can check the count first. The two trusted arms are the only
+	 * ones pairing a locally authored attribute with a route that can reach a
+	 * unicast table -- the only table set this gate reads:
 	 *   BGP_ROUTE_STATIC        bgp_route.c:8827, `network`
 	 *   BGP_ROUTE_REDISTRIBUTE  bgp_route.c:11095, redistribution + route-map
-	 * Scoped to unicast deliberately: bgp_ls.c:742 is a third peer_self
-	 * producer (REDISTRIBUTE, SAFI_LINKSTATE) and bgp_evpn.c:1722/:2113 a
-	 * fourth and fifth (STATIC, EVPN), but no consumer of this gate can see
-	 * them -- bgp_dimt_route_update() returns at the safi != SAFI_UNICAST
-	 * guard below, and bgp_mvpn_resolve_attested_umh() only ever gets a path
-	 * selected out of bgp->rib[afi][SAFI_UNICAST] (bgp_mvpn.c:1447).
+	 * Scoped to unicast deliberately: four more are locally authored but
+	 * originate outside unicast -- bgp_ls.c:742 (REDISTRIBUTE, SAFI_LINKSTATE)
+	 * and bgp_evpn.c:1722, bgp_evpn.c:2113, bgp_evpn_mh.c:516 (STATIC, EVPN).
+	 * No consumer of this gate can see them: bgp_dimt_route_update() returns
+	 * at the safi != SAFI_UNICAST guard below, and
+	 * bgp_mvpn_resolve_attested_umh() only ever gets a path selected out of
+	 * bgp->rib[afi][SAFI_UNICAST] (bgp_mvpn.c:1447). The remaining two are
+	 * refused by sub_type on their own arms below: bgp_mplsvpn.c:1417
+	 * (IMPORTED) and bgp_route.c:9696 (AGGREGATE).
 	 *
 	 * BGP_ROUTE_NORMAL is deliberately NOT on the list. Its one peer_self
 	 * producer is bgp_unreach.c:922, which originates into SAFI_UNREACH, so
