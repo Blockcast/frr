@@ -1075,15 +1075,48 @@ jobs:
             exit 1
           fi
 
+          # BLO-36708: hand pytest the FILES, not the node IDs.  A topotest
+          # module is a stateful sequence -- one module-scoped topology
+          # fixture, and tests that mutate it in order -- so selecting a
+          # single node ID runs it against a topology its predecessors never
+          # built.  That is not a rerun of the failure, it is a different
+          # test, and it fails on a different assertion:
+          #   * ospf_topo1::test_ospf6_link_down re-run alone never sees
+          #     test_ospf_link_down take r3-eth0 down, so it compares against
+          #     the link-down reference with the link still up;
+          #   * ospf_rfc4222_dscp::test_ospf_dscp_all_and_low_control re-run
+          #     alone starts ~15s after topology start, before the adjacency
+          #     test_ospf_dscp_basic waits for, and dies on "R1 did not reach
+          #     Full with R2".
+          # Neither can ever be cleared by the flake filter, so master stayed
+          # red from run 36101674598 onward and every PR branched off it
+          # inherited a CI-Verdict it could not fix.
+          #
+          # The node IDs still drive --expected below, so coverage
+          # verification is unchanged and strictly stronger than the old
+          # `cut -f1 -d:` harvest: every ID that failed must still produce a
+          # result, we just stop pretending it can be re-executed out of its
+          # module's order.  Extra results from the rest of the file are fine
+          # (verify_rerun_coverage.py checks expected against actual, not the
+          # reverse) and pytest's exit code then covers the whole file, which
+          # is the conservative direction.
+          rerun_files_raw=$(printf '%s\n' "${rerun_tests[@]}" | sed 's/::.*//' | sort -u)
+          mapfile -t rerun_files < <(printf '%s' "${rerun_files_raw}")
+          if [ ${#rerun_files[@]} -eq 0 ]; then
+            echo "ERROR: failing node IDs reduced to an empty file list." >&2
+            exit 1
+          fi
+
           echo "ERROR: Some tests failed during parallel run, rerunning serially." >&2
           echo "RERUN_TESTS: ${rerun_tests[*]}" >&2
+          echo "RERUN_FILES: ${rerun_files[*]}" >&2
           docker stop "frr-${RESULT_ID}-cont"
           docker rm "frr-${RESULT_ID}-cont"
 
           mv "test-results-${RESULT_ID}" "test-results-${RESULT_ID}-initial"
 
-          # Pass the test IDs as real positional arguments consumed by "$@",
-          # NOT by concatenating them onto the `bash -c` script string.
+          # Pass the rerun targets as real positional arguments consumed by
+          # "$@", NOT by concatenating them onto the `bash -c` script string.
           # Appending an unquoted word list to `bash -c 'cmd '$list` hands only
           # the FIRST word to cmd; every later word becomes $0, $1, ... of the
           # -c script and is silently discarded.  In run 32421578651 that fed
@@ -1092,7 +1125,7 @@ jobs:
           # reported success over three real failures.
           rerun_rc=0
           docker run --init -i --privileged --name "frr-${RESULT_ID}-cont" ${ADD_DOCKER_ENV} -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
-            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest "$@"' pytest-rerun "${rerun_tests[@]}" || rerun_rc=$?
+            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest "$@"' pytest-rerun "${rerun_files[@]}" || rerun_rc=$?
 
           # pytest's exit code only claims "everything I collected passed",
           # which is strictly weaker than "every test we named passed".  A
