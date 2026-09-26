@@ -308,11 +308,14 @@ def test_join_requests_tunnel_and_zebra_creates_it():
 
     expect(lambda: check_tunnel_state(r2, "installed"))
 
-    # The acknowledgement is only meaningful if the kernel agrees.
+    # The acknowledgement is only meaningful if the kernel agrees.  ttl=64:
+    # the netdev must never inherit its outer TTL, or every link-local PIM
+    # packet leaves with outer TTL 1 (pim_dimt_tunnel_jp/ covers the
+    # multi-hop consequence end to end).
     ifname = tunnel_ifname(r2)
     expect(
         lambda: check_gre_link(
-            r2, ifname, local=OUTER_LOCAL, remote=OUTER_REMOTE
+            r2, ifname, local=OUTER_LOCAL, remote=OUTER_REMOTE, ttl=64
         )
     )
 
