@@ -75,7 +75,12 @@
 # GC's reach, and the run still exits nonzero.  An empty desired peer
 # set, or a registry with malformed entries, skips stale-tunnel GC
 # (--allow-empty overrides the empty case) -- each would otherwise be
-# indistinguishable from "delete that tunnel on purpose".  An MTU below
+# indistinguishable from "delete that tunnel on purpose".  Note that with
+# --allow-empty and an empty registry no mode is wanted, so no capability
+# gate runs and GC reaps every tunnel this script owns; the old
+# unconditional ensure_fou() used to refuse first whenever FOU was
+# unavailable, which was incidental protection rather than a contract.
+# An MTU below
 # 1280 leaves the tunnels v4-only (the kernel disables IPv6 on such
 # links) and is warned about loudly, as is an MTU that overflows the
 # outer path to the peer.
@@ -228,13 +233,18 @@ endpoint_of() {
 # An endpoint-map cutover must be atomic.  Refuse before ensure_fou(), the GRE
 # capability probe, endpoint-drift deletion, or GC if any desired identity is
 # absent or malformed.
-validate_endpoints() {
+#
+# Takes the registry snapshot as an argument rather than calling peers()
+# itself: every consumer in one reconcile() pass must see the same registry
+# (see the snapshot comment in reconcile()).
+# shellcheck disable=SC2086  # $1 is a peer-spec list, split on purpose
+validate_endpoints() { # <peer-spec-list>
 	[ -n "$ENDPOINTS_FILE" ] || return 0
 	[ -r "$ENDPOINTS_FILE" ] || {
 		log "ERROR: endpoints file $ENDPOINTS_FILE missing/unreadable; refusing cutover"
 		return 1
 	}
-	for spec in "$SELF" $(peers); do
+	for spec in "$SELF" ${1:-}; do
 		overlay=$(overlay_of "$spec")
 		endpoint=$(endpoint_of "$overlay") || {
 			log "ERROR: no managed underlay endpoint for overlay $overlay; refusing cutover"
@@ -251,15 +261,21 @@ validate_endpoints() {
 	done
 }
 
+# fou/gre may not be loaded at boot (nothing else pulls them in).
+# Best-effort: inside an unprivileged container this fails and the
+# pre-added host state carries us, same as the EPERM path below.
+#
+# Hoisted out of ensure_fou(), which now runs only when the registry asks
+# for gre-in-fou: an all-plain-GRE box would otherwise never modprobe at
+# all and would depend solely on the kernel's rtnl-link-gre autoload.
+load_tunnel_modules() {
+	command -v modprobe >/dev/null 2>&1 || return 0
+	modprobe fou 2>/dev/null || true
+	modprobe gre 2>/dev/null || true
+	modprobe ip_gre 2>/dev/null || true
+}
+
 ensure_fou() {
-	# fou/gre may not be loaded at boot (nothing else pulls them in).
-	# Best-effort: inside an unprivileged container this fails and the
-	# pre-added host state carries us, same as the EPERM path below.
-	if command -v modprobe >/dev/null 2>&1; then
-		modprobe fou 2>/dev/null || true
-		modprobe gre 2>/dev/null || true
-		modprobe ip_gre 2>/dev/null || true
-	fi
 	case "$(ip fou show 2>/dev/null)" in
 	*"port $FOU_PORT ipproto 47"*) return 0 ;;
 	*"port $FOU_PORT "*)
@@ -427,10 +443,18 @@ ensure_peer() { # <peer-overlay> <encap-mode>
 	# Test for the presence of `encap fou` rather than for a literal
 	# `encap none`: iproute2 versions differ on whether they print
 	# anything at all for an unencapsulated tunnel.
+	#
+	# Three outcomes, not two.  `ip link add type gre` also accepts gue
+	# and mpls, and iproute2 prints those as `encap gue`/`encap mpls`.
+	# Folding them into `gre` would compare equal against a plain-GRE
+	# registry entry and leave a wrongly-encapsulated tunnel in place --
+	# exactly the silent drift this check exists to catch.  `other`
+	# matches neither validated mode, so it always recreates.
 	if [ "$gone" = 0 ] && ip link show "$dev" >/dev/null 2>&1; then
 		cur=$(ip -d link show "$dev" 2>/dev/null)
 		case "$cur" in
 		*"encap fou"*) cur_mode=gre-in-fou ;;
+		*"encap "*) cur_mode=other ;;
 		*) cur_mode=gre ;;
 		esac
 		if [ "$cur_mode" != "$mode" ]; then
@@ -565,7 +589,21 @@ reconcile() {
 		return 1
 	fi
 
-	validate_endpoints || return 1
+	# Read the registry EXACTLY ONCE per pass and iterate that snapshot
+	# everywhere below.  Re-reading would let the capability pre-scan and
+	# the build loop disagree if config management rewrites the file
+	# between them: a peer seen as plain-GRE by the pre-scan and as
+	# gre-in-fou by the build loop would keep fou_ok=1 by default, so
+	# ensure_fou would never have run for it and the netdev would be
+	# created with `encap fou` against an unbound port -- the inbound
+	# blackhole the gate below exists to prevent.
+	all_peers=$(peers)
+
+	validate_endpoints "$all_peers" || return 1
+
+	# Loading the tunnel modules is unconditional: both modes need
+	# ip_gre, and only the FOU path used to pull it in.
+	load_tunnel_modules
 
 	# Which encap modes does the registry actually ask for?  Decided
 	# before the peer loop, because every capability gate below must run
@@ -573,7 +611,7 @@ reconcile() {
 	# rejects those peers, so nothing should be probed on their behalf.
 	want_fou=0
 	want_plain=0
-	for spec in $(peers); do
+	for spec in $all_peers; do
 		[ "$(overlay_of "$spec")" = "$SELF" ] && continue
 		case "$(encap_of "$spec")" in
 		gre-in-fou) want_fou=1 ;;
@@ -617,7 +655,7 @@ reconcile() {
 	seen=""
 	npeers=0
 	invalid=0
-	for spec in $(peers); do
+	for spec in $all_peers; do
 		peer=$(overlay_of "$spec")
 		mode=$(encap_of "$spec")
 		[ "$peer" = "$SELF" ] && continue

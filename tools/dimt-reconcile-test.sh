@@ -100,8 +100,12 @@ link/show)
 		echo "    link/$typ $2 peer $3"
 		if [ "$enc" = fou ]; then
 			echo "    $typ remote $3 local $2 ttl 64 encap fou encap-sport auto encap-dport 6637"
-		else
+		elif [ "$enc" = none ]; then
 			echo "    $typ remote $3 local $2 ttl 64"
+		else
+			# gue/mpls: same `ip link add type gre` syntax, different
+			# encap keyword -- seeds the third-encap drift case.
+			echo "    $typ remote $3 local $2 ttl 64 encap $enc encap-sport auto encap-dport 6637"
 		fi
 	fi
 	exit 0
@@ -766,6 +770,64 @@ rc=$?
 check "h9: padded single-column entry exits 0" [ "$rc" -eq 0 ]
 check "h9: defaults to gre-in-fou" log_has \
 	"^ip link add dimt-0-47 type gre local 100.64.0.40 remote 100.64.0.47 ttl 64 encap fou "
+
+# --- (h10) a THIRD encap type is drift, not "plain GRE" ---------------
+# `ip link add type gre` also takes gue/mpls.  Classifying anything that
+# is not `encap fou` as plain GRE made an `encap gue` tunnel compare equal
+# to a `gre` registry row, so the wrongly-encapsulated netdev survived.
+new_state h10
+echo "dimt-0-47 100.64.0.40 100.64.0.47 gre gue" >> "$FAKEIP_DIR/links"
+echo "dimt-0-47 inet 10.99.0.40 peer 10.99.0.47/32" >> "$FAKEIP_DIR/addrs"
+echo "dimt-0-47 inet6 fd99::40 peer fd99::47/128" >> "$FAKEIP_DIR/addrs"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-plain" 2>&1)
+rc=$?
+check "h10: exit 0" [ "$rc" -eq 0 ]
+check "h10: a non-FOU encap is not mistaken for plain GRE" err_has \
+	"encap mode drifted (other -> gre)"
+check "h10: the gue tunnel is deleted" log_has "^ip link del dimt-0-47$"
+check "h10: delete precedes recreate" \
+	awk '/^ip link del dimt-0-47$/ { d = NR } /^ip link add dimt-0-47 / { a = NR }
+	     END { exit !(d && a && d < a) }' "$FAKEIP_DIR/ip.log"
+check "h10: recreated as unencapsulated GRE" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+
+# --- (h11) the registry is read exactly once per reconcile ------------
+# The capability pre-scan and the build loop must see the same snapshot.
+# If they re-read $PEERS_FILE independently, a rewrite between them lets a
+# peer be plain-GRE for the FOU gate and gre-in-fou for the netdev create,
+# so `encap fou` is configured against a port ensure_fou never bound.
+# That race has no deterministic behavioural fixture -- it needs the file
+# to change mid-run -- so this pins the structural property instead: no
+# peers() call survives anywhere except the single snapshot assignment.
+check "h11: reconcile snapshots the registry once" \
+	[ "$(grep -c '\$(peers)' "$RECONCILE")" -eq 1 ]
+check "h11: the one call is the snapshot assignment" \
+	grep -q '^	all_peers=\$(peers)$' "$RECONCILE"
+check "h11: validate_endpoints consumes the snapshot" \
+	grep -q 'validate_endpoints "\$all_peers"' "$RECONCILE"
+
+# --- (h12) both registry grammars parse on both paths -----------------
+# `overlay=mode` and `overlay mode` are one grammar accepted on both the
+# file and the inline path; that was load-bearing and untested.
+new_state h12
+printf '100.64.0.47=gre\n' > "$TESTDIR/peers-eq"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-eq" 2>&1)
+rc=$?
+check "h12: file path accepts overlay=mode" [ "$rc" -eq 0 ]
+check "h12: file overlay=mode yields plain GRE" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+new_state h12b
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers "100.64.0.60 gre" \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h12b: inline path accepts space-separated mode" [ "$rc" -eq 0 ]
+check "h12b: inline space form yields plain GRE" \
+	awk '/^ip link add dimt-0-60 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
 
 # --- (f) --watch rejects non-numeric ----------------------------------
 new_state f
