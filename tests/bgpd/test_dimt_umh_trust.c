@@ -96,12 +96,12 @@ int main(void)
 		switch (st) {
 		case BGP_ROUTE_STATIC:       /* `network`                  */
 		case BGP_ROUTE_REDISTRIBUTE: /* redistribution + route-map */
-		case BGP_ROUTE_NORMAL:       /* bgp_unreach.c SAFI_UNREACH */
 			want = true;
 			break;
 		default:
-			/* IMPORTED (VPN leak), AGGREGATE (as-set merges a
-			 * component's ecommunity), RFP, and anything later. */
+			/* NORMAL (0, so also an unset sub_type), IMPORTED (VPN
+			 * leak), AGGREGATE (as-set merges a component's
+			 * ecommunity), RFP, and anything later. */
 			want = false;
 			break;
 		}
@@ -123,6 +123,14 @@ int main(void)
 	check("leaked from another instance", &pi, false);
 	pi = path(&self_peer, BGP_ROUTE_AGGREGATE);
 	check("as-set aggregate of a neighbour's route", &pi, false);
+
+	/* BGP_ROUTE_NORMAL is 0, so this is also the verdict for a path whose
+	 * sub_type was never set -- a zero-initialised or partially-constructed
+	 * bgp_path_info must land on the REFUSED side, not the trusted one.
+	 * Its only peer_self producer (bgp_unreach.c:922) originates into
+	 * SAFI_UNREACH, which no consumer of this gate reads. */
+	pi = path(&self_peer, BGP_ROUTE_NORMAL);
+	check("peer_self with an unset/default sub_type", &pi, false);
 
 	/* Negative control: the neighbour arms still behave, so a regression
 	 * that refused everything could not pass this file. */

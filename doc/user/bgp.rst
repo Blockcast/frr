@@ -4568,7 +4568,9 @@ driven by these routes is not yet implemented.
    an exact arrival count, where add-path is configured. A refusal on a route
    bgpd holds locally (see the trust rules below) is logged against the
    prefix and the BGP instance instead, and is not counted -- ``show bgp
-   neighbors`` has no entry for the local speaker to carry it.
+   neighbors`` has no entry for the local speaker to carry it. That line
+   names one representative prefix per instance per minute, not one line per
+   offending route: a leak affecting many prefixes at once still logs once.
 
    The default is deny because a UMH community says "send your join toward
    this address", so any speaker that can attach one to a route you accept
@@ -4596,10 +4598,9 @@ driven by these routes is not yet implemented.
 
    Routes this speaker originated itself are always trusted: their UMH came
    from your own route-map. Specifically, routes from a ``network``
-   statement, from redistribution, and locally originated unreachability
-   routes. A route that merely *carries* the local ``peer_self`` is not
-   trusted, because two things re-home a route onto it without this speaker
-   having authored the attribute:
+   statement and routes from redistribution. A route that merely *carries*
+   the local ``peer_self`` is not trusted, because two things re-home a
+   route onto it without this speaker having authored the attribute:
 
    - A route **imported from another BGP instance**. A VPN leak copies the
      attribute wholesale -- only route targets are stripped, not the UMH --

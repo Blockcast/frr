@@ -145,19 +145,35 @@ bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi, const char **why)
 	 * gate's deny-list needed extending twice in two review rounds
 	 * (BGP_ROUTE_IMPORTED, then BGP_ROUTE_AGGREGATE); that is the argument.
 	 *
-	 * The three trusted arms are every producer in the tree that calls
-	 * info_make() with peer_self and a locally authored attribute:
-	 *   BGP_ROUTE_STATIC        bgp_route.c, `network`
-	 *   BGP_ROUTE_REDISTRIBUTE  bgp_route.c, redistribution + its route-map
-	 *   BGP_ROUTE_NORMAL        bgp_unreach.c, fork-local SAFI_UNREACH
-	 * BGP_ROUTE_NORMAL is on that list rather than excluded as suspicious:
-	 * bgp_unreach.c originates locally under the default sub_type, so an
-	 * allow-list without it would silently refuse our own UMHs. */
+	 * The two trusted arms are every producer that calls info_make() with
+	 * peer_self, a locally authored attribute, and a route that can reach a
+	 * unicast table -- which is the only table set this gate reads:
+	 *   BGP_ROUTE_STATIC        bgp_route.c:8827, `network`
+	 *   BGP_ROUTE_REDISTRIBUTE  bgp_route.c:11095, redistribution + route-map
+	 * Scoped to unicast deliberately: bgp_ls.c:742 is a third peer_self
+	 * producer (REDISTRIBUTE, SAFI_LINKSTATE) and bgp_evpn.c:1722/:2113 a
+	 * fourth and fifth (STATIC, EVPN), but no consumer of this gate can see
+	 * them -- bgp_dimt_route_update() returns at the safi != SAFI_UNICAST
+	 * guard below, and bgp_mvpn_resolve_attested_umh() only ever gets a path
+	 * selected out of bgp->rib[afi][SAFI_UNICAST] (bgp_mvpn.c:1447).
+	 *
+	 * BGP_ROUTE_NORMAL is deliberately NOT on the list. Its one peer_self
+	 * producer is bgp_unreach.c:922, which originates into SAFI_UNREACH, so
+	 * by the same scoping no path this gate sees can carry it and refusing
+	 * it costs nothing reachable. Excluding it matters because
+	 * BGP_ROUTE_NORMAL is 0 (bgp_route.h:384): leaving it in would put the
+	 * one value a zero-initialised or partially-constructed bgp_path_info
+	 * carries on the TRUSTED side. The fail-closed default below protects
+	 * against a sub-type someone adds later; this protects against a
+	 * producer that never set the field -- which is the shape both prior
+	 * bypasses took, a path re-homed onto peer_self carrying an attribute we
+	 * did not author. If a future caller does run this gate against a
+	 * non-unicast table (e.g. the BLO-36558 LC lane), re-derive this list
+	 * for that table rather than widening it here. */
 	if (peer == peer->bgp->peer_self) {
 		switch (pi->sub_type) {
 		case BGP_ROUTE_STATIC:
 		case BGP_ROUTE_REDISTRIBUTE:
-		case BGP_ROUTE_NORMAL:
 			return true;
 		case BGP_ROUTE_IMPORTED:
 			*why = "route was imported from another BGP instance";
@@ -173,7 +189,9 @@ bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi, const char **why)
 			*why = "route is an aggregate, which may carry a component's UMH";
 			return false;
 		default:
-			/* BGP_ROUTE_RFP (VNC) and anything added later. */
+			/* BGP_ROUTE_NORMAL (0, and so the value an unset
+			 * sub_type carries), BGP_ROUTE_RFP (VNC), and anything
+			 * added later. */
 			*why = "route was not originated by this speaker";
 			return false;
 		}
