@@ -42,7 +42,13 @@ import urllib.request
 # deferral (BLO-18926/BLO-18965). One consequence is deliberate: on a PR the
 # App authored, the seat's bare formal CHANGES_REQUESTED is a self-review
 # signal like any other, so it no longer vetoes -- only its body findings do.
-# (Production-neutral: the seat holds `read`, so that veto never bound.)
+# (Production-neutral ON THIS REPO ONLY: the seat holds `read` on Blockcast/frr,
+# so that veto never bound here. This file exists in divergent copies across
+# the gate repos, and the premise is per-repo: as of 2026-09-26 the seat holds
+# `write` on Blockcast/onprem-k8s, where its veto DOES bind and this change
+# would remove a live merge control. Re-verify the seat's permission --
+# `gh api repos/<owner>/<repo>/collaborators/allyblockcast/permission` --
+# before porting this there or anywhere else.)
 DEFAULT_ALLY_LOGINS = ["allyblockcast[bot]", "app/allyblockcast"]
 
 # Identities that act on PRs but are never reviewers. This list, not the Ally
