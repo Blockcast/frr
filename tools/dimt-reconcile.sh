@@ -4,7 +4,7 @@
 # DIMT tunnel reconciler (draft-zzhang-mboned-dynamic-internet-mcast-tunnel,
 # Phase C of the PIM Light / UMH deployment).
 #
-# Ensures one dual-stack GRE-in-FOU tunnel netdev per peer (GRE carries
+# Ensures one dual-stack GRE tunnel netdev per peer (GRE carries
 # both IPv4 and IPv6 inner over the IPv4 overlay) and enrolls it with
 # pimd and pim6d (`ip pim` + `ip pim light`, `ipv6 pim` + `ipv6 pim
 # light`), so that adding a PE<->PoP pair needs nothing beyond listing
@@ -35,6 +35,17 @@
 # against.  The auto link-local (fe80::) is never touched: pim6d sources
 # Join/Prune from it.
 #
+# Peer registry format:
+#   One peer per line, "<overlay-ipv4> [gre|gre-in-fou]".  The second
+#   column is the ENCAP MODE and defaults to gre-in-fou, so a
+#   single-column registry keeps the pre-existing behavior verbatim.
+#   Vendor PEs that terminate plain GRE with no FOU take `gre`; the
+#   names match pimd's native `encap <gre|gre-in-fou>` (pim_cmd.c).
+#   --peers spells the same thing inline as "<overlay-ipv4>[=<mode>]".
+#   A peer's encap mode is part of its drift identity: flipping it
+#   recreates the netdev, because the kernel cannot add or remove FOU
+#   encapsulation on an existing tunnel in place.
+#
 # The FOU receive port is bound `ipproto 47` (GRE).  Pre-GRE deployments
 # bound 6636 to ipproto 4 (ipip); the GRE port defaults to 6637 so both
 # bindings coexist during migration -- GC the old one afterwards
@@ -42,7 +53,9 @@
 # treated as drift and recreated as GRE (brief forwarding gap; run both
 # ends of a pair in the same window -- a freshly created tunnel gets a
 # best-effort inner ping so a one-sided migration is loud, not a silent
-# blackhole).
+# blackhole).  The FOU binding and its capability probe are scoped to
+# gre-in-fou peers: a box whose registry is all plain GRE never needs
+# FOU, and a FOU failure must not take its plain-GRE peers down with it.
 #
 # Runs identically on the PE (Alpine container; `ip fou add` may be
 # EPERM inside an unprivileged container -- pre-add it from the host, we
@@ -50,11 +63,16 @@
 #
 # Safety: reconciliation is REFUSED outright -- before anything is
 # deleted -- when (a) the peers file is missing/unreadable with no
-# --peers inline list, (b) the FOU receive binding cannot be ensured (a
-# GRE tunnel without FOU RX blackholes all inbound traffic), or (c) the
-# kernel cannot create a GRE-in-FOU netdev at all (kmod-gre/ip_gre
-# missing -- probed with a throwaway device, since the ipip->GRE
-# migration deletes the working tunnel first).  An empty desired peer
+# --peers inline list, or (b) the managed-underlay endpoint map is
+# incomplete.  Two further capability failures are refused per ENCAP
+# MODE rather than per run, so one mode's breakage cannot take the
+# other's peers down: (c) the FOU receive binding cannot be ensured (a
+# GRE-in-FOU tunnel without FOU RX blackholes all inbound traffic), and
+# (d) the kernel cannot create a netdev of that mode at all
+# (kmod-gre/ip_gre missing -- probed with a throwaway device, since the
+# ipip->GRE migration deletes the working tunnel first).  Peers of a
+# failed mode are skipped with their tunnels left intact and held out of
+# GC's reach, and the run still exits nonzero.  An empty desired peer
 # set, or a registry with malformed entries, skips stale-tunnel GC
 # (--allow-empty overrides the empty case) -- each would otherwise be
 # indistinguishable from "delete that tunnel on purpose".  An MTU below
@@ -167,11 +185,29 @@ dev_of() {
 	echo "$1" | awk -F. '{ printf "dimt-%s-%s", $3, $4 }'
 }
 
+# Emits one whitespace-free "<overlay>[=<mode>]" spec per desired peer,
+# so the registry's two-column form and --peers' inline form collapse to
+# a single token the callers below split with overlay_of/encap_of.
+# Interior whitespace is NOT deleted any more (it used to be, which
+# silently repaired "100.64. 0.47" into a different valid address);
+# a mangled entry now fails the dotted-quad check loudly instead.
 peers() {
 	{
 		[ -n "$PEERS_INLINE" ] && echo "$PEERS_INLINE" | tr ',' '\n'
 		[ -r "$PEERS_FILE" ] && sed 's/#.*//' "$PEERS_FILE"
-	} | tr -d ' \t\r' | grep . | sort -u
+	} | tr -d '\r' |
+		awk 'NF { print (NF > 1 ? $1 "=" $2 : $1) }' | sort -u
+}
+
+overlay_of() { echo "${1%%=*}"; }
+
+# Absent second column means gre-in-fou: every registry written before
+# this knob existed describes GRE-in-FOU peers.
+encap_of() {
+	case "$1" in
+	*=*) echo "${1#*=}" ;;
+	*) echo "gre-in-fou" ;;
+	esac
 }
 
 # Resolve an overlay identity to its GRE transport endpoint.  Keeping this
@@ -198,7 +234,8 @@ validate_endpoints() {
 		log "ERROR: endpoints file $ENDPOINTS_FILE missing/unreadable; refusing cutover"
 		return 1
 	}
-	for overlay in "$SELF" $(peers); do
+	for spec in "$SELF" $(peers); do
+		overlay=$(overlay_of "$spec")
 		endpoint=$(endpoint_of "$overlay") || {
 			log "ERROR: no managed underlay endpoint for overlay $overlay; refusing cutover"
 			return 1
@@ -239,17 +276,23 @@ ensure_fou() {
 	fi
 }
 
-# Prove the kernel can create a GRE-in-FOU netdev with a throwaway
+# Prove the kernel can create a netdev of <encap-mode> with a throwaway
 # device BEFORE anything is deleted: the ipip->GRE migration removes
 # the working production tunnel first, and modprobe failures above are
 # deliberately suppressed -- without this probe a missing kmod-gre
 # would strand the box with no tunnel at all.  (The probe device is
-# dimt-prefixed, so a leaked one is swept up by the next GC.)
-gre_probe() {
+# dimt-prefixed, so a leaked one is swept up by the next GC.)  Probed
+# per mode actually desired: gre-in-fou needs the fou module on top of
+# ip_gre, so a plain-GRE-only box must not be gated on FOU support.
+gre_probe() { # <encap-mode>
 	probe="${PREFIX}probe0"
+	probe_encap=""
+	[ "$1" = gre-in-fou ] &&
+		probe_encap="encap fou encap-sport auto encap-dport $FOU_PORT"
 	ip link del "$probe" 2>/dev/null
+	# shellcheck disable=SC2086  # probe_encap is intentionally split
 	if ! ip link add "$probe" type gre local 127.0.0.1 remote 127.0.0.2 \
-		ttl 64 encap fou encap-sport auto encap-dport "$FOU_PORT" 2>/dev/null; then
+		ttl 64 $probe_encap 2>/dev/null; then
 		return 1
 	fi
 	ip link del "$probe" 2>/dev/null
@@ -327,8 +370,9 @@ frr_iface() { # <dev> <add|del>
 	return 0
 }
 
-ensure_peer() { # <peer-overlay>
+ensure_peer() { # <peer-overlay> <encap-mode>
 	peer="$1"
+	mode="$2"
 	self_endpoint=$(endpoint_of "$SELF") || return 1
 	peer_endpoint=$(endpoint_of "$peer") || return 1
 	dev=$(dev_of "$peer")
@@ -336,28 +380,37 @@ ensure_peer() { # <peer-overlay>
 	peer_in=$(inner_of "$peer")
 	self_in6=$(inner6_of "$SELF")
 	peer_in6=$(inner6_of "$peer")
+	if [ "$mode" = gre-in-fou ]; then
+		encap_args="encap fou encap-sport auto encap-dport $FOU_PORT"
+		overhead=32
+		overhead_label="GRE-in-FOU"
+	else
+		encap_args=""
+		overhead=24
+		overhead_label="GRE"
+	fi
 
-	# Inner MTU + outer IPv4(20) + UDP(8) + GRE(4) must fit the path
-	# to the peer, or near-MTU multicast fragments/blackholes (the
-	# DF-multicast trap).  Read-only, best-effort: unknown route or
-	# unparsable output just skips the check.
+	# Inner MTU + outer IPv4(20) + GRE(4), plus UDP(8) when FOU-encapped,
+	# must fit the path to the peer, or near-MTU multicast
+	# fragments/blackholes (the DF-multicast trap).  Read-only,
+	# best-effort: unknown route or unparsable output just skips the check.
 	out_dev=$(ip route get "$peer_endpoint" 2>/dev/null |
 		sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)
 	if [ -n "$out_dev" ]; then
 		out_mtu=$(ip link show "$out_dev" 2>/dev/null |
 			sed -n 's/.* mtu \([0-9]*\).*/\1/p' | head -n 1)
-		if [ -n "$out_mtu" ] && [ $((MTU + 32)) -gt "$out_mtu" ]; then
-			log "WARNING: $dev: inner MTU $MTU + 32B GRE-in-FOU overhead" \
-				"exceeds $out_dev MTU $out_mtu; lower --mtu to $((out_mtu - 32))"
+		if [ -n "$out_mtu" ] && [ $((MTU + overhead)) -gt "$out_mtu" ]; then
+			log "WARNING: $dev: inner MTU $MTU + ${overhead}B $overhead_label overhead" \
+				"exceeds $out_dev MTU $out_mtu; lower --mtu to $((out_mtu - overhead))"
 		fi
 	fi
 
-	# Recreate on tunnel-type or endpoint drift; the kernel cannot
-	# change a tunnel's type in place (ipip -> gre migration lands
-	# here), and `ip link change` cannot retarget local/remote
-	# reliably across kernels.  `gone` tracks a delete this run so
-	# --dry-run previews the recreate coherently (the real netdev
-	# still exists after a DRY delete).
+	# Recreate on tunnel-type, encap-mode or endpoint drift; the kernel
+	# cannot change a tunnel's type in place (ipip -> gre migration lands
+	# here), cannot add/remove FOU encapsulation on a live tunnel, and
+	# `ip link change` cannot retarget local/remote reliably across
+	# kernels.  `gone` tracks a delete this run so --dry-run previews the
+	# recreate coherently (the real netdev still exists after a DRY delete).
 	gone=0
 	if ip link show "$dev" >/dev/null 2>&1; then
 		cur=$(ip -d link show "$dev" 2>/dev/null)
@@ -370,6 +423,22 @@ ensure_peer() { # <peer-overlay>
 			gone=1
 			;;
 		esac
+	fi
+	# Test for the presence of `encap fou` rather than for a literal
+	# `encap none`: iproute2 versions differ on whether they print
+	# anything at all for an unencapsulated tunnel.
+	if [ "$gone" = 0 ] && ip link show "$dev" >/dev/null 2>&1; then
+		cur=$(ip -d link show "$dev" 2>/dev/null)
+		case "$cur" in
+		*"encap fou"*) cur_mode=gre-in-fou ;;
+		*) cur_mode=gre ;;
+		esac
+		if [ "$cur_mode" != "$mode" ]; then
+			log "$dev encap mode drifted ($cur_mode -> $mode); recreating"
+			frr_iface "$dev" del
+			run ip link del "$dev"
+			gone=1
+		fi
 	fi
 	if [ "$gone" = 0 ] && ip link show "$dev" >/dev/null 2>&1; then
 		cur=$(ip -d link show "$dev" 2>/dev/null)
@@ -386,9 +455,10 @@ ensure_peer() { # <peer-overlay>
 
 	created=0
 	if [ "$gone" = 1 ] || ! ip link show "$dev" >/dev/null 2>&1; then
+		# shellcheck disable=SC2086  # encap_args is intentionally split
 		run ip link add "$dev" type gre local "$self_endpoint" remote "$peer_endpoint" \
-			ttl 64 encap fou encap-sport auto encap-dport "$FOU_PORT" || return 1
-		log "created $dev ($self_endpoint -> $peer_endpoint; overlay $SELF -> $peer)"
+			ttl 64 $encap_args || return 1
+		log "created $dev ($mode; $self_endpoint -> $peer_endpoint; overlay $SELF -> $peer)"
 		created=1
 	fi
 
@@ -497,29 +567,59 @@ reconcile() {
 
 	validate_endpoints || return 1
 
+	# Which encap modes does the registry actually ask for?  Decided
+	# before the peer loop, because every capability gate below must run
+	# before the first delete.  Unrecognised modes are left out: the loop
+	# rejects those peers, so nothing should be probed on their behalf.
+	want_fou=0
+	want_plain=0
+	for spec in $(peers); do
+		[ "$(overlay_of "$spec")" = "$SELF" ] && continue
+		case "$(encap_of "$spec")" in
+		gre-in-fou) want_fou=1 ;;
+		gre) want_plain=1 ;;
+		esac
+	done
+
 	# No FOU receive binding means every inbound GRE-in-FOU packet is
 	# dropped -- proceeding would migrate the netdevs onto a receive
 	# path that does not exist (an inbound-only blackhole that looks
-	# healthy from this side).  Refuse before touching anything.
-	if ! ensure_fou; then
-		log "ERROR: FOU receive binding for port $FOU_PORT unavailable;" \
-			"refusing to reconcile (tunnels would blackhole inbound traffic)"
-		return 1
+	# healthy from this side).  Scoped to gre-in-fou peers, and fatal
+	# only to them: plain-GRE peers never touch the FOU port.
+	fou_ok=1
+	plain_ok=1
+	if [ "$want_fou" = 1 ]; then
+		if ! ensure_fou; then
+			log "ERROR: FOU receive binding for port $FOU_PORT unavailable;" \
+				"refusing to reconcile gre-in-fou peers" \
+				"(tunnels would blackhole inbound traffic)"
+			fou_ok=0
+			rc=1
+		elif [ "$DRY" != 1 ] && ! gre_probe gre-in-fou; then
+			log "ERROR: kernel cannot create a GRE-in-FOU netdev" \
+				"(kmod-gre/ip_gre missing?); refusing to reconcile" \
+				"gre-in-fou peers (the ipip->GRE migration would" \
+				"delete working tunnels with no replacement)"
+			fou_ok=0
+			rc=1
+		fi
 	fi
-
-	if [ "$DRY" != 1 ] && ! gre_probe; then
-		log "ERROR: kernel cannot create a GRE-in-FOU netdev" \
+	if [ "$want_plain" = 1 ] && [ "$DRY" != 1 ] && ! gre_probe gre; then
+		log "ERROR: kernel cannot create a plain GRE netdev" \
 			"(kmod-gre/ip_gre missing?); refusing to reconcile" \
-			"(the ipip->GRE migration would delete working tunnels" \
-			"with no replacement)"
-		return 1
+			"gre peers (a type migration would delete working" \
+			"tunnels with no replacement)"
+		plain_ok=0
+		rc=1
 	fi
 
 	want=""
 	seen=""
 	npeers=0
 	invalid=0
-	for peer in $(peers); do
+	for spec in $(peers); do
+		peer=$(overlay_of "$spec")
+		mode=$(encap_of "$spec")
 		[ "$peer" = "$SELF" ] && continue
 		if ! echo "$peer" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
 			log "ignoring invalid peer entry '$peer'"
@@ -527,10 +627,22 @@ reconcile() {
 			rc=1
 			continue
 		fi
+		case "$mode" in
+		gre | gre-in-fou) : ;;
+		*)
+			log "ignoring peer $peer: unknown encap mode '$mode'" \
+				"(expected gre or gre-in-fou)"
+			invalid=1
+			rc=1
+			continue
+			;;
+		esac
 		dev=$(dev_of "$peer")
 		# Two peers in different /16s can collide on dimt-<o3>-<o4>;
 		# without this check the pair fights over one netdev as an
-		# endpoints-drifted recreate flip-flop every cycle.
+		# endpoints-drifted recreate flip-flop every cycle.  The same
+		# guard catches one overlay listed twice under different encap
+		# modes, where the flip-flop would be over encap instead.
 		prev=""
 		for pair in $seen; do
 			case "$pair" in
@@ -538,17 +650,29 @@ reconcile() {
 			esac
 		done
 		if [ -n "$prev" ]; then
-			log "ERROR: peers $prev and $peer both derive device $dev;" \
-				"skipping $peer (addressing contract needs one overlay /16)"
+			if [ "$prev" = "$peer" ]; then
+				log "ERROR: peer $peer is listed twice with conflicting" \
+					"encap modes; skipping the later entry"
+			else
+				log "ERROR: peers $prev and $peer both derive device $dev;" \
+					"skipping $peer (addressing contract needs one overlay /16)"
+			fi
 			rc=1
 			continue
 		fi
 		seen="$seen $dev=$peer"
 		npeers=$((npeers + 1))
 		# Keep desired peers out of GC's reach even when ensure_peer
-		# fails, so a transient failure cannot delete the tunnel.
+		# fails or its mode is unavailable, so a transient failure
+		# cannot delete the tunnel.
 		want="$want $dev"
-		if ! ensure_peer "$peer"; then
+		if { [ "$mode" = gre-in-fou ] && [ "$fou_ok" != 1 ]; } ||
+			{ [ "$mode" = gre ] && [ "$plain_ok" != 1 ]; }; then
+			log "skipping peer $peer: $mode is unavailable on this box" \
+				"(existing $dev left untouched)"
+			continue
+		fi
+		if ! ensure_peer "$peer" "$mode"; then
 			log "failed to ensure peer $peer"
 			rc=1
 		fi
@@ -562,7 +686,7 @@ reconcile() {
 			"stale-tunnel GC this run"
 	elif [ "$npeers" -eq 0 ] && [ "$ALLOW_EMPTY" != 1 ]; then
 		log "WARNING: desired peer set is empty; skipping stale-tunnel GC" \
-			"(pass --allow-empty to force removal of every ${PREFIX}* tunnel)"
+			"(pass --allow-empty to force removal of every tunnel this script owns)"
 	else
 		gc_stale "$want"
 	fi

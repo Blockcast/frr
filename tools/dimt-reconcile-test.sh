@@ -8,9 +8,10 @@
 # (set DIMT_TEST_SH=dash/busybox-ash to exercise another interpreter).
 #
 # Failure injection (create the marker file in $FAKEIP_DIR):
-#   fail-gre-add -- every `ip link add ... type gre` fails (no kmod-gre)
-#   fail-fou-add -- `ip fou add` fails (EPERM in unprivileged container)
-#   ping-fail    -- the inner-address ping probe fails (one-sided flip)
+#   fail-gre-add     -- every `ip link add ... type gre` fails (no kmod-gre)
+#   fail-fou-gre-add -- only GRE-in-FOU adds fail (ip_gre present, fou not)
+#   fail-fou-add     -- `ip fou add` fails (EPERM in unprivileged container)
+#   ping-fail        -- the inner-address ping probe fails (one-sided flip)
 
 set -u
 
@@ -26,8 +27,11 @@ mkdir -p "$BIN"
 
 # ---------------------------------------------------------------------
 # fake ip(8): state lives in $FAKEIP_DIR
-#   links  -- one line per netdev: "<dev> <local> <remote> [<type>]"
-#             (type defaults to ipip so pre-GRE state can be seeded)
+#   links  -- one line per netdev: "<dev> <local> <remote> [<type>] [<encap>]"
+#             (type defaults to ipip so pre-GRE state can be seeded;
+#              encap defaults to fou, the only mode that existed before
+#              the per-peer encap column -- set it to "none" to seed a
+#              plain-GRE tunnel)
 #   addrs  -- one line per address: "<dev> <inet|inet6> <a> peer <p>/NN"
 #   fou    -- verbatim `ip fou show` output
 #   route-dev -- if present, `ip route get X` says "X dev $(cat route-dev)"
@@ -90,28 +94,37 @@ link/show)
 	[ -n "$line" ] || exit 1
 	set -- $line
 	typ="${4:-ipip}"
+	enc="${5:-fou}"
 	echo "7: $dev: <POINTOPOINT,MULTICAST,UP> mtu 1388 qdisc noqueue state UNKNOWN"
 	if [ "$detail" = 1 ]; then
 		echo "    link/$typ $2 peer $3"
-		echo "    $typ remote $3 local $2 ttl 64 encap fou encap-sport auto encap-dport 6637"
+		if [ "$enc" = fou ]; then
+			echo "    $typ remote $3 local $2 ttl 64 encap fou encap-sport auto encap-dport 6637"
+		else
+			echo "    $typ remote $3 local $2 ttl 64"
+		fi
 	fi
 	exit 0
 	;;
 link/add)
 	dev="$1"; shift
-	loc=""; rem=""; typ=""
+	loc=""; rem=""; typ=""; enc=none
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		type) typ="$2"; shift 2 ;;
 		local) loc="$2"; shift 2 ;;
 		remote) rem="$2"; shift 2 ;;
+		encap) [ "$2" = fou ] && enc=fou; shift 2 ;;
 		*) shift ;;
 		esac
 	done
 	if [ "$typ" = gre ] && [ -f "$FAKEIP_DIR/fail-gre-add" ]; then
 		exit 2
 	fi
-	echo "$dev $loc $rem ${typ:-ipip}" >> "$LINKS"
+	if [ "$enc" = fou ] && [ -f "$FAKEIP_DIR/fail-fou-gre-add" ]; then
+		exit 2
+	fi
+	echo "$dev $loc $rem ${typ:-ipip} $enc" >> "$LINKS"
 	exit 0
 	;;
 link/del)
@@ -583,6 +596,176 @@ check "e10: previews the v6 inner add" err_has \
 check "e10: nothing is mutated" \
 	grep -q "^dimt-0-47 100.64.0.40 100.64.0.47 ipip$" "$FAKEIP_DIR/links"
 check "e10: no real delete issued" log_lacks "^ip link del dimt-0-47"
+
+# --- (h) plain-GRE peer: no FOU anywhere on its path -------------------
+# Vendor PEs terminate plain GRE.  A box whose registry is entirely
+# plain GRE must not bind a FOU port, probe FOU capability, or put
+# `encap fou` on the netdev.
+new_state h
+printf '100.64.0.47 gre\n' > "$TESTDIR/peers-plain"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-plain" 2>&1)
+rc=$?
+check "h: plain-GRE reconcile exits 0" [ "$rc" -eq 0 ]
+check "h: creates the tunnel without encap fou" \
+	awk '/^ip link add dimt-0-47 type gre local 100.64.0.40 remote 100.64.0.47 /
+	     { if ($0 !~ /encap/) ok = 1 } END { exit !ok }' "$FAKEIP_DIR/ip.log"
+check "h: no FOU port is bound for a plain-GRE-only registry" \
+	log_lacks "^ip fou add"
+check "h: no GRE-in-FOU capability probe" \
+	log_lacks "^ip link add dimt-probe0 .* encap fou"
+check "h: still probes plain GRE capability before touching anything" log_has \
+	"^ip link add dimt-probe0 type gre local 127.0.0.1 remote 127.0.0.2 ttl 64 *$"
+check "h: dual-stack inner addressing is unchanged" log_has \
+	"^ip -6 addr add fd99::40 peer fd99::47/128 dev dimt-0-47$"
+check "h: enrolled with FRR like any other peer" \
+	grep -q "interface dimt-0-47" "$FAKEIP_DIR/vtysh.log"
+
+new_state h0
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47=gre \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h0: inline overlay=mode exits 0" [ "$rc" -eq 0 ]
+check "h0: inline mode reaches the netdev" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+
+# --- (h2) encap flip gre-in-fou -> gre is drift ------------------------
+new_state h2
+echo "dimt-0-47 100.64.0.40 100.64.0.47 gre fou" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-plain" 2>&1)
+rc=$?
+check "h2: exit 0" [ "$rc" -eq 0 ]
+check "h2: encap drift is logged" err_has \
+	"encap mode drifted (gre-in-fou -> gre)"
+check "h2: delete precedes recreate" \
+	awk '/^ip link del dimt-0-47$/ { d = NR } /^ip link add dimt-0-47 / { a = NR }
+	     END { exit !(d && a && d < a) }' "$FAKEIP_DIR/ip.log"
+check "h2: recreated without FOU encapsulation" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+check "h2: FRR stanza is rebuilt after the recreate" \
+	grep -q "no interface dimt-0-47" "$FAKEIP_DIR/vtysh.log"
+
+# --- (h3) encap flip gre -> gre-in-fou is drift ------------------------
+new_state h3
+echo "dimt-0-47 100.64.0.40 100.64.0.47 gre none" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47 \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h3: exit 0" [ "$rc" -eq 0 ]
+check "h3: reverse encap drift is logged" err_has \
+	"encap mode drifted (gre -> gre-in-fou)"
+check "h3: recreated with FOU encapsulation" log_has \
+	"^ip link add dimt-0-47 type gre local 100.64.0.40 remote 100.64.0.47 ttl 64 encap fou "
+
+# --- (h4) a matching encap mode is NOT drift (no churn every cycle) ----
+new_state h4
+echo "dimt-0-47 100.64.0.40 100.64.0.47 gre none" >> "$FAKEIP_DIR/links"
+echo "dimt-0-47 inet 10.99.0.40 peer 10.99.0.47/32" >> "$FAKEIP_DIR/addrs"
+echo "dimt-0-47 inet6 fd99::40 peer fd99::47/128" >> "$FAKEIP_DIR/addrs"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-plain" 2>&1)
+rc=$?
+check "h4: exit 0" [ "$rc" -eq 0 ]
+check "h4: steady-state plain-GRE peer is not recreated" \
+	log_lacks "^ip link del dimt-0-47"
+check "h4: no encap-drift log on a matching mode" err_lacks "encap mode drifted"
+
+# --- (h5) FOU failure must not take plain-GRE peers down ---------------
+# Mixed registry, FOU binding unavailable (EPERM).  The gre-in-fou peer
+# is skipped with its tunnel intact; the plain-GRE peer reconciles.
+new_state h5
+touch "$FAKEIP_DIR/fail-fou-add"
+printf '100.64.0.47 gre\n100.64.0.48 gre-in-fou\n' > "$TESTDIR/peers-mixed"
+echo "dimt-0-48 100.64.0.40 100.64.0.48 gre fou" >> "$FAKEIP_DIR/links"
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-mixed" 2>&1)
+rc=$?
+check "h5: run still exits nonzero (the FOU peer did not reconcile)" \
+	[ "$rc" -ne 0 ]
+check "h5: FOU refusal names the scope" err_has \
+	"refusing to reconcile gre-in-fou peers"
+check "h5: the plain-GRE peer is still created" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+check "h5: the plain-GRE peer is still enrolled with FRR" \
+	grep -q "interface dimt-0-47" "$FAKEIP_DIR/vtysh.log"
+check "h5: the FOU peer is skipped, not reconciled" err_has \
+	"skipping peer 100.64.0.48"
+check "h5: the FOU peer's live tunnel is left untouched" \
+	log_lacks "^ip link del dimt-0-48"
+check "h5: the FOU peer is still held out of GC's reach" \
+	grep -q "^dimt-0-48 " "$FAKEIP_DIR/links"
+check "h5: genuinely stale tunnels are still GC'd" \
+	log_has "^ip link del dimt-9-9$"
+
+# The mirror case: ip_gre present but FOU encap unsupported.  Plain-GRE
+# peers reconcile; the FOU peer fails its own probe only.
+new_state h5b
+touch "$FAKEIP_DIR/fail-fou-gre-add"
+echo "dimt-0-48 100.64.0.40 100.64.0.48 gre fou" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-mixed" 2>&1)
+rc=$?
+check "h5b: exits nonzero" [ "$rc" -ne 0 ]
+check "h5b: GRE-in-FOU probe failure is scoped" err_has \
+	"refusing to reconcile gre-in-fou peers"
+check "h5b: plain-GRE peer still reconciles" log_has "^ip link add dimt-0-47 "
+check "h5b: FOU peer's tunnel survives" log_lacks "^ip link del dimt-0-48"
+
+# --- (h6) unknown encap mode: loud, skipped, GC suppressed -------------
+new_state h6
+printf '100.64.0.47 wireguard\n' > "$TESTDIR/peers-badmode"
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-badmode" 2>&1)
+rc=$?
+check "h6: unknown mode exits nonzero" [ "$rc" -ne 0 ]
+check "h6: unknown mode is named" err_has "unknown encap mode 'wireguard'"
+check "h6: no tunnel created for it" log_lacks "^ip link add dimt-0-47"
+check "h6: GC suppressed (the entry may be a desired peer)" \
+	log_lacks "^ip link del dimt-9-9"
+
+# --- (h7) one overlay listed twice under conflicting modes -------------
+new_state h7
+printf '100.64.0.47 gre\n100.64.0.47 gre-in-fou\n' > "$TESTDIR/peers-conflict"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-conflict" 2>&1)
+rc=$?
+check "h7: conflicting modes exit nonzero" [ "$rc" -ne 0 ]
+check "h7: the conflict is diagnosed as a duplicate, not a /16 collision" \
+	err_has "listed twice with conflicting encap modes"
+check "h7: only one dimt-0-47 created (no per-cycle flip-flop)" \
+	log_count "^ip link add dimt-0-47 " 1
+
+# --- (h8) plain GRE overhead is 24B, not GRE-in-FOU's 32B --------------
+new_state h8
+echo "tailscale0 0.0.0.0 0.0.0.0 dummy" >> "$FAKEIP_DIR/links"
+echo "tailscale0" > "$FAKEIP_DIR/route-dev"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-plain" --mtu 1364 2>&1)
+check "h8: plain GRE fits where GRE-in-FOU would not (1364+24 = 1388)" \
+	err_lacks "exceeds tailscale0"
+new_state h8b
+echo "tailscale0 0.0.0.0 0.0.0.0 dummy" >> "$FAKEIP_DIR/links"
+echo "tailscale0" > "$FAKEIP_DIR/route-dev"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47 --mtu 1364 \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+check "h8b: the same MTU overflows under GRE-in-FOU (1364+32 > 1388)" \
+	err_has "1364 + 32B GRE-in-FOU overhead"
+
+# --- (h9) a single-column registry keeps the pre-existing behavior -----
+new_state h9
+printf '  100.64.0.47  \n' > "$TESTDIR/peers-padded"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-padded" 2>&1)
+rc=$?
+check "h9: padded single-column entry exits 0" [ "$rc" -eq 0 ]
+check "h9: defaults to gre-in-fou" log_has \
+	"^ip link add dimt-0-47 type gre local 100.64.0.40 remote 100.64.0.47 ttl 64 encap fou "
 
 # --- (f) --watch rejects non-numeric ----------------------------------
 new_state f
