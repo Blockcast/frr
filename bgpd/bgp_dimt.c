@@ -145,12 +145,16 @@ bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi, const char **why)
 	 * gate's deny-list needed extending twice in two review rounds
 	 * (BGP_ROUTE_IMPORTED, then BGP_ROUTE_AGGREGATE); that is the argument.
 	 *
-	 * bgpd has ten producers that call info_make() with peer_self: the
-	 * enumeration below accounts for nine, and BGP_ROUTE_NORMAL's one is in
+	 * bgpd has twelve producers that call info_make() with peer_self: the
+	 * enumeration below accounts for eleven, and BGP_ROUTE_NORMAL's one is in
 	 * the paragraph after it. A reader redoing this for a new table can check
-	 * the count first -- but must follow peer_self THROUGH wrapper parameters
-	 * to reproduce it. A literal grep for peer_self at the info_make() call
-	 * finds only nine; bgp_mvpn.c:402 receives it as an argument. The two
+	 * the count first -- but NO textual sweep reproduces it. The question at
+	 * each info_make() is whether its peer ARGUMENT can evaluate to peer_self,
+	 * and only data flow answers that: a literal grep at the call site finds
+	 * nine, bgp_mvpn.c:402 receives it through a wrapper parameter, and two
+	 * more inherit it from another path as parent_pi->peer. Expect that last
+	 * form -- a path re-homed onto peer_self while carrying an attribute we
+	 * did not author is the shape both prior bypasses here took. The two
 	 * trusted arms are the only ones pairing a locally authored attribute
 	 * with a route that can reach a unicast table -- the only table set this
 	 * gate reads:
@@ -167,10 +171,17 @@ bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi, const char **why)
 	 * No consumer of this gate can see them: bgp_dimt_route_update() returns
 	 * at the safi != SAFI_UNICAST guard below, and
 	 * bgp_mvpn_resolve_attested_umh() only ever gets a path selected out of
-	 * bgp->rib[afi][SAFI_UNICAST] (bgp_mvpn.c:1447). The remaining two are
-	 * refused by sub_type on their own arms below: bgp_mplsvpn.c:1417
-	 * (IMPORTED) and bgp_route.c:9696 (AGGREGATE). That is 2 + 5 + 2 = 9
-	 * here; the tenth is BGP_ROUTE_NORMAL's, next paragraph.
+	 * bgp->rib[afi][SAFI_UNICAST] (bgp_mvpn.c:1447). The remaining four are
+	 * refused by sub_type on their own arms below -- bgp_mplsvpn.c:1417,
+	 * bgp_evpn.c:3151 and bgp_evpn_mh.c:292 (IMPORTED), bgp_route.c:9696
+	 * (AGGREGATE) -- so for three of them it is the IMPORTED arm, not the
+	 * scoping, that is load-bearing. bgp_evpn.c:3151 is why that distinction
+	 * matters: it is the only peer_self producer outside the trusted pair
+	 * that reaches UNICAST, installing into bgp_vrf->rib[afi][SAFI_UNICAST]
+	 * (bgp_evpn.c:3241, :3245) from install_evpn_route_entry_in_vrf(), for a
+	 * parent that BGP_PATH_LOCAL_IMPORT_EVPN_RT2_MACIP marks as locally
+	 * originated. That is 2 + 5 + 4 = 11 here; the twelfth is
+	 * BGP_ROUTE_NORMAL's, next paragraph.
 	 *
 	 * BGP_ROUTE_NORMAL is deliberately NOT on the list. Its one peer_self
 	 * producer is bgp_unreach.c:922, which originates into SAFI_UNREACH, so
