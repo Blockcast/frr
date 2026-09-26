@@ -175,6 +175,20 @@ def _skip_on_failure():
     return tgen
 
 
+def _precondition(pred, expected):
+    """The stages below run in file order and each leaves trust state the next
+    one depends on.  Nothing in pytest enforces that -- a `-k` selection, a
+    shuffling plugin, or a stage inserted in the middle would run against state
+    its predecessor never applied, and the stage would then assert against the
+    WRONG trust state rather than erroring.  Fail loudly and say so."""
+    err = pred()
+    if err is not None:
+        pytest.fail(
+            "precondition not met -- expected {}, got: {}.  Stages in this "
+            "file are order-dependent; run them in file order.".format(expected, err)
+        )
+
+
 def test_untrusted_peer_umh_is_ignored_and_counted():
     """DEFAULT DENY.  r1 is not marked dimt-trusted, so its UMH EC is refused
     -- but the route it rides on is still accepted, and the refusal is
@@ -198,7 +212,10 @@ def test_untrusted_peer_umh_is_ignored_and_counted():
     # Absence is checked only AFTER the counter has moved, so this is not a
     # race against a mapping that simply has not arrived yet: the counter
     # moving proves bgpd reached the decision point and refused.
-    assert _mapping_absent() is None, _mapping_absent()
+    # Bound once: re-calling it in the message would report a different table
+    # state than the one that failed.
+    absent = _mapping_absent()
+    assert absent is None, absent
 
 
 def test_trusted_peer_umh_pins():
@@ -212,6 +229,7 @@ def test_trusted_peer_umh_pins():
     the bgp_route_update hook never fires.  This stage and stage 4 are what
     catch a regression back to a refresh."""
     _skip_on_failure()
+    _precondition(_mapping_absent, "no mapping, as stage 1 left it")
 
     assert _umh_rejected() is not None, "r2: counter unreadable before the knob"
 
@@ -246,6 +264,7 @@ def test_origin_as_mismatch_is_rejected():
     trusted neighbor may claim a UMH for what it originates, not for a third
     party's prefix it merely carries -- so the mapping goes away again."""
     _skip_on_failure()
+    _precondition(_mapping_present, "the mapping pinned, as stage 2 left it")
 
     before = _umh_rejected()
     assert before is not None, "r2: counter unreadable before the prepend"
@@ -282,7 +301,8 @@ def test_origin_as_mismatch_is_rejected():
     assert result is None, result
 
     # The route must survive the UMH refusal -- only the UMH is refused.
-    assert _route_learned() is None, _route_learned()
+    learned = _route_learned()
+    assert learned is None, learned
 
     # Restore r1 for the next stage.
     get_topogen().gears["r1"].vtysh_cmd(
@@ -303,6 +323,7 @@ def test_untrusting_the_peer_withdraws_the_mapping():
     previously-trusted peer's UMH steering joins forever after the operator
     revoked it."""
     _skip_on_failure()
+    _precondition(_mapping_present, "the mapping restored, as stage 3 left it")
 
     get_topogen().gears["r2"].vtysh_cmd(
         """
@@ -315,7 +336,8 @@ def test_untrusting_the_peer_withdraws_the_mapping():
     _, result = topotest.run_and_expect(_mapping_absent, None, count=60, wait=1)
     assert result is None, result
 
-    assert _route_learned() is None, _route_learned()
+    learned = _route_learned()
+    assert learned is None, learned
 
 
 def test_memory_leak():

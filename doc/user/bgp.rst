@@ -4563,16 +4563,21 @@ driven by these routes is not yet implemented.
 
    Marking a neighbor trusted is necessary but not sufficient: the route's
    origin AS must also authorise the claim, mirroring the trust rule the UMH
-   *large* community already applies (see
-   :clicmd:`bgp mvpn umh-large-community`). A route whose AS_PATH bears an
-   AS_SET, carries AS 0, or resolves to a confederation member AS has no
-   usable origin and its UMH is refused. For an **eBGP** neighbor the origin
-   AS must equal that neighbor's AS: a trusted peer may claim a UMH for
-   prefixes it originates, not for a third party's prefix it only transits.
-   For an **iBGP** neighbor the claim is accepted, since marking an internal
-   neighbor trusted asserts that your own AS vets UMHs at its border -- a
-   route reflector legitimately relays an eBGP-learned route together with
-   the UMH its ingress speaker already accepted under this same rule.
+   *large* community already applies (the ``bgp mvpn umh-large-community``
+   knob). For an **eBGP** neighbor the origin AS must equal that neighbor's
+   AS: a trusted peer may claim a UMH for prefixes it originates, not for a
+   third party's prefix it only transits. A route whose AS_PATH bears an
+   AS_SET, carries AS 0, or resolves to a confederation member AS names no
+   usable origin to compare, so its UMH is refused on that arm.
+
+   For an **iBGP** or **confederation** neighbor the claim is accepted
+   without comparing an origin AS, since marking an internal neighbor trusted
+   asserts that your own AS vets UMHs at its border -- a route reflector
+   legitimately relays an eBGP-learned route together with the UMH its
+   ingress speaker already accepted under this same rule. The unusable-origin
+   test above does not apply there either: routes from another confederation
+   member always resolve to a member AS, and holding that against them would
+   make the knob unusable inside a confederation.
 
    Locally originated routes are always trusted: their UMH came from your own
    route-map.

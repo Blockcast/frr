@@ -68,7 +68,8 @@ static struct route_table *dimt_sent[AFI_MAX];
  *    bgp_mvpn_resolve_from_lcommunity(): the claimant must be the route's
  *    origin, and that origin must be knowable at all. The two lanes share
  *    aspath_origin_as() so an AS_SET, an AS 0, or a confederation-member
- *    origin refuses a UMH identically in both.
+ *    origin refuses a UMH identically in both. This determinacy test only
+ *    runs where an origin AS is actually compared, i.e. on the eBGP arm.
  *
  *    The LC lane compares the origin against the tuple's Global
  *    Administrator. The EC has no AS field -- its Global Administrator is the
@@ -87,7 +88,8 @@ static struct route_table *dimt_sent[AFI_MAX];
  *            same gate, and re-deriving origin == peer->as at the RR client
  *            would refuse every such route. An empty AS_PATH (locally
  *            originated inside our AS) is the same trust domain by
- *            definition.
+ *            definition. Confederation members are on this arm too, and
+ *            their AS_CONFED_SEQUENCE origin is not held against them.
  *
  * *why is filled with a short reason on refusal, for the caller's log.
  */
@@ -114,16 +116,22 @@ bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi, const char **why)
 		return false;
 	}
 
+	/* Inside our own AS the border already applied this gate; see (2).
+	 * This short-circuits BEFORE the determinacy test below, which only
+	 * exists to make origin_as meaningful and which the internal arm never
+	 * reads. Testing it here anyway would make the knob unusable in a
+	 * confederation: a route from another member AS ends in an
+	 * AS_CONFED_SEQUENCE, so every such route is "ambiguous" and a
+	 * dimt-trusted BGP_PEER_CONFED neighbour would be refused outright. */
+	if (peer->sort == BGP_PEER_IBGP || peer->sort == BGP_PEER_CONFED)
+		return true;
+
 	origin_as = aspath_origin_as(pi->attr ? pi->attr->aspath : NULL,
 				     &ambiguous_reason, &path_is_empty);
 	if (ambiguous_reason) {
 		*why = ambiguous_reason;
 		return false;
 	}
-
-	/* Inside our own AS the border already applied this gate; see (2). */
-	if (peer->sort == BGP_PEER_IBGP || peer->sort == BGP_PEER_CONFED)
-		return true;
 
 	/* eBGP. An empty AS_PATH names no origin and cannot authorise a claim;
 	 * it is malformed over eBGP anyway (RFC 7606 treat-as-withdraw at
@@ -140,7 +148,11 @@ bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi, const char **why)
  * counter. The log is throttled because a crafted feed could otherwise spam
  * it; the counter is what a probe is actually detected on, so it is never
  * throttled. Per-peer rather than per-instance so "who is probing us" is
- * answerable from `show bgp neighbor` without grepping logs. */
+ * answerable from `show bgp neighbor` without grepping logs.
+ *
+ * Callers must have a peer to charge: bgp_dimt_peer_is_trusted() can refuse
+ * without one (no peer, no trust), and there is nothing to count or name in
+ * that case. */
 static void bgp_dimt_umh_refuse(struct peer *peer, const char *why)
 {
 	time_t now = monotime(NULL);
@@ -156,35 +168,28 @@ static void bgp_dimt_umh_refuse(struct peer *peer, const char *why)
 	peer->dimt_umh_log_seen = true;
 	peer->dimt_umh_log_last = now;
 	zlog_notice("DIMT: UMH extended community from %s refused: %s",
-		    peer->host ? peer->host : "(unknown peer)", why);
+		    peer->host ? peer->host : "(unknown peer)",
+		    why ? why : "no usable peer on the path");
 }
 
-/* Pull the best UMH EC (highest preference wins) out of a path's extended
- * communities. The IPv4 UMH rides the 8-byte ecommunity list (type 0x01,
- * Local Admin at byte 7); the IPv6 UMH rides the 20-byte ipv6_ecommunity list
- * (type 0x00, Local Admin at byte 19). Returns true and fills a family-tagged
- * umh/umh_type/preference on match.
+/* Decode only: pull the best UMH EC (highest preference wins) out of a path's
+ * extended communities, with no trust check. The IPv4 UMH rides the 8-byte
+ * ecommunity list (type 0x01, Local Admin at byte 7); the IPv6 UMH rides the
+ * 20-byte ipv6_ecommunity list (type 0x00, Local Admin at byte 19). Returns
+ * true and fills a family-tagged umh/umh_type/preference on match.
  *
- * Refuses everything from a peer that fails bgp_dimt_peer_is_trusted(). That
- * gate lives HERE, not at the call sites, so every consumer of a 0x80 EC --
- * the pin path below and bgp_mvpn.c's settlement attestation lane alike --
- * inherits it. An attested settlement origin forged by a route server is as
- * damaging as a redirected join.
- *
- * Trust is evaluated AFTER decoding rather than as an early return, so the
- * counter moves only when a path actually carried a UMH we would otherwise
- * have honoured. An untrusted neighbour sending ordinary routes must not
- * inflate it.
- *
- * Exported (see bgp_dimt.h): bgp_mvpn.c's settlement-event attestation lane
- * decodes 0x80 through this function rather than duplicating the layout.
+ * Split out from bgp_dimt_umh_from_path() so that "is a UMH present" can be
+ * asked without charging a refusal: the wrong-family diagnostic in
+ * bgp_dimt_route_update() is such a question. Going through the gated entry
+ * point there would both suppress the hint (the gate refuses, so the warn
+ * never fires) and charge the peer for an EC that could never have been
+ * honoured anyway, contradicting the counter's invariant below.
  */
-bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
-			    struct ipaddr *umh, uint8_t *umh_type,
-			    uint8_t *preference)
+static bool bgp_dimt_umh_decode(const struct bgp_path_info *pi, afi_t afi,
+				struct ipaddr *umh, uint8_t *umh_type,
+				uint8_t *preference)
 {
 	const struct ecommunity *ecom;
-	const char *why = NULL;
 	bool is_v6 = (afi == AFI_IP6);
 	uint8_t want_type = is_v6 ? ECOMMUNITY_ENCODE_AS : ECOMMUNITY_ENCODE_IP;
 	uint8_t unit = is_v6 ? IPV6_ECOMMUNITY_SIZE : ECOMMUNITY_SIZE;
@@ -231,14 +236,46 @@ bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
 		found = true;
 	}
 
-	/* pi is const, but the peer it points at is not -- the refusal is a
-	 * property of the peer, not of the path. */
-	if (found && !bgp_dimt_peer_is_trusted(pi, &why)) {
-		bgp_dimt_umh_refuse(pi->peer, why);
-		return false;
-	}
-
 	return found;
+}
+
+/* Decode a path's UMH EC and apply the trust gate to it.
+ *
+ * Refuses everything from a peer that fails bgp_dimt_peer_is_trusted(). That
+ * gate lives HERE, not at the call sites, so every consumer of a 0x80 EC --
+ * the pin path below and bgp_mvpn.c's settlement attestation lane alike --
+ * inherits it. An attested settlement origin forged by a route server is as
+ * damaging as a redirected join.
+ *
+ * Trust is evaluated AFTER decoding rather than as an early return, so the
+ * counter moves only when a path actually carried a UMH we would otherwise
+ * have honoured. An untrusted neighbour sending ordinary routes must not
+ * inflate it -- and neither must one whose UMH is unusable for an unrelated
+ * reason, which is why the wrong-family probe calls the decoder directly.
+ *
+ * Exported (see bgp_dimt.h): bgp_mvpn.c's settlement-event attestation lane
+ * decodes 0x80 through this function rather than duplicating the layout.
+ */
+bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
+			    struct ipaddr *umh, uint8_t *umh_type,
+			    uint8_t *preference)
+{
+	const char *why = NULL;
+
+	if (!bgp_dimt_umh_decode(pi, afi, umh, umh_type, preference))
+		return false;
+
+	if (bgp_dimt_peer_is_trusted(pi, &why))
+		return true;
+
+	/* pi is const, but the peer it points at is not -- the refusal is a
+	 * property of the peer, not of the path. A refusal with no peer to
+	 * charge is still a refusal; there is just nobody to count it against.
+	 */
+	if (pi->peer)
+		bgp_dimt_umh_refuse(pi->peer, why);
+
+	return false;
 }
 
 static void bgp_dimt_umh_send(const struct prefix *p,
@@ -327,10 +364,17 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 		/* A wrong-family UMH EC still attaches and displays in
 		 * `show bgp`, so without a hint the operator sees a
 		 * "configured" UMH that never maps and multicast that never
-		 * starts. Say why nothing happened. */
-		if (bgp_dimt_umh_from_path(new_route,
-					   afi == AFI_IP ? AFI_IP6 : AFI_IP,
-					   &xf_umh, &xf_type, &xf_pref))
+		 * starts. Say why nothing happened.
+		 *
+		 * Decode-only on purpose: this asks "is there a UMH here at
+		 * all", not "may it steer us". Asking through the gated entry
+		 * point would suppress this hint for exactly the untrusted
+		 * neighbours whose operator most needs it, and would charge a
+		 * refusal for an EC that the family mismatch already made
+		 * unusable. */
+		if (bgp_dimt_umh_decode(new_route,
+					afi == AFI_IP ? AFI_IP6 : AFI_IP,
+					&xf_umh, &xf_type, &xf_pref))
 			zlog_warn("DIMT: %pFX carries a UMH extended community of the wrong address family; ignored (the UMH family must match the route family)",
 				  p);
 

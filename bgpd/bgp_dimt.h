@@ -40,7 +40,10 @@ extern bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
 /*
  * May this path's UMH steer where we join? True for a locally originated
  * route, or one from a `dimt-trusted` neighbour whose AS the route's origin
- * authorises. On false, *why is a short reason for the caller's log.
+ * authorises. On false, *why is a short reason for the caller's log -- EXCEPT
+ * when the path has no usable peer to name, where it stays NULL. A caller that
+ * logs *why must tolerate that, and one that charges a per-peer counter must
+ * check pi->peer first; there is nobody to charge in that case.
  *
  * Exported for the UMH LARGE community lane (BLO-36558): an LC-UMH that
  * bypassed this gate would be an untrusted peer's refused EC accepted under a
