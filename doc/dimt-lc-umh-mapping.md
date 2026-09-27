@@ -167,9 +167,13 @@ Two separate restrictions, and they are not the same one:
    not an identity in a v4 core.
 
    So the DIMT LC decode runs for `AFI_IP` only. An LC-UMH on a v6 unicast
-   route is ignored, and it reuses the existing cross-family warn's wording so
-   the operator sees why a "configured" UMH never mapped, but not its call
-   site. That warn (`bgp_dimt.c:204`) is an unthrottled `zlog_warn` that fires
+   route is ignored, and its log follows the shape of the existing
+   cross-family warn so the operator sees why a "configured" UMH never mapped,
+   but names the attribute that was actually rejected: "carries a UMH large
+   community of the wrong address family; ignored (the UMH family must match
+   the route family)". Copying the warn's "extended community" text verbatim
+   would send the operator to `attr->ecommunity` for a `0x80` that is not
+   there. It does not reuse the warn's call site either. That warn (`bgp_dimt.c:204`) is an unthrottled `zlog_warn` that fires
    on every route update, which suits the cross-family EC because it is rare.
    A v6 route carrying an LC-UMH is the common shape on an IX-connected box
    (see "Why this exists"), so it goes to the throttled call-site log with the
@@ -286,7 +290,7 @@ route carrying any other LC inflates the number.
   lane's v4-UMH-on-v6-route behaviour must not regress.
 - A v6 unicast route carrying an LC-UMH pins to nothing on the DIMT lane, and
   logs through the throttled call-site log, not the per-update cross-family
-  warn.
+  warn, with a line that names a large community, not an extended community.
 - A v4 route whose lowest DIMT tuple is valid and which also carries two
   higher-`GA` GA-mismatched DIMT tuples resolves from the valid tuple and moves
   the DIMT counter by exactly 2.
