@@ -858,7 +858,7 @@ def ally_finding_artifacts(reviews, comments, ally_logins):
         attested = parse_reviewed_head(body)
         if (
             isinstance(login, str)
-            and login in ally
+            and login_matches_any(login, ally)
             # An APPROVED artifact can still carry blocking findings; the
             # review signal path fails closed on those findings before it
             # considers the approval state. It must therefore mint the same
@@ -874,7 +874,7 @@ def ally_finding_artifacts(reviews, comments, ally_logins):
         attested = parse_reviewed_head(body)
         if (
             isinstance(login, str)
-            and login in ally
+            and login_matches_any(login, ally)
             and attested is not None
             and (
                 is_consolidated_ally_comment_for_head(body, attested)
@@ -1154,7 +1154,7 @@ def qualifying_ally_bodies_for_head(reviews, comments, head_sha, ally_logins):
         body = str(review.get("body") or "")
         if (
             isinstance(login, str)
-            and login in ally
+            and login_matches_any(login, ally)
             # Keep this in lockstep with ally_finding_artifacts(): a finding
             # on an APPROVED review is still blocking evidence and may be the
             # finding a load-bearing deferral needs to name in its audit trail.
@@ -1168,7 +1168,7 @@ def qualifying_ally_bodies_for_head(reviews, comments, head_sha, ally_logins):
         body = str(comment.get("body") or "")
         if (
             isinstance(login, str)
-            and login in ally
+            and login_matches_any(login, ally)
             and parse_reviewed_head(body) == normalized
             and (
                 is_consolidated_ally_comment_for_head(body, head_sha)
@@ -1370,7 +1370,7 @@ def review_signals_for_head(
     for review in reviews:
         user = review.get("user") or {}
         login = user.get("login")
-        if not isinstance(login, str) or login not in ally:
+        if not login_matches_any(login, ally):
             continue
         if review.get("state") == "DISMISSED":
             continue
@@ -1672,7 +1672,7 @@ def distinct_reviewer_candidate_logins(reviews, head_sha, ally_logins, pr_author
         is_distinct = (
             isinstance(login, str)
             and login != pr_author_login
-            and (login not in ally or user.get("type") == "User")
+            and (not login_matches_any(login, ally) or user.get("type") == "User")
         )
         # commit_id match OR a body attestation of this head: the signal pass
         # accepts either as head-relevance, so the permission lookup must cover
@@ -1712,7 +1712,7 @@ def distinct_reviewer_signals_for_head(
         is_distinct = (
             isinstance(login, str)
             and login != pr_author_login
-            and (login not in ally or user.get("type") == "User")
+            and (not login_matches_any(login, ally) or user.get("type") == "User")
         )
         # The permission lookup is AUTHORITATIVE, and an unresolved lookup is
         # UNTRUSTED. Falling back to author_association on error failed open:
@@ -1804,7 +1804,7 @@ def comment_signals_for_head(
         user = comment.get("user") or {}
         login = user.get("login")
         body = str(comment.get("body") or "")
-        if not isinstance(login, str) or login not in ally:
+        if not login_matches_any(login, ally):
             continue
         # No positive seat gating here: since #45 the comment path carries
         # no positive branch, and its blocking evidence is deliberately
@@ -1938,10 +1938,15 @@ def canonical_actor_login(login, seat):
     the seat separation from round 2 (normalized App vs User with the same
     login string) is untouched: the seat component of the key still
     distinguishes them.
+
+    Case-folded first, like login_matches_any: GitHub logins are
+    case-insensitive, so `AllyBlockcast[bot]` and `allyblockcast[bot]` are one
+    seat, and the `app/` and `[bot]` strips must see the folded form too
+    (`App/allyblockcast`).
     """
     if seat != "app":
         return login
-    name = login
+    name = login.strip().lower()
     if name.startswith("app/"):
         name = name[len("app/"):]
     if name.endswith("[bot]"):
@@ -2128,7 +2133,7 @@ def decide(
     permission_trusted_logins = permission_trusted_logins or set()
     deferrals = deferrals or {}
     ally = set(ally_logins)
-    is_self_review = isinstance(pr_author_login, str) and pr_author_login in ally
+    is_self_review = login_matches_any(pr_author_login, ally)
 
     # Severity-level ambiguity is resolved once, for the LIVE head, from the
     # Ally bodies that attest to it -- two same-head reports that disagree about
@@ -2225,7 +2230,9 @@ def decide(
             if reduced is not None and reduced["status"] == "failure":
                 chosen = reduced
             elif reduced is not None and reduced["status"] == "success":
-                non_ally_signals = [s for s in distinct_signals if s["author"] not in ally]
+                non_ally_signals = [
+                    s for s in distinct_signals if not login_matches_any(s["author"], ally)
+                ]
                 reduced_non_ally = reduce_distinct_reviewer_signals(non_ally_signals)
                 if reduced_non_ally is not None and reduced_non_ally["status"] == "success":
                     chosen = reduced_non_ally
@@ -3151,7 +3158,7 @@ def main():
     pull_number = pull_request["number"]
     ally_logins = parse_list(os.environ.get("ALLY_REVIEWER_LOGINS"), DEFAULT_ALLY_LOGINS)
     pr_author_login = (pull_request.get("user") or {}).get("login")
-    is_self_review = isinstance(pr_author_login, str) and pr_author_login in set(ally_logins)
+    is_self_review = login_matches_any(pr_author_login, ally_logins)
 
     # Claim the context as `pending` BEFORE the fallible reads below. Everything
     # from here on can raise (network, rate limit, malformed payload), and a
