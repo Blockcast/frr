@@ -109,8 +109,10 @@ def unexpected_failures(expected_ids, failed):
     only RERUN_TESTS/RERUN_FILES, neither of which need contain the culprit.
     Name it, so "Some rerun tests still failed" is actionable.
 
-    A bare-file expectation accounts for every test in that file, matching
-    covers(): analyze.py emits a bare path when a whole module errors out.
+    A file and the tests in it account for each other in both directions, as
+    in covers(): a bare-file expectation accounts for every failure in that
+    file, and a bare-file failure -- a module-level error, see testcase_id()
+    -- is accounted for by any expected test from that file.
     """
     return sorted(f for f in failed if not _accounted_for(f, expected_ids))
 
@@ -118,7 +120,10 @@ def unexpected_failures(expected_ids, failed):
 def _accounted_for(failure, expected_ids):
     if failure in expected_ids:
         return True
-    return failure.split("::", 1)[0] in expected_ids
+    if "::" in failure:
+        return failure.split("::", 1)[0] in expected_ids
+    prefix = failure + "::"
+    return any(e.startswith(prefix) for e in expected_ids)
 
 
 def verify(expected_ids, executed, skipped):

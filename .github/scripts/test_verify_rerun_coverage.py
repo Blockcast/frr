@@ -33,7 +33,9 @@ PIM = "pim_dimt_forwarding_events/test_pim_dimt_forwarding_events.py"
 def junit(cases):
     """Render a junit document from (file, name, kind) triples.
 
-    kind is one of "pass", "skipped", "failure".
+    kind is "pass", or the name of the child element to emit: "skipped",
+    "failure", or "error".  An empty name renders a file-level testcase, the
+    shape a module-level error takes.
     """
     body = []
     for fname, name, kind in cases:
@@ -213,6 +215,19 @@ class TestUnexpectedFailureReporting(unittest.TestCase):
         failed = self.failures(junit([(PIM, "test_x", "failure")]))
         outside = guard.unexpected_failures(expected, failed)
         self.assertEqual(outside, [PIM + "::test_x"])
+
+    def test_module_error_in_a_harvested_file_is_accounted_for(self):
+        """The mirror of the case above: a whole-file rerun whose module setup
+        blows up reports a bare-path failure, and that file was harvested."""
+        expected = {PIM + "::test_install_then_exactly_one_forwarding_ready"}
+        failed = self.failures(junit([(PIM, "", "error")]))
+        self.assertEqual(failed, {PIM})
+        self.assertEqual(guard.unexpected_failures(expected, failed), [])
+
+    def test_module_error_in_an_unharvested_file_is_still_unexpected(self):
+        expected = {GRPC + "::test_shutdown_checks"}
+        failed = self.failures(junit([(PIM, "", "error")]))
+        self.assertEqual(guard.unexpected_failures(expected, failed), [PIM])
 
     def test_errors_count_as_failures(self):
         """A module that errors out never reports <failure>, only <error>."""

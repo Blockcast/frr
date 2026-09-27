@@ -176,7 +176,7 @@ def _stop_ospf_capture(router, iface, pcap_path):
     topotest.sleep(1, "Saving Capture")
 
 
-def _tshark_dscp_and_type(router, pcap_path, src=R1_ADDR):
+def _tshark_dscp_and_type(router, pcap_path, src):
     """
     Return a list of (dscp, ospf.msg) tuples from the pcap, restricted to the
     packets *sourced by* `src`.
@@ -214,8 +214,12 @@ def _tshark_dscp_and_type(router, pcap_path, src=R1_ADDR):
     return res
 
 
-def _dscp_flags(router, iface, pcap_path, stimulate, settle=6):
+def _dscp_flags(router, iface, pcap_path, stimulate, src, settle=6):
     """Capture OSPF on `iface` across one window while `stimulate()` runs.
+
+    Only packets sourced by `src` are counted.  It has no default on purpose:
+    any capture on this p2p link also carries the peer's packets, so the
+    source has to be named at every call site (see _tshark_dscp_and_type).
 
     Returns (hello_ok, ack_ok, low_ctrl_ok, npackets) as observed in THIS
     window only; the caller ORs successive windows together.
@@ -227,7 +231,7 @@ def _dscp_flags(router, iface, pcap_path, stimulate, settle=6):
     _stop_ospf_capture(router, iface, pcap_path)
 
     hello_ok = ack_ok = low_ctrl_ok = False
-    tuples = _tshark_dscp_and_type(router, pcap_path)
+    tuples = _tshark_dscp_and_type(router, pcap_path, src)
     for dscp, msg in tuples:
         # msg: 1=Hello, 2=DB-Desc, 3=LS-Req, 4=LS-Upd, 5=LS-Ack
         hello_ok = hello_ok or (msg == 1 and dscp == 46)
@@ -300,7 +304,9 @@ interface r1-eth0
         # Link State ID, and MinLSInterval only rate-limits re-originating the
         # SAME LSA.  Do not tune this window against a throttle that never
         # applies to it.
-        hello, ack, low_ctrl, seen = _dscp_flags(r1, "r1-eth0", pcap, stimulate)
+        hello, ack, low_ctrl, seen = _dscp_flags(
+            r1, "r1-eth0", pcap, stimulate, src=R1_ADDR
+        )
         hello_ok = hello_ok or hello
         ack_ok = ack_ok or ack
         low_ctrl_ok = low_ctrl_ok or low_ctrl
@@ -383,6 +389,19 @@ interface r2-eth0
             break
 
     logger.info("isolation window: r1 dscps={} r2 dscps={}".format(r1_dscps, r2_dscps))
+
+    # Captures are done; put r2-eth0 back to unmarked so the invariant
+    # _tshark_dscp_and_type documents (r2 emits CS6/48) holds for any test
+    # after this one.  r1 is reset by test_ospf_dscp_display's Case 1.
+    r2.vtysh_cmd(
+        """
+configure terminal
+interface r2-eth0
+  no ip ospf dscp all
+  exit
+  exit
+"""
+    )
 
     # Preconditions.  Without these the real assertion is vacuous: "no 46
     # from r1" is trivially true if r2 never transmitted, or if the capture
