@@ -196,6 +196,43 @@ static void check_refusal_charged_once(void)
 	bgp_attr_unintern(&no_umh);
 }
 
+/* The wrong-family hint's throttle, pinned directly: check_refusal_charged_once()
+ * runs a VRF instance, so the hook returns before the wrong-family block and
+ * never reaches it. */
+static void check_xfam_throttle(void)
+{
+	struct peer peer = {};
+	struct {
+		const char *name;
+		struct peer *peer;
+		time_t now;
+		bool want;
+	} steps[] = {
+		{ "no peer is never throttled", NULL, 0, true },
+		{ "no peer, again", NULL, 0, true },
+		/* 0 is a real monotime during the first second of uptime, so the
+		 * first call must log even at 0. */
+		{ "first call at t=0", &peer, 0, true },
+		{ "inside the 60s window", &peer, 30, false },
+		/* Had the suppressed call at 30 stamped the state, 60 would
+		 * still be inside the window. */
+		{ "exactly 60s after the last emit", &peer, 60, true },
+		{ "inside the next window", &peer, 119, false },
+		{ "exactly 60s after that emit", &peer, 120, true },
+	};
+	size_t i;
+
+	for (i = 0; i < array_size(steps); i++) {
+		bool got = bgp_dimt_umh_xfam_should_log(steps[i].peer, steps[i].now);
+
+		if (got != steps[i].want) {
+			fprintf(stderr, "FAIL %s: got %d, expected %d\n", steps[i].name, got,
+				steps[i].want);
+			exit(1);
+		}
+	}
+}
+
 int main(void)
 {
 	struct bgp_path_info pi;
@@ -305,6 +342,7 @@ int main(void)
 	check("path with no peer", &pi, false);
 
 	check_refusal_charged_once();
+	check_xfam_throttle();
 
 	puts("DIMT UMH trust-gate tests passed");
 	return 0;

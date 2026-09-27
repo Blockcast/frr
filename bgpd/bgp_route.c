@@ -6807,10 +6807,13 @@ filtered:
 		 * bgp_path_info_add(), which is where the peer reference is
 		 * taken -- info_make() is a bare XCALLOC that only stores
 		 * new->peer. The helper's peer_unlock() would underflow a
-		 * refcount we never took, and its bgp_attr_unintern(&attr)
-		 * would release the caller's still-owned attr_new. Mirror
-		 * only the part that is ours: the refused attribute the
-		 * helper uninterns. NULL on every path reaching here today,
+		 * refcount we never took. Its bgp_attr_unintern(&attr) is not
+		 * the same hazard: new->attr is attr_new, interned once above
+		 * and not referenced again after `goto filtered`, so that
+		 * reference is leaked here. That leak is pre-existing
+		 * (upstream's filtered: block has the same shape) and is not
+		 * addressed by this block. What it does mirror is the refused
+		 * attribute the helper uninterns. NULL on every path reaching here today,
 		 * since only the loc-RIB bgp_route_update hook sets it and
 		 * this `new` never gets that far -- kept so that setting it
 		 * earlier in bgp_update() cannot silently leak. */

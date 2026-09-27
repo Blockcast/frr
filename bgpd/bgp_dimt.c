@@ -296,6 +296,27 @@ static void bgp_dimt_umh_refuse(struct peer *peer, const char *why)
 		    why ? why : "no usable peer on the path");
 }
 
+/* Whether the wrong-family UMH hint in the route-update hook may be logged
+ * now, charging @peer's throttle when it may. Same 60s basis as
+ * bgp_dimt_umh_refuse(), on its own fields for the reason given at the call
+ * site. The throttle state is written only when the hint is emitted, so a
+ * suppressed call cannot push the window out.
+ *
+ * A NULL peer is never throttled: there is nowhere to keep the state, and a
+ * wrong-family EC with nobody to charge is still worth saying.
+ *
+ * Exported for tests/bgpd/test_dimt_umh_trust.c. */
+bool bgp_dimt_umh_xfam_should_log(struct peer *peer, time_t now)
+{
+	if (!peer)
+		return true;
+	if (peer->dimt_umh_xfam_log_seen && now - peer->dimt_umh_xfam_log_last < 60)
+		return false;
+	peer->dimt_umh_xfam_log_seen = true;
+	peer->dimt_umh_xfam_log_last = now;
+	return true;
+}
+
 /* A refusal on a path bgpd attributes to peer_self: the path reached the
  * loc-RIB wearing a local identity while carrying a UMH we did not author --
  * a VPN leak, or an as-set aggregate that merged a component's ecommunity.
@@ -681,15 +702,13 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 			 * attribute. That case keeps today's unthrottled
 			 * behaviour; it is not the re-process storm this
 			 * throttle is for, which is per-peer by construction. */
-			if (!xf_peer || !xf_peer->dimt_umh_xfam_log_seen ||
-			    now - xf_peer->dimt_umh_xfam_log_last >= 60) {
-				if (xf_peer) {
-					xf_peer->dimt_umh_xfam_log_seen = true;
-					xf_peer->dimt_umh_xfam_log_last = now;
-				}
-				zlog_warn("DIMT: %pFX carries a UMH extended community of the wrong address family; ignored (the UMH family must match the route family)",
-					  p);
-			}
+			if (bgp_dimt_umh_xfam_should_log(xf_peer, now))
+				zlog_warn("DIMT: %pFX from %s carries a UMH extended community of the wrong address family; ignored (the UMH family must match the route family)%s",
+					  p,
+					  xf_peer && xf_peer->host ? xf_peer->host
+								   : "(unknown peer)",
+					  xf_peer ? "; further wrong-family UMH prefixes from this peer suppressed for 60s"
+						  : "");
 		}
 
 		/* Route withdrawn, or re-announced without the EC: DEL iff
