@@ -223,15 +223,19 @@ both. Counted by the decoder, per tuple: origin-ambiguous, `GA == 0`,
 `GA != origin_as`, and unusable UMH address.
 
 Counted by the DIMT call site, once per route: untrusted neighbor and wrong
-address family. Both reject the route before the decoder runs, so no tuple is
-examined and "per tuple" has nothing to count. Neither belongs in the shared
-decoder: neighbor trust is the BLO-36553 per-peer knob and the family gate is
-DIMT-only, and the MVPN lane must inherit neither. Either counts only when the
-route carries at least one tuple with the DIMT function. That takes a
+address family. Both are properties of the route and its peer, not of any
+tuple, so the count cannot scale with tuple cardinality however many tuples the
+call site inspects. A route that trips both moves the counter once in total,
+not once per reason: the trust gate runs first, then the family gate, and the
+first to reject names the reason in the throttled log. Neither belongs in the
+shared decoder: neighbor trust is the BLO-36553 per-peer knob and the family
+gate is DIMT-only, and the MVPN lane must inherit neither. Either counts only
+when the route carries at least one tuple with the DIMT function. That takes a
 `Function` match over the LC list at the call site, the one place a call site
-looks inside a tuple, and it must reuse the decoder's match
-(`bgp_mvpn.c:1327-1335`) through a shared helper rather than copy it. A route
-whose LCs carry only another function is not a reject on either count.
+looks inside a tuple, and it decides only *whether* to count, never how many
+times. It must reuse the decoder's match (`bgp_mvpn.c:1327-1335`) through a
+shared helper rather than copy it. A route whose LCs carry only another
+function is not a reject on either count.
 
 A wrong `Function` is **not** a
 reject — it is an unrelated large community and must not be counted, or every
@@ -267,11 +271,13 @@ route carrying any other LC inflates the number.
   lane's v4-UMH-on-v6-route behaviour must not regress.
 - A v6 unicast route carrying an LC-UMH pins to nothing on the DIMT lane, and
   warns.
-- Call-site rejects are per route. A v6 unicast route carrying two tuples with
-  the DIMT function moves the DIMT counter by exactly 1 and the MVPN counter by
-  0, and the same holds for a v4 route from an untrusted neighbor carrying two
-  such tuples. A v6 route whose only LC carries another lane's function moves
-  neither counter.
+- With both knobs set to different function code points, call-site rejects
+  are per route. A v6 unicast route carrying two tuples with the DIMT function
+  moves the DIMT counter by exactly 1 and the MVPN counter by 0, and the same
+  holds for a v4 route from an untrusted neighbor carrying two such tuples. A
+  v6 route from an untrusted neighbor carrying two such tuples trips both
+  call-site gates and still moves the DIMT counter by exactly 1. A v6 route
+  whose only LC carries the MVPN function moves neither counter.
 - Endianness known-answer vector `184549374 -> 10.255.255.254` reused verbatim.
 
 ## References
