@@ -205,14 +205,23 @@ The LC lane today has only a once-a-minute throttled `zlog_notice`, which is
 not countable. Add a per-instance counter **per lane**, incremented on every
 rejected tuple and readable from `show bgp` with the lane named, keeping the
 throttled log for detail. The MVPN lane has no counter today either, so step 2
-adds both: the DIMT one and the MVPN one, the latter at the MVPN call site
-(`bgp_mvpn_resolve_from_source_route()`, `bgp_mvpn.c:1578`). The shared decoder
-owns no counter: it returns why it rejected a tuple and the call site counts
-into its own lane's counter.
-Otherwise the four reasons below that the decoder raises for both lanes would
-land in one number with no attribution on an instance running both. Counted:
-origin-ambiguous, `GA == 0`, `GA != origin_as`, unusable UMH address, and (for
-the DIMT call site) wrong address family. A wrong `Function` is **not** a
+adds both: the DIMT one and the MVPN one, the latter owned by the MVPN call
+site (`bgp_mvpn_resolve_from_source_route()`, `bgp_mvpn.c:1578`).
+
+The shared decoder owns no counter, but it is the one that increments: each
+call site passes a pointer to its own lane's counter, and the decoder bumps it
+once per rejected tuple. A return value cannot carry this. The decoder walks
+the whole LC list, `continue`s past each rejected tuple (`bgp_mvpn.c:1344`,
+`:1401`) and returns one `bool` per route (`:1424`), so a call site counting
+from the return moves at most once for a route carrying three GA-mismatched
+tuples, under-counting exactly the flood the counter exists to show. Were the
+counter the decoder's own instead, the four reasons below that it raises for
+both lanes would land in one number with no attribution on an instance running
+both. Counted: origin-ambiguous, `GA == 0`, `GA != origin_as`, unusable UMH
+address, and (for the DIMT call site) wrong address family. The family reject
+is the one the DIMT call site takes itself, before the decoder runs, and it is
+per tuple too: one count for each tuple carrying the DIMT function on a v6
+route. A wrong `Function` is **not** a
 reject — it is an unrelated large community and must not be counted, or every
 route carrying any other LC inflates the number.
 
@@ -223,10 +232,19 @@ route carrying any other LC inflates the number.
   counter**: GA mismatch, unusable address, and untrusted neighbor each move
   the DIMT counter, while the MVPN counter, with the MVPN knob unset, stays `0`.
 - With **both** knobs set, to different function code points, a GA-mismatch LC
-  carrying the MVPN function, read while resolving a Type-7 join, moves only
-  the MVPN counter; the DIMT counter stays `0`. The single-knob case above
-  cannot see this direction: with the MVPN knob unset the MVPN decoder returns
-  before examining any tuple (`bgp_mvpn.c:1244`), so it never rejects.
+  carrying the MVPN function moves only the MVPN counter when read while
+  resolving a Type-7 join. The same route is also read on the DIMT pin path,
+  where the DIMT decoder examines the tuple and declines on `Function`
+  mismatch, so the DIMT counter's `0` is a measured decline rather than an
+  absent read. The single-knob case above cannot see this direction: with the
+  MVPN knob unset the MVPN decoder returns before examining any tuple
+  (`bgp_mvpn.c:1244`), so it never rejects.
+- With both knobs set to different function code points, a route whose only LC
+  is a valid tuple carrying one lane's function, read on the DIMT pin path and
+  while resolving a Type-7 join, resolves on that lane and declines on
+  `Function` mismatch on the other, and both counters stay `0`; run it once
+  for each lane's function. This pins the rule that a wrong `Function` is not
+  a reject.
 - With the knob set, a v4 route carrying a valid LC-UMH and a `0x80` EC whose
   selected tuple is `amt-relay` maps as `amt-relay` from the EC and does not
   pin; the same route with a `pim` EC maps from the LC.
