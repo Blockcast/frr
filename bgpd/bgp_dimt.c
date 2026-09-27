@@ -660,9 +660,37 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 		 * is nothing left to decide here. */
 		if (bgp_dimt_umh_decode(new_route,
 					afi == AFI_IP ? AFI_IP6 : AFI_IP,
-					&xf_umh, &xf_type, &xf_pref))
-			zlog_warn("DIMT: %pFX carries a UMH extended community of the wrong address family; ignored (the UMH family must match the route family)",
-				  p);
+					&xf_umh, &xf_type, &xf_pref)) {
+			struct peer *xf_peer = new_route->peer;
+			time_t now = monotime(NULL);
+
+			/* Throttled on the same 60s basis as
+			 * bgp_dimt_umh_refuse(), but on its own state: this
+			 * hook re-runs per path on a loc-RIB re-process, so an
+			 * unthrottled warn floods on a storm exactly the way
+			 * the refusal notice would. Its own fields, not the
+			 * refusal's, for the decode-only reason given above --
+			 * sharing them would let a refusal charged microseconds
+			 * earlier in this same pass swallow the hint, which is
+			 * the suppression this block exists to avoid.
+			 *
+			 * No peer means nowhere to keep the throttle, not a
+			 * reason to drop the hint: a wrong-family EC with
+			 * nobody to charge is still worth saying, the same way
+			 * bgp_dimt_umh_audit() still counts a refusal it cannot
+			 * attribute. That case keeps today's unthrottled
+			 * behaviour; it is not the re-process storm this
+			 * throttle is for, which is per-peer by construction. */
+			if (!xf_peer || !xf_peer->dimt_umh_xfam_log_seen ||
+			    now - xf_peer->dimt_umh_xfam_log_last >= 60) {
+				if (xf_peer) {
+					xf_peer->dimt_umh_xfam_log_seen = true;
+					xf_peer->dimt_umh_xfam_log_last = now;
+				}
+				zlog_warn("DIMT: %pFX carries a UMH extended community of the wrong address family; ignored (the UMH family must match the route family)",
+					  p);
+			}
+		}
 
 		/* Route withdrawn, or re-announced without the EC: DEL iff
 		 * we ever announced it. */

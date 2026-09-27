@@ -2119,6 +2119,13 @@ struct peer {
 	 * "Ever logged" is its own flag because monotime() 0 is a real time. */
 	time_t dimt_umh_log_last;
 	bool dimt_umh_log_seen;
+	/* Throttle state for the wrong-address-family UMH hint. Same 60s
+	 * basis, deliberately NOT the two fields above: that pair is a trust
+	 * refusal, this is a configuration hint, and sharing state would let a
+	 * refused neighbour's notice swallow the hint its operator most needs.
+	 * See the decode-only rationale in bgp_dimt_route_update(). */
+	time_t dimt_umh_xfam_log_last;
+	bool dimt_umh_xfam_log_seen;
 
 	/* BGP state count */
 	uint32_t established; /* Established */

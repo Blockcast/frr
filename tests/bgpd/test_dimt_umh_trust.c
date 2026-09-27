@@ -95,13 +95,22 @@ static struct attr *umh_attr(uint8_t octet)
  * the same way. Only argless entries exist here. */
 static void reprocess(struct bgp_path_info *pi)
 {
-	int (*fn)(struct bgp *bgp, afi_t afi, safi_t safi, struct bgp_dest *bn,
-		  struct bgp_path_info *old_route, struct bgp_path_info *new_route);
+	/* Same union lib/hook.h lands he->hookfn through: ISO C defines no
+	 * conversion between void * and a function pointer, so assigning one
+	 * to the other directly is a constraint violation a pedantic build
+	 * rejects. */
+	union {
+		void *voidptr;
+		int (*fptr)(struct bgp *bgp, afi_t afi, safi_t safi,
+			    struct bgp_dest *bn,
+			    struct bgp_path_info *old_route,
+			    struct bgp_path_info *new_route);
+	} hookp;
 	struct hookent *he;
 
 	for (he = _hook_bgp_route_update.entries; he; he = he->next) {
-		fn = he->hookfn;
-		fn(&test_bgp, AFI_IP, SAFI_UNICAST, NULL, pi, pi);
+		hookp.voidptr = he->hookfn;
+		hookp.fptr(&test_bgp, AFI_IP, SAFI_UNICAST, NULL, pi, pi);
 	}
 }
 
