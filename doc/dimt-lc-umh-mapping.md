@@ -193,8 +193,10 @@ same route, refused as an EC, accepted as an LC. The parent epic's sequencing
 rule — E2 lands before on-demand rows run on an IX-connected box — applies to
 this lane for the same reason. Hence the blocker.
 
-Usable-address rejects are unchanged and stay per-route (`0/8`, `127/8`,
-`169.254/16`, `224/4`, `240/4` including `255.255.255.255`). Deliberately not
+Usable-address rejects are unchanged: each one skips only its own tuple, like
+the other decoder rejects (see the counter section). The rejected ranges are
+`0/8`, `127/8`, `169.254/16`, `224/4` and `240/4`, including
+`255.255.255.255`. Deliberately not
 `ipv4_unicast_valid()`, which treats Class E as usable and gates `0/8` and
 `127/8` on `allow-reserved-ranges` — neither is acceptable for an address an
 adversary can put on the wire.
