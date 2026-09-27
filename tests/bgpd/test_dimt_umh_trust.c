@@ -8,6 +8,10 @@
  * neighbour arms end-to-end through a real eBGP session.  What it cannot
  * reach cheaply is the locally-originated arm, which needs a VPNv4 session and
  * a VRF leak to exercise, so that arm is pinned here instead.  BLO-36553.
+ *
+ * check_refusal_charged_once() is the one part that goes through the loc-RIB
+ * update hook, because what it pins -- one refusal per attribute set, however
+ * often the path is re-processed -- lives in the hook, not in the gate.
  */
 
 #include <zebra.h>
@@ -15,6 +19,9 @@
 #include "privs.h"
 
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_attr.h"
+#include "bgpd/bgp_ecommunity.h"
+#include "bgpd/bgp_network.h"
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_dimt.h"
 
@@ -57,6 +64,127 @@ static void check(const char *name, struct bgp_path_info *pi, bool want)
 		fprintf(stderr, "FAIL %s: refused without a reason\n", name);
 		exit(1);
 	}
+}
+
+/* An interned attribute set carrying one IPv4 UMH (192.0.2.<octet>, type
+ * PIM), or none when octet is 0. */
+static struct attr *umh_attr(uint8_t octet)
+{
+	uint8_t umh[ECOMMUNITY_SIZE] = {
+		ECOMMUNITY_ENCODE_IP,
+		ECOMMUNITY_UMH,
+		192,
+		0,
+		2,
+		octet,
+		0,
+		ECOMMUNITY_UMH_LA(0, ZAPI_UMH_TYPE_PIM),
+	};
+	struct attr attr = {};
+
+	if (octet)
+		bgp_attr_set_ecommunity(&attr, ecommunity_parse(umh, sizeof(umh), false));
+	return bgp_attr_intern(&attr);
+}
+
+/* One loc-RIB pass over pi as its unchanged best path, which is what
+ * bgp_process_main_one() does on a re-process with add-path transmit on.
+ *
+ * hook_call() for this hook is static to bgp_route.c, so walk the entries
+ * bgp_dimt_init() registered instead -- the same function bgpd calls, reached
+ * the same way. Only argless entries exist here. */
+static void reprocess(struct bgp_path_info *pi)
+{
+	int (*fn)(struct bgp *bgp, afi_t afi, safi_t safi, struct bgp_dest *bn,
+		  struct bgp_path_info *old_route, struct bgp_path_info *new_route);
+	struct hookent *he;
+
+	for (he = _hook_bgp_route_update.entries; he; he = he->next) {
+		fn = he->hookfn;
+		fn(&test_bgp, AFI_IP, SAFI_UNICAST, NULL, pi, pi);
+	}
+}
+
+static void check_count(const char *name, const struct peer *peer, uint64_t want)
+{
+	if (peer->stat_dimt_umh_rejected != want) {
+		fprintf(stderr, "FAIL %s: refusal counter is %" PRIu64 ", expected %" PRIu64 "\n",
+			name, peer->stat_dimt_umh_rejected, want);
+		exit(1);
+	}
+}
+
+/* The refusal counter tracks what the neighbour sent, so re-reading a path
+ * whose attributes have not moved must not charge it again -- and a path whose
+ * attributes HAVE moved must, even though it is the same bgp_path_info. */
+static void check_refusal_charged_once(void)
+{
+	struct attr *umh_a, *umh_b, *no_umh, *cur, *next;
+	struct peer untrusted = {};
+	struct bgp_path_info pi;
+
+	/* bgp_attr_unintern() reaches bgp_get_default(), so bm must exist. */
+	qobj_init();
+	bgp_master_init(event_master_create(NULL), BGP_SOCKET_SNDBUF_SIZE, list_new());
+	bgp_attr_init();
+	umh_a = umh_attr(1);
+	umh_b = umh_attr(2);
+	no_umh = umh_attr(0);
+
+	untrusted.bgp = &test_bgp;
+	untrusted.as = 65002;
+	untrusted.sort = BGP_PEER_EBGP;
+	pi = path(&untrusted, BGP_ROUTE_NORMAL);
+
+	/* Not the default instance, so the hook stops after the audit and never
+	 * reaches the pin path, which needs a real dest and a zclient. */
+	test_bgp.inst_type = BGP_INSTANCE_TYPE_VRF;
+	bgp_dimt_init();
+
+	pi.attr = umh_a;
+	reprocess(&pi);
+	check_count("first arrival", &untrusted, 1);
+	reprocess(&pi);
+	reprocess(&pi);
+	check_count("re-processed with unchanged attributes", &untrusted, 1);
+
+	pi.attr = umh_b;
+	reprocess(&pi);
+	check_count("same path re-announced with different attributes", &untrusted, 2);
+
+	/* Losing the UMH releases the record, so the charged set coming back is
+	 * a new arrival rather than a re-read. */
+	pi.attr = no_umh;
+	reprocess(&pi);
+	pi.attr = umh_b;
+	reprocess(&pi);
+	check_count("UMH dropped then re-announced", &untrusted, 3);
+
+	/* Two UPDATEs landing before best-path runs, with bgp_update()'s order:
+	 * intern the new attr, then unintern the old. Here the path is the only
+	 * other holder, so the record's own reference is all that keeps the
+	 * charged set alive -- without it that set is freed at the first swap
+	 * and the next same-sized allocation hands its address straight back. */
+	cur = umh_attr(3);
+	pi.attr = cur;
+	reprocess(&pi);
+	check_count("sole-owner path, first arrival", &untrusted, 4);
+	next = umh_attr(4);
+	bgp_attr_unintern(&cur);
+	pi.attr = cur = next;
+	next = umh_attr(5);
+	bgp_attr_unintern(&cur);
+	pi.attr = cur = next;
+	reprocess(&pi);
+	check_count("two re-announcements coalesced before best-path", &untrusted, 5);
+
+	bgp_dimt_terminate();
+	if (pi.dimt_umh_refused)
+		bgp_attr_unintern(&pi.dimt_umh_refused);
+	bgp_attr_unintern(&cur);
+	bgp_attr_unintern(&umh_a);
+	bgp_attr_unintern(&umh_b);
+	bgp_attr_unintern(&no_umh);
 }
 
 int main(void)
@@ -166,6 +294,8 @@ int main(void)
 	/* No peer to name: refused, and *why stays NULL by contract. */
 	pi = path(NULL, BGP_ROUTE_NORMAL);
 	check("path with no peer", &pi, false);
+
+	check_refusal_charged_once();
 
 	puts("DIMT UMH trust-gate tests passed");
 	return 0;

@@ -459,8 +459,11 @@ bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
  * route is refused by a consumer that would otherwise have honoured it. That
  * is also why this is not the same question as the wrong-family hint below,
  * which asks only whether the PIN path can use it.
+ *
+ * Returns true when it refused a UMH, whether or not there was a peer to
+ * charge, so bgp_dimt_umh_audit_path() can record the verdict.
  */
-static void bgp_dimt_umh_audit(const struct bgp_path_info *pi, afi_t afi)
+static bool bgp_dimt_umh_audit(const struct bgp_path_info *pi, afi_t afi)
 {
 	struct ipaddr umh = {};
 	uint8_t umh_type = 0;
@@ -468,10 +471,10 @@ static void bgp_dimt_umh_audit(const struct bgp_path_info *pi, afi_t afi)
 	const char *why = NULL;
 
 	if (!bgp_dimt_umh_decode(pi, afi, &umh, &umh_type, &preference))
-		return;
+		return false;
 
 	if (bgp_dimt_peer_is_trusted(pi, &why))
-		return;
+		return false;
 
 	/* pi is const, but the peer it points at is not -- the refusal is a
 	 * property of the peer, not of the path. A refusal with no peer to
@@ -480,12 +483,60 @@ static void bgp_dimt_umh_audit(const struct bgp_path_info *pi, afi_t afi)
 	 * A path bgpd attributes to peer_self has a peer, but not one a counter
 	 * or a log line can honestly name: see bgp_dimt_umh_refuse_local(). */
 	if (!pi->peer)
-		return;
+		return true;
 
 	if (pi->peer->bgp && pi->peer == pi->peer->bgp->peer_self)
 		bgp_dimt_umh_refuse_local(pi->peer->bgp, pi, why);
 	else
 		bgp_dimt_umh_refuse(pi->peer, why);
+	return true;
+}
+
+/* Audit both EC lists of a loc-RIB path, at most once per attribute set.
+ *
+ * The route-update hook also fires on re-processes that carry no new
+ * announcement: with add-path transmit configured, bgp_process_main_one()
+ * skips its unchanged-bestpath early return (the trailing
+ * !bgp_addpath_is_addpath_used() clause), and without it an RPKI
+ * revalidation, a multipath change or `clear ip bgp PREFIX` still gets
+ * through. pi->dimt_umh_refused records the attribute set the last refusal
+ * was charged for, so a pass that finds pi->attr unchanged is recognised as
+ * a re-read and skipped. A re-announcement that changes the attributes -- an
+ * origin-AS change reusing the same bgp_path_info included -- interns to a
+ * different attr and is charged again, and a path that regains best after a
+ * sibling leaves keeps its record and is not.
+ *
+ * The record holds an interned reference, which is what makes comparing
+ * pointers sound. Without it bgp_update() frees the old attr when it swaps
+ * in the new one, and the next same-sized allocation readily returns that
+ * address for different attributes. Released here once the path stops being
+ * refused, and in bgp_path_info_free() when the path goes away.
+ *
+ * Two cheaper discriminators are both WRONG, recorded so they are not
+ * retried:
+ *   - CHECK_FLAG(pi->flags, BGP_PATH_ATTR_CHANGED) always reads false here.
+ *     bgp_route.c unsets that flag on new_select a dozen lines BEFORE
+ *     calling this hook, so gating on it would silence the counter.
+ *   - old_route != new_route suppresses the legitimate case too: the
+ *     origin-AS change above has old == new, and the topotest's stage 3
+ *     pins it as MUST count.
+ */
+static void bgp_dimt_umh_audit_path(struct bgp_path_info *pi)
+{
+	bool refused;
+
+	if (!pi || pi->dimt_umh_refused == pi->attr)
+		return;
+
+	/* Not short-circuited: a refusal in either list is real. */
+	refused = bgp_dimt_umh_audit(pi, AFI_IP);
+	refused |= bgp_dimt_umh_audit(pi, AFI_IP6);
+
+	/* Reassigned rather than left to bgp_attr_unintern(), which only NULLs
+	 * the pointer when it frees the attr. */
+	if (pi->dimt_umh_refused)
+		bgp_attr_unintern(&pi->dimt_umh_refused);
+	pi->dimt_umh_refused = refused ? bgp_attr_intern(pi->attr) : NULL;
 }
 
 static void bgp_dimt_umh_send(const struct prefix *p,
@@ -557,31 +608,9 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 	 *
 	 * Auditing both lists unconditionally is also what makes the counter
 	 * match its contract in bgpd.h: refused ECs, counted once each, when
-	 * they arrive.
-	 *
-	 * KNOWN CEILING (BLO-36553 review, not fixed here): with add-path
-	 * transmit configured for the afi/safi, bgp_process_main_one() skips its
-	 * unchanged-bestpath early return -- the trailing
-	 * !bgp_addpath_is_addpath_used(&bgp->tx_addpath, afi, safi) clause -- so
-	 * this hook also fires on re-processes that carry no new announcement
-	 * (nexthop tracking, a peer event on a sibling path, a route-map
-	 * refresh), and each one re-charges the refusal. `clear ip bgp PREFIX`
-	 * is the same shape via BGP_NODE_USER_CLEAR.
-	 *
-	 * Two obvious fixes are both WRONG, recorded so they are not retried:
-	 *   - CHECK_FLAG(new_route->flags, BGP_PATH_ATTR_CHANGED) always reads
-	 *     false here. bgp_route.c unsets that flag on new_select a dozen
-	 *     lines BEFORE calling this hook, so gating on it would silence the
-	 *     counter permanently rather than stabilise it.
-	 *   - old_route != new_route suppresses the legitimate case too. A
-	 *     re-announce that changes attributes reuses the same
-	 *     bgp_path_info, so old == new on a genuine origin-AS change --
-	 *     which the topotest's stage 3 pins as MUST count.
-	 * Discriminating them needs the previous attr pointer, i.e. per-path
-	 * audit state that does not exist yet; that is a design decision, not a
-	 * gate tweak. */
-	bgp_dimt_umh_audit(new_route, AFI_IP);
-	bgp_dimt_umh_audit(new_route, AFI_IP6);
+	 * they arrive. "Once" is per attribute set, which the hook alone cannot
+	 * tell apart from a re-process; bgp_dimt_umh_audit_path() does. */
+	bgp_dimt_umh_audit_path(new_route);
 
 	/* The pin path proper is default-instance only. */
 	if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT)
@@ -627,7 +656,7 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 		 * point would suppress this hint for exactly the untrusted
 		 * neighbours whose operator most needs it. Trust for this EC
 		 * has already been adjudicated -- and charged, if it was
-		 * refused -- by the bgp_dimt_umh_audit() pass above, so there
+		 * refused -- by the bgp_dimt_umh_audit_path() pass above, so there
 		 * is nothing left to decide here. */
 		if (bgp_dimt_umh_decode(new_route,
 					afi == AFI_IP ? AFI_IP6 : AFI_IP,

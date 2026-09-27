@@ -4559,13 +4559,13 @@ driven by these routes is not yet implemented.
    refusals are counted even though only the default instance pins.
 
    The counter is charged when the route arrives, not when bgpd later
-   re-reads it, so it tracks what the neighbor sent. One exception: with
-   **add-path transmit** enabled for the address family, a loc-RIB
-   re-process that carries no new announcement -- nexthop tracking, an event
-   on a sibling path, a route-map refresh, ``clear ip bgp`` for the prefix --
-   can re-charge the same refusal and re-arm the once-a-minute log. Read the
-   counter as "this neighbor is sending UMHs it is not entitled to", not as
-   an exact arrival count, where add-path is configured. A refusal on a route
+   re-reads it, so it tracks what the neighbor sent: once per set of
+   attributes the route is selected with. A loc-RIB re-process that leaves
+   those attributes as they were -- nexthop tracking or an event on a sibling
+   path with **add-path transmit** enabled, ``clear ip bgp`` for the prefix,
+   the route regaining best after another path is withdrawn -- does not
+   re-charge it or re-arm the once-a-minute log; a re-announcement that
+   changes them does. A refusal on a route
    bgpd holds locally (see the trust rules below) is logged against the
    prefix and the BGP instance instead, and is not counted -- ``show bgp
    neighbors`` has no entry for the local speaker to carry it. That line

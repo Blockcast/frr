@@ -2103,9 +2103,9 @@ struct peer {
 	 * charged once per EC list when the path arrives in the loc-RIB, in
 	 * every instance rather than only the default one, and never again when
 	 * a consumer re-reads that path, so this tracks what the NEIGHBOUR sent
-	 * rather than how often we happened to look. Caveat: with add-path
-	 * transmit enabled a loc-RIB re-process can still re-charge it -- see
-	 * the KNOWN CEILING note in bgp_dimt.c's route-update hook.
+	 * rather than how often we happened to look. A loc-RIB re-process that
+	 * leaves the path's attributes as they were -- add-path transmit
+	 * included -- does not re-charge it; see bgp_dimt_umh_audit_path().
 	 *
 	 * NEVER charged against peer_self. A refusal on a path bgpd attributes
 	 * to peer_self is real -- that is the laundering case the trust gate
