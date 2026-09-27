@@ -858,7 +858,7 @@ def ally_finding_artifacts(reviews, comments, ally_logins):
         attested = parse_reviewed_head(body)
         if (
             isinstance(login, str)
-            and login in ally
+            and login_matches_any(login, ally)
             # An APPROVED artifact can still carry blocking findings; the
             # review signal path fails closed on those findings before it
             # considers the approval state. It must therefore mint the same
@@ -874,7 +874,7 @@ def ally_finding_artifacts(reviews, comments, ally_logins):
         attested = parse_reviewed_head(body)
         if (
             isinstance(login, str)
-            and login in ally
+            and login_matches_any(login, ally)
             and attested is not None
             and (
                 is_consolidated_ally_comment_for_head(body, attested)
@@ -1154,7 +1154,7 @@ def qualifying_ally_bodies_for_head(reviews, comments, head_sha, ally_logins):
         body = str(review.get("body") or "")
         if (
             isinstance(login, str)
-            and login in ally
+            and login_matches_any(login, ally)
             # Keep this in lockstep with ally_finding_artifacts(): a finding
             # on an APPROVED review is still blocking evidence and may be the
             # finding a load-bearing deferral needs to name in its audit trail.
@@ -1168,7 +1168,7 @@ def qualifying_ally_bodies_for_head(reviews, comments, head_sha, ally_logins):
         body = str(comment.get("body") or "")
         if (
             isinstance(login, str)
-            and login in ally
+            and login_matches_any(login, ally)
             and parse_reviewed_head(body) == normalized
             and (
                 is_consolidated_ally_comment_for_head(body, head_sha)
@@ -1370,7 +1370,7 @@ def review_signals_for_head(
     for review in reviews:
         user = review.get("user") or {}
         login = user.get("login")
-        if not isinstance(login, str) or login not in ally:
+        if not login_matches_any(login, ally):
             continue
         if review.get("state") == "DISMISSED":
             continue
@@ -1672,7 +1672,7 @@ def distinct_reviewer_candidate_logins(reviews, head_sha, ally_logins, pr_author
         is_distinct = (
             isinstance(login, str)
             and login != pr_author_login
-            and (login not in ally or user.get("type") == "User")
+            and (not login_matches_any(login, ally) or user.get("type") == "User")
         )
         # commit_id match OR a body attestation of this head: the signal pass
         # accepts either as head-relevance, so the permission lookup must cover
@@ -1712,7 +1712,7 @@ def distinct_reviewer_signals_for_head(
         is_distinct = (
             isinstance(login, str)
             and login != pr_author_login
-            and (login not in ally or user.get("type") == "User")
+            and (not login_matches_any(login, ally) or user.get("type") == "User")
         )
         # The permission lookup is AUTHORITATIVE, and an unresolved lookup is
         # UNTRUSTED. Falling back to author_association on error failed open:
@@ -1804,7 +1804,7 @@ def comment_signals_for_head(
         user = comment.get("user") or {}
         login = user.get("login")
         body = str(comment.get("body") or "")
-        if not isinstance(login, str) or login not in ally:
+        if not login_matches_any(login, ally):
             continue
         # No positive seat gating here: since #45 the comment path carries
         # no positive branch, and its blocking evidence is deliberately

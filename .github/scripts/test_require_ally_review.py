@@ -279,6 +279,22 @@ class TestSelfReview(unittest.TestCase):
         )
         self.assertNotEqual(state, "success")
 
+    def test_drifted_ally_login_blocking_body_is_not_discarded(self):
+        """A Critical carried under a drifted Ally spelling still counts: a
+        canonical clean APPROVED at the same head must not green the gate
+        over it, on either the review or the comment surface."""
+        blocking = CONSOLIDATED + "### Critical Issues (1)\n"
+        clean = review("APPROVED", body=CLEAN, at="2026-07-27T11:00:00Z")
+        for drifted in ("AllyBlockcast[bot]", "App/AllyBlockcast", "Allyblockcast"):
+            with self.subTest(surface="review", login=drifted):
+                state, _ = decide(reviews=[
+                    review("COMMENTED", body=blocking, login=drifted), clean])
+                self.assertEqual(state, "failure")
+            with self.subTest(surface="comment", login=drifted):
+                state, _ = decide(reviews=[clean],
+                                  comments=[comment(blocking, login=drifted)])
+                self.assertEqual(state, "failure")
+
     def test_distinct_approval_trusted_via_collaborator_permission(self):
         """Branch 8 — association is CONTRIBUTOR (the visibility-gated false
         negative the original documents); permission lookup rescues it."""
