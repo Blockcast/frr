@@ -49,9 +49,12 @@ THE RPF TIEBREAK (E15) -- the reason this suite exists
   Remove that policy and the prefix arrives over BOTH sessions.  Every
   earlier bestpath step then ties -- same AS_PATH length, same origin, no
   MED, both eBGP, and both paths carry the SAME router-id 10.0.0.1 -- so
-  selection falls through to LOWEST PEER ADDRESS.  10.0.0.1 < 10.99.1.1, so
-  the underlay wins, RPF leaves the tunnel, and because r2-eth0 runs no PIM
-  the stream silently delivers ZERO packets.
+  selection falls through to LOWEST PEER ADDRESS.  10.0.0.1 < 10.99.1.1,
+  so the underlay wins bestpath.  Whether RPF FOLLOWS bestpath off the
+  tunnel is a separate question with a surprising answer; see BESTPATH
+  DOES NOT DECIDE RPF below.  In this harness it does -- because r2 also
+  sets `maximum-paths 1` -- and the stream then delivers ZERO packets,
+  because r2-eth0 runs no PIM.
 
   That fall-through only happens because r2 sets `bgp bestpath
   compare-routerid`.  Without it, bestpath step 12 ("prefer the path
@@ -75,9 +78,13 @@ THE RPF TIEBREAK (E15) -- the reason this suite exists
   finding and not just a knob.
 
   In lab row T1a the tunnel won that tiebreak only by accident of
-  addressing.  The addressing here is chosen so the underlay wins, making
-  the negative control deterministic instead of a coin flip: it proves the
-  policy -- not luck -- is what pins RPF to the tunnel.
+  addressing.  The addressing here is chosen so the underlay wins
+  bestpath, making the negative control deterministic instead of a coin
+  flip.  What that control proves is scoped: ON THIS HARNESS, with
+  `maximum-paths 1` installing bestpath alone, the policy is what pins RPF
+  to the tunnel.  On a STOCK box it is PIM-capability that pins it -- the
+  policy leak is survivable there, and that inversion is the field finding
+  this suite exists to record.
 
 MARKER INDEX
   No xfail markers.  The static profile is expected to pass on the unfixed
@@ -551,8 +558,10 @@ def test_rpf_negative_control_underlay_steals_rpf():
     prefix also arrives over the underlay, which wins the lowest-peer-address
     tiebreak.  RPF leaves the tunnel and delivery stops.
 
-    This is the T1a hazard made deterministic -- the failure mode that
-    would silently deliver 0 packets on the demo box.  The policy is
+    RPF only follows bestpath here because r2 sets `maximum-paths 1`; with
+    FRR's default eBGP multipath the tunnel keeps RPF on PIM-capability and
+    the leak is survivable.  So this reproduces the T1a hazard as it behaves
+    on a box whose underlay also runs PIM -- see r2/bgpd.conf.  The policy is
     restored at the end and the tunnel re-asserted, so later tests are not
     left on the broken path."""
     tgen = get_topogen()
@@ -649,18 +658,22 @@ def test_rpf_negative_control_underlay_steals_rpf():
                 return None
 
             expect(_rpf_off_tunnel)
-            # The zero below only proves anything if the receiver is still
-            # listening: _send() blocks ~2.5s, and a receiver that expired
-            # inside expect() above would report 0 for the wrong reason.
-            assert receiver.poll() is None, (
-                "receiver expired during expect(_rpf_off_tunnel) -- the zero "
-                "below would be measuring the timeout, not the RPF move"
-            )
 
             # And delivery fails: r2-eth0 runs no PIM, so the stream has no
             # path at all.  This is the silent zero.
             rc = _send(receiver=receiver)
             assert rc == 0, "sender exited {}".format(rc)
+            # _send() already asserts liveness BEFORE the send, so the window
+            # that needs closing here is the send ITSELF (~2.5s of blocking).
+            # A receiver whose 90s deadline lands inside it reports 0 for a
+            # reason that has nothing to do with forwarding, and the
+            # assertion at the end of this test would accept that as proof
+            # delivery stopped.  Bracketing the send is what makes the zero
+            # below mean what it claims.
+            assert receiver.poll() is None, (
+                "receiver expired during the send -- the zero below would be "
+                "measuring the timeout, not the RPF move"
+            )
             report = _receiver_report(receiver)
         finally:
             if receiver.poll() is None:
@@ -683,6 +696,17 @@ def test_rpf_negative_control_underlay_steals_rpf():
     # Restored: RPF must come back to the tunnel, or every later test is
     # measuring the broken path.
     def _rpf_back_on_tunnel():
+        # The receiver below exists only to hold the (S,G) open.  If it
+        # expired, the upstream would drain and _rpf would report "no RPF
+        # row" -- an expect timeout naming the wrong cause.  Checked HERE
+        # rather than after expect(): expect() asserts on timeout, so a
+        # check placed after it never runs on the path it is meant to
+        # explain.
+        if receiver.poll() is not None:
+            return (
+                "the (S,G)-holding receiver expired -- the RPF row is "
+                "draining, which is not RPF failing to return to the tunnel"
+            )
         row, error = _rpf("r2")
         if error:
             return error
