@@ -391,16 +391,18 @@ netlink_gre_set_msg_encoder(struct zebra_dplane_ctx *ctx, void *buf,
 /*
  * Does the link at dimt->delete_ifindex carry this tunnel's identity?
  *
- * `check_ttl` adds the outer TTL to the comparison.  The address phase sets
- * it: a link is only ever completed into a tunnel when it carries
- * ZEBRA_DIMT_TUNNEL_TTL.  The delete paths clear it: any link that is ours by
- * name and endpoints may be torn down whatever its TTL, including a netdev a
- * pre-TTL build created with "inherit" -- refusing that delete would strand
- * the very link zebra is replacing.
+ * `check_outer_hdr` adds the fixed outer header -- the TTL, and on ip6gre
+ * also "encaplimit none" -- to the comparison.  The address phase sets it: a
+ * link is only ever completed into a tunnel when it carries
+ * ZEBRA_DIMT_TUNNEL_TTL, and ZEBRA_DIMT_TUNNEL_IP6_FLAGS if it is ip6gre.
+ * The delete paths clear it: any link that is ours by name and endpoints may
+ * be torn down whatever its outer header, including a netdev an older build
+ * created with "inherit" or with the default encap limit -- refusing that
+ * delete would strand the very link zebra is replacing.
  */
 static bool netlink_dimt_if_matches(struct zebra_dplane_ctx *ctx,
 				    const struct zebra_dimt_tunnel_ctx *dimt,
-				    bool check_ttl)
+				    bool check_outer_hdr)
 {
 	const struct zapi_dimt_tunnel *tunnel = &dimt->tunnel;
 	struct zebra_ns *zns = zebra_ns_lookup(dplane_ctx_get_ns_id(ctx));
@@ -431,7 +433,10 @@ static bool netlink_dimt_if_matches(struct zebra_dplane_ctx *ctx,
 	if ((tunnel->options & ZAPI_DIMT_TUNNEL_MTU_PRESENT) &&
 	    ifp->mtu != tunnel->mtu)
 		return false;
-	if (check_ttl && gre->ttl != ZEBRA_DIMT_TUNNEL_TTL)
+	if (check_outer_hdr &&
+	    (gre->ttl != ZEBRA_DIMT_TUNNEL_TTL ||
+	     (IS_IPADDR_V6(&tunnel->outer_local) &&
+	      gre->flags != ZEBRA_DIMT_TUNNEL_IP6_FLAGS)))
 		return false;
 	if (tunnel->encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU)
 		encap_type = TUNNEL_ENCAP_FOU;
@@ -573,6 +578,16 @@ static ssize_t netlink_dimt_tunnel_msg_encoder(struct zebra_dplane_ctx *ctx,
 	if (!nl_attr_put8(&req->n, buflen, IFLA_GRE_TTL, ZEBRA_DIMT_TUNNEL_TTL))
 		return 0;
 
+	/* "encaplimit none" on ip6gre; see ZEBRA_DIMT_TUNNEL_IP6_FLAGS.  Both
+	 * attributes are sent: the flag is what suppresses the destination
+	 * option, and the explicit limit keeps what the kernel reports back
+	 * from depending on a memset. */
+	if (IS_IPADDR_V6(&tunnel->outer_local) &&
+	    (!nl_attr_put8(&req->n, buflen, IFLA_GRE_ENCAP_LIMIT, 0) ||
+	     !nl_attr_put32(&req->n, buflen, IFLA_GRE_FLAGS,
+			    ZEBRA_DIMT_TUNNEL_IP6_FLAGS)))
+		return 0;
+
 	if (tunnel->options & ZAPI_DIMT_TUNNEL_KEY_PRESENT) {
 		key = htonl(tunnel->key);
 		if (!nl_attr_put16(&req->n, buflen, IFLA_GRE_IFLAGS,
@@ -702,6 +717,10 @@ static int netlink_extract_gre_info(struct rtattr *link_data, struct zebra_l2inf
 	 * IFLA_GRE_TTL.  0 means "inherit from the inner packet". */
 	if (attr[IFLA_GRE_TTL])
 		gre_info->ttl = *(uint8_t *)RTA_DATA(attr[IFLA_GRE_TTL]);
+	/* ip6gre only; ipgre_fill_info() never emits it, so gre links keep
+	 * the memset 0.  See ZEBRA_DIMT_TUNNEL_IP6_FLAGS. */
+	if (attr[IFLA_GRE_FLAGS])
+		gre_info->flags = *(uint32_t *)RTA_DATA(attr[IFLA_GRE_FLAGS]);
 	return 0;
 }
 

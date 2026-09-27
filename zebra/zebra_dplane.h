@@ -122,6 +122,33 @@ enum zebra_dplane_startup_notifications {
  */
 #define ZEBRA_DIMT_TUNNEL_TTL 64
 
+/*
+ * IFLA_GRE_FLAGS of every ip6gre DIMT netdev: "encaplimit none".
+ *
+ * The value is the kernel's IP6_TNL_F_IGN_ENCAP_LIMIT (linux/ip6_tunnel.h,
+ * 0x1), spelled out here so neither zebra_dimt.c nor the encoder has to pull
+ * in that header.  It is UAPI and cannot change.
+ *
+ * Without it the kernel prepends a Tunnel Encapsulation Limit destination
+ * option to every outer packet, carrying whatever IFLA_GRE_ENCAP_LIMIT says.
+ * Omitting IFLA_GRE_ENCAP_LIMIT does not mean "no option": ip6gre_newlink
+ * memsets its parms, so the limit is *0*, and RFC 2473 s5.1 requires a router
+ * that must encapsulate a packet whose limit has reached zero to discard it
+ * and answer ICMPv6 Parameter Problem.  A DIMT ip6gre built that way
+ * therefore cannot be nested inside any further tunnel in the underlay -- the
+ * same class of silent, one-hop-lab-invisible blackhole as an inherited outer
+ * TTL, and it also costs 8 bytes of every packet's MTU for a policy DIMT does
+ * not want.
+ *
+ * ip6gre_fill_info() reports IFLA_GRE_FLAGS unconditionally, in the same
+ * nla_put chain as the IFLA_GRE_TTL that ZEBRA_DIMT_TUNNEL_TTL already
+ * depends on, so a kernel that echoes one echoes the other -- which is what
+ * makes the flag safe to use as a drift signal.  Plain gre has no such
+ * attribute (ipgre_fill_info never emits it), so both the encode and the
+ * comparison are ip6gre-only.
+ */
+#define ZEBRA_DIMT_TUNNEL_IP6_FLAGS 0x1
+
 struct zebra_dimt_tunnel_ctx {
 	struct zapi_dimt_tunnel tunnel;
 	uint8_t owner_proto;

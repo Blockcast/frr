@@ -3,6 +3,7 @@
 
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -1141,12 +1142,21 @@ V6_OUTER_LOCAL = "2001:db8:2::1"
 V6_OUTER_REMOTE = "2001:db8:2::2"
 
 
-def test_ip6gre_tunnel_carries_fixed_outer_hop_limit():
-    """An IPv6-outer DIMT tunnel gets the same fixed outer hop limit.
+def test_ip6gre_tunnel_carries_fixed_outer_header():
+    """An IPv6-outer DIMT tunnel gets the fixed hop limit AND `encaplimit none`.
 
     ip6gre inherits exactly like gre when IFLA_GRE_TTL is absent (hop_limit 0
     copies the inner packet's), so the fix has to cover both kinds -- a v4-only
     fix would leave every IPv6 underlay with the multi-hop blackhole.
+
+    The encap limit is the ip6gre-only half.  Without
+    IP6_TNL_F_IGN_ENCAP_LIMIT the kernel prepends a Tunnel Encapsulation Limit
+    destination option to every outer packet, and because ip6gre_newlink
+    memsets its parms the limit it prepends is *0* -- which RFC 2473 s5.1
+    turns into an instruction to every transit router to discard any packet it
+    would have to encapsulate again, and which costs 8 bytes of MTU besides.
+    Same class of blackhole as an inherited TTL, same invisibility in a
+    one-hop lab.
     """
     router = get_topogen().gears["r1"]
     _, ready = topotest.run_and_expect(
@@ -1170,9 +1180,133 @@ def test_ip6gre_tunnel_carries_fixed_outer_hop_limit():
         local=V6_OUTER_LOCAL,
         remote=V6_OUTER_REMOTE,
         ttl=64,
+        encaplimit="none",
     )
     assert kernel_error is None, kernel_error
     assert request("del", 15)["result"] == 2
+
+
+def test_stale_ip6gre_encap_limit_link_is_replaced_not_adopted():
+    """An ip6gre of ours with the default encap limit is rebuilt, not adopted.
+
+    The ip6gre half of the upgrade case that
+    test_stale_ttl_link_is_replaced_not_adopted() covers for gre, and it is
+    not redundant: the TTL is already correct on this link, so only the encap
+    limit distinguishes it.  A zebra that checked the outer TTL alone would
+    re-adopt it, re-notify INSTALLED, and leave the encapsulation blackhole in
+    place on exactly the IPv6 underlays DIMT is being rolled out onto.
+
+    This is also what makes the rollout staged rather than a sweep: zebra
+    never walks the DIMT links looking for stale ones.  Each pre-fix netdev is
+    replaced only when its own tunnel is next requested (here) or changes in
+    place, so an upgraded PoP converts one tunnel at a time, driven by pimd's
+    own demand edges.
+    """
+    router = get_topogen().gears["r1"]
+    name = "dimt-00000010"
+    # A DIFFERENT outer remote from tunnel 15: two GRE links may not share an
+    # (outer local, outer remote) tuple, and ordering between these two tests
+    # is not something this file should depend on.  Still inside the connected
+    # 2001:db8:2::/64 on r1-eth0, so the outer-remote route check passes.
+    stale_remote = "2001:db8:2::3"
+    _, ready = topotest.run_and_expect(
+        lambda: "r1-eth0"
+        in router.vtysh_cmd("show ipv6 route {}".format(stale_remote)),
+        True,
+        count=20,
+        wait=0.5,
+    )
+    assert ready, router.vtysh_cmd("show ipv6 route {}".format(stale_remote))
+
+    # hoplimit 64 is already right here -- the encap limit is the ONLY thing
+    # wrong, which is the whole point of this test.
+    router.run(
+        "ip link add {} type ip6gre local {} remote {} hoplimit 64 "
+        "encaplimit 4".format(name, V6_OUTER_LOCAL, stale_remote)
+    )
+    stale = check_gre_link(
+        router,
+        name,
+        local=V6_OUTER_LOCAL,
+        remote=stale_remote,
+        expected_up=False,
+        ttl=64,
+        encaplimit=4,
+    )
+    assert stale is None, stale
+    _, seen = topotest.run_and_expect(
+        lambda: zebra_ifindex(router, name) is not None, True, count=20, wait=0.2
+    )
+    assert seen, "zebra never learned the pre-existing {}".format(name)
+    stale_ifindex = zebra_ifindex(router, name)
+
+    installed = request(
+        "add", 16, outer_local=V6_OUTER_LOCAL, outer_remote=stale_remote
+    )
+    assert installed["result"] == 0, installed
+    assert installed["ifindex"] != stale_ifindex, (
+        "zebra adopted the encaplimit-4 ip6gre (ifindex {}) instead of "
+        "replacing it: {}".format(stale_ifindex, installed)
+    )
+    kernel_error = check_gre_link(
+        router,
+        name,
+        local=V6_OUTER_LOCAL,
+        remote=stale_remote,
+        ttl=64,
+        encaplimit="none",
+    )
+    assert kernel_error is None, kernel_error
+
+    assert request("del", 16)["result"] == 2
+    _, gone = topotest.run_and_expect(
+        lambda: router.run("ip link show {} 2>/dev/null".format(name)),
+        "",
+        count=10,
+        wait=0.2,
+    )
+    assert gone == "", gone
+
+
+def test_request_without_mtu_warns():
+    """A request with no MTU option is accepted, and says so in the log.
+
+    dimt_zapi_client.py sends options=0, so every ADD in this file takes the
+    no-MTU path: the netdev inherits the kernel default, which does not
+    subtract the outer header, and full-size payloads then fragment or drop.
+    zebra cannot invent an MTU it was not given, so the warning is the whole
+    remedy -- and a silent warning is the same as no warning.
+    """
+    tgen = get_topogen()
+    router = tgen.gears["r1"]
+    # Self-contained: issue the MTU-less ADD here rather than relying on an
+    # earlier test in this file having run.
+    mtuless_remote = "2001:db8:2::4"
+    _, ready = topotest.run_and_expect(
+        lambda: "r1-eth0"
+        in router.vtysh_cmd("show ipv6 route {}".format(mtuless_remote)),
+        True,
+        count=20,
+        wait=0.5,
+    )
+    assert ready, router.vtysh_cmd("show ipv6 route {}".format(mtuless_remote))
+    installed = request(
+        "add", 17, outer_local=V6_OUTER_LOCAL, outer_remote=mtuless_remote
+    )
+    assert installed["result"] == 0, installed
+    assert request("del", 17)["result"] == 2
+
+    logs = sorted(pathlib.Path(tgen.logdir).glob("**/zebra.log"))
+    assert logs, "no zebra.log under {}; the warning is unproven, not absent".format(
+        tgen.logdir
+    )
+    text = "".join(log.read_text(errors="replace") for log in logs)
+    assert text.strip(), "zebra.log(s) empty: {}".format(logs)
+    assert "no MTU in the request" in text, (
+        "zebra accepted MTU-less DIMT ADDs without warning; searched {}".format(
+            [str(log) for log in logs]
+        )
+    )
 
 
 def test_stale_ttl_link_is_replaced_not_adopted():

@@ -32,6 +32,17 @@ qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
 
 LINK_ABSENT = 'Device "dimt-00000001" does not exist.\n'
 
+# ip6gre, as iproute2 prints it.  `encaplimit none` is IP6_TNL_F_IGN_ENCAP_LIMIT;
+# without that flag iproute2 prints `encaplimit N` instead -- see GRE6_LINK_LIMITED.
+GRE6_LINK = """\
+19: dimt-0000000f@NONE: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1448 \
+qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/gre6 2001:db8:2::1 peer 2001:db8:2::2 promiscuity 0 minmtu 0 maxmtu 0
+    ip6gre remote 2001:db8:2::2 local 2001:db8:2::1 hoplimit 64 encaplimit none
+"""
+
+GRE6_LINK_LIMITED = GRE6_LINK.replace("encaplimit none", "encaplimit 0")
+
 # `ip -o link show` output: the positive enumeration check_link_absent()
 # derives absence from.  The loopback is what makes the enumeration
 # trustworthy -- see link_names().
@@ -121,6 +132,47 @@ def test_check_gre_link_rejects_missing_and_wrong_kernel_state():
 
     assert "is missing" in missing
     assert "wrong remote" in wrong_remote
+
+
+def test_check_gre_link_reads_ip6gre_hop_limit_and_encap_limit():
+    """`encaplimit none` is the only value a DIMT ip6gre may carry.
+
+    A non-None `encaplimit` must reject the default-limit link, or the check
+    would pass on exactly the netdev the fix exists to replace: without
+    IP6_TNL_F_IGN_ENCAP_LIMIT the kernel prepends a Tunnel Encapsulation
+    Limit destination option, and the value it prepends is 0 -- which RFC
+    2473 s5.1 makes an instruction to every transit router to discard any
+    packet it would have to encapsulate again.
+    """
+    ok = check_gre_link(
+        FakeRouter(link=GRE6_LINK),
+        "dimt-0000000f",
+        local="2001:db8:2::1",
+        remote="2001:db8:2::2",
+        ttl=64,
+        encaplimit="none",
+    )
+    limited = check_gre_link(
+        FakeRouter(link=GRE6_LINK_LIMITED),
+        "dimt-0000000f",
+        local="2001:db8:2::1",
+        remote="2001:db8:2::2",
+        ttl=64,
+        encaplimit="none",
+    )
+    # The hop limit is read through the same `ttl` argument as gre: iproute2
+    # prints `hoplimit N` for ip6gre and `ttl N` for gre.
+    wrong_hoplimit = check_gre_link(
+        FakeRouter(link=GRE6_LINK),
+        "dimt-0000000f",
+        local="2001:db8:2::1",
+        remote="2001:db8:2::2",
+        ttl=1,
+    )
+
+    assert ok is None
+    assert "wrong encap limit" in limited, limited
+    assert "wrong outer TTL" in wrong_hoplimit, wrong_hoplimit
 
 
 def test_check_ip_mr_cache_positive_and_negative_assertions():
