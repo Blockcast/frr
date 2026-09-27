@@ -203,10 +203,12 @@ adversary can put on the wire.
 
 The LC lane today has only a once-a-minute throttled `zlog_notice`, which is
 not countable. Add a per-instance counter **per lane**, incremented on every
-rejected tuple and readable from `show bgp` with the lane named, keeping the
-throttled log for detail. The MVPN lane has no counter today either, so step 2
-adds both: the DIMT one and the MVPN one, the latter owned by the MVPN call
-site (`bgp_mvpn_resolve_from_source_route()`, `bgp_mvpn.c:1578`).
+rejected tuple for the reasons the decoder raises and once per route for the
+two the DIMT call site raises itself (below), readable from `show bgp` with
+the lane named, keeping the throttled log for detail. The MVPN lane has no
+counter today either, so step 2 adds both: the DIMT one and the MVPN one,
+the latter owned by the MVPN call site
+(`bgp_mvpn_resolve_from_source_route()`, `bgp_mvpn.c:1578`).
 
 The shared decoder owns no counter, but it is the one that increments: each
 call site passes a pointer to its own lane's counter, and the decoder bumps it
@@ -217,11 +219,21 @@ from the return moves at most once for a route carrying three GA-mismatched
 tuples, under-counting exactly the flood the counter exists to show. Were the
 counter the decoder's own instead, the four reasons below that it raises for
 both lanes would land in one number with no attribution on an instance running
-both. Counted: origin-ambiguous, `GA == 0`, `GA != origin_as`, unusable UMH
-address, and (for the DIMT call site) wrong address family. The family reject
-is the one the DIMT call site takes itself, before the decoder runs, and it is
-per tuple too: one count for each tuple carrying the DIMT function on a v6
-route. A wrong `Function` is **not** a
+both. Counted by the decoder, per tuple: origin-ambiguous, `GA == 0`,
+`GA != origin_as`, and unusable UMH address.
+
+Counted by the DIMT call site, once per route: untrusted neighbor and wrong
+address family. Both reject the route before the decoder runs, so no tuple is
+examined and "per tuple" has nothing to count. Neither belongs in the shared
+decoder: neighbor trust is the BLO-36553 per-peer knob and the family gate is
+DIMT-only, and the MVPN lane must inherit neither. Either counts only when the
+route carries at least one tuple with the DIMT function. That takes a
+`Function` match over the LC list at the call site, the one place a call site
+looks inside a tuple, and it must reuse the decoder's match
+(`bgp_mvpn.c:1327-1335`) through a shared helper rather than copy it. A route
+whose LCs carry only another function is not a reject on either count.
+
+A wrong `Function` is **not** a
 reject — it is an unrelated large community and must not be counted, or every
 route carrying any other LC inflates the number.
 
@@ -255,6 +267,11 @@ route carrying any other LC inflates the number.
   lane's v4-UMH-on-v6-route behaviour must not regress.
 - A v6 unicast route carrying an LC-UMH pins to nothing on the DIMT lane, and
   warns.
+- Call-site rejects are per route. A v6 unicast route carrying two tuples with
+  the DIMT function moves the DIMT counter by exactly 1 and the MVPN counter by
+  0, and the same holds for a v4 route from an untrusted neighbor carrying two
+  such tuples. A v6 route whose only LC carries another lane's function moves
+  neither counter.
 - Endianness known-answer vector `184549374 -> 10.255.255.254` reused verbatim.
 
 ## References
