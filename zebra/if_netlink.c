@@ -388,8 +388,19 @@ netlink_gre_set_msg_encoder(struct zebra_dplane_ctx *ctx, void *buf,
 	return NLMSG_ALIGN(req->n.nlmsg_len);
 }
 
+/*
+ * Does the link at dimt->delete_ifindex carry this tunnel's identity?
+ *
+ * `check_ttl` adds the outer TTL to the comparison.  The address phase sets
+ * it: a link is only ever completed into a tunnel when it carries
+ * ZEBRA_DIMT_TUNNEL_TTL.  The delete paths clear it: any link that is ours by
+ * name and endpoints may be torn down whatever its TTL, including a netdev a
+ * pre-TTL build created with "inherit" -- refusing that delete would strand
+ * the very link zebra is replacing.
+ */
 static bool netlink_dimt_if_matches(struct zebra_dplane_ctx *ctx,
-				    const struct zebra_dimt_tunnel_ctx *dimt)
+				    const struct zebra_dimt_tunnel_ctx *dimt,
+				    bool check_ttl)
 {
 	const struct zapi_dimt_tunnel *tunnel = &dimt->tunnel;
 	struct zebra_ns *zns = zebra_ns_lookup(dplane_ctx_get_ns_id(ctx));
@@ -419,6 +430,8 @@ static bool netlink_dimt_if_matches(struct zebra_dplane_ctx *ctx,
 		return false;
 	if ((tunnel->options & ZAPI_DIMT_TUNNEL_MTU_PRESENT) &&
 	    ifp->mtu != tunnel->mtu)
+		return false;
+	if (check_ttl && gre->ttl != ZEBRA_DIMT_TUNNEL_TTL)
 		return false;
 	if (tunnel->encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU)
 		encap_type = TUNNEL_ENCAP_FOU;
@@ -458,7 +471,7 @@ static ssize_t netlink_dimt_tunnel_msg_encoder(struct zebra_dplane_ctx *ctx,
 
 		if (buflen < sizeof(*addr))
 			return 0;
-		if (!netlink_dimt_if_matches(ctx, dimt))
+		if (!netlink_dimt_if_matches(ctx, dimt, true))
 			return 0;
 		memset(addr, 0, sizeof(*addr));
 		bytelen = IS_IPADDR_V4(&tunnel->inner_local) ? 4 : 16;
@@ -494,7 +507,7 @@ static ssize_t netlink_dimt_tunnel_msg_encoder(struct zebra_dplane_ctx *ctx,
 		/* Revalidate identity at encode time: the check in
 		 * netlink_put_dimt_tunnel_msg() may be stale by the time the
 		 * batch is (re)encoded. */
-		if (!netlink_dimt_if_matches(ctx, dimt))
+		if (!netlink_dimt_if_matches(ctx, dimt, false))
 			return 0;
 		req->n.nlmsg_type = RTM_DELLINK;
 		/* Bind the delete to the validated ifindex, the identity that
@@ -552,6 +565,12 @@ static ssize_t netlink_dimt_tunnel_msg_encoder(struct zebra_dplane_ctx *ctx,
 		   !nl_attr_put(&req->n, buflen, IFLA_GRE_REMOTE,
 				&tunnel->outer_remote.ipaddr_v6,
 				sizeof(struct in6_addr)))
+		return 0;
+
+	/* Fixed outer TTL / hop limit; see ZEBRA_DIMT_TUNNEL_TTL.  Omitting
+	 * the attribute means "inherit" for both gre and ip6gre, which copies
+	 * the inner TTL 1 of every PIM/IGMP packet onto the outer header. */
+	if (!nl_attr_put8(&req->n, buflen, IFLA_GRE_TTL, ZEBRA_DIMT_TUNNEL_TTL))
 		return 0;
 
 	if (tunnel->options & ZAPI_DIMT_TUNNEL_KEY_PRESENT) {
@@ -679,6 +698,10 @@ static int netlink_extract_gre_info(struct rtattr *link_data, struct zebra_l2inf
 			*(uint16_t *)RTA_DATA(attr[IFLA_GRE_ENCAP_DPORT]);
 	if (attr[IFLA_GRE_ENCAP_FLAGS])
 		gre_info->encap_flags = *(uint16_t *)RTA_DATA(attr[IFLA_GRE_ENCAP_FLAGS]);
+	/* Outer TTL (gre) or hop limit (ip6gre); both kinds report it under
+	 * IFLA_GRE_TTL.  0 means "inherit from the inner packet". */
+	if (attr[IFLA_GRE_TTL])
+		gre_info->ttl = *(uint8_t *)RTA_DATA(attr[IFLA_GRE_TTL]);
 	return 0;
 }
 
@@ -1058,7 +1081,7 @@ netlink_put_dimt_tunnel_msg(struct nl_batch *bth,
 	       dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL);
 	dimt = dplane_ctx_get_dimt_tunnel(ctx);
 	if (dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL &&
-	    !netlink_dimt_if_matches(ctx, dimt)) {
+	    !netlink_dimt_if_matches(ctx, dimt, false)) {
 		dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_SUCCESS);
 		return FRR_NETLINK_SUCCESS;
 	}

@@ -2389,6 +2389,8 @@ static void zebra_if_dplane_ifp_handling(struct zebra_dplane_ctx *ctx)
 			 */
 			interface_update_l2info(ctx, ifp, zif_type, 0,
 						link_nsid);
+			/* After the l2info refresh: it reads the GRE TTL. */
+			zebra_dimt_tunnel_if_change(ifp);
 			if (IS_ZEBRA_IF_BRIDGE(ifp))
 				zebra_l2if_update_bridge(ifp, chgflags);
 			if (IS_ZEBRA_IF_BOND(ifp))

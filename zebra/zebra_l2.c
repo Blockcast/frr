@@ -310,6 +310,12 @@ void zebra_l2_greif_add_update(struct interface *ifp,
 		return;
 	}
 
+	/* The outer TTL can change in place (`ip link set ... type gre ttl`).
+	 * Keep it current: zebra_dimt_tunnel_if_change() reads it right after
+	 * this refresh and replaces an installed DIMT link that lost its
+	 * fixed TTL. */
+	zif->l2info.gre.ttl = gre_info->ttl;
+
 	old_vtep_ip = zif->l2info.gre.vtep_ip;
 	if (ipaddr_is_same(&old_vtep_ip, &gre_info->vtep_ip))
 		return;

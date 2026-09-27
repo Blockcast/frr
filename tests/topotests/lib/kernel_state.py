@@ -230,8 +230,15 @@ def link_ifindex(router, interface):
     return int(match.group(1)) if match else None
 
 
-def check_gre_link(router, interface, local, remote, mtu=None, expected_up=True):
-    """Check GRE endpoint and link attributes from `ip -d link show`."""
+def check_gre_link(
+    router, interface, local, remote, mtu=None, expected_up=True, ttl=None
+):
+    """Check GRE endpoint and link attributes from `ip -d link show`.
+
+    `ttl` is the outer TTL (gre) or hop limit (ip6gre).  iproute2 prints it as
+    `ttl N` / `hoplimit N`, and as `ttl inherit` / `hoplimit inherit` when it
+    is 0 -- so a numeric expectation can never match an inheriting tunnel.
+    """
     output = router.run(
         "ip -d link show dev {} 2>&1".format(shlex.quote(interface))
     )
@@ -263,5 +270,11 @@ def check_gre_link(router, interface, local, remote, mtu=None, expected_up=True)
     if not re.search(r"\blocal\s+{}\b".format(re.escape(local)), detail):
         return "kernel GRE {} has wrong local (expected {}): {}".format(
             interface, local, output.strip()
+        )
+    if ttl is not None and not re.search(
+        r"\b(?:ttl|hoplimit)\s+{}\b".format(ttl), detail
+    ):
+        return "kernel GRE {} has wrong outer TTL (expected {}): {}".format(
+            interface, ttl, output.strip()
         )
     return None
