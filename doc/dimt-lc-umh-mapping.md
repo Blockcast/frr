@@ -167,8 +167,14 @@ Two separate restrictions, and they are not the same one:
    not an identity in a v4 core.
 
    So the DIMT LC decode runs for `AFI_IP` only. An LC-UMH on a v6 unicast
-   route is ignored, and it reuses the existing cross-family warn wording so
-   the operator sees why a "configured" UMH never mapped.
+   route is ignored, and it reuses the existing cross-family warn's wording so
+   the operator sees why a "configured" UMH never mapped, but not its call
+   site. That warn (`bgp_dimt.c:204`) is an unthrottled `zlog_warn` that fires
+   on every route update, which suits the cross-family EC because it is rare.
+   A v6 route carrying an LC-UMH is the common shape on an IX-connected box
+   (see "Why this exists"), so it goes to the throttled call-site log with the
+   other call-site reject, at most once a minute per instance (see the counter
+   section).
 
    **The MVPN lane keeps `p6` working unchanged.** The shared decoder must not
    impose the DIMT family rule on the MVPN caller — the family gate belongs to
@@ -214,7 +220,14 @@ the latter owned by the MVPN call site
 
 The shared decoder owns no counter, but it is the one that increments: each
 call site passes a pointer to its own lane's counter, and the decoder bumps it
-once per rejected tuple. A return value cannot carry this. The decoder walks
+once per rejected tuple. That includes tuples after a winner. Today the decoder
+skips every tuple past the first one that resolves before any reject check runs
+(`bgp_mvpn.c:1337-1342`). Tuples sort ascending by Global Administrator, the
+field the GA checks test, so a crafted tuple with a `GA` above the origin AS
+sorts behind a legitimate one and would never be counted. The decoder must
+therefore run the reject checks on every tuple with the lane's `Function`,
+winner or not. A tuple past the winner that passes them is still ignored, not
+counted, and cannot change which tuple resolves. A return value cannot carry this. The decoder walks
 the whole LC list, `continue`s past each rejected tuple (`bgp_mvpn.c:1344`,
 `:1401`) and returns one `bool` per route (`:1424`), so a call site counting
 from the return moves at most once for a route carrying three GA-mismatched
@@ -272,7 +285,11 @@ route carrying any other LC inflates the number.
 - `p6` and every other vector in `bgp_mvpn_gtm_umh_lc` stays green — the MVPN
   lane's v4-UMH-on-v6-route behaviour must not regress.
 - A v6 unicast route carrying an LC-UMH pins to nothing on the DIMT lane, and
-  warns.
+  logs through the throttled call-site log, not the per-update cross-family
+  warn.
+- A v4 route whose lowest DIMT tuple is valid and which also carries two
+  higher-`GA` GA-mismatched DIMT tuples resolves from the valid tuple and moves
+  the DIMT counter by exactly 2.
 - With both knobs set to different function code points, call-site rejects
   are per route. A v6 unicast route carrying two tuples with the DIMT function
   moves the DIMT counter by exactly 1 and the MVPN counter by 0, and the same
