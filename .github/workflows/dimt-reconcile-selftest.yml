@@ -1,0 +1,47 @@
+name: dimt-reconcile-selftest
+
+# tools/dimt-reconcile.sh creates and DELETES netdevs on PE and PoP boxes, so
+# its decision logic is unit-tested against a fake `ip`/`vtysh`/`ping` on PATH
+# (tools/dimt-reconcile-test.sh).  Same reasoning as rerun-guard-selftest.yml:
+# its own workflow, verifiable in seconds, not buried in a job it could abort.
+#
+# Run under BOTH bash and dash: the script ships to an OpenWrt PoP running ash,
+# so a bashism that passes on the runner is a break in the field.
+#
+# Plain `pull_request` (not `pull_request_target`) with read-only permissions
+# and no secrets, so executing PR-authored code here carries no write-scoped
+# credentials.
+
+on:
+  pull_request:
+    paths:
+      - 'tools/dimt-reconcile.sh'
+      - 'tools/dimt-reconcile-test.sh'
+      - '.github/workflows/dimt-reconcile-selftest.yml'
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - 'tools/dimt-reconcile.sh'
+      - 'tools/dimt-reconcile-test.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: dimt-reconcile self-test
+    runs-on: default
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Run dimt-reconcile tests under bash
+        run: bash tools/dimt-reconcile-test.sh
+
+      - name: Run dimt-reconcile tests under dash (OpenWrt ash proxy)
+        run: |
+          command -v dash >/dev/null 2>&1 || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq dash; }
+          dash tools/dimt-reconcile-test.sh

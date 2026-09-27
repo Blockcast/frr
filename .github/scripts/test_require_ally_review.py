@@ -11,11 +11,14 @@ Run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 """
 
 import contextlib
+import http.client
 import importlib.util
 import io
+import itertools
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -257,6 +260,52 @@ class TestSelfReview(unittest.TestCase):
         # (never success), so the human's is the only signal available.
         self.assertEqual(state, "success")
         self.assertIn("approved head", desc)
+
+    def test_self_review_demotion_survives_login_casing_drift(self):
+        """GitHub logins are case-insensitive and REST casing is not stable:
+        a drifted spelling of the Ally seat is still a self-review."""
+        for author in ("AllyBlockcast[bot]", "Allyblockcast", "app/AllyBlockcast"):
+            with self.subTest(author=author):
+                state, desc = decide(reviews=[review("APPROVED")], author=author)
+                self.assertEqual(state, "pending")
+                self.assertIn("write-access human", desc)
+
+    def test_drifted_ally_login_is_not_a_distinct_non_ally_approval(self):
+        """The Ally seat under another spelling must not supply the distinct
+        non-Ally approval that clears an Ally-authored PR, even when it is
+        permission-trusted."""
+        drifted = "AllyBlockcast[bot]"
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login="app/allyblockcast", at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login=drifted, at="2026-07-27T11:00:00Z"),
+            ],
+            author="app/allyblockcast",
+            trusted={drifted},
+        )
+        self.assertNotEqual(state, "success")
+
+    def test_drifted_ally_login_blocking_body_is_not_discarded(self):
+        """A Critical carried under a drifted Ally spelling still counts: a
+        canonical clean APPROVED at the same head must not green the gate
+        over it, on either the review or the comment surface.
+
+        The blocker is the NEWER signal. Every spelling is one App seat
+        (canonical_actor_login), so an older blocker is correctly superseded
+        by that seat's newer clean approval, exactly as for the canonical
+        login; only a newer one can show the drifted body was not dropped."""
+        blocking = CONSOLIDATED + "### Critical Issues (1)\n"
+        clean = review("APPROVED", body=CLEAN, at="2026-07-27T11:00:00Z")
+        newer = "2026-07-27T12:00:00Z"
+        for drifted in ("AllyBlockcast[bot]", "App/AllyBlockcast", "Allyblockcast"):
+            with self.subTest(surface="review", login=drifted):
+                state, _ = decide(reviews=[
+                    review("COMMENTED", body=blocking, login=drifted, at=newer), clean])
+                self.assertEqual(state, "failure")
+            with self.subTest(surface="comment", login=drifted):
+                state, _ = decide(reviews=[clean],
+                                  comments=[comment(blocking, login=drifted, at=newer)])
+                self.assertEqual(state, "failure")
 
     def test_distinct_approval_trusted_via_collaborator_permission(self):
         """Branch 8 — association is CONTRIBUTOR (the visibility-gated false
@@ -1058,12 +1107,12 @@ class TestStalePayloadOrchestration(unittest.TestCase):
         self.assertNotIn(HEAD, {sha for sha, _ in statuses})
 
     def test_settled_pr_resolves_the_early_claim(self):
-        # Round 2: a delayed event whose payload still said open earns the
-        # early claim, then the refetch says merged/closed AT THE SAME HEAD.
-        # A silent return would strand a required context yellow forever on a
-        # commit that reached the base branch -- nothing re-evaluates a
-        # settled PR. The claim must resolve to success (the PR cannot merge
-        # again, so the context gates nothing).
+        # A delayed event whose payload still said open earns the early claim,
+        # then the refetch says merged/closed AT THE SAME HEAD. The claim is
+        # resolved -- with a reason -- but never to success: the status is
+        # keyed by SHA, so a green would also clear any other open PR at this
+        # head with no review evidence. A settled PR is not gated by it, and a
+        # PR sharing the head overwrites it on its own evaluation.
         _, statuses = self._run_main(
             payload_draft=False,
             refetched={
@@ -1077,7 +1126,7 @@ class TestStalePayloadOrchestration(unittest.TestCase):
         )
         self.assertEqual(
             statuses,
-            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "success")],
+            [(self.STALE_HEAD, "pending"), (self.STALE_HEAD, "pending")],
         )
 
     def test_draft_pr_same_head_keeps_the_claim_failclosed(self):
@@ -2148,6 +2197,23 @@ class TestSeatAwareReduction(unittest.TestCase):
         )
         self.assertEqual(state, "success")
 
+    def test_case_drifted_app_login_still_supersedes_its_own_approval(self):
+        # One App seat, two spellings: the newer clean COMMENTED review under
+        # a case-drifted login must still withdraw the stale APPROVED, not
+        # stand beside it as a second actor that keeps the old success.
+        for spelling in ("allyblockcast[bot]", "app/allyblockcast", "allyblockcast",
+                         "AllyBlockcast[bot]", "ALLYBLOCKCAST", "App/allyblockcast"):
+            with self.subTest(login=spelling):
+                state, _ = decide(
+                    reviews=[
+                        review("APPROVED", login="allyblockcast[bot]", utype="Bot",
+                               at="2026-07-27T09:00:00Z"),
+                        review("COMMENTED", body=CLEAN, login=spelling, utype="Bot",
+                               at="2026-07-27T11:00:00Z"),
+                    ]
+                )
+                self.assertEqual(state, "pending")
+
     def test_apps_own_ambiguous_approval_supersedes_its_success(self):
         # An ambiguous approval is the seat's newest formal verdict: the
         # earlier clean success is no longer current, and the gate pends.
@@ -2507,13 +2573,49 @@ class TestBLO25488PositiveAuthorityRestored(unittest.TestCase):
 
 
 class _FakeResponse:
-    """Minimal urlopen() context-manager stand-in."""
+    """Minimal urlopen() context-manager stand-in.
+
+    read1(amt) mirrors http.client.HTTPResponse's signature, not just a single
+    all-at-once read: _read_bounded_response() calls it in a loop, so a fake
+    that ignored `amt` would hide bugs in that loop. Only read1() is defined,
+    deliberately -- production must never reach for read(), and a fake that
+    offered both would let that regression pass unnoticed.
+    """
 
     def __init__(self, payload):
         self._body = b"" if payload is None else json.dumps(payload).encode()
+        self._offset = 0
 
-    def read(self):
-        return self._body
+    def read1(self, amt=None):
+        end = len(self._body) if amt is None else self._offset + amt
+        chunk = self._body[self._offset:end]
+        self._offset += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class _TricklingResponse:
+    """A peer that yields one byte per read1() call, forever.
+
+    This is a UNIT-level check on _read_bounded_response()'s loop only: it
+    proves the deadline is consulted between receives and that the loop
+    terminates. It CANNOT prove the production property, because returning one
+    byte per top-level call is precisely the behaviour a real HTTPResponse does
+    not have -- see TestBoundedReadOverRealSocket, which is the authoritative
+    fixture for the buffering hazard.
+    """
+
+    def __init__(self):
+        self._sent = 0
+
+    def read1(self, amt=None):
+        self._sent += 1
+        return b"x"
 
     def __enter__(self):
         return self
@@ -2539,6 +2641,448 @@ def _rate_limit_error(code, retry_after=None, rate_remaining=None, rate_reset=No
     return urllib.error.HTTPError(
         "https://api.github.com/x", code, "synthetic", headers, None
     )
+
+
+class TestBoundedResponseRead(unittest.TestCase):
+    """[gstack/review] on BLO-19826: urlopen(timeout=...) only bounds a
+    single socket operation, not the aggregate time spent in
+    response.read() -- a peer trickling a byte at a time, each comfortably
+    inside that timeout, could hold a bare read() open indefinitely, blowing
+    past both REQUEST_TIMEOUT_SECONDS and REQUEST_RETRY_BUDGET_SECONDS
+    despite the bounded-retry contract. _read_bounded_response() rechecks a
+    wall-clock deadline between chunks so that failure mode is a
+    deterministic bound, not an open-ended hang."""
+
+    def test_already_expired_deadline_reads_nothing(self):
+        response = _TricklingResponse()
+        with mock.patch.object(gate.time, "monotonic", side_effect=[100.0]):
+            with self.assertRaises(TimeoutError):
+                gate._read_bounded_response(response, attempt_deadline=0.0)
+        self.assertEqual(
+            response._sent, 0, "must not read from an already-expired peer"
+        )
+
+    def test_trickling_peer_is_stopped_once_the_deadline_crosses(self):
+        response = _TricklingResponse()
+        # Checks 1 and 2 land before the deadline (one chunk each); check 3
+        # lands after it -- proves the loop rechecks every iteration, not
+        # just once at entry.
+        with mock.patch.object(gate.time, "monotonic", side_effect=[0.0, 1.0, 2.0]):
+            with self.assertRaises(TimeoutError):
+                gate._read_bounded_response(response, attempt_deadline=1.5)
+        self.assertEqual(
+            response._sent, 2, "exactly two chunks must be read before the bound trips"
+        )
+
+    def test_oversized_response_is_rejected(self):
+        class _OneShot:
+            def __init__(self, body):
+                self._body = body
+                self._done = False
+
+            def read1(self, amt=None):
+                if self._done:
+                    return b""
+                self._done = True
+                return self._body
+
+        oversized = _OneShot(b"x" * (gate.REQUEST_MAX_RESPONSE_BYTES + 1))
+        with self.assertRaises(ValueError):
+            gate._read_bounded_response(
+                oversized, attempt_deadline=gate.time.monotonic() + 60
+            )
+
+    def test_a_body_exactly_at_the_cap_is_accepted(self):
+        """The cap is `total > max_bytes`: a body of exactly max_bytes is
+        legitimate. Pins the boundary so `>=` cannot slip in unnoticed."""
+        response = _FakeResponse(None)
+        response._body = b"abcd"
+        body = gate._read_bounded_response(
+            response, attempt_deadline=gate.time.monotonic() + 60, max_bytes=4
+        )
+        self.assertEqual(body, b"abcd")
+
+    def test_a_response_without_read1_fails_closed(self):
+        """Falling back to read() would silently restore the unbounded-read
+        hazard, and every other test here would still pass. So the absence of
+        read1() must be an error, not a downgrade."""
+
+        class _ReadOnly:
+            def read(self, amt=None):
+                return b""
+
+        with self.assertRaises(TypeError) as caught:
+            gate._read_bounded_response(
+                _ReadOnly(), attempt_deadline=gate.time.monotonic() + 60
+            )
+        self.assertIn("read1", str(caught.exception))
+
+    def test_small_response_reads_normally(self):
+        response = _FakeResponse({"ok": True})
+        body = gate._read_bounded_response(
+            response, attempt_deadline=gate.time.monotonic() + 60
+        )
+        self.assertEqual(json.loads(body), {"ok": True})
+
+
+class TestBoundedReadOverRealSocket(unittest.TestCase):
+    """The authoritative fixture for the trickling-peer bound.
+
+    _TricklingResponse returns one byte per TOP-LEVEL call, so the deadline is
+    re-consulted every byte no matter which primitive production uses -- it
+    therefore cannot distinguish a real bound from a broken one. That is the
+    gap this class closes: it drives a genuine http.client.HTTPResponse over a
+    genuine socket carrying genuine chunked framing, so CPython's own
+    buffering is in the loop.
+
+    The discriminator is structural rather than timing-based, so nothing here
+    sleeps. A chunked body of _CHUNKS single-byte chunks is written to the
+    socket up front:
+
+      * read1(65536) -> _read1_chunked -> at most one chunk -> ONE byte per
+        call, so _read_bounded_response() gets a deadline check per byte and
+        the clock below stops it after a handful of them.
+      * read(65536) is specified to return 65536 bytes, so _read_chunked()
+        loops over every chunk internally and hands back the WHOLE body from a
+        single call -- one deadline check total, no TimeoutError, bound gone.
+
+    So `read` fails these tests and `read1` passes them, on the real class,
+    which is exactly the property Ally's finding said was untested.
+    """
+
+    _CHUNKS = 4096
+
+    def _real_response(self, raw, idle_timeout=300):
+        """A real HTTPResponse fed `raw` bytes over a real socket pair.
+
+        The socket timeout is left deliberately generous: it must not be what
+        bounds anything here, or these tests would pass for the wrong reason.
+        """
+        server, client = socket.socketpair()
+        self.addCleanup(server.close)
+        self.addCleanup(client.close)
+        client.settimeout(idle_timeout)
+        server.sendall(raw)
+        server.shutdown(socket.SHUT_WR)
+        response = http.client.HTTPResponse(client, method="GET")
+        self.addCleanup(response.close)
+        response.begin()
+        return response
+
+    def _chunked_response(self, **kwargs):
+        """A real chunked HTTPResponse of _CHUNKS one-byte chunks."""
+        payload = [b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"]
+        payload.extend(b"1\r\nx\r\n" for _ in range(self._CHUNKS))
+        payload.append(b"0\r\n\r\n")
+        response = self._real_response(b"".join(payload), **kwargs)
+        self.assertTrue(response.chunked, "fixture must exercise chunked framing")
+        return response
+
+    def test_one_receive_per_deadline_check_on_a_real_response(self):
+        """A single read1() must not hand back the whole trickled body."""
+        response = self._chunked_response()
+        first = response.read1(gate.REQUEST_READ_CHUNK_BYTES)
+        self.assertEqual(
+            len(first),
+            1,
+            "read1() returned %d bytes -- it consumed more than one receive, so "
+            "the deadline check cannot bound the read" % len(first),
+        )
+
+    def test_read_would_swallow_the_whole_body_in_one_call(self):
+        """Pins the hazard itself, so this suite fails loudly if CPython's
+        read() semantics ever stop being the reason read1() is required."""
+        response = self._chunked_response()
+        self.assertEqual(
+            len(response.read(gate.REQUEST_READ_CHUNK_BYTES)), self._CHUNKS
+        )
+
+    def test_trickling_real_peer_is_bounded_by_the_deadline(self):
+        """End-to-end on the real class: the deadline stops the read early and
+        leaves the rest of the body unread."""
+        response = self._chunked_response()
+        reads = []
+        real_read1 = response.read1
+
+        def counting_read1(amt=None):
+            chunk = real_read1(amt)
+            reads.append(len(chunk))
+            return chunk
+
+        response.read1 = counting_read1
+
+        # Advance 0.5s per consultation. _read_bounded_response() calls
+        # monotonic() exactly once per iteration, so a 2.0s deadline is crossed
+        # on the 5th check -- after 4 one-byte reads.
+        ticks = itertools.count(start=0.0, step=0.5)
+        with mock.patch.object(gate.time, "monotonic", lambda: next(ticks)):
+            with self.assertRaises(TimeoutError) as caught:
+                gate._read_bounded_response(response, attempt_deadline=2.0)
+
+        self.assertIn("trickling peer", str(caught.exception))
+        self.assertEqual(reads, [1, 1, 1, 1])
+        # Stopped early: the body still has data behind it. Under read() the
+        # call would have consumed all _CHUNKS bytes and raised nothing at all.
+        self.assertEqual(real_read1(gate.REQUEST_READ_CHUNK_BYTES), b"x")
+
+    def test_a_short_real_response_still_reads_to_completion(self):
+        """The bound must not truncate an ordinary well-behaved body."""
+        body = json.dumps({"ok": True}).encode()
+        response = self._real_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body)
+        )
+        read = gate._read_bounded_response(
+            response, attempt_deadline=gate.time.monotonic() + 60
+        )
+        self.assertEqual(json.loads(read), {"ok": True})
+
+    def test_a_truncated_content_length_body_raises_incomplete_read(self):
+        """read1() returns b"" at a FIN whatever Content-Length promised, so the
+        loop must raise the shortfall itself. IncompleteRead is an
+        HTTPException, which _request() retries as transient (pinned in
+        TestTransientRetry); returning the partial body instead would reach
+        json.loads() and escape the retry loop as a ValueError."""
+        for sent in (b'{"ok":true', b""):
+            with self.subTest(sent=sent):
+                response = self._real_response(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n" + sent
+                )
+                with self.assertRaises(http.client.IncompleteRead) as caught:
+                    gate._read_bounded_response(
+                        response, attempt_deadline=gate.time.monotonic() + 60
+                    )
+                self.assertEqual(caught.exception.partial, sent)
+                self.assertEqual(caught.exception.expected, 50 - len(sent))
+
+    def test_a_real_chunked_body_reads_to_completion_without_a_deadline_hit(self):
+        """read1()'s one-chunk-per-call loop must still reassemble the whole
+        body -- the fix must not turn a slow-but-fine response into a failure."""
+        response = self._chunked_response()
+        read = gate._read_bounded_response(
+            response, attempt_deadline=gate.time.monotonic() + 60
+        )
+        self.assertEqual(read, b"x" * self._CHUNKS)
+
+
+class TestBoundedErrorBodyOverRealSocket(unittest.TestCase):
+    """The HTTPError twin of TestBoundedReadOverRealSocket.
+
+    _http_error_diagnostics() consumes the error body BEFORE _request() can
+    classify the error and schedule a retry, so an unbounded read there is
+    strictly worse than one on the success path: it stalls the retry loop that
+    exists to absorb the very 5xx being diagnosed, and neither
+    REQUEST_TIMEOUT_SECONDS nor REQUEST_RETRY_BUDGET_SECONDS ever gets to run.
+
+    HTTPError proxies attribute access to the HTTPResponse underneath it, so
+    `error.read()` is the same unbounded primitive read1() replaced on the
+    success path -- and `error.read1()` is likewise the real one. These
+    fixtures drive a genuine HTTPError over a genuine socket with genuine
+    chunked framing, so CPython's own buffering is in the loop. Nothing
+    sleeps: the whole body is written up front and the clock is faked.
+    """
+
+    _CHUNKS = 4096
+
+    def _error(self, code=503, headers=b"", chunks=None):
+        """A real HTTPError whose body trickles one byte per chunk."""
+        chunks = self._CHUNKS if chunks is None else chunks
+        payload = [b"HTTP/1.1 %d Synthetic\r\nTransfer-Encoding: chunked\r\n%s\r\n"
+                   % (code, headers)]
+        payload.extend(b"1\r\nx\r\n" for _ in range(chunks))
+        payload.append(b"0\r\n\r\n")
+        server, client = socket.socketpair()
+        self.addCleanup(server.close)
+        self.addCleanup(client.close)
+        # Deliberately generous: the socket must not be what bounds anything
+        # here, or these tests would pass for the wrong reason.
+        client.settimeout(300)
+        server.sendall(b"".join(payload))
+        server.shutdown(socket.SHUT_WR)
+        response = http.client.HTTPResponse(client, method="GET")
+        self.addCleanup(response.close)
+        response.begin()
+        self.assertTrue(response.chunked, "fixture must exercise chunked framing")
+        error = urllib.error.HTTPError(
+            "https://api.github.com/x", code, "synthetic", response.headers, response
+        )
+        return error, response
+
+    def _ticking_clock(self, step=0.5):
+        """A monotonic() that advances `step` per consultation."""
+        return mock.patch.object(
+            gate.time, "monotonic", lambda t=itertools.count(0.0, step): next(t)
+        )
+
+    def test_error_read_would_swallow_the_whole_body_in_one_call(self):
+        """Pins the hazard: HTTPError.read() really does proxy to the
+        unbounded HTTPResponse.read(), so this suite fails loudly if the
+        reason a bounded path is required ever stops being true."""
+        error, _ = self._error()
+        self.assertEqual(len(error.read(gate.REQUEST_READ_CHUNK_BYTES)), self._CHUNKS)
+
+    def test_trickling_error_body_is_bounded_by_the_deadline(self):
+        """THE discriminator. Reverting _http_error_diagnostics() to
+        error.read() consumes the whole trickled body with no deadline check
+        and no marker, so this fails."""
+        error, response = self._error()
+        with self._ticking_clock():
+            diagnostics = gate._http_error_diagnostics(error)
+
+        self.assertEqual(diagnostics["body"], "<body unreadable: TimeoutError>")
+        # Stopped early: the body still has data behind it. Under read() the
+        # call would have consumed all _CHUNKS bytes and raised nothing.
+        self.assertEqual(response.read1(gate.REQUEST_READ_CHUNK_BYTES), b"x")
+
+    def test_rate_limit_classification_survives_an_unreadable_body(self):
+        """Losing the body must cost log detail, never correctness: every
+        signal _request() branches on comes from the headers, which are
+        already fully received by the time an HTTPError exists."""
+        error, _ = self._error(
+            429, b"Retry-After: 7\r\nX-RateLimit-Remaining: 0\r\n"
+        )
+        with self._ticking_clock():
+            diagnostics = gate._http_error_diagnostics(error)
+
+        self.assertTrue(diagnostics["body"].startswith("<body unreadable:"))
+        self.assertEqual(diagnostics["retry_after"], "7")
+        self.assertEqual(diagnostics["rate_remaining"], "0")
+        self.assertEqual(gate._rate_limit_wait_seconds(diagnostics), 7.0)
+
+    def test_an_ordinary_error_body_is_still_captured(self):
+        """The bound must not blind the diagnostics it exists to protect --
+        BLO-20820's whole point was making a 4xx readable from the job log."""
+        body = json.dumps({"message": "Bad credentials"}).encode()
+        server, client = socket.socketpair()
+        self.addCleanup(server.close)
+        self.addCleanup(client.close)
+        server.sendall(
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: %d\r\n\r\n%s"
+            % (len(body), body)
+        )
+        server.shutdown(socket.SHUT_WR)
+        response = http.client.HTTPResponse(client, method="GET")
+        self.addCleanup(response.close)
+        response.begin()
+        error = urllib.error.HTTPError(
+            "https://api.github.com/x", 401, "no", response.headers, response
+        )
+
+        diagnostics = gate._http_error_diagnostics(error)
+        self.assertEqual(json.loads(diagnostics["body"]), {"message": "Bad credentials"})
+
+    def test_the_error_body_cap_is_actually_wired_up(self):
+        """Enforcement and wiring are separate failures: _read_bounded_response
+        can honour max_bytes perfectly while _http_error_diagnostics forgets to
+        pass it. This pins the wiring."""
+        self.assertLess(
+            gate.REQUEST_ERROR_BODY_MAX_BYTES, gate.REQUEST_MAX_RESPONSE_BYTES
+        )
+        error, _ = self._error(chunks=8)
+        seen = {}
+        real = gate._read_bounded_response
+
+        def spy(response, attempt_deadline, max_bytes=None):
+            seen["max_bytes"] = max_bytes
+            return real(response, attempt_deadline, max_bytes=max_bytes)
+
+        with mock.patch.object(gate, "_read_bounded_response", spy):
+            gate._http_error_diagnostics(error)
+        self.assertEqual(seen["max_bytes"], gate.REQUEST_ERROR_BODY_MAX_BYTES)
+
+    def test_the_size_cap_is_enforced(self):
+        """And this pins enforcement: a body past the cap must raise rather
+        than keep streaming."""
+        error, _ = self._error(chunks=8)
+        with self.assertRaises(ValueError) as caught:
+            gate._read_bounded_response(
+                error, gate.time.monotonic() + 60, max_bytes=4
+            )
+        self.assertIn("exceeded 4 bytes", str(caught.exception))
+
+    def test_error_body_read_is_clamped_to_the_retry_budget(self):
+        """A fresh REQUEST_TIMEOUT_SECONDS per error body lets every retry
+        spend a full timeout reading before _request() consults the budget,
+        so a trickling 5xx could hold the check pending ~2x the budget. The
+        read must stop at whichever deadline is sooner."""
+        error, response = self._error()
+        reads = []
+        real_read1 = response.read1
+
+        def counting_read1(amt=None):
+            chunk = real_read1(amt)
+            reads.append(len(chunk))
+            return chunk
+
+        response.read1 = counting_read1
+        # Clock ticks 0.5s per consultation: the arm reads 0.0, so the read
+        # deadline is min(0.0 + REQUEST_TIMEOUT_SECONDS, 2.0) = 2.0 and the
+        # loop stops on its 4th check, after 3 reads. Unclamped it would run
+        # to 20.0 -- 39 reads.
+        with self._ticking_clock():
+            diagnostics = gate._http_error_diagnostics(error, budget_deadline=2.0)
+
+        self.assertEqual(diagnostics["body"], "<body unreadable: TimeoutError>")
+        self.assertEqual(reads, [1, 1, 1])
+
+    def test_an_expired_retry_budget_reads_no_error_body(self):
+        """Once the budget is spent the body is not worth a single receive."""
+        error, response = self._error()
+        reads = []
+        real_read1 = response.read1
+        response.read1 = lambda amt=None: reads.append(amt) or real_read1(amt)
+        with self._ticking_clock():
+            diagnostics = gate._http_error_diagnostics(error, budget_deadline=0.0)
+        self.assertEqual(diagnostics["body"], "<body unreadable: TimeoutError>")
+        self.assertEqual(reads, [])
+
+    def test_request_passes_its_budget_deadline_to_the_error_body_read(self):
+        """Pins the wiring: the clamp is worthless if _request() does not hand
+        its budget deadline through."""
+        seen = []
+        real = gate._http_error_diagnostics
+
+        def spy(error, budget_deadline=None):
+            seen.append(budget_deadline)
+            return real(error, budget_deadline)
+
+        with mock.patch.object(gate, "_http_error_diagnostics", spy):
+            with mock.patch.object(gate.time, "sleep"):
+                with mock.patch.object(gate.time, "monotonic", return_value=100.0):
+                    with mock.patch.object(
+                        gate.urllib.request,
+                        "urlopen",
+                        side_effect=[_http_error(503), _FakeResponse({"ok": True})],
+                    ):
+                        gate._request("https://api/x", "t")
+        self.assertEqual(seen, [100.0 + gate.REQUEST_RETRY_BUDGET_SECONDS])
+
+    def test_an_unexpected_exception_in_the_body_read_is_not_swallowed(self):
+        """Best-effort covers a damaged or hostile BODY, not a bug in this
+        file: a later edit that raises e.g. NameError must surface, not be
+        logged as `<body unreadable: NameError>` and silently ignored."""
+        error, _ = self._error(chunks=8)
+        with mock.patch.object(
+            gate, "_read_bounded_response", side_effect=RuntimeError("bug")
+        ):
+            with self.assertRaises(RuntimeError):
+                gate._http_error_diagnostics(error)
+
+    def test_a_trickling_error_body_does_not_stop_the_retry_loop(self):
+        """End-to-end, and the property Ally's finding is really about: a 503
+        whose body trickles must still be classified transient and retried,
+        rather than stalling _request() before any bound can run."""
+        error, _ = self._error(503)
+        good = _FakeResponse({"ok": True})
+        sleeps = []
+        with mock.patch.object(gate.time, "sleep", side_effect=sleeps.append):
+            with self._ticking_clock():
+                with mock.patch.object(
+                    gate.urllib.request, "urlopen", side_effect=[error, good]
+                ) as urlopen:
+                    self.assertEqual(gate._request("https://api/x", "t"), {"ok": True})
+
+        self.assertEqual(urlopen.call_count, 2, "the retry never ran")
+        self.assertEqual(sleeps, [1.0])
 
 
 class TestTransientRetry(unittest.TestCase):
@@ -2646,7 +3190,13 @@ class TestTransientRetry(unittest.TestCase):
         """(c) part 2: the attempt count is not the only bound. If attempts
         themselves burn time, the budget stops the retry rather than letting
         attempts x timeout hold the merge path open."""
-        with mock.patch.object(gate.time, "monotonic", side_effect=[0.0, 10_000.0]):
+        # Scripted monotonic() reads, in order: [0] arms the budget deadline,
+        # [1] arms _http_error_diagnostics()'s bounded-read deadline, [2] is
+        # that read's loop check, [3] is the pre-sleep budget check that must
+        # stop us.
+        with mock.patch.object(
+            gate.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 10_000.0]
+        ):
             with self._urlopen([_http_error(503)] * 50) as urlopen:
                 with self.assertRaises(urllib.error.HTTPError):
                     gate._request("https://api/x", "t")
@@ -2748,7 +3298,13 @@ class TestRateLimitRetry(unittest.TestCase):
         REQUEST_RETRY_BUDGET_SECONDS. Retrying must not hang the job for an
         hour -- it fails closed exactly like an exhausted 5xx retry, only now
         with the rate-limit diagnostics already printed to the job log."""
-        with mock.patch.object(gate.time, "monotonic", side_effect=[0.0, 0.0]):
+        # Scripted monotonic() reads, in order: [0] arms the budget deadline,
+        # [1] arms _http_error_diagnostics()'s bounded-read deadline, [2] is
+        # that read's loop check, [3] is the pre-sleep budget check that must
+        # reject the 3600s wait.
+        with mock.patch.object(
+            gate.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 0.0]
+        ):
             with self._urlopen(
                 [_rate_limit_error(403, retry_after=3600)] * 8
             ) as urlopen:

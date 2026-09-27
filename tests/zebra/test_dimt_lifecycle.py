@@ -65,13 +65,15 @@ class TestDimtLifecycleWiring(unittest.TestCase):
             "if (dimt->phase == ZEBRA_DIMT_TUNNEL_ADDRESS)", 1
         )[1].split("RTM_NEWADDR", 1)[0]
 
-        self.assertIn("netlink_dimt_if_matches(ctx, dimt)", address_branch)
+        # The address phase completes a link into a tunnel, so it demands the
+        # fixed outer TTL as well as identity.
+        self.assertIn("netlink_dimt_if_matches(ctx, dimt, true)", address_branch)
 
     def test_delete_worker_revalidates_dimt_link_identity(self):
         encoder = (ROOT / "zebra" / "if_netlink.c").read_text()
         delete_put = encoder.split("netlink_put_dimt_tunnel_msg", 1)[1]
 
-        self.assertIn("netlink_dimt_if_matches(ctx, dimt)", delete_put)
+        self.assertIn("netlink_dimt_if_matches(ctx, dimt, false)", delete_put)
         self.assertIn("ZEBRA_DPLANE_REQUEST_SUCCESS", delete_put)
 
     def test_delete_encoder_revalidates_and_binds_to_ifindex(self):
@@ -84,7 +86,7 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         # to the validated ifindex -- the identity Linux never reuses until
         # wrap -- NOT the trivially reusable dimt-%08x name, so a same-name
         # replacement created after encoding cannot be deleted.
-        self.assertIn("netlink_dimt_if_matches(ctx, dimt)", delete_branch)
+        self.assertIn("netlink_dimt_if_matches(ctx, dimt, false)", delete_branch)
         self.assertIn("RTM_DELLINK", delete_branch)
         self.assertIn("req->ifi.ifi_index = dimt->delete_ifindex", delete_branch)
         self.assertNotIn("IFLA_IFNAME", delete_branch)
@@ -98,8 +100,143 @@ class TestDimtLifecycleWiring(unittest.TestCase):
             "ZAPI_DIMT_TUNNEL_KEY_PRESENT",
             "ZAPI_DIMT_TUNNEL_MTU_PRESENT",
             "encap_dport",
+            "check_ttl && gre->ttl != ZEBRA_DIMT_TUNNEL_TTL",
         ):
             self.assertIn(check, matcher)
+
+    def test_create_encodes_a_fixed_outer_ttl(self):
+        # Without IFLA_GRE_TTL both gre and ip6gre inherit the inner TTL,
+        # which is 1 for every link-local PIM/IGMP packet: control traffic
+        # dies at the first transit router of a multi-hop underlay.
+        encoder = (ROOT / "zebra" / "if_netlink.c").read_text()
+        dplane = (ROOT / "zebra" / "zebra_dplane.h").read_text()
+        create = encoder.split(
+            "static ssize_t netlink_dimt_tunnel_msg_encoder", 1
+        )[1].split("req->n.nlmsg_type = RTM_NEWLINK;", 1)[1]
+        create = create.split("nl_attr_nest_end(&req->n, rta_data)", 1)[0]
+
+        self.assertIn("#define ZEBRA_DIMT_TUNNEL_TTL 64", dplane)
+        self.assertIn(
+            "nl_attr_put8(&req->n, buflen, IFLA_GRE_TTL, ZEBRA_DIMT_TUNNEL_TTL)",
+            create,
+        )
+        # One encoding for both kinds: the TTL must not sit inside the
+        # v4-only branch.
+        v4_branch = create.split("if (IS_IPADDR_V4(&tunnel->outer_local)) {", 1)[
+            1
+        ].split("} else if", 1)[0]
+        self.assertNotIn("IFLA_GRE_TTL", v4_branch)
+
+    def test_gre_ttl_is_parsed_and_kept_current(self):
+        netlink = (ROOT / "zebra" / "if_netlink.c").read_text()
+        l2 = (ROOT / "zebra" / "zebra_l2.c").read_text()
+        l2h = (ROOT / "zebra" / "zebra_l2.h").read_text()
+
+        gre = l2h.split("struct zebra_l2info_gre {", 1)[1].split("};", 1)[0]
+        self.assertIn("uint8_t ttl;", gre)
+        extract = netlink.split("static int netlink_extract_gre_info", 1)[1]
+        extract = extract.split("static int netlink_extract_vxlan_info", 1)[0]
+        self.assertIn("attr[IFLA_GRE_TTL]", extract)
+        # An in-place `ip link set ... ttl` arrives as an UPDATE, which only
+        # refreshed vtep_ip before; the TTL must be refreshed there too.
+        update = l2.split("void zebra_l2_greif_add_update", 1)[1].split(
+            "old_vtep_ip = zif->l2info.gre.vtep_ip;", 1
+        )[0]
+        self.assertIn("zif->l2info.gre.ttl = gre_info->ttl;", update)
+
+    def test_wrong_ttl_link_is_replaced_not_adopted(self):
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+        request = dimt.split("void zebra_dimt_tunnel_request", 1)[1]
+        request = request.split("void zebra_dimt_tunnel_dplane_result", 1)[0]
+        result = dimt.split("void zebra_dimt_tunnel_dplane_result", 1)[1]
+
+        # Adoption is the strict (TTL-checking) match; a same-identity link
+        # with the wrong TTL is deleted and re-created, never adopted and
+        # never merely refused.
+        self.assertLess(
+            request.index("zebra_dimt_if_stale_ttl(entry, ifp)"),
+            request.index("zebra_dimt_if_matches(entry, ifp)"),
+        )
+        replace = request.split("zebra_dimt_if_stale_ttl(entry, ifp)", 1)[1]
+        replace = replace.split("zebra_dimt_if_matches(entry, ifp)", 1)[0]
+        self.assertIn("zebra_dimt_tunnel_replace(entry, ifp)", replace)
+        helper = dimt.split("zebra_dimt_tunnel_replace(struct zebra_dimt_tunnel", 1)[1]
+        helper = helper.split("\n}\n", 1)[0]
+        self.assertIn("ZEBRA_DIMT_REPLACING", helper)
+        self.assertIn("dplane_dimt_tunnel_del", helper)
+        # The replacement's create rides the delete's result.
+        replacing = result.split("entry->state == ZEBRA_DIMT_REPLACING", 1)[1]
+        replacing = replacing.split("cleanup = entry", 1)[0]
+        self.assertIn("ZEBRA_DIMT_TUNNEL_CREATE", replacing)
+        self.assertIn("dplane_dimt_tunnel_add", replacing)
+        # Delete and cleanup paths use identity only, so a wrong-TTL link of
+        # ours can always be removed.
+        resolve = dimt.split("static bool zebra_dimt_tunnel_resolve_ifindex", 1)[1]
+        resolve = resolve.split("static void", 1)[0]
+        self.assertIn("zebra_dimt_if_identity_matches(entry, ifp)", resolve)
+
+    def test_installed_link_that_loses_its_ttl_is_replaced(self):
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+        iface = (ROOT / "zebra" / "interface.c").read_text()
+
+        # The UPDATE path (an existing link changed in place) must look at
+        # the refreshed TTL, not only the first sighting of the link.
+        update = iface.split("interface_update_l2info(ctx, ifp, zif_type, 0,", 1)[1]
+        update = update.split("zebra_l2if_update_bond", 1)[0]
+        self.assertIn("zebra_dimt_tunnel_if_change(ifp);", update)
+        change = dimt.split("void zebra_dimt_tunnel_if_change(struct interface *ifp)", 1)[1]
+        change = change.split("\n}\n", 1)[0]
+        self.assertIn("ZEBRA_DIMT_INSTALLED", change)
+        self.assertIn("zebra_dimt_if_stale_ttl(entry, ifp)", change)
+        self.assertIn("zebra_dimt_tunnel_replace(entry, ifp)", change)
+
+    def test_failed_replacement_delete_keeps_a_cleanup_tombstone(self):
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+        result = dimt.split("void zebra_dimt_tunnel_dplane_result", 1)[1]
+        replacing = result.split("entry->state == ZEBRA_DIMT_REPLACING", 1)[1]
+        failed = replacing.split("if (!success) {", 1)[1].split("\n\t\t}\n", 1)[0]
+        # Never forget an entry whose stale link may survive the failed
+        # delete: that strands a blackholing netdev nothing tracks.
+        self.assertIn("zebra_dimt_tunnel_replace_failed(", failed)
+        self.assertNotIn("zebra_dimt_tunnel_forget", failed)
+        helper = dimt.split("zebra_dimt_tunnel_replace_failed(struct zebra_dimt_tunnel", 1)[1]
+        helper = helper.split("\n}\n", 1)[0]
+        self.assertIn("ZEBRA_DIMT_CLEANUP", helper)
+        # Forget only once the link is provably gone.
+        self.assertLess(
+            helper.index("zebra_dimt_tunnel_resolve_ifindex(entry)"),
+            helper.index("zebra_dimt_tunnel_forget(entry)"),
+        )
+
+    def test_delete_during_replacement_cancels_the_create(self):
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+        request = dimt.split("void zebra_dimt_tunnel_request", 1)[1]
+        request = request.split("void zebra_dimt_tunnel_dplane_result", 1)[0]
+        delete = request.split("entry->state == ZEBRA_DIMT_REPLACING", 1)[1]
+        delete = delete.split("return;", 1)[0]
+        self.assertIn("entry->replace_cancelled = true;", delete)
+        result = dimt.split("void zebra_dimt_tunnel_dplane_result", 1)[1]
+        replacing = result.split("entry->state == ZEBRA_DIMT_REPLACING", 1)[1]
+        cancelled = replacing.split("if (entry->replace_cancelled) {", 1)[1]
+        cancelled = cancelled.split("}", 1)[0]
+        self.assertIn("ZAPI_DIMT_TUNNEL_REMOVED", cancelled)
+
+    def test_pimd_teardown_prunes_only_when_a_delete_can_follow(self):
+        pim = (ROOT / "pimd" / "pim_dimt.c").read_text()
+        reconcile = pim.split("void pim_dimt_reconcile(struct pim_instance *pim)", 1)[1]
+        reconcile = reconcile.split("\nvoid ", 1)[0]
+        # Every prune ahead of a DEL is preceded by the zclient check, so a
+        # zebra outage does not turn each reconcile pass into prune+join.
+        chunks = reconcile.split("pim_dimt_tunnel_prune_riders(pim, tun);")[:-1]
+        self.assertEqual(len(chunks), 2)
+        for chunk in chunks:
+            self.assertIn("pim_dimt_zclient_usable()", chunk[-400:])
+
+    def test_pimd_tunnel_ifp_checks_the_name_behind_the_ifindex(self):
+        pim = (ROOT / "pimd" / "pim_dimt.c").read_text()
+        ifp = pim.split("pim_dimt_tunnel_ifp(struct pim_instance *pim,", 1)[1]
+        ifp = ifp.split("\n}\n", 1)[0]
+        self.assertIn("strncmp(ifp->name, tun->ifname", ifp)
 
     def test_add_during_delete_rejects_instead_of_rebinding_owner(self):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()

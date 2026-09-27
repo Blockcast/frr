@@ -311,6 +311,44 @@ class TestWorkflowWiring(unittest.TestCase):
             "the success message is printed before the coverage check runs",
         )
 
+    def test_rerun_runs_whole_files_but_verifies_node_ids(self):
+        """BLO-36708: the serial rerun must hand pytest FILES, not node IDs.
+
+        A topotest module is a stateful sequence sharing one module-scoped
+        topology fixture, so re-running a single node ID runs it against a
+        topology its predecessors never built -- it then fails on an
+        assertion the parallel run never reached, and the flake filter can
+        never clear it.  Coverage is still checked per node ID, which is the
+        property `cut -f1 -d:` used to destroy; the two must not be collapsed
+        back into one list in either direction.
+        """
+        rerun = re.search(
+            r"sudo -E pytest[^\n]*pytest-rerun[^\n]*", self.workflow
+        )
+        self.assertTrue(rerun, "expected to find the serial rerun invocation")
+        self.assertIn(
+            '"${rerun_files[@]}"',
+            rerun.group(0),
+            "the rerun must pass whole files: " + rerun.group(0).strip(),
+        )
+        self.assertNotIn(
+            '"${rerun_tests[@]}"',
+            rerun.group(0),
+            "the rerun passes node IDs, which breaks intra-module ordering: "
+            + rerun.group(0).strip(),
+        )
+        # ...and the coverage check must still be fed the node IDs.
+        expected = re.search(
+            r"printf[^\n]*>\s*/tmp/rerun-expected\.txt", self.workflow
+        )
+        self.assertTrue(expected, "expected to find the --expected harvest")
+        self.assertIn(
+            '"${rerun_tests[@]}"',
+            expected.group(0),
+            "coverage must be verified per node ID, not per file: "
+            + expected.group(0).strip(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
