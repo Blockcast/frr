@@ -65,6 +65,15 @@ THE RPF TIEBREAK (E15) -- the reason this suite exists
   after the underlay one moves RPF onto the underlay and silently delivers
   zero -- with no config change anywhere.  See r2/bgpd.conf.
 
+  BESTPATH DOES NOT DECIDE RPF -- multipath does.  FRR enables eBGP
+  multipath by default (bgpd/bgpd.c:4072 sets maxpaths_ebgp =
+  multipath_num, not 1), so with the policy removed BOTH paths carry
+  BGP_PATH_MULTIPATH and zebra gets BOTH nexthops.  pimd resolves RPF over
+  that ECMP set and keeps the tunnel, because the underlay member is
+  rejected for having no PIM (pim_rpf.c:85 neigh_needed).  r2 therefore
+  also sets `maximum-paths 1`; see r2/bgpd.conf for why that is a demo-box
+  finding and not just a knob.
+
   In lab row T1a the tunnel won that tiebreak only by accident of
   addressing.  The addressing here is chosen so the underlay wins, making
   the negative control deterministic instead of a coin flip: it proves the
@@ -619,12 +628,18 @@ def test_rpf_negative_control_underlay_steals_rpf():
                 # pimd keeps an RPF row only while the upstream resolves onto
                 # a PIM-enabled interface.  r2-eth0 runs no PIM, so when the
                 # underlay path wins the row does not move to the underlay --
-                # it disappears outright.  Asserting rpfAddress ==
+                # pim_nht_lookup_ecmp finds no usable member, the upstream's
+                # rpf is cleared (pim_rpf.c pim_upstream_rpf_clear), and the
+                # row disappears outright.  Asserting rpfAddress ==
                 # UNDERLAY_PEER was unsatisfiable by construction.  Both an
                 # absent row and a non-tunnel row mean "RPF left the tunnel";
                 # only a surviving tunnel row is a failure.  A dead pimd is
                 # still an error, so absence can never pass vacuously, and
                 # the zero-delivery assertion below is the real control.
+                #
+                # This is exactly what `maximum-paths 1` on r2 buys: without
+                # it the underlay merely JOINS the tunnel in the ECMP set and
+                # the tunnel member keeps winning, so the row never moves.
                 data = _json_cmd("r2", "show ip pim rpf json")
                 if data is None:
                     return "r2: unparseable pim rpf JSON (pimd dead?)"
@@ -634,6 +649,13 @@ def test_rpf_negative_control_underlay_steals_rpf():
                 return None
 
             expect(_rpf_off_tunnel)
+            # The zero below only proves anything if the receiver is still
+            # listening: _send() blocks ~2.5s, and a receiver that expired
+            # inside expect() above would report 0 for the wrong reason.
+            assert receiver.poll() is None, (
+                "receiver expired during expect(_rpf_off_tunnel) -- the zero "
+                "below would be measuring the timeout, not the RPF move"
+            )
 
             # And delivery fails: r2-eth0 runs no PIM, so the stream has no
             # path at all.  This is the silent zero.
