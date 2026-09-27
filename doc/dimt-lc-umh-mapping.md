@@ -204,8 +204,11 @@ adversary can put on the wire.
 The LC lane today has only a once-a-minute throttled `zlog_notice`, which is
 not countable. Add a per-instance counter **per lane**, incremented on every
 rejected tuple and readable from `show bgp` with the lane named, keeping the
-throttled log for detail. The shared decoder owns no counter: it returns why it
-rejected a tuple and the call site counts into its own lane's counter.
+throttled log for detail. The MVPN lane has no counter today either, so step 2
+adds both: the DIMT one and the MVPN one, the latter at the MVPN call site
+(`bgp_mvpn_resolve_from_source_route()`, `bgp_mvpn.c:1578`). The shared decoder
+owns no counter: it returns why it rejected a tuple and the call site counts
+into its own lane's counter.
 Otherwise the four reasons below that the decoder raises for both lanes would
 land in one number with no attribution on an instance running both. Counted:
 origin-ambiguous, `GA == 0`, `GA != origin_as`, unusable UMH address, and (for
@@ -219,6 +222,11 @@ route carrying any other LC inflates the number.
 - Malformed / untrusted LC is rejected **and counted on the DIMT lane's
   counter**: GA mismatch, unusable address, and untrusted neighbor each move
   the DIMT counter, while the MVPN counter, with the MVPN knob unset, stays `0`.
+- With **both** knobs set, to different function code points, a GA-mismatch LC
+  carrying the MVPN function, read while resolving a Type-7 join, moves only
+  the MVPN counter; the DIMT counter stays `0`. The single-knob case above
+  cannot see this direction: with the MVPN knob unset the MVPN decoder returns
+  before examining any tuple (`bgp_mvpn.c:1244`), so it never rejects.
 - With the knob set, a v4 route carrying a valid LC-UMH and a `0x80` EC whose
   selected tuple is `amt-relay` maps as `amt-relay` from the EC and does not
   pin; the same route with a `pim` EC maps from the LC.
