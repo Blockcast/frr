@@ -561,7 +561,10 @@ def test_rpf_negative_control_underlay_steals_rpf():
     RPF only follows bestpath here because r2 sets `maximum-paths 1`; with
     FRR's default eBGP multipath the tunnel keeps RPF on PIM-capability and
     the leak is survivable.  So this reproduces the T1a hazard as it behaves
-    on a box whose underlay also runs PIM -- see r2/bgpd.conf.  The policy is
+    on a box whose underlay also runs PIM and that has not set
+    `maximum-paths 1` -- reproduced here by a different route (this box has
+    no usable member at all, rather than a usable one with no upstream); see
+    r2/bgpd.conf.  The policy is
     restored at the end and the tunnel re-asserted, so later tests are not
     left on the broken path."""
     tgen = get_topogen()
