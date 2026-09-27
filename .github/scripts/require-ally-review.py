@@ -1938,10 +1938,15 @@ def canonical_actor_login(login, seat):
     the seat separation from round 2 (normalized App vs User with the same
     login string) is untouched: the seat component of the key still
     distinguishes them.
+
+    Case-folded first, like login_matches_any: GitHub logins are
+    case-insensitive, so `AllyBlockcast[bot]` and `allyblockcast[bot]` are one
+    seat, and the `app/` and `[bot]` strips must see the folded form too
+    (`App/allyblockcast`).
     """
     if seat != "app":
         return login
-    name = login
+    name = login.strip().lower()
     if name.startswith("app/"):
         name = name[len("app/"):]
     if name.endswith("[bot]"):
