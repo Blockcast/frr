@@ -160,17 +160,44 @@ class WindowNeverOpened(Exception):
 # absorbed, so if the hold ever starts working and zebra then misbehaves, that
 # surfaces as a hard failure rather than hiding under this marker. See
 # WindowNeverOpened for why Failed was too wide.
+#
+# strict=False, the one exception to the strict=True rule above, because that
+# rule assumes a marked test fails deterministically and this one no longer
+# does: the hold now takes on some runners and not others. Measured on
+# 2026-09-27/28 -- master run 36278687998 xfailed (window never opened), while
+# the unrelated frr#107 (run 36332531703) and frr#109 (run 36337004794), neither
+# touching zebra, XPASSed: the window opened, readd was rejected, and every
+# behavioural assertion below held. Under strict=True each of those correct
+# runs failed the build. Non-strict keeps what matters: a run whose window
+# opens still fails hard on any AssertionError, and a run whose window never
+# opens is still reported, as xfail, not hidden.
+#
+# "Opened" means only what the guard samples: pending.poll() is None once, at
+# ~0.3s. The readd is processed later (request() spawns a client and waits on a
+# full ZAPI round-trip), so a partial hold can pass the guard and still let the
+# delete finish before zebra sees the ADD. That run returns result=0, which is
+# the ordinary post-delete ADD, and fails hard here although zebra did nothing
+# wrong (frr#101 run 36419490474 is one such run; it does not show an ADD
+# rebinding a live DELETE). BLO-29000 tracks re-checking the guard after the
+# readd returns.
+#
+# What non-strict gives up: strict=True made an XPASS fail the build, which
+# forced this marker off in the PR that fixed the hold. Nothing enforces that
+# now, so the marker no longer removes itself; BLO-29000 owns removing it.
+# Restore strict=True (or drop the marker) when hold_dplane_worker() holds
+# deterministically.
 XFAIL_BLO_29000 = pytest.mark.xfail(
-    strict=True,
+    strict=False,
     raises=WindowNeverOpened,
     reason=(
-        "BLO-29000: this test does not currently exercise its own window -- "
-        "hold_dplane_worker() does not hold the `del 9` client, which exits "
-        "with result=2 (REMOVED) before the readd runs. Measured, not "
-        "inferred: the pending.poll() guard fires. The zebra defect originally "
-        "filed here was a phantom -- a post-delete ADD succeeding is correct, "
-        "and this test's own tail asserts it. Remove this marker when the hold "
-        "works and the guard stops firing."
+        "BLO-29000: hold_dplane_worker() holds the `del 9` client on some "
+        "runners and not others. A run whose window never opens (the "
+        "pending.poll() guard fires) is absorbed here; a run whose window "
+        "opens is not, and fails hard on any AssertionError. The original "
+        "'readd returns result=0' filing is not established as a zebra "
+        "defect: a post-delete ADD succeeding is correct, and this test's own "
+        "tail asserts it. Remove this marker when hold_dplane_worker() holds "
+        "deterministically."
     ),
 )
 
