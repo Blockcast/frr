@@ -160,8 +160,20 @@ class WindowNeverOpened(Exception):
 # absorbed, so if the hold ever starts working and zebra then misbehaves, that
 # surfaces as a hard failure rather than hiding under this marker. See
 # WindowNeverOpened for why Failed was too wide.
+#
+# strict=False, the one exception to the strict=True rule above, because that
+# rule assumes a marked test fails deterministically and this one no longer
+# does: the hold now takes on some runners and not others. Measured on
+# 2026-09-27/28 -- master run 36278687998 xfailed (window never opened), while
+# the unrelated frr#107 (run 36332531703) and frr#109 (run 36337004794), neither
+# touching zebra, XPASSed: the window opened, readd was rejected, and every
+# behavioural assertion below held. Under strict=True each of those correct
+# runs failed the build. Non-strict keeps what matters: a run whose window
+# opens still fails hard on any AssertionError, and a run whose window never
+# opens is still reported, as xfail, not hidden. Restore strict=True (or drop
+# the marker) when hold_dplane_worker() holds deterministically.
 XFAIL_BLO_29000 = pytest.mark.xfail(
-    strict=True,
+    strict=False,
     raises=WindowNeverOpened,
     reason=(
         "BLO-29000: this test does not currently exercise its own window -- "
