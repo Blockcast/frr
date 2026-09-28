@@ -595,13 +595,12 @@ def test_rpf_negative_control_underlay_steals_rpf():
                 )
             # Positive evidence for E15, asserted at the BGP layer because
             # that is the only layer where it is observable.  _rpf_off_tunnel
-            # below has to tolerate the RPF row VANISHING (r2-eth0 runs no
-            # PIM, so the row cannot move to the underlay), which means it
-            # can no longer distinguish "the underlay won" -- the documented
-            # mechanism -- from "the (S,G) simply went away".  Naming the
-            # winner here restores that distinction: if bestpath ever landed
-            # on the tunnel, RPF would stay put and the zero below would be
-            # measuring nothing.
+            # below proves RPF is no longer on the tunnel, but r2-eth0 runs no
+            # PIM, so the row cannot move to the underlay: it stays with
+            # rpfInterface "<ifname?>", which names no winner.  That the
+            # UNDERLAY won -- the documented mechanism -- is therefore visible
+            # only here.  If bestpath ever landed on the tunnel, RPF would
+            # stay put and the zero below would be measuring nothing.
             #
             # In PREFIX-DETAIL output `bestpath` is an OBJECT, not the bare
             # `true` the route-table listing uses, and its mere presence does
