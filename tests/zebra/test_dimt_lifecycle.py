@@ -102,9 +102,13 @@ class TestDimtLifecycleWiring(unittest.TestCase):
             "encap_dport",
             "check_outer_hdr &&",
             "gre->ttl != ZEBRA_DIMT_TUNNEL_TTL",
-            "gre->flags != ZEBRA_DIMT_TUNNEL_IP6_FLAGS",
+            "!(gre->flags & ZEBRA_DIMT_TUNNEL_IP6_FLAGS)",
         ):
             self.assertIn(check, matcher)
+        # Mask, never compare: see test_outer_header_drift_covers_ttl_and_ip6_
+        # encap_limit() for the kernel behaviour that makes the equality form
+        # reject every link.
+        self.assertNotIn("gre->flags != ZEBRA_DIMT_TUNNEL_IP6_FLAGS", matcher)
 
     def test_create_encodes_a_fixed_outer_ttl(self):
         # Without IFLA_GRE_TTL both gre and ip6gre inherit the inner TTL,
@@ -433,6 +437,18 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         Split by family on purpose: ipgre_fill_info() never emits
         IFLA_GRE_FLAGS, so a gre link's cached `flags` is the memset 0 and an
         unconditional comparison would reject every IPv4-outer tunnel.
+
+        Both readers MASK for the bit.  IFLA_GRE_FLAGS reads back as a
+        superset of what was sent -- ip6_tnl_link_config() recomputes the
+        link's IP6_TNL_F_CAP_* bits into the same word on every config -- so
+        `flags == ZEBRA_DIMT_TUNNEL_IP6_FLAGS` is false even for a netdev
+        zebra has just created with exactly that value.  That equality form
+        shipped in f2c0d7f9 and hung every IPv6-outer ADD: adoption is what
+        answers the client, so a link that can never be adopted produces no
+        reply at all, and the caller times out rather than seeing a failure.
+        Assert the absence of the equality form too -- checking only that the
+        constant is *mentioned* passes on both spellings, which is why the
+        original of this test was green against the bug.
         """
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
         outer = dimt.split("static bool zebra_dimt_if_outer_hdr_matches", 1)[
@@ -440,8 +456,13 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         ].split("\n}", 1)[0]
 
         self.assertIn("ZEBRA_DIMT_TUNNEL_TTL", outer)
-        self.assertIn("ZEBRA_DIMT_TUNNEL_IP6_FLAGS", outer)
         self.assertIn("ZEBRA_IF_IP6GRE", outer)
+        self.assertIn(
+            "(zif->l2info.gre.flags & ZEBRA_DIMT_TUNNEL_IP6_FLAGS)", outer
+        )
+        self.assertNotIn(
+            "zif->l2info.gre.flags == ZEBRA_DIMT_TUNNEL_IP6_FLAGS", outer
+        )
 
         # Replacement, not refusal: a pre-fix netdev must be rebuilt, and
         # rebuilt one tunnel at a time off its own demand edge -- zebra never

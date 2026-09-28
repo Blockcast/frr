@@ -121,6 +121,13 @@ static bool zebra_dimt_if_identity_matches(const struct zebra_dimt_tunnel *entry
  *
  * gre never reports IFLA_GRE_FLAGS, so the flag half is ip6gre-only -- on a
  * v4 link `flags` is the memset 0 and comparing it would reject every tunnel.
+ *
+ * Test the bit, never the whole word: IFLA_GRE_FLAGS reads back as a superset
+ * of what was requested, because ip6_tnl_link_config() ORs the link's current
+ * IP6_TNL_F_CAP_* capability bits into the same field.  An equality test
+ * therefore rejects zebra's own freshly created netdev, and since the create
+ * path answers the client only once it adopts the link, the request gets no
+ * reply at all rather than a failure.
  */
 static bool zebra_dimt_if_outer_hdr_matches(const struct interface *ifp)
 {
@@ -129,7 +136,7 @@ static bool zebra_dimt_if_outer_hdr_matches(const struct interface *ifp)
 	if (!zif || zif->l2info.gre.ttl != ZEBRA_DIMT_TUNNEL_TTL)
 		return false;
 	return zif->zif_type != ZEBRA_IF_IP6GRE ||
-	       zif->l2info.gre.flags == ZEBRA_DIMT_TUNNEL_IP6_FLAGS;
+	       (zif->l2info.gre.flags & ZEBRA_DIMT_TUNNEL_IP6_FLAGS);
 }
 
 /*

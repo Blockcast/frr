@@ -146,6 +146,15 @@ enum zebra_dplane_startup_notifications {
  * makes the flag safe to use as a drift signal.  Plain gre has no such
  * attribute (ipgre_fill_info never emits it), so both the encode and the
  * comparison are ip6gre-only.
+ *
+ * What comes back is a SUPERSET of what was sent: ip6_tnl_link_config()
+ * recomputes the link's IP6_TNL_F_CAP_* bits into the very same word on every
+ * config, so a netdev created with exactly this value reports it with the
+ * capability bits added.  Every reader must therefore mask for this bit
+ * rather than compare the word -- see zebra_dimt_if_outer_hdr_matches() and
+ * netlink_dimt_if_matches().  This define stays a bare bit, not a mask of
+ * "acceptable" words, because the capability bits are the kernel's to change
+ * and none of them says anything about the encapsulation limit.
  */
 #define ZEBRA_DIMT_TUNNEL_IP6_FLAGS 0x1
 

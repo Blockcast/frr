@@ -436,7 +436,7 @@ static bool netlink_dimt_if_matches(struct zebra_dplane_ctx *ctx,
 	if (check_outer_hdr &&
 	    (gre->ttl != ZEBRA_DIMT_TUNNEL_TTL ||
 	     (IS_IPADDR_V6(&tunnel->outer_local) &&
-	      gre->flags != ZEBRA_DIMT_TUNNEL_IP6_FLAGS)))
+	      !(gre->flags & ZEBRA_DIMT_TUNNEL_IP6_FLAGS))))
 		return false;
 	if (tunnel->encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU)
 		encap_type = TUNNEL_ENCAP_FOU;
