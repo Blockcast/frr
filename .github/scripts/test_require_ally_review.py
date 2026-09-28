@@ -255,6 +255,52 @@ class TestSelfReview(unittest.TestCase):
         self.assertEqual(state, "success")
         self.assertIn("approved head", desc)
 
+    def test_self_review_demotion_survives_login_casing_drift(self):
+        """GitHub logins are case-insensitive and REST casing is not stable:
+        a drifted spelling of the Ally seat is still a self-review."""
+        for author in ("AllyBlockcast[bot]", "Allyblockcast", "app/AllyBlockcast"):
+            with self.subTest(author=author):
+                state, desc = decide(reviews=[review("APPROVED")], author=author)
+                self.assertEqual(state, "pending")
+                self.assertIn("write-access human", desc)
+
+    def test_drifted_ally_login_is_not_a_distinct_non_ally_approval(self):
+        """The Ally seat under another spelling must not supply the distinct
+        non-Ally approval that clears an Ally-authored PR, even when it is
+        permission-trusted."""
+        drifted = "AllyBlockcast[bot]"
+        state, _ = decide(
+            reviews=[
+                review("APPROVED", login="app/allyblockcast", at="2026-07-27T09:00:00Z"),
+                review("APPROVED", login=drifted, at="2026-07-27T11:00:00Z"),
+            ],
+            author="app/allyblockcast",
+            trusted={drifted},
+        )
+        self.assertNotEqual(state, "success")
+
+    def test_drifted_ally_login_blocking_body_is_not_discarded(self):
+        """A Critical carried under a drifted Ally spelling still counts: a
+        canonical clean APPROVED at the same head must not green the gate
+        over it, on either the review or the comment surface.
+
+        The blocker is the NEWER signal. Every spelling is one App seat
+        (canonical_actor_login), so an older blocker is correctly superseded
+        by that seat's newer clean approval, exactly as for the canonical
+        login; only a newer one can show the drifted body was not dropped."""
+        blocking = CONSOLIDATED + "### Critical Issues (1)\n"
+        clean = review("APPROVED", body=CLEAN, at="2026-07-27T11:00:00Z")
+        newer = "2026-07-27T12:00:00Z"
+        for drifted in ("AllyBlockcast[bot]", "App/AllyBlockcast", "Allyblockcast"):
+            with self.subTest(surface="review", login=drifted):
+                state, _ = decide(reviews=[
+                    review("COMMENTED", body=blocking, login=drifted, at=newer), clean])
+                self.assertEqual(state, "failure")
+            with self.subTest(surface="comment", login=drifted):
+                state, _ = decide(reviews=[clean],
+                                  comments=[comment(blocking, login=drifted, at=newer)])
+                self.assertEqual(state, "failure")
+
     def test_distinct_approval_trusted_via_collaborator_permission(self):
         """Branch 8 — association is CONTRIBUTOR (the visibility-gated false
         negative the original documents); permission lookup rescues it."""
@@ -2145,6 +2191,23 @@ class TestSeatAwareReduction(unittest.TestCase):
             ]
         )
         self.assertEqual(state, "success")
+
+    def test_case_drifted_app_login_still_supersedes_its_own_approval(self):
+        # One App seat, two spellings: the newer clean COMMENTED review under
+        # a case-drifted login must still withdraw the stale APPROVED, not
+        # stand beside it as a second actor that keeps the old success.
+        for spelling in ("allyblockcast[bot]", "app/allyblockcast", "allyblockcast",
+                         "AllyBlockcast[bot]", "ALLYBLOCKCAST", "App/allyblockcast"):
+            with self.subTest(login=spelling):
+                state, _ = decide(
+                    reviews=[
+                        review("APPROVED", login="allyblockcast[bot]", utype="Bot",
+                               at="2026-07-27T09:00:00Z"),
+                        review("COMMENTED", body=CLEAN, login=spelling, utype="Bot",
+                               at="2026-07-27T11:00:00Z"),
+                    ]
+                )
+                self.assertEqual(state, "pending")
 
     def test_apps_own_ambiguous_approval_supersedes_its_success(self):
         # An ambiguous approval is the seat's newest formal verdict: the

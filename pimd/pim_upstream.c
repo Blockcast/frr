@@ -591,6 +591,29 @@ void join_timer_start(struct pim_upstream *up)
 }
 
 /*
+ * Run the upstream's own periodic Join Timer, t_periodic from now, even when
+ * a neighbor exists for its RPF' -- i.e. without joining that neighbor's
+ * J/P aggregation list.  For callers (DIMT tunnel teardown) that have just
+ * pruned RPF' and taken the upstream off that list: the refresh must not go
+ * out immediately, but must not stop either if the teardown never happens.
+ * Whatever next moves the upstream calls join_timer_start() again.
+ */
+void pim_upstream_join_timer_defer(struct pim_upstream *up)
+{
+	const struct pim_interface *pim_ifp = NULL;
+	int t_periodic = router->t_periodic;
+
+	if (up->rpf.source_nexthop.interface)
+		pim_ifp = up->rpf.source_nexthop.interface->info;
+	if (pim_ifp)
+		t_periodic = pim_if_jp_period(pim_ifp);
+
+	event_cancel(&up->t_join_timer);
+	event_add_timer(router->master, on_join_timer, up, t_periodic,
+			&up->t_join_timer);
+}
+
+/*
  * This is only called when we are switching the upstream
  * J/P from one neighbor to another
  *
