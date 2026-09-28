@@ -238,8 +238,18 @@ from the return moves at most once for a route carrying three GA-mismatched
 tuples, under-counting exactly the flood the counter exists to show. Were the
 counter the decoder's own instead, the four reasons below that it raises for
 both lanes would land in one number with no attribution on an instance running
-both. Counted by the decoder, per tuple: origin-ambiguous, `GA == 0`,
-`GA != origin_as`, and unusable UMH address.
+both. Counted by the decoder, per tuple: `GA == 0`, `GA != origin_as`, and
+unusable UMH address, each read from the tuple itself (its Global
+Administrator or its `Parameter`).
+
+Counted by the decoder, once per route: origin-ambiguous. It is a property of
+the route's AS_PATH (an AS_SET, AS 0, or a confederation-member origin), which
+the decoder resolves once, before the tuple walk, and which is identical for
+every tuple on the route. So it is counted on first detection, before the walk
+begins, and cannot scale with tuple cardinality. Today's
+`bgp_mvpn_resolve_from_lcommunity()` computes `origin_ambiguous` before its
+loop but tests it inside, once per tuple; carried over as-is, that test would
+count per tuple.
 
 Counted by the DIMT call site, once per route: untrusted neighbor and wrong
 address family. Both are properties of the route and its peer, not of any
@@ -282,7 +292,10 @@ route carrying any other LC inflates the number.
   a reject.
 - With the knob set, a v4 route carrying a valid LC-UMH and a `0x80` EC whose
   selected tuple is `amt-relay` maps as `amt-relay` from the EC and does not
-  pin; the same route with a `pim` EC maps from the LC.
+  pin; the same route with a `pim` EC maps from the LC. With `debug bgp zebra`
+  on, that route emits the LC-vs-EC disagreement log even when the
+  `amt-relay` EC names the same address as the LC: the type comparison is the
+  one the MVPN log lacks, and same-address is the case only it can catch.
 - Setting only `bgp mvpn umh-large-community` leaves the DIMT lane EC-only, and
   setting only `bgp dimt umh-large-community` leaves MVPN Type-7 resolution
   unchanged.
@@ -294,6 +307,9 @@ route carrying any other LC inflates the number.
 - A v4 route whose lowest DIMT tuple is valid and which also carries two
   higher-`GA` GA-mismatched DIMT tuples resolves from the valid tuple and moves
   the DIMT counter by exactly 2.
+- A v4 route whose AS_PATH bears an AS_SET and which carries two DIMT tuples
+  pins to nothing and moves the DIMT counter by exactly 1: origin-ambiguous is
+  counted once per route, not once per tuple.
 - With both knobs set to different function code points, call-site rejects
   are per route. A v6 unicast route carrying two tuples with the DIMT function
   moves the DIMT counter by exactly 1 and the MVPN counter by 0, and the same
