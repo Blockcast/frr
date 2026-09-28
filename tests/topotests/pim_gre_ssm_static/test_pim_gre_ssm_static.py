@@ -637,25 +637,29 @@ def test_rpf_negative_control_underlay_steals_rpf():
         try:
 
             def _rpf_off_tunnel():
-                # pimd keeps an RPF row only while the upstream resolves onto
-                # a PIM-enabled interface.  r2-eth0 runs no PIM, so when the
-                # underlay path wins the row does not move to the underlay --
-                # pim_nht_lookup_ecmp finds no usable member, the upstream's
-                # rpf is cleared (pim_rpf.c pim_upstream_rpf_clear), and the
-                # row disappears outright.  Asserting rpfAddress ==
-                # UNDERLAY_PEER was unsatisfiable by construction.  Both an
-                # absent row and a non-tunnel row mean "RPF left the tunnel";
-                # only a surviving tunnel row is a failure.  A dead pimd is
-                # still an error, so absence can never pass vacuously, and
-                # the zero-delivery assertion below is the real control.
+                # r2-eth0 runs no PIM, so when the underlay path wins the row
+                # does not move to the underlay: pim_nht_lookup_ecmp finds no
+                # usable member and pim_upstream_rpf_clear (pim_rpf.c) clears
+                # the nexthop.  Asserting rpfAddress == UNDERLAY_PEER was
+                # unsatisfiable by construction.  The clear does NOT delete
+                # the upstream, and pim_show_rpf (pim_cmd_common.c) prints a
+                # row for every upstream, with rpfInterface "<ifname?>" when
+                # it is unresolved -- so the row stays, off the tunnel.
+                #
+                # An ABSENT row therefore means the receiver started just
+                # above has not reached pimd as an (S,G) upstream yet
+                # (_start_receiver waits only for the kernel join), not that
+                # RPF moved.  Accepting absence would let the first poll pass
+                # before the join exists, so only a present, non-tunnel row
+                # counts; _rpf reports absence as an error and expect()
+                # retries.
                 #
                 # This is exactly what `maximum-paths 1` on r2 buys: without
                 # it the underlay merely JOINS the tunnel in the ECMP set and
                 # the tunnel member keeps winning, so the row never moves.
-                data = _json_cmd("r2", "show ip pim rpf json")
-                if data is None:
-                    return "r2: unparseable pim rpf JSON (pimd dead?)"
-                row = data.get(GROUP, {}).get(SOURCE, {})
+                row, error = _rpf("r2")
+                if error:
+                    return error
                 if row.get("rpfInterface") == TUNNEL:
                     return "r2 RPF is still the tunnel: {}".format(row)
                 return None
