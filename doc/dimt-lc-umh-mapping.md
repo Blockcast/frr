@@ -214,19 +214,20 @@ adversary can put on the wire.
 ### Reject counter
 
 The LC lane today has only a once-a-minute throttled `zlog_notice`, which is
-not countable. Add a per-instance counter **per lane**, incremented on every
-rejected tuple for the reasons the decoder raises and once per route for the
-two the DIMT call site raises itself (below), readable from `show bgp` with
-the lane named, keeping the throttled log for detail. The MVPN lane has no
-counter today either, so step 2 adds both: the DIMT one and the MVPN one,
-the latter owned by the MVPN call site
+not countable. Add a per-instance counter **per lane**, incremented for the
+reasons the decoder raises (per tuple or once per route, as set out below) and
+once per route for the two the DIMT call site raises itself, readable from
+`show bgp` with the lane named, keeping the throttled log for detail. The MVPN
+lane has no counter today either, so step 2 adds both: the DIMT one and the
+MVPN one, the latter owned by the MVPN call site
 (`bgp_mvpn_resolve_from_source_route()`, `bgp_mvpn.c:1578`).
 
 The shared decoder owns no counter, but it is the one that increments: each
 call site passes a pointer to its own lane's counter, and the decoder bumps it
-once per rejected tuple. That includes tuples after a winner. Today the decoder
-skips every tuple past the first one that resolves before any reject check runs
-(`bgp_mvpn.c:1337-1342`). Tuples sort ascending by Global Administrator, the
+once per rejected tuple, except for the route-scoped reason below. That
+includes tuples after a winner. Today the decoder skips every tuple past the
+first one that resolves before any reject check runs (`bgp_mvpn.c:1337-1342`).
+Tuples sort ascending by Global Administrator, the
 field the GA checks test, so a crafted tuple with a `GA` above the origin AS
 sorts behind a legitimate one and would never be counted. The decoder must
 therefore run the reject checks on every tuple with the lane's `Function`,
@@ -245,11 +246,15 @@ Administrator or its `Parameter`).
 Counted by the decoder, once per route: origin-ambiguous. It is a property of
 the route's AS_PATH (an AS_SET, AS 0, or a confederation-member origin), which
 the decoder resolves once, before the tuple walk, and which is identical for
-every tuple on the route. So it is counted on first detection, before the walk
-begins, and cannot scale with tuple cardinality. Today's
-`bgp_mvpn_resolve_from_lcommunity()` computes `origin_ambiguous` before its
-loop but tests it inside, once per tuple; carried over as-is, that test would
-count per tuple.
+every tuple on the route. So it is counted once, when the walk reaches the
+first tuple with the lane's `Function`, and cannot scale with tuple
+cardinality. It must not be counted before that match. A route carrying no
+tuple with the lane's `Function` is not on this lane at all, and counting its
+AS_SET would make the counter's floor the peer's count of aggregated routes.
+This is the same precondition the call site's two reasons carry (below).
+Today's `bgp_mvpn_resolve_from_lcommunity()` computes `origin_ambiguous`
+before its loop but tests it inside, once per tuple; carried over as-is, that
+test would count per tuple.
 
 Counted by the DIMT call site, once per route: untrusted neighbor and wrong
 address family. Both are properties of the route and its peer, not of any
@@ -310,6 +315,10 @@ route carrying any other LC inflates the number.
 - A v4 route whose AS_PATH bears an AS_SET and which carries two DIMT tuples
   pins to nothing and moves the DIMT counter by exactly 1: origin-ambiguous is
   counted once per route, not once per tuple.
+- A v4 route whose AS_PATH bears an AS_SET and whose only LC carries another
+  function moves neither counter, and neither does the same route carrying no
+  UMH large community at all: origin-ambiguous is counted only once the route
+  carries a tuple with the lane's `Function`.
 - With both knobs set to different function code points, call-site rejects
   are per route. A v6 unicast route carrying two tuples with the DIMT function
   moves the DIMT counter by exactly 1 and the MVPN counter by 0, and the same
