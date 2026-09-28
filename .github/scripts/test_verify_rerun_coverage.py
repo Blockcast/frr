@@ -14,8 +14,10 @@ Run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 import importlib.util
 import os
 import re
+import sys
 import tempfile
 import unittest
+import unittest.mock
 
 _SPEC = importlib.util.spec_from_file_location(
     "verify_rerun_coverage",
@@ -584,6 +586,43 @@ class TestRun36343914099(unittest.TestCase):
         )
         self.assertEqual(len(problems), 1)
         self.assertIn("NEVER EXECUTED", problems[0])
+
+
+class TestMainWiresTheParallelJunit(unittest.TestCase):
+    """main() must feed parse_errored's result, and only that, into verify().
+
+    TestRun36343914099 calls verify() and TestParseErroredDiscriminates calls
+    parse_errored() directly, so neither sees what main() passes between
+    them: dropping the argument, or reading it with parse_failures, left
+    every other test green while reverting BLO-36708.
+    """
+
+    SRV6 = "srv6_sid_manager/test_srv6_sid_manager.py"
+    BODY = ["test_isis_adjacencies", "test_rib_ipv4", "test_ping"]
+
+    def _main(self, *extra):
+        ids = [self.SRV6 + "::" + n for n in self.BODY + ["test_memory_leak"]]
+        rerun = _tmpxml(junit(
+            [(self.SRV6, n, "pass") for n in self.BODY]
+            + [(self.SRV6, "test_memory_leak", "skipped")]))
+        argv = ["verify_rerun_coverage.py", "--expected",
+                _tmpxml("\n".join(ids) + "\n"), "--results", rerun]
+        with unittest.mock.patch.object(sys, "argv", argv + list(extra)):
+            return guard.main()
+
+    def _parallel(self, verdict):
+        return _tmpxml(junit(
+            [(self.SRV6, n, "error") for n in self.BODY]
+            + [(self.SRV6, "test_memory_leak", verdict)]))
+
+    def test_errored_then_skipped_is_excused_through_main(self):
+        self.assertEqual(
+            self._main("--parallel-results", self._parallel("error")), 0)
+
+    def test_failed_then_skipped_is_not_excused_through_main(self):
+        """Pins parse_errored, not parse_failures, as main()'s source."""
+        self.assertEqual(
+            self._main("--parallel-results", self._parallel("failure")), 1)
 
 
 if __name__ == "__main__":
