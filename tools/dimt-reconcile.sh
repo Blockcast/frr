@@ -80,10 +80,9 @@
 # gate runs and GC reaps every tunnel this script owns; the old
 # unconditional ensure_fou() used to refuse first whenever FOU was
 # unavailable, which was incidental protection rather than a contract.
-# An MTU below
-# 1280 leaves the tunnels v4-only (the kernel disables IPv6 on such
-# links) and is warned about loudly, as is an MTU that overflows the
-# outer path to the peer.
+# An MTU below 1280 leaves the tunnels v4-only (the kernel disables IPv6
+# on such links) and is warned about loudly, as is an MTU that overflows
+# the outer path to the peer.
 #
 # Managed-underlay cutover:
 #   --endpoints-file (or DIMT_ENDPOINTS_FILE) names a rendered file with
@@ -196,12 +195,18 @@ dev_of() {
 # Interior whitespace is NOT deleted any more (it used to be, which
 # silently repaired "100.64. 0.47" into a different valid address);
 # a mangled entry now fails the dotted-quad check loudly instead.
+# EVERY field is joined, not just the first two: a third column used to
+# be dropped on the floor, so "100.64.0.47 gre extra" parsed as a valid
+# gre peer.  Joining it makes the mode "gre=extra", which the build loop
+# rejects loudly -- the last silent repair in this parser.
 peers() {
 	{
 		[ -n "$PEERS_INLINE" ] && echo "$PEERS_INLINE" | tr ',' '\n'
 		[ -r "$PEERS_FILE" ] && sed 's/#.*//' "$PEERS_FILE"
 	} | tr -d '\r' |
-		awk 'NF { print (NF > 1 ? $1 "=" $2 : $1) }' | sort -u
+		awk 'NF { spec = $1
+			for (i = 2; i <= NF; i++) spec = spec "=" $i
+			print spec }' | sort -u
 }
 
 overlay_of() { echo "${1%%=*}"; }
@@ -609,6 +614,10 @@ reconcile() {
 	# before the peer loop, because every capability gate below must run
 	# before the first delete.  Unrecognised modes are left out: the loop
 	# rejects those peers, so nothing should be probed on their behalf.
+	# That holds for the MODE only -- a malformed overlay ("garbage=gre")
+	# still arms its mode's probe here and is rejected by the dotted-quad
+	# check below, so one probe can run for a peer nothing is built for.
+	# Harmless: invalid=1 already forces rc=1 and suppresses GC.
 	want_fou=0
 	want_plain=0
 	for spec in $all_peers; do
@@ -667,6 +676,17 @@ reconcile() {
 		fi
 		case "$mode" in
 		gre | gre-in-fou) : ;;
+		*=*)
+			# peers() joins every field, so a surviving "=" means the
+			# entry had a third column.  Echo it back in its original
+			# spacing rather than the joined form.
+			log "ignoring peer $peer: trailing field(s) after encap mode" \
+				"in '$peer $(echo "$mode" | tr '=' ' ')'" \
+				"(expected '<overlay> <gre|gre-in-fou>')"
+			invalid=1
+			rc=1
+			continue
+			;;
 		*)
 			log "ignoring peer $peer: unknown encap mode '$mode'" \
 				"(expected gre or gre-in-fou)"

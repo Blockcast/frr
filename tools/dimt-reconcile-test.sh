@@ -733,6 +733,56 @@ check "h6: no tunnel created for it" log_lacks "^ip link add dimt-0-47"
 check "h6: GC suppressed (the entry may be a desired peer)" \
 	log_lacks "^ip link del dimt-9-9"
 
+# --- (h6b) a THIRD column is loud, not silently dropped ----------------
+# The parser used to keep $1/$2 and discard the rest, so this parsed as a
+# perfectly valid plain-GRE peer.  It is the last silent repair that was
+# left after "100.64. 0.47" was made to fail the dotted-quad check.
+new_state h6b
+printf '100.64.0.47 gre extra\n' > "$TESTDIR/peers-junk"
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-junk" 2>&1)
+rc=$?
+check "h6b: a trailing field exits nonzero" [ "$rc" -ne 0 ]
+check "h6b: the offending line is echoed back" err_has \
+	"trailing field(s) after encap mode in '100.64.0.47 gre extra'"
+check "h6b: not mistaken for a valid gre peer" log_lacks "^ip link add dimt-0-47"
+check "h6b: GC suppressed (the entry may be a desired peer)" \
+	log_lacks "^ip link del dimt-9-9"
+# Same line from --peers, where the field separator is a comma.
+new_state h6b2
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers '100.64.0.47 gre extra' \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6b2: inline trailing field exits nonzero" [ "$rc" -ne 0 ]
+check "h6b2: inline trailing field is named" err_has \
+	"trailing field(s) after encap mode"
+
+# --- (h6c) both valid grammars still build a plain-GRE tunnel ----------
+# Positive control for h6b: the field-joining that makes a third column
+# loud must not break the two documented forms.  The file's two-column
+# form is exercised throughout (peers-plain); this pins the inline form,
+# where the mode arrives already glued on with "=".
+new_state h6c
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47=gre \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6c: inline <overlay>=<mode> exits zero" [ "$rc" -eq 0 ]
+check "h6c: inline form creates an unencapsulated GRE tunnel" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+new_state h6c2
+printf '100.64.0.47 gre\n100.64.0.48\n' > "$TESTDIR/peers-mixed"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-mixed" 2>&1)
+rc=$?
+check "h6c2: mixed explicit/absent modes exit zero" [ "$rc" -eq 0 ]
+check "h6c2: the explicit gre peer is unencapsulated" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+check "h6c2: the absent-mode peer defaults to gre-in-fou" log_has \
+	"^ip link add dimt-0-48 type gre local 100.64.0.40 remote 100.64.0.48 ttl 64 encap fou "
+
 # --- (h7) one overlay listed twice under conflicting modes -------------
 new_state h7
 printf '100.64.0.47 gre\n100.64.0.47 gre-in-fou\n' > "$TESTDIR/peers-conflict"
@@ -843,6 +893,11 @@ rc=$?
 check "g: unknown flag exits nonzero" [ "$rc" -ne 0 ]
 check "g: usage mentions the refuse-outright safety" err_has "REFUSED outright"
 check "g: usage prints the last header line" err_has "\[--allow-empty\]"
+# usage() prints the header block verbatim, so a reflow artifact in the
+# comment is user-visible in `-h`.  Pins the sentence that was stranded
+# as a three-word line mid-paragraph.
+check "g: the MTU sentence is not broken mid-clause" err_has \
+	"An MTU below 1280 leaves the tunnels v4-only"
 
 echo
 if [ "$FAILS" -gt 0 ]; then
