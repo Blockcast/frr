@@ -801,7 +801,14 @@ def test_source_netdev_delete_midstream():
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
-    receiver = _start_receiver(count=PACKETS)
+    # The receiver holds r2's membership for the whole test, including the
+    # release check below, so any (S,G) that disappears on r1 disappears
+    # because of the delete and not because the stream was torn down.  Its
+    # count matches the sender's, so it never exits early by count (the
+    # default PACKETS, at 0.1s per packet, would exit ~5s after forwarding
+    # starts).  Its timeout covers _r1_forwarding (60s) + check_link_absent
+    # (20s) + _iif_released (30s) with margin.
+    receiver = _start_receiver(count=400, timeout=180.0)
     sender = None
     try:
         helper = os.path.join(CWD, "mcast_traffic.py")
@@ -826,6 +833,39 @@ def test_source_netdev_delete_midstream():
         # Positive evidence the netdev is really gone -- check_link_absent
         # refuses to report absence from an unreadable link table.
         expect(lambda: check_link_absent(tgen.gears["r1"], "r1-eth1"), count=20)
+
+        # And r1 must not still claim a netdev that no longer exists.  Given
+        # time to converge: the point is that it settles, not that it is
+        # instantaneous.  Checked HERE, while the receiver still holds the
+        # membership, not after the finally tears the stream down: once the
+        # stream is gone the (S,G) ages out on its own, and an absent entry
+        # would then pass whether or not r1 released the netdev.
+        #
+        # An absent entry IS a legitimate release here, not only a
+        # non-r1-eth1 IIF.  With r1-eth1 gone r1 has no route to the source,
+        # r1 withdraws the source prefix, r2 loses its RPF and prunes, and
+        # show ip mroute also skips an entry whose IIF no longer resolves
+        # (it is not installed).  That is the delete being processed, and
+        # _r1_forwarding above already proved the entry existed on r1-eth1.
+        # A pimd that wedged on the delete would instead keep claiming
+        # r1-eth1, which is the failure this catches.
+        def _iif_released():
+            if receiver.poll() is not None:
+                return (
+                    "the membership-holding receiver exited -- an absent "
+                    "(S,G) would then prove nothing about the release"
+                )
+            data = _json_cmd("r1", "show ip mroute json")
+            if data is None:
+                return "r1: unparseable mroute JSON after the delete"
+            sg = data.get(GROUP, {}).get(SOURCE, {})
+            if sg.get("iif") == "r1-eth1":
+                return "r1 still claims the deleted netdev as the (S,G) IIF: {}".format(
+                    sg
+                )
+            return None
+
+        expect(_iif_released, count=30)
     finally:
         if sender is not None and sender.poll() is None:
             sender.terminate()
@@ -844,22 +884,6 @@ def test_source_netdev_delete_midstream():
         assert data is not None, "{}: zebra stopped answering after the delete".format(
             rname
         )
-
-    # And r1 must not still claim a netdev that no longer exists.  Given
-    # time to converge: the point is that it settles, not that it is
-    # instantaneous.
-    def _iif_released():
-        data = _json_cmd("r1", "show ip mroute json")
-        if data is None:
-            return "r1: unparseable mroute JSON after the delete"
-        sg = data.get(GROUP, {}).get(SOURCE, {})
-        if sg.get("iif") == "r1-eth1":
-            return "r1 still claims the deleted netdev as the (S,G) IIF: {}".format(
-                sg
-            )
-        return None
-
-    expect(_iif_released, count=30)
 
     assert not tgen.routers_have_failure(), tgen.errors
 
