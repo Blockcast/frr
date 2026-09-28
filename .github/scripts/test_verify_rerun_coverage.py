@@ -488,6 +488,29 @@ class TestWorkflowWiring(unittest.TestCase):
             + expected.group(0).strip(),
         )
 
+    def test_rerun_verifier_is_given_the_parallel_junit(self):
+        """No --parallel-results, no excuse: BLO-36708 silently reverts.
+
+        An unreadable parallel junit warns, but an absent flag prints nothing:
+        parallel_errored just stays empty and an ERRORED-then-skipped
+        test_memory_leak turns the shard red again.  Anchored on `python3` so
+        prose mentions of the script in nearby comments are not matched.
+        """
+        inv = re.findall(
+            r"python3 [^\n]*verify_rerun_coverage\.py[\s\S]{0,300}?; then",
+            self.workflow,
+        )
+        self.assertTrue(inv, "expected the rerun-coverage invocation")
+        for i in inv:
+            self.assertIn(
+                "--parallel-results",
+                i,
+                "verify_rerun_coverage.py is called without "
+                "--parallel-results, so an ERRORED-then-skipped target is "
+                "unexcusable and a module-scoped fixture failure has no "
+                "green path (BLO-36708): " + i,
+            )
+
 
 class TestRun36343914099(unittest.TestCase):
     """Replay of run 36343914099 u22 s2 @ 7f2ef5069 (BLO-36708).
