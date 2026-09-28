@@ -803,18 +803,23 @@ def test_source_netdev_delete_midstream():
 
     # The receiver holds r2's membership for the whole test, including the
     # release check below, so any (S,G) that disappears on r1 disappears
-    # because of the delete and not because the stream was torn down.  Its
-    # count matches the sender's, so it never exits early by count (the
-    # default PACKETS, at 0.1s per packet, would exit ~5s after forwarding
-    # starts).  Its timeout covers _r1_forwarding (60s) + check_link_absent
-    # (20s) + _iif_released (30s) with margin.
-    receiver = _start_receiver(count=400, timeout=180.0)
+    # because of the delete and not because the stream was torn down.  It
+    # has no lifetime budget to get wrong: an infinite --timeout leaves the
+    # finally below as the only thing that ends it, however long the
+    # expect() windows take (each costs count x (probe + wait), and the
+    # probe is a vtysh round-trip of unbounded cost on a loaded runner).  It
+    # shares the sender's packet count, and the delete is asserted to land
+    # while the sender is still sending, so it cannot collect its count and
+    # exit early either.  Its report is never read, so the bounded timeout
+    # _receiver_report() relies on elsewhere does not apply.
+    packets = 400
+    receiver = _start_receiver(count=packets, timeout=float("inf"))
     sender = None
     try:
         helper = os.path.join(CWD, "mcast_traffic.py")
         # A slow, long stream so the delete really lands mid-flight.
         sender = tgen.gears["h1"].popen(
-            [helper, GROUP, "h1-eth0", "--send", "400", "--interval", "0.1"]
+            [helper, GROUP, "h1-eth0", "--send", str(packets), "--interval", "0.1"]
         )
 
         def _r1_forwarding():
@@ -828,6 +833,14 @@ def test_source_netdev_delete_midstream():
 
         expect(_r1_forwarding)
 
+        # _r1_forwarding converges on mroute state that r2's SSM join holds
+        # even with no traffic, so without this the test would still pass
+        # if the stream had already ended, and the delete would then be a
+        # quieter event than the one this test is named for.
+        assert sender.poll() is None, (
+            "sender finished before the delete -- this is no longer a "
+            "midstream delete"
+        )
         tgen.gears["r1"].run("ip link del r1-eth1")
 
         # Positive evidence the netdev is really gone -- check_link_absent
