@@ -66,6 +66,15 @@ def parse(xml):
         os.unlink(path)
 
 
+def _tmpxml(xml):
+    """Write xml to a temp file and return its path (leaked; test-only)."""
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".xml", delete=False
+    ) as f:
+        f.write(xml)
+        return f.name
+
+
 class TestRun32421578651(unittest.TestCase):
     """Replay of the exact scenario in run 32421578651 / frr#66 @ 1e7809d0.
 
@@ -161,6 +170,33 @@ class TestCoverage(unittest.TestCase):
         problems = guard.verify(expected, executed, skipped)
         self.assertTrue(problems)
         self.assertIn("NEVER EXECUTED", problems[0])
+
+
+class TestParseErroredDiscriminates(unittest.TestCase):
+    """parse_errored must return ONLY <error> ids, not every testcase.
+
+    Every other parse_errored fixture here feeds junit whose cases are all
+    "error", so a parse_errored that ignored the <error> filter entirely would
+    return the identical set and no test would notice.  That mutation is the
+    merge-authorizing one: the excused-skip branch in verify() is gated on
+    membership of this set, so a set containing everything excuses every skip
+    and the rerun-coverage guard becomes vacuous.  One mixed file pins it.
+    """
+
+    def test_only_errored_ids_come_back(self):
+        errored = guard.parse_errored(
+            _tmpxml(
+                junit(
+                    [
+                        (GRPC, "test_pass", "pass"),
+                        (GRPC, "test_fail", "failure"),
+                        (GRPC, "test_skip", "skipped"),
+                        (GRPC, "test_err", "error"),
+                    ]
+                )
+            )
+        )
+        self.assertEqual(errored, {GRPC + "::test_err"})
 
 
 class TestUnexpectedFailureReporting(unittest.TestCase):
@@ -451,6 +487,80 @@ class TestWorkflowWiring(unittest.TestCase):
             "coverage must be verified per node ID, not per file: "
             + expected.group(0).strip(),
         )
+
+
+class TestRun36343914099(unittest.TestCase):
+    """Replay of run 36343914099 u22 s2 @ 7f2ef5069 (BLO-36708).
+
+    srv6_sid_manager hit "got error mounting new sysfs"; pytest ERRORED all 7
+    items in the file, including test_memory_leak, which every topotest file
+    carries and which skips unconditionally in CI.  The whole-file rerun came
+    back 6 passed / 1 skipped -- a clean module -- and the shard was still
+    failed, because an always-skipped ID can never come back executed.  Any
+    module-scoped fixture failure was therefore unclearable and master had no
+    green path at all.
+    """
+
+    SRV6 = "srv6_sid_manager/test_srv6_sid_manager.py"
+    BODY = ["test_isis_adjacencies", "test_rib_ipv4", "test_ping"]
+
+    def setUp(self):
+        self.expected = {
+            self.SRV6 + "::" + n for n in self.BODY + ["test_memory_leak"]
+        }
+        # The rerun: the module came up, the real tests ran, memleak skipped.
+        self.executed, self.skipped = parse(
+            junit(
+                [(self.SRV6, n, "pass") for n in self.BODY]
+                + [(self.SRV6, "test_memory_leak", "skipped")]
+            )
+        )
+        # The parallel run: the fixture died, so every item is an <error>.
+        self.par_errored = guard.parse_errored(
+            _tmpxml(
+                junit(
+                    [
+                        (self.SRV6, n, "error")
+                        for n in self.BODY + ["test_memory_leak"]
+                    ]
+                )
+            )
+        )
+
+    def test_error_then_skip_is_excused(self):
+        self.assertEqual(
+            guard.verify(
+                self.expected, self.executed, self.skipped, self.par_errored
+            ),
+            [],
+        )
+
+    def test_still_red_without_the_parallel_junit(self):
+        """The excuse is opt-in: no --parallel-results, no excuse."""
+        problems = guard.verify(self.expected, self.executed, self.skipped)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("test_memory_leak", problems[0])
+
+    def test_failed_then_skipped_is_still_red(self):
+        """The guard's whole point survives: a real FAILURE is not excusable."""
+        par_errored = guard.parse_errored(
+            _tmpxml(junit([(self.SRV6, n, "error") for n in self.BODY]))
+        )
+        problems = guard.verify(
+            self.expected, self.executed, self.skipped, par_errored
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("test_memory_leak", problems[0])
+
+    def test_never_executed_is_still_red(self):
+        """An ERRORED target that the rerun never ran at all stays a problem."""
+        expected = self.expected | {self.SRV6 + "::test_vanished"}
+        par_errored = self.par_errored | {self.SRV6 + "::test_vanished"}
+        problems = guard.verify(
+            expected, self.executed, self.skipped, par_errored
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("NEVER EXECUTED", problems[0])
 
 
 if __name__ == "__main__":
