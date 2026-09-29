@@ -796,11 +796,16 @@ check "h6d2: no capability probe runs on its behalf" \
 # peer arms its mode's gate first and binds the FOU port on a box that
 # builds only plain GRE.  Pinned here so the deferred dedupe-hoist has
 # a failing assertion to flip instead of a paragraph to re-derive.
-# The third assertion pins the BOUND, which is not what it looks like:
-# the collision branch sets rc=1 without invalid=1, so GC is NOT
-# suppressed the way it is for a malformed entry (contrast h6d).  What
-# keeps the contested device safe is the winning peer having already
-# put it in want.
+# The BOUND is pinned by two assertions, named here rather than
+# numbered because an ordinal breaks the moment one is inserted:
+#   "GC is NOT suppressed on the collision path"
+#   "the contested device survives GC"
+# It is not what it looks like: the collision branch sets rc=1 without
+# invalid=1, so GC is NOT suppressed the way it is for a malformed
+# entry (contrast h6d).  What keeps the contested device safe is the
+# winning peer having already put it in want.  By contrast
+#   "the residual FOU bind happens anyway"
+# is the HOLE this block exists to disclose -- not the safety property.
 new_state h6e
 echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
 err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
