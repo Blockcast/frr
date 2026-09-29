@@ -205,7 +205,7 @@ rule — E2 lands before on-demand rows run on an IX-connected box — applies t
 this lane for the same reason. Hence the blocker.
 
 Usable-address rejects are unchanged: each one skips only its own tuple, like
-the other decoder rejects (see the counter section). The rejected ranges are
+the two `GA` rejects (see the counter section). The rejected ranges are
 `0/8`, `127/8`, `169.254/16`, `224/4` and `240/4`, including
 `255.255.255.255`. Deliberately not
 `ipv4_unicast_valid()`, which treats Class E as usable and gates `0/8` and
@@ -233,17 +233,20 @@ Tuples sort ascending by Global Administrator, the
 field the GA checks test, so a crafted tuple with a `GA` above the origin AS
 sorts behind a legitimate one and would never be counted. The decoder must
 therefore run the reject checks on every tuple with the lane's `Function`,
-winner or not. A tuple past the winner that passes them is still ignored, not
-counted, and cannot change which tuple resolves. A return value cannot carry this. The decoder walks
-the whole LC list, `continue`s past each rejected tuple (`bgp_mvpn.c:1344`,
-`:1401`) and returns one `bool` per route (`:1424`), so a call site counting
-from the return moves at most once for a route carrying three GA-mismatched
-tuples, under-counting exactly the flood the counter exists to show. Were the
-counter the decoder's own instead, the four reasons below that it raises for
-both lanes would land in one number with no attribution on an instance running
-both. Counted by the decoder, per tuple: `GA == 0`, `GA != origin_as`, and
-unusable UMH address, each read from the tuple itself (its Global
-Administrator or its `Parameter`).
+winner or not, on any route whose origin AS resolves; an origin-ambiguous
+route is the one exception, and its decode ends at its first such tuple
+(below). A tuple past the winner that passes the checks is still ignored, not
+counted, and cannot change which tuple resolves. A return value cannot carry
+this. The decoder walks the whole LC list, `continue`s past each rejected
+tuple (`bgp_mvpn.c:1344`, `:1401`) and returns one `bool` per route (`:1424`),
+so a call site counting from the return moves at most once for a route
+carrying three GA-mismatched tuples, under-counting exactly the flood the
+counter exists to show. Were the counter the decoder's own instead, the four
+reasons below that it raises for both lanes would land in one number with no
+attribution on an instance running both. Counted by the decoder, per tuple, on
+a route whose origin AS resolves: `GA == 0`, `GA != origin_as`, and unusable
+UMH address, each read from the tuple itself (its Global Administrator or its
+`Parameter`).
 
 Counted by the decoder, once per route: origin-ambiguous. It is a property of
 the route's AS_PATH (an AS_SET, AS 0, or a confederation-member origin), which
@@ -254,9 +257,27 @@ cardinality. It must not be counted before that match. A route carrying no
 tuple with the lane's `Function` is not on this lane at all, and counting its
 AS_SET would make the counter's floor the peer's count of aggregated routes.
 This is the same precondition the call site's two reasons carry (below).
-Today's `bgp_mvpn_resolve_from_lcommunity()` computes `origin_ambiguous`
-before its loop but tests it inside, once per tuple; carried over as-is, that
-test would count per tuple.
+
+That count ends the route's decode: the decoder returns no UMH without
+examining any later tuple. The per-tuple checks (`GA == 0`, `GA != origin_as`
+and unusable address) neither run nor count on an origin-ambiguous route, on
+its first tuple or on any other. The `GA` tests have no resolved origin AS to
+compare against, and no tuple on the route can resolve, so nothing later in
+the walk could change the outcome or add a reason. An origin-ambiguous route
+therefore moves its lane's counter by exactly 1, however many tuples with the
+lane's `Function` it carries and whatever their `GA` or `Parameter`.
+
+Today's `bgp_mvpn_resolve_from_lcommunity()` already never reaches the
+per-tuple checks on such a route. `origin_ambiguous` leads the combined
+condition at `bgp_mvpn.c:1344` (`origin_ambiguous || ga == 0 ||
+ga != origin_as`), so it short-circuits the `GA` tests, the notice it emits
+names only the ambiguous reason (`:1368-1372`), and the `continue` there skips
+the usable-address check at `:1401`. What it does not do is stop: it computes
+`origin_ambiguous` before its loop but tests it inside, and `continue`s to
+reject the next tuple with the lane's `Function` for the same reason, so
+carried over as-is that test would count once per tuple. Step 2 returns at the
+first match instead. The route's outcome is unchanged, since no tuple on it
+resolves either way.
 
 Counted by the DIMT call site, once per route: untrusted neighbor and wrong
 address family. Both are properties of the route and its peer, not of any
@@ -300,8 +321,9 @@ one VRF cannot mask a distinct probe on another"), reintroduced one lane inside
 the instance. So step 2 splits it: each lane owns its throttle pair, and each
 call site passes a pointer to its own lane's pair alongside the counter
 pointer, exactly as for the counter. The DIMT call site holds its own pair for
-each of its two reasons, four pairs in total, so neither call-site reason shares
-a pair with the DIMT decoder or with the other. A v6 LC-UMH flood, the common
+each of its two reasons, so the instance holds four throttle pairs: one per
+decoder lane plus these two. Neither call-site reason shares a pair with the
+DIMT decoder or with the other. A v6 LC-UMH flood, the common
 shape on an IX-connected box, is a steady stream of wrong-family rejects. On a
 shared pair it would claim the slot every minute. That would silence the
 decoder's detail on the same lane, and it would silence the untrusted-neighbor
@@ -349,7 +371,9 @@ one lane inside the instance.
   the DIMT counter by exactly 2.
 - A v4 route whose AS_PATH bears an AS_SET and which carries two DIMT tuples
   pins to nothing and moves the DIMT counter by exactly 1: origin-ambiguous is
-  counted once per route, not once per tuple.
+  counted once per route, not once per tuple. The same route with both tuples
+  also carrying `GA == 0` still moves it by exactly 1, not 3: the decode ends
+  at the first DIMT tuple, so no per-tuple reason accrues on either tuple.
 - A v4 route whose AS_PATH bears an AS_SET and whose only LC carries another
   function moves neither counter, and neither does the same route carrying no
   UMH large community at all: origin-ambiguous is counted only once the route
