@@ -176,10 +176,10 @@ Two separate restrictions, and they are not the same one:
    there. It does not reuse the warn's call site either. That warn (`bgp_dimt.c:204`) is an unthrottled `zlog_warn` that fires
    on every route update, which suits the cross-family EC because it is rare.
    A v6 route carrying an LC-UMH is the common shape on an IX-connected box
-   (see "Why this exists"), so it goes to the throttled call-site log with the
-   other call-site reject, at most once a minute on the DIMT call site's own
-   throttle pair, not the decoder's (see "The throttled log is per lane too"
-   under the counter section).
+   (see "Why this exists"), so it goes to the throttled call-site log, at most
+   once a minute on the wrong-family reject's own throttle pair, which it
+   shares with neither the decoder nor the untrusted-neighbor reject (see "The
+   throttled log is per lane too" under the counter section).
 
    **The MVPN lane keeps `p6` working unchanged.** The shared decoder must not
    impose the DIMT family rule on the MVPN caller — the family gate belongs to
@@ -263,7 +263,8 @@ address family. Both are properties of the route and its peer, not of any
 tuple, so the count cannot scale with tuple cardinality however many tuples the
 call site inspects. A route that trips both moves the counter once in total,
 not once per reason: the trust gate runs first, then the family gate, and the
-first to reject names the reason in the throttled log. Neither belongs in the
+first to reject names the reason on that reason's own throttle pair. Neither
+belongs in the
 shared decoder: neighbor trust is the BLO-36553 per-peer knob and the family
 gate is DIMT-only, and the MVPN lane must inherit neither. Either counts only
 when the route carries at least one tuple with the DIMT function. That takes a
@@ -279,7 +280,16 @@ route carrying any other LC inflates the number.
 
 **The throttled log is per lane too.** The log kept "for detail" needs the
 counter's ownership rule, because the counter says how many and only the log
-says which tuple (`ga`, `fn`, `param`) and why. Its throttle state today is one
+says which tuple (`ga`, `fn`, `param`) and why. Only three of the decoder's
+four reasons reach that log: origin-ambiguous, `GA == 0` and
+`GA != origin_as`, the trust-boundary rejects the notice is guarded on
+(`bgp_mvpn.c:1344`, `:1364-1365`). The fourth, unusable UMH address, is an
+unthrottled `zlog_debug` behind `debug bgp zebra` (`bgp_mvpn.c:1404-1406`) and
+touches no throttle state. Step 2 keeps it there. Its tuple has already passed
+origin-AS, so it is the originating AS naming a bad address for its own route.
+That is a misconfiguration to diagnose, not a probe across the trust boundary,
+and in production the counter is its only trace, deliberately. Its throttle
+state today is one
 pair per instance, `bgp->mvpn_umh_untrusted_log_last` and
 `bgp->mvpn_umh_untrusted_log_seen` (`bgpd.h:997`, `:1004`, read and written at
 `bgp_mvpn.c:1355-1367`). Carried over as-is onto a decoder shared by two lanes,
@@ -289,11 +299,15 @@ the other lane's rejects are counted and never described. That is the masking
 one VRF cannot mask a distinct probe on another"), reintroduced one lane inside
 the instance. So step 2 splits it: each lane owns its throttle pair, and each
 call site passes a pointer to its own lane's pair alongside the counter
-pointer, exactly as for the counter. The DIMT call-site log (untrusted
-neighbor, wrong address family) holds a third pair of its own rather than
-sharing the DIMT decoder's. A v6 LC-UMH flood, the common shape on an
-IX-connected box, would otherwise silence the decoder's detail on the same
-lane.
+pointer, exactly as for the counter. The DIMT call site holds its own pair for
+each of its two reasons, four pairs in total, so neither call-site reason shares
+a pair with the DIMT decoder or with the other. A v6 LC-UMH flood, the common
+shape on an IX-connected box, is a steady stream of wrong-family rejects. On a
+shared pair it would claim the slot every minute. That would silence the
+decoder's detail on the same lane, and it would silence the untrusted-neighbor
+reject, the security-load-bearing one (see "Trust"), which would be counted and
+never described exactly as above, one reason inside the call site instead of
+one lane inside the instance.
 
 ## Test obligations
 
@@ -327,8 +341,9 @@ lane.
 - `p6` and every other vector in `bgp_mvpn_gtm_umh_lc` stays green — the MVPN
   lane's v4-UMH-on-v6-route behaviour must not regress.
 - A v6 unicast route carrying an LC-UMH pins to nothing on the DIMT lane, and
-  logs through the throttled call-site log, not the per-update cross-family
-  warn, with a line that names a large community, not an extended community.
+  logs through the call site's throttled wrong-family log, not the per-update
+  cross-family warn, with a line that names a large community, not an
+  extended community.
 - A v4 route whose lowest DIMT tuple is valid and which also carries two
   higher-`GA` GA-mismatched DIMT tuples resolves from the valid tuple and moves
   the DIMT counter by exactly 2.
@@ -346,11 +361,21 @@ lane.
   v6 route from an untrusted neighbor carrying two such tuples trips both
   call-site gates and still moves the DIMT counter by exactly 1. A v6 route
   whose only LC carries the MVPN function moves neither counter.
-- With both knobs set to different function code points, a flood of rejects
-  on one lane does not suppress the other lane's throttled log line within the
-  same minute. Nor does a flood of DIMT call-site rejects (v6 routes carrying
-  an LC-UMH) suppress the DIMT decoder's line for a GA-mismatched tuple on a v4
-  route within that minute.
+- With both knobs set to different function code points, a flood of
+  trust-boundary rejects (GA mismatch) on one lane does not suppress the other
+  lane's throttled log line for a GA-mismatched tuple within the same minute.
+  Nor does a flood of DIMT call-site rejects (v6 routes carrying an LC-UMH)
+  suppress the DIMT decoder's line for a GA-mismatched tuple on a v4 route
+  within that minute. Every flood and every probe here must be a reject that
+  reaches the throttled notice: an unusable-address reject is debug-only,
+  touches no throttle state, and would pass these obligations without
+  exercising the split.
+- With both call-site gates live, a flood of v6 routes carrying an LC-UMH from
+  a trusted neighbor does not suppress the untrusted-neighbor line for a v4
+  route from an untrusted neighbor within the same minute, and the flood's own
+  wrong-family line is still logged once in that minute.
+- An unusable-address reject moves the lane's counter and emits no notice-level
+  line, with or without `debug bgp zebra`, which adds only the debug line.
 - Endianness known-answer vector `184549374 -> 10.255.255.254` reused verbatim.
 
 ## References
