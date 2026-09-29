@@ -122,6 +122,31 @@ VTYSH6_WARNED=0
 
 log() { printf '%s\n' "dimt-reconcile: $*" >&2; }
 
+# The build loop's dotted-quad gate, shared with the capability pre-scan
+# in reconcile() AND with validate_endpoints() so the three can never
+# disagree about which addresses are buildable.
+#
+# A real dotted quad, not just the shape: this used to be
+# '([0-9]{1,3}\.){3}[0-9]{1,3}', which passed 999.999.999.999 through to
+# dev dimt-999-999 and inner addresses 10.99.999.999/32 -- rejected by
+# `ip`, so it failed loudly downstream rather than silently.  Two reasons
+# the shape check is not enough:
+#   - an octet > 255 is a mangled line, and dev_of() reads octets 3-4, so
+#     the device we derive is not the device the operator meant;
+#   - a leading zero ALIASES: 10.99.010.20 and 10.99.10.20 are the same
+#     address but derive dimt-010-20 and dimt-10-20, i.e. two netdevs
+#     fighting over one peer (and 010 is octal to inet_aton besides).
+# [1-9]?[0-9] is what forbids the leading zero while still admitting 0.
+is_quad() {
+	# grep -Eq is LINE-oriented, so the anchors alone accept an embedded
+	# newline (they match the first line and grep -q succeeds on any
+	# matching line).  A quad is digits and dots, so rejecting anything
+	# else first closes that hole and every other embedded-junk one.
+	case "$1" in *[!0-9.]*) return 1 ;; esac
+	printf '%s\n' "$1" | grep -Eq \
+		'^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
+}
+
 run() {
 	if [ "$DRY" = 1 ]; then
 		log "DRY: $*"
@@ -158,6 +183,14 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$SELF" ] || { log "--self <overlay-ipv4> is required"; exit 1; }
+
+# --self is the fourth address consumer and was the one left outside the
+# gate: it was only checked non-empty, then flowed into inner_of/inner6_of
+# ("10.99.<o3>.<o4>") and the local endpoint.  It also decides the
+# self-skip, which is a TEXTUAL compare against each peer, so an
+# unvalidated --self 100.64.010.40 would not match a peers-file
+# 100.64.10.40 and the box would build a tunnel to itself.
+is_quad "$SELF" || { log "--self must be a dotted quad: '$SELF'"; exit 1; }
 
 if [ "$MTU" -lt 1280 ]; then
 	log "WARNING: MTU $MTU is below the IPv6 minimum of 1280;" \
@@ -213,39 +246,6 @@ peers() {
 
 overlay_of() { printf '%s\n' "${1%%=*}"; }
 
-# The build loop's dotted-quad gate, shared with the capability pre-scan
-# in reconcile() AND with validate_endpoints() so the three can never
-# disagree about which addresses are buildable.
-#
-# A real dotted quad, not just the shape: this used to be
-# '([0-9]{1,3}\.){3}[0-9]{1,3}', which passed 999.999.999.999 through to
-# dev dimt-999-999 and inner addresses 10.99.999.999/32 -- rejected by
-# `ip`, so it failed loudly downstream rather than silently.  Two reasons
-# the shape check is not enough:
-#   - an octet > 255 is a mangled line, and dev_of() reads octets 3-4, so
-#     the device we derive is not the device the operator meant;
-#   - a leading zero ALIASES: 10.99.010.20 and 10.99.10.20 are the same
-#     address but derive dimt-010-20 and dimt-10-20, i.e. two netdevs
-#     fighting over one peer (and 010 is octal to inet_aton besides).
-# [1-9]?[0-9] is what forbids the leading zero while still admitting 0.
-is_quad() {
-	printf '%s\n' "$1" | grep -Eq \
-		'^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
-}
-
-# --self is the fourth address consumer and was the one left outside the
-# gate: it was only checked non-empty, then flowed into inner_of/inner6_of
-# ("10.99.<o3>.<o4>") and the local endpoint.  It also decides the
-# self-skip, which is a TEXTUAL compare against each peer, so an
-# unvalidated --self 100.64.010.40 would not match a peers-file
-# 100.64.10.40 and the box would build a tunnel to itself.
-#
-# Deliberately NOT next to the `-n "$SELF"` check above: that runs during
-# argument parsing, ~70 lines before is_quad() is defined, so the call
-# would be a `command not found` -> rc 127 -> the `||` fires and EVERY
-# --self is rejected, valid ones included.  It has to follow the
-# definition it uses.
-is_quad "$SELF" || { log "--self must be a dotted quad: '$SELF'"; exit 1; }
 
 # Absent second column means gre-in-fou: every registry written before
 # this knob existed describes GRE-in-FOU peers.

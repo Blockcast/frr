@@ -978,12 +978,12 @@ check "h6f5b: no aliased inner address is configured" \
 	log_lacks "10.99.010.40"
 
 # h6f5c: positive control for the gate's PLACEMENT, not its regex.  The
-# obvious home for this check is next to the `-n "$SELF"` test during
-# argument parsing -- but that runs ~70 lines before is_quad() is
-# defined, so the call would be `command not found` -> rc 127 -> the
-# `||` fires and EVERY --self is rejected, valid ones included.  Every
-# other test in this file passes a valid --self and so is also a control
-# for that; this one just says so out loud.
+# gate sits next to the `-n "$SELF"` test, which only works because
+# is_quad() is defined up by log().  Move that definition back down
+# among the other address helpers and the call becomes `command not
+# found` -> rc 127 -> the `||` fires and EVERY --self is rejected, valid
+# ones included.  Every other test here passes a valid --self and so is
+# also a control for that; this one just says so out loud.
 new_state h6f5c
 err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47 \
 	--peers-file "$TESTDIR/no-such-file" 2>&1)
@@ -993,6 +993,20 @@ check "h6f5c: a valid --self still builds its peer" log_has \
 	"^ip link add dimt-0-47 "
 check "h6f5c: a valid --self is never called malformed" err_lacks \
 	"--self must be a dotted quad"
+
+# h6f5d: is_quad's grep is LINE-oriented, so '^...$' alone accepts an
+# embedded newline -- the anchors match the first line and grep -q
+# succeeds on any matching line, so "1.2.3.4\n9.9.9.9" built a device.
+# Only reachable via --self: peers() splits on whitespace ($1) and
+# endpoint_of() prints one field, so neither file path can carry one.
+new_state h6f5d
+err=$($RUN_SH "$RECONCILE" --self "$(printf '100.64.0.40\n9.9.9.9')" \
+	--peers 100.64.0.47 --peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6f5d: a multi-line --self exits nonzero" [ "$rc" -ne 0 ]
+check "h6f5d: the multi-line --self is named" err_has \
+	"--self must be a dotted quad"
+check "h6f5d: no device is derived from it" log_lacks "ip link add "
 
 # --- (h6f6) the gate is escape-proof under a POSIX echo --------------
 # `echo "$1" | grep -Eq` is escape-sensitive: under dash (advertised at
