@@ -198,7 +198,9 @@ dev_of() {
 # EVERY field is joined, not just the first two: a third column used to
 # be dropped on the floor, so "100.64.0.47 gre extra" parsed as a valid
 # gre peer.  Joining it makes the mode "gre=extra", which the build loop
-# rejects loudly -- the last silent repair in this parser.
+# rejects loudly.  One silent drop remains by design: the self line is
+# skipped before the mode check, so a third column on it is ignored with
+# no diagnostic -- nothing is built for self either way.
 peers() {
 	{
 		[ -n "$PEERS_INLINE" ] && echo "$PEERS_INLINE" | tr ',' '\n'
@@ -617,14 +619,23 @@ reconcile() {
 
 	# Which encap modes does the registry actually ask for?  Decided
 	# before the peer loop, because every capability gate below must run
-	# before the first delete.  Only entries the build loop could build
-	# arm a gate: an unrecognised mode is left out, and so is a malformed
-	# overlay, since the loop rejects both and nothing should be probed or
-	# bound on their behalf.  The overlay check is what keeps a bare junk
-	# line ("garbage") from breaking the all-plain-GRE-needs-no-FOU
-	# contract in the header: encap_of() defaults its absent mode to
-	# gre-in-fou, and want_fou runs ensure_fou(), which BINDS the FOU port
-	# (`ip fou add`) rather than merely probing.
+	# before the first delete.  Three classes are skipped here because the
+	# build loop rejects them too, and nothing should be probed or bound
+	# on their behalf: self, a malformed overlay, and an unrecognised
+	# mode.  The overlay check is what keeps a bare junk line ("garbage")
+	# from breaking the all-plain-GRE-needs-no-FOU contract in the header:
+	# encap_of() defaults its absent mode to gre-in-fou, and want_fou runs
+	# ensure_fou(), which BINDS the FOU port (`ip fou add`) rather than
+	# merely probing.
+	#
+	# Known residual -- this is NOT "only entries the loop could build".
+	# The device-collision check runs inside the build loop, i.e. after
+	# this scan, so a collision-losing peer still arms its mode's gate and
+	# is then never built: two peers deriving one dimt-N-M can bind the
+	# FOU port on an otherwise all-plain-GRE box.  Pre-existing (base
+	# 77c3bb30 behaves identically) and bounded, since invalid=1 forces
+	# rc=1 and suppresses GC.  Hoisting the dedupe ahead of this scan
+	# would close it.
 	want_fou=0
 	want_plain=0
 	for spec in $all_peers; do
@@ -687,8 +698,10 @@ reconcile() {
 		gre | gre-in-fou) : ;;
 		*=*)
 			# peers() joins every field, so a surviving "=" means the
-			# entry had a third column.  Echo it back in its original
-			# spacing rather than the joined form.
+			# entry had a third column.  Echo it back with the "="
+			# turned back into spaces -- normalized to single spaces,
+			# NOT the entry's original spacing, so an operator grepping
+			# their peers file for this string may not match the line.
 			log "ignoring peer $peer: trailing field(s) after encap mode" \
 				"in '$peer $(echo "$mode" | tr '=' ' ')'" \
 				"(expected '<overlay> <gre|gre-in-fou>')"
