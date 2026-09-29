@@ -284,8 +284,11 @@ address family. Both are properties of the route and its peer, not of any
 tuple, so the count cannot scale with tuple cardinality however many tuples the
 call site inspects. A route that trips both moves the counter once in total,
 not once per reason: the trust gate runs first, then the family gate, and the
-first to reject names the reason on that reason's own throttle pair. Neither
-belongs in the
+first to reject names the reason on that reason's own throttle pair. A call-site
+reject also ends the route's DIMT handling: the decoder is not invoked, so no
+decoder reason (`GA == 0`, `GA != origin_as`, unusable address) accrues on any
+of its tuples, and the route moves the DIMT counter by exactly 1 whatever its
+tuples carry. Neither gate belongs in the
 shared decoder: neighbor trust is the BLO-36553 per-peer knob and the family
 gate is DIMT-only, and the MVPN lane must inherit neither. Either counts only
 when the route carries at least one tuple with the DIMT function. That takes a
@@ -380,8 +383,11 @@ one lane inside the instance.
   carries a tuple with the lane's `Function`.
 - With both knobs set to different function code points, call-site rejects
   are per route. A v6 unicast route carrying two tuples with the DIMT function
-  moves the DIMT counter by exactly 1 and the MVPN counter by 0, and the same
-  holds for a v4 route from an untrusted neighbor carrying two such tuples. A
+  moves the DIMT counter by exactly 1 and the MVPN counter by 0. A v4 route
+  from an untrusted neighbor carrying two DIMT tuples that are both
+  GA-mismatched also moves the DIMT counter by exactly 1, not 3: the trust
+  reject ends the route's DIMT handling before the decoder runs, so neither
+  tuple's `GA != origin_as` reason accrues. A
   v6 route from an untrusted neighbor carrying two such tuples trips both
   call-site gates and still moves the DIMT counter by exactly 1. A v6 route
   whose only LC carries the MVPN function moves neither counter.
