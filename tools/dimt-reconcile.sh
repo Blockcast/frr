@@ -211,6 +211,11 @@ peers() {
 
 overlay_of() { echo "${1%%=*}"; }
 
+# The build loop's dotted-quad gate, shared with the capability pre-scan
+# in reconcile() so the two can never disagree about which entries are
+# buildable.
+is_quad() { echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
+
 # Absent second column means gre-in-fou: every registry written before
 # this knob existed describes GRE-in-FOU peers.
 encap_of() {
@@ -612,16 +617,20 @@ reconcile() {
 
 	# Which encap modes does the registry actually ask for?  Decided
 	# before the peer loop, because every capability gate below must run
-	# before the first delete.  Unrecognised modes are left out: the loop
-	# rejects those peers, so nothing should be probed on their behalf.
-	# That holds for the MODE only -- a malformed overlay ("garbage=gre")
-	# still arms its mode's probe here and is rejected by the dotted-quad
-	# check below, so one probe can run for a peer nothing is built for.
-	# Harmless: invalid=1 already forces rc=1 and suppresses GC.
+	# before the first delete.  Only entries the build loop could build
+	# arm a gate: an unrecognised mode is left out, and so is a malformed
+	# overlay, since the loop rejects both and nothing should be probed or
+	# bound on their behalf.  The overlay check is what keeps a bare junk
+	# line ("garbage") from breaking the all-plain-GRE-needs-no-FOU
+	# contract in the header: encap_of() defaults its absent mode to
+	# gre-in-fou, and want_fou runs ensure_fou(), which BINDS the FOU port
+	# (`ip fou add`) rather than merely probing.
 	want_fou=0
 	want_plain=0
 	for spec in $all_peers; do
-		[ "$(overlay_of "$spec")" = "$SELF" ] && continue
+		peer=$(overlay_of "$spec")
+		[ "$peer" = "$SELF" ] && continue
+		is_quad "$peer" || continue
 		case "$(encap_of "$spec")" in
 		gre-in-fou) want_fou=1 ;;
 		gre) want_plain=1 ;;
@@ -668,7 +677,7 @@ reconcile() {
 		peer=$(overlay_of "$spec")
 		mode=$(encap_of "$spec")
 		[ "$peer" = "$SELF" ] && continue
-		if ! echo "$peer" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+		if ! is_quad "$peer"; then
 			log "ignoring invalid peer entry '$peer'"
 			invalid=1
 			rc=1

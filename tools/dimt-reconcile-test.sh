@@ -758,6 +758,38 @@ check "h6b2: inline trailing field exits nonzero" [ "$rc" -ne 0 ]
 check "h6b2: inline trailing field is named" err_has \
 	"trailing field(s) after encap mode"
 
+# --- (h6d) a malformed overlay arms no capability gate ----------------
+# encap_of() defaults an absent mode to gre-in-fou, so a bare junk line
+# used to set want_fou and run ensure_fou() -- a real `ip fou add` bind,
+# not a probe -- on a box whose registry is otherwise all plain GRE, and
+# only then be rejected by the dotted-quad check.  h6/h6b cannot see
+# this: their junk yields modes ("0.47", "gre=extra") that arm nothing.
+new_state h6d
+printf '100.64.0.47 gre\ngarbage\n' > "$TESTDIR/peers-garbage"
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-garbage" 2>&1)
+rc=$?
+check "h6d: a bare junk line exits nonzero" [ "$rc" -ne 0 ]
+check "h6d: the junk line is rejected by name" err_has \
+	"ignoring invalid peer entry 'garbage'"
+check "h6d: no FOU port is bound on its behalf" log_lacks "^ip fou add"
+check "h6d: no GRE-in-FOU probe on its behalf" \
+	log_lacks "^ip link add dimt-probe0 .* encap fou"
+check "h6d: the valid plain-GRE peer still builds" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+check "h6d: GC suppressed (the entry may be a desired peer)" \
+	log_lacks "^ip link del dimt-9-9"
+# The explicit-mode twin: "garbage=gre" must not run the plain-GRE probe.
+new_state h6d2
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers garbage=gre \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6d2: a malformed explicit-mode overlay exits nonzero" [ "$rc" -ne 0 ]
+check "h6d2: no capability probe runs on its behalf" \
+	log_lacks "^ip link add dimt-probe0"
+
 # --- (h6c) both valid grammars still build a plain-GRE tunnel ----------
 # Positive control for h6b: the field-joining that makes a third column
 # loud must not break the two documented forms.  The file's two-column
