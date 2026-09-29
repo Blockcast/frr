@@ -26,21 +26,31 @@ which neither CI nor the agent fleet holds).
 
 So the probe degrades instead of vanishing.  When the Harbor API refuses, it
 falls back to `HEAD /v2/<repo>/manifests/<tag>` and reads
-`Docker-Content-Digest`, which the pull scope provably reaches.  That answers
-"did the cache advance?" -- in fact more precisely than `push_time`, which also
-advances on a re-push of byte-identical content -- but carries no timestamp, so
-absolute age becomes unmeasurable rather than wrong.  The two modes are kept
-visibly distinct; the fallback never reports an age it did not measure.
+`Docker-Content-Digest`, which the pull scope provably reaches.  A digest
+carries no timestamp, so absolute age becomes unmeasurable rather than wrong.
+It also measures a different thing than `push_time`: whether the cache
+*content* changed, not whether anyone rewrote it.  A no-op re-seed on an
+unchanged master re-pushes identical content under the same digest, and that is
+the successful outcome here, so an unchanged digest is reported as a warning
+("unchanged"), never as a failure.  The evidence that the push happened is the
+seed job's own result (a failed `cache-to` export fails the build), which the
+workflow consumes separately.  A tag that is absent is still a failure.  The two
+modes are kept visibly distinct; the fallback never reports an age it did not
+measure.
 
 Exit codes
 ----------
-0  every requested tag is present and within the freshness budget
-1  at least one tag is missing, too old, or (with --baseline) did not advance
-2  the probe itself could not run (auth, network, malformed response), or the
-   question asked needs a push time and only digests were obtainable
+0  every requested tag is present and within the freshness budget (or, with
+   --baseline, advanced; in digest mode an unchanged digest is a warning)
+1  at least one tag is missing, too old, or (with --baseline, push_time mode)
+   did not advance
+2  the probe itself could not run (auth, network, malformed response)
+3  absolute age was asked for, but only registry digests were readable, and a
+   digest carries no time (BLO-33101)
 
-1 and 2 are kept distinct so a Harbor outage does not get read as a stale
-cache.  Both are non-green; only the diagnosis differs.
+1, 2 and 3 are kept distinct so a Harbor outage does not get read as a stale
+cache, and so a caller that can tolerate "age unmeasurable" does not also
+swallow a Harbor defect.  All are non-green; only the diagnosis differs.
 """
 
 from __future__ import annotations
@@ -59,6 +69,10 @@ import urllib.request
 EXIT_OK = 0
 EXIT_STALE = 1
 EXIT_PROBE_ERROR = 2
+EXIT_AGE_UNMEASURABLE = 3
+
+# Row statuses that are reported but do not fail the run.  See `evaluate_digests`.
+WARN_STATUSES = ("unchanged",)
 
 DEFAULT_REGISTRY = "registry.blockcast.net"
 DEFAULT_PROJECT = "cache"
@@ -224,7 +238,12 @@ def render_summary(
         else:
             shown = row["push_time"].isoformat() if row["push_time"] else "—"
         age = f"{row['age_hours']:.1f}h" if row["age_hours"] is not None else "—"
-        mark = "✅" if row["status"] == "ok" else "❌"
+        if row["status"] == "ok":
+            mark = "✅"
+        elif row["status"] in WARN_STATUSES:
+            mark = "⚠️"
+        else:
+            mark = "❌"
         lines.append(f"| `{row['tag']}` | {shown} | {age} | {mark} {row['detail']} |")
     return "\n".join(lines) + "\n"
 
@@ -398,6 +417,11 @@ def evaluate_digests(
     Deliberately a separate function from `evaluate`: a digest supports exactly
     one question (did this change?) and unifying the two would invite an age
     comparison against a value that carries no time.
+
+    An unchanged digest is "unchanged", not "not_advanced": an identical
+    re-push and no push at all read the same here, and the former is what a
+    successful no-op re-seed produces.  The digest cannot tell them apart, so it
+    does not fail on them; the seed job result is the push evidence.
     """
     results = []
     for tag, digest in observed.items():
@@ -413,8 +437,11 @@ def evaluate_digests(
             row["status"] = "ok"
             row["detail"] = f"seeded (no prior tag); digest {digest[:19]}…"
         elif digest == prior:
-            row["status"] = "not_advanced"
-            row["detail"] = f"digest unchanged: still {digest[:19]}…"
+            row["status"] = "unchanged"
+            row["detail"] = (
+                f"digest unchanged: still {digest[:19]}… (an identical re-push "
+                "reads the same; the seed job result is the push evidence)"
+            )
         else:
             row["status"] = "ok"
             row["detail"] = f"advanced {prior[:19]}… -> {digest[:19]}…"
@@ -551,7 +578,7 @@ def main(argv: list[str] | None = None) -> int:
                 "Advancement (--baseline) is still answerable.",
                 file=sys.stderr,
             )
-            return EXIT_PROBE_ERROR
+            return EXIT_AGE_UNMEASURABLE
         results = evaluate_digests(observed, baseline)
     else:
         results = evaluate(observed, now, args.max_age_hours, baseline)
@@ -563,15 +590,18 @@ def main(argv: list[str] | None = None) -> int:
         with open(step_summary, "a", encoding="utf-8") as fh:
             fh.write(summary)
 
-    bad = [r for r in results if r["status"] != "ok"]
+    warned = [r for r in results if r["status"] in WARN_STATUSES]
+    bad = [r for r in results if r["status"] not in ("ok", *WARN_STATUSES)]
     if args.report_only:
-        for row in bad:
+        for row in warned + bad:
             # A pre-seed reading that is already stale means the guard was
             # needed -- surface it without failing the seeding run that is
             # about to repair it.
             print(f"::warning::buildcache {row['tag']}: {row['detail']}")
         return EXIT_OK
 
+    for row in warned:
+        print(f"::warning::buildcache {row['tag']}: {row['detail']}")
     for row in bad:
         print(f"::error::buildcache {row['tag']}: {row['detail']}")
     return EXIT_STALE if bad else EXIT_OK

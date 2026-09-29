@@ -615,6 +615,38 @@ class TestFreshnessGateFailsClosedOnFailedVerify(unittest.TestCase):
         self.assertIn("always()", block)
 
 
+def _seeder_job_block(test, job_id):
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "buildcache-seed.yml"
+    )
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    match = re.search(rf"^  {re.escape(job_id)}:\n(.*?)(?=^  \S|\Z)", text, re.S | re.M)
+    test.assertIsNotNone(match, f"{job_id} job not found in buildcache-seed.yml")
+    return match.group(1)
+
+
+class TestFreshnessGateToleratesOnlyUnmeasurableAge(unittest.TestCase):
+    """Ally Important on #114: tolerating every exit 2 turned a Harbor defect
+    (the case AUTHZ_STATUSES exists to keep loud) into a green gate."""
+
+    def test_gate_tolerates_exactly_the_age_unmeasurable_exit(self):
+        block = _seeder_job_block(self, "freshness-gate")
+        tolerated = re.findall(r'\[ "\$\{rc\}" -eq (\d+) \]', block)
+        self.assertEqual([str(bcf.EXIT_AGE_UNMEASURABLE)], tolerated)
+
+
+class TestVerifyRequiresTheSeedResult(unittest.TestCase):
+    """An unchanged digest is a warning, so it cannot prove a push happened;
+    `verify` must take that evidence from the seed legs' own result."""
+
+    def test_verify_fails_closed_on_a_non_success_seed(self):
+        block = _seeder_job_block(self, "verify")
+        self.assertRegex(
+            block, r"if: \$\{\{ needs\.seed\.result != 'success' \}\}[\s\S]*?exit 1"
+        )
+
+
 class TestEveryJobIsConfinedToTheCanonicalRepo(unittest.TestCase):
     """No job in the seeder may run outside Blockcast/frr.
 
@@ -729,10 +761,13 @@ class TestEvaluateDigests(unittest.TestCase):
     A = "sha256:" + "a" * 64
     B = "sha256:" + "b" * 64
 
-    def test_unchanged_digest_is_not_advanced(self):
-        # The property that matters: a seed that silently no-ops must go red.
+    def test_unchanged_digest_is_a_warning_not_a_failure(self):
+        # A no-op re-seed on an unchanged master re-pushes identical content
+        # under the same digest. That is the successful steady state, so it
+        # must not go red -- but it must not claim "advanced" either.
         rows = bcf.evaluate_digests({"t": self.A}, {"t": self.A})
-        self.assertEqual("not_advanced", rows[0]["status"])
+        self.assertEqual("unchanged", rows[0]["status"])
+        self.assertIn("unchanged", bcf.WARN_STATUSES)
 
     def test_changed_digest_advances(self):
         rows = bcf.evaluate_digests({"t": self.B}, {"t": self.A})
@@ -833,10 +868,21 @@ class TestFallbackWiring(unittest.TestCase):
         )
         self.assertEqual(bcf.EXIT_PROBE_ERROR, rc)
 
-    def test_digest_run_against_digest_baseline_compares(self):
+    def test_unchanged_digest_after_a_reseed_does_not_go_red(self):
+        # Ally Critical on #114: a successful no-op re-seed keeps the digest,
+        # and exit 1 here was tolerated nowhere in buildcache-seed.yml, so the
+        # gate went red on success. The push evidence is the seed job result,
+        # asserted in TestVerifyRequiresTheSeedResult.
         same = "sha256:" + "d" * 64
         rc = self._with_baseline({"t": same}, lambda *a, **k: {"t": same})
-        # Same digest => the seed did not advance => stale, not a probe error.
+        self.assertEqual(bcf.EXIT_OK, rc)
+
+    def test_absent_tag_against_a_digest_baseline_still_goes_red(self):
+        # The warning is for "unchanged" only; a tag that vanished (Harbor
+        # retention, the thing this gate guards) must stay exit 1.
+        rc = self._with_baseline(
+            {"t": "sha256:" + "d" * 64}, lambda *a, **k: {"t": None}
+        )
         self.assertEqual(bcf.EXIT_STALE, rc)
 
     def test_digest_run_reports_advancement(self):
@@ -849,8 +895,11 @@ class TestFallbackWiring(unittest.TestCase):
     def test_age_question_is_refused_when_only_digests_are_available(self):
         # No --baseline: the only remaining question is absolute age, which a
         # digest cannot answer. This must NOT come back green.
+        # Its own exit code, so freshness-gate can tolerate exactly this and
+        # still fail on exit 2 (a Harbor defect).
         rc = self._main(["--tag", "t"], lambda *a, **k: {"t": "sha256:" + "e" * 64})
-        self.assertEqual(bcf.EXIT_PROBE_ERROR, rc)
+        self.assertEqual(bcf.EXIT_AGE_UNMEASURABLE, rc)
+        self.assertNotEqual(bcf.EXIT_PROBE_ERROR, bcf.EXIT_AGE_UNMEASURABLE)
 
     def test_both_surfaces_down_is_a_probe_error(self):
         rc = self._main(["--tag", "t"], _refuse_harbor)
