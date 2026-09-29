@@ -142,6 +142,9 @@ extern unsigned long aspath_count(void);
 extern unsigned int aspath_count_hops(const struct aspath *aspath);
 extern bool aspath_check_as_sets(struct aspath *aspath);
 extern bool aspath_check_as_zero(struct aspath *aspath);
+extern unsigned int aspath_origin_as(struct aspath *aspath,
+				     const char **ambiguous_reason,
+				     bool *path_is_empty);
 extern unsigned int aspath_count_confeds(struct aspath *aspath);
 extern unsigned int aspath_size(struct aspath *aspath);
 extern as_t aspath_highest(struct aspath *aspath);

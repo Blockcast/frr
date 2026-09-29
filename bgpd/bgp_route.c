@@ -483,6 +483,8 @@ void bgp_path_info_free_with_caller(const char *name,
 {
 	frrtrace(2, frr_bgp, bgp_path_info_free, path, name);
 	bgp_attr_unintern(&path->attr);
+	if (path->dimt_umh_refused)
+		bgp_attr_unintern(&path->dimt_umh_refused);
 
 	bgp_unlink_nexthop(path);
 	bgp_path_info_extra_free(&path->extra);
