@@ -20,7 +20,9 @@ permissions:
 
 jobs:
   enforce:
-    runs-on: default
+    # arc-light, not `default`: checkout plus one stdlib Python script, the
+    # same shape CI-Verdict runs there on every push and PR (github-ci.yml).
+    runs-on: arc-light
     steps:
       - uses: actions/checkout@v5
       - name: Reject GitHub-hosted runner labels
