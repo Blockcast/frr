@@ -72,13 +72,18 @@ jobs:
     # 4.6-10.7 h in runs 36495098055, 36551077943 and 36464895185
     # (2026-09-28/29).
     #
-    # arc-light runs the same runner image (onprem-k8s pins one digest in
-    # arc/arc-{light,default}-values.yaml).  Keep it that way: actions/cache
-    # folds the compression it picks (zstd if the image has it, else gzip)
-    # into an entry's version, so an image that differed there would save a
-    # MIB entry that Build, on `default`, cannot restore.  push and
-    # workflow_dispatch stay on `default`: they do the full-history checkout
-    # below (2.48 min at the median), not seconds of work.
+    # push and workflow_dispatch stay on `default`: they do the full-history
+    # checkout below (2.48 min at the median), not seconds of work.  Both
+    # pools are pinned to one runner image digest (onprem-k8s
+    # arc/runner-image-pins.rb holds every ARC pool's pin to
+    # arc/arc-runner-image.txt).  actions/cache folds the compression it
+    # picks (zstd if the image has it, else gzip) into an entry's version,
+    # so were the two images ever to differ on zstd, Build, on `default`,
+    # could not restore an entry this job saved on arc-light.  It would fall
+    # back to its own version's entry on the base or default branch, which
+    # only those push and workflow_dispatch runs save: the likely cost is a
+    # miss here and the nine fetches once per pull request, not a broken
+    # Build.
     runs-on: ${{ github.event_name == 'pull_request' && 'arc-light' || 'default' }}
     name: Documentation path filter
     # The folded MIB population's budget (Prepare-MIB-Cache's 20).

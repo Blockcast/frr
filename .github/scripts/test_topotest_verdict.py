@@ -704,8 +704,9 @@ class TestGateWiring(unittest.TestCase):
     """BLO-35428 item 4: what gates Build, Unit-Test and Test.
 
     Every property here is one whose loss lets a run skip building or
-    testing while the verdict does not notice, or lets the verdict stop
-    seeing a job that can fail.
+    testing while the verdict does not notice, lets the verdict stop
+    seeing a job that can fail, or puts the filter on the wrong runner
+    pool for its event.
     """
 
     # Jobs the verdict does not judge by a success/skip rule of their own:
@@ -814,6 +815,16 @@ class TestGateWiring(unittest.TestCase):
         )
         self.assertIn("fetch-depth: 0", co)
         self.assertRegex(self.filter, r"(?m)^      pull-requests: read$")
+
+    def test_filter_runs_on_arc_light_exactly_when_it_skips_the_checkout(self):
+        """pull_request, the one event whose full-history Checkout is skipped,
+        runs the filter on arc-light; push and workflow_dispatch check out
+        and stay on `default` (the comment on its runs-on has the numbers)."""
+        (runs_on,) = re.findall(r"(?m)^    runs-on: (.*)$", self.filter)
+        self.assertEqual(
+            runs_on,
+            "${{ github.event_name == 'pull_request' && 'arc-light' || 'default' }}",
+        )
 
     def test_one_lost_build_leg_does_not_skip_the_other_platform(self):
         for name in ("Unit-Test", "Test"):
