@@ -514,6 +514,31 @@ def test_neighbor_expiry_with_pin_held():
     # class this ticket exists to kill.
     expect(lambda: check_pinned(r2, ifname, UNRESOLVED))
 
+    # Re-derive the pin from scratch with no adjacency present, by bouncing
+    # the membership inside the down window.  Everything above this point
+    # only ever observes an upstream that was ALREADY Joined -- the static
+    # group is held across the expiry, so JoinDesired never flips and the
+    # assertions below cannot see the NotJoined->Joined edge.  That edge is
+    # the ordinary bootstrap shape (netdev adopted `pim-mode normal`, no
+    # neighbour yet, downstream interest already there), and it is the only
+    # way an unresolved RPF' reaches the J/P send path.  Nothing stops
+    # pim_upstream_send_join() on that edge; the packet dies one level down
+    # at the pim_addr_is_any() return in pim_jp_send() (pim_join.c).  That
+    # guard is generic pimd code this feature does not own, so assert the
+    # observable rather than trusting it to stay put.
+    set_static_group(r2, False)
+    expect(
+        lambda: None
+        if (umh_entry(r2) or {}).get("pinSource") != "tunnel"
+        else "{} is still pinned to the tunnel".format(SRC_PREFIX),
+        count=PROMPT,
+    )
+    set_static_group(r2, True)
+    expect(lambda: check_tunnel_installed(r2), count=PROMPT)
+    # Dropping to zero demand may have rebuilt the netdev under a new name.
+    ifname = tunnel_ifname(r2)
+    expect(lambda: check_pinned(r2, ifname, UNRESOLVED), count=PROMPT)
+
     # Give any errant periodic refresh a chance to show up before we look.
     time.sleep(5)
     capture.stop()
