@@ -1145,7 +1145,10 @@ jobs:
           fi
 
           if [ "${rerun_rc}" -ne 0 ]; then
-            echo "Some rerun tests still failed."
+            # The rerun runs whole FILES, so the culprit need not appear in
+            # RERUN_TESTS/RERUN_FILES above.  verify_rerun_coverage.py has
+            # already named any failure outside the harvested set (BLO-36839).
+            echo "Some rerun tests still failed -- see the failure list above." >&2
             exit 1
           fi
           echo "All rerun tests passed."

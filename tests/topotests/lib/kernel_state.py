@@ -231,13 +231,25 @@ def link_ifindex(router, interface):
 
 
 def check_gre_link(
-    router, interface, local, remote, mtu=None, expected_up=True, ttl=None
+    router,
+    interface,
+    local,
+    remote,
+    mtu=None,
+    expected_up=True,
+    ttl=None,
+    encaplimit=None,
 ):
     """Check GRE endpoint and link attributes from `ip -d link show`.
 
     `ttl` is the outer TTL (gre) or hop limit (ip6gre).  iproute2 prints it as
     `ttl N` / `hoplimit N`, and as `ttl inherit` / `hoplimit inherit` when it
     is 0 -- so a numeric expectation can never match an inheriting tunnel.
+
+    `encaplimit` is the ip6gre Tunnel Encapsulation Limit, printed as
+    `encaplimit none` when IP6_TNL_F_IGN_ENCAP_LIMIT is set and `encaplimit N`
+    otherwise.  Plain gre has no such attribute and prints nothing, so a
+    non-None expectation here also asserts the link is ip6gre.
     """
     output = router.run(
         "ip -d link show dev {} 2>&1".format(shlex.quote(interface))
@@ -276,5 +288,11 @@ def check_gre_link(
     ):
         return "kernel GRE {} has wrong outer TTL (expected {}): {}".format(
             interface, ttl, output.strip()
+        )
+    if encaplimit is not None and not re.search(
+        r"\bencaplimit\s+{}\b".format(encaplimit), detail
+    ):
+        return "kernel GRE {} has wrong encap limit (expected {}): {}".format(
+            interface, encaplimit, output.strip()
         )
     return None

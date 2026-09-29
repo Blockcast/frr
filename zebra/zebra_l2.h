@@ -83,6 +83,9 @@ struct zebra_l2info_gre {
 	uint16_t encap_sport;	/* IFLA_GRE_ENCAP_SPORT */
 	uint16_t encap_dport;	/* IFLA_GRE_ENCAP_DPORT */
 	uint8_t ttl;		/* IFLA_GRE_TTL, 0 = inherit */
+	uint32_t flags;		/* IFLA_GRE_FLAGS, ip6gre only (gre never
+				 * reports it, so it stays 0 there)
+				 */
 };
 
 struct zebra_vxlan_vni {

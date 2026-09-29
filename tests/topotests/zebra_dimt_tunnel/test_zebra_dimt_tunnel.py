@@ -3,6 +3,7 @@
 
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -160,17 +161,44 @@ class WindowNeverOpened(Exception):
 # absorbed, so if the hold ever starts working and zebra then misbehaves, that
 # surfaces as a hard failure rather than hiding under this marker. See
 # WindowNeverOpened for why Failed was too wide.
+#
+# strict=False, the one exception to the strict=True rule above, because that
+# rule assumes a marked test fails deterministically and this one no longer
+# does: the hold now takes on some runners and not others. Measured on
+# 2026-09-27/28 -- master run 36278687998 xfailed (window never opened), while
+# the unrelated frr#107 (run 36332531703) and frr#109 (run 36337004794), neither
+# touching zebra, XPASSed: the window opened, readd was rejected, and every
+# behavioural assertion below held. Under strict=True each of those correct
+# runs failed the build. Non-strict keeps what matters: a run whose window
+# opens still fails hard on any AssertionError, and a run whose window never
+# opens is still reported, as xfail, not hidden.
+#
+# "Opened" means only what the guard samples: pending.poll() is None once, at
+# ~0.3s. The readd is processed later (request() spawns a client and waits on a
+# full ZAPI round-trip), so a partial hold can pass the guard and still let the
+# delete finish before zebra sees the ADD. That run returns result=0, which is
+# the ordinary post-delete ADD, and fails hard here although zebra did nothing
+# wrong (frr#101 run 36419490474 is one such run; it does not show an ADD
+# rebinding a live DELETE). BLO-29000 tracks re-checking the guard after the
+# readd returns.
+#
+# What non-strict gives up: strict=True made an XPASS fail the build, which
+# forced this marker off in the PR that fixed the hold. Nothing enforces that
+# now, so the marker no longer removes itself; BLO-29000 owns removing it.
+# Restore strict=True (or drop the marker) when hold_dplane_worker() holds
+# deterministically.
 XFAIL_BLO_29000 = pytest.mark.xfail(
-    strict=True,
+    strict=False,
     raises=WindowNeverOpened,
     reason=(
-        "BLO-29000: this test does not currently exercise its own window -- "
-        "hold_dplane_worker() does not hold the `del 9` client, which exits "
-        "with result=2 (REMOVED) before the readd runs. Measured, not "
-        "inferred: the pending.poll() guard fires. The zebra defect originally "
-        "filed here was a phantom -- a post-delete ADD succeeding is correct, "
-        "and this test's own tail asserts it. Remove this marker when the hold "
-        "works and the guard stops firing."
+        "BLO-29000: hold_dplane_worker() holds the `del 9` client on some "
+        "runners and not others. A run whose window never opens (the "
+        "pending.poll() guard fires) is absorbed here; a run whose window "
+        "opens is not, and fails hard on any AssertionError. The original "
+        "'readd returns result=0' filing is not established as a zebra "
+        "defect: a post-delete ADD succeeding is correct, and this test's own "
+        "tail asserts it. Remove this marker when hold_dplane_worker() holds "
+        "deterministically."
     ),
 )
 
@@ -1141,12 +1169,21 @@ V6_OUTER_LOCAL = "2001:db8:2::1"
 V6_OUTER_REMOTE = "2001:db8:2::2"
 
 
-def test_ip6gre_tunnel_carries_fixed_outer_hop_limit():
-    """An IPv6-outer DIMT tunnel gets the same fixed outer hop limit.
+def test_ip6gre_tunnel_carries_fixed_outer_header():
+    """An IPv6-outer DIMT tunnel gets the fixed hop limit AND `encaplimit none`.
 
     ip6gre inherits exactly like gre when IFLA_GRE_TTL is absent (hop_limit 0
     copies the inner packet's), so the fix has to cover both kinds -- a v4-only
     fix would leave every IPv6 underlay with the multi-hop blackhole.
+
+    The encap limit is the ip6gre-only half.  Without
+    IP6_TNL_F_IGN_ENCAP_LIMIT the kernel prepends a Tunnel Encapsulation Limit
+    destination option to every outer packet, and because ip6gre_newlink
+    memsets its parms the limit it prepends is *0* -- which RFC 2473 s5.1
+    turns into an instruction to every transit router to discard any packet it
+    would have to encapsulate again, and which costs 8 bytes of MTU besides.
+    Same class of blackhole as an inherited TTL, same invisibility in a
+    one-hop lab.
     """
     router = get_topogen().gears["r1"]
     _, ready = topotest.run_and_expect(
@@ -1170,9 +1207,133 @@ def test_ip6gre_tunnel_carries_fixed_outer_hop_limit():
         local=V6_OUTER_LOCAL,
         remote=V6_OUTER_REMOTE,
         ttl=64,
+        encaplimit="none",
     )
     assert kernel_error is None, kernel_error
     assert request("del", 15)["result"] == 2
+
+
+def test_stale_ip6gre_encap_limit_link_is_replaced_not_adopted():
+    """An ip6gre of ours with the default encap limit is rebuilt, not adopted.
+
+    The ip6gre half of the upgrade case that
+    test_stale_ttl_link_is_replaced_not_adopted() covers for gre, and it is
+    not redundant: the TTL is already correct on this link, so only the encap
+    limit distinguishes it.  A zebra that checked the outer TTL alone would
+    re-adopt it, re-notify INSTALLED, and leave the encapsulation blackhole in
+    place on exactly the IPv6 underlays DIMT is being rolled out onto.
+
+    This is also what makes the rollout staged rather than a sweep: zebra
+    never walks the DIMT links looking for stale ones.  Each pre-fix netdev is
+    replaced only when its own tunnel is next requested (here) or changes in
+    place, so an upgraded PoP converts one tunnel at a time, driven by pimd's
+    own demand edges.
+    """
+    router = get_topogen().gears["r1"]
+    name = "dimt-00000010"
+    # A DIFFERENT outer remote from tunnel 15: two GRE links may not share an
+    # (outer local, outer remote) tuple, and ordering between these two tests
+    # is not something this file should depend on.  Still inside the connected
+    # 2001:db8:2::/64 on r1-eth0, so the outer-remote route check passes.
+    stale_remote = "2001:db8:2::3"
+    _, ready = topotest.run_and_expect(
+        lambda: "r1-eth0"
+        in router.vtysh_cmd("show ipv6 route {}".format(stale_remote)),
+        True,
+        count=20,
+        wait=0.5,
+    )
+    assert ready, router.vtysh_cmd("show ipv6 route {}".format(stale_remote))
+
+    # hoplimit 64 is already right here -- the encap limit is the ONLY thing
+    # wrong, which is the whole point of this test.
+    router.run(
+        "ip link add {} type ip6gre local {} remote {} hoplimit 64 "
+        "encaplimit 4".format(name, V6_OUTER_LOCAL, stale_remote)
+    )
+    stale = check_gre_link(
+        router,
+        name,
+        local=V6_OUTER_LOCAL,
+        remote=stale_remote,
+        expected_up=False,
+        ttl=64,
+        encaplimit=4,
+    )
+    assert stale is None, stale
+    _, seen = topotest.run_and_expect(
+        lambda: zebra_ifindex(router, name) is not None, True, count=20, wait=0.2
+    )
+    assert seen, "zebra never learned the pre-existing {}".format(name)
+    stale_ifindex = zebra_ifindex(router, name)
+
+    installed = request(
+        "add", 16, outer_local=V6_OUTER_LOCAL, outer_remote=stale_remote
+    )
+    assert installed["result"] == 0, installed
+    assert installed["ifindex"] != stale_ifindex, (
+        "zebra adopted the encaplimit-4 ip6gre (ifindex {}) instead of "
+        "replacing it: {}".format(stale_ifindex, installed)
+    )
+    kernel_error = check_gre_link(
+        router,
+        name,
+        local=V6_OUTER_LOCAL,
+        remote=stale_remote,
+        ttl=64,
+        encaplimit="none",
+    )
+    assert kernel_error is None, kernel_error
+
+    assert request("del", 16)["result"] == 2
+    _, gone = topotest.run_and_expect(
+        lambda: router.run("ip link show {} 2>/dev/null".format(name)),
+        "",
+        count=10,
+        wait=0.2,
+    )
+    assert gone == "", gone
+
+
+def test_request_without_mtu_warns():
+    """A request with no MTU option is accepted, and says so in the log.
+
+    dimt_zapi_client.py sends options=0, so every ADD in this file takes the
+    no-MTU path: the netdev inherits the kernel default, which does not
+    subtract the outer header, and full-size payloads then fragment or drop.
+    zebra cannot invent an MTU it was not given, so the warning is the whole
+    remedy -- and a silent warning is the same as no warning.
+    """
+    tgen = get_topogen()
+    router = tgen.gears["r1"]
+    # Self-contained: issue the MTU-less ADD here rather than relying on an
+    # earlier test in this file having run.
+    mtuless_remote = "2001:db8:2::4"
+    _, ready = topotest.run_and_expect(
+        lambda: "r1-eth0"
+        in router.vtysh_cmd("show ipv6 route {}".format(mtuless_remote)),
+        True,
+        count=20,
+        wait=0.5,
+    )
+    assert ready, router.vtysh_cmd("show ipv6 route {}".format(mtuless_remote))
+    installed = request(
+        "add", 17, outer_local=V6_OUTER_LOCAL, outer_remote=mtuless_remote
+    )
+    assert installed["result"] == 0, installed
+    assert request("del", 17)["result"] == 2
+
+    logs = sorted(pathlib.Path(tgen.logdir).glob("**/zebra.log"))
+    assert logs, "no zebra.log under {}; the warning is unproven, not absent".format(
+        tgen.logdir
+    )
+    text = "".join(log.read_text(errors="replace") for log in logs)
+    assert text.strip(), "zebra.log(s) empty: {}".format(logs)
+    assert "no MTU in the request" in text, (
+        "zebra accepted MTU-less DIMT ADDs without warning; searched {}".format(
+            [str(log) for log in logs]
+        )
+    )
 
 
 def test_stale_ttl_link_is_replaced_not_adopted():

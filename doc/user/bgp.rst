@@ -4542,6 +4542,95 @@ driven by these routes is not yet implemented.
    facing the UMH -- no per-source static route is needed. Among multiple
    UMH communities on one route the highest preference wins.
 
+   A *received* UMH community is only honoured from a neighbor marked
+   :clicmd:`neighbor PEER dimt-trusted`; see there for why the default is to
+   ignore it.
+
+.. clicmd:: neighbor PEER dimt-trusted
+
+   Honour the DIMT Upstream Multicast Hop extended community (sub-type
+   ``0x80``) received from this neighbor. **Default: off** -- an unmarked
+   neighbor's UMH community is ignored, and the refusal is counted per peer
+   per refused community (``DIMT UMH rejected`` in ``show bgp neighbors``,
+   ``dimtUmhRejected`` under ``prefixStats`` in its JSON form) and logged at
+   notice, throttled to once a minute per peer. A single route carrying both
+   an IPv4 and an IPv6 UMH community therefore increments it by two, and the
+   count covers every BGP instance, not only the default one -- a VRF's
+   refusals are counted even though only the default instance pins.
+
+   The counter is charged when the route arrives, not when bgpd later
+   re-reads it, so it tracks what the neighbor sent: once per set of
+   attributes the route is selected with. A loc-RIB re-process that leaves
+   those attributes as they were -- nexthop tracking or an event on a sibling
+   path with **add-path transmit** enabled, ``clear ip bgp`` for the prefix,
+   the route regaining best after another path is withdrawn -- does not
+   re-charge it or re-arm the once-a-minute log; a re-announcement that
+   changes them does. A refusal on a route
+   bgpd holds locally (see the trust rules below) is logged against the
+   prefix and the BGP instance instead, and is not counted -- ``show bgp
+   neighbors`` has no entry for the local speaker to carry it. That line
+   names one representative prefix per instance per minute, not one line per
+   offending route: a leak affecting many prefixes at once still logs once.
+
+   The default is deny because a UMH community says "send your join toward
+   this address", so any speaker that can attach one to a route you accept
+   decides where a stream is pulled from. Without this knob a transit AS, or
+   an IX route server, could attach a UMH to a prefix it merely carries and
+   redirect your join.
+
+   Marking a neighbor trusted is necessary but not sufficient: the route's
+   origin AS must also authorise the claim, mirroring the trust rule the UMH
+   *large* community already applies (the ``bgp mvpn umh-large-community``
+   knob). For an **eBGP** neighbor the origin AS must equal that neighbor's
+   AS: a trusted peer may claim a UMH for prefixes it originates, not for a
+   third party's prefix it only transits. A route whose AS_PATH bears an
+   AS_SET, carries AS 0, or resolves to a confederation member AS names no
+   usable origin to compare, so its UMH is refused on that arm.
+
+   For an **iBGP** or **confederation** neighbor the claim is accepted
+   without comparing an origin AS, since marking an internal neighbor trusted
+   asserts that your own AS vets UMHs at its border -- a route reflector
+   legitimately relays an eBGP-learned route together with the UMH its
+   ingress speaker already accepted under this same rule. The unusable-origin
+   test above does not apply there either: routes from another confederation
+   member always resolve to a member AS, and holding that against them would
+   make the knob unusable inside a confederation.
+
+   Routes this speaker originated itself are always trusted: their UMH came
+   from your own route-map. Specifically, routes from a ``network``
+   statement and routes from redistribution. A route that merely *carries*
+   the local ``peer_self`` is not trusted, because two things re-home a
+   route onto it without this speaker having authored the attribute:
+
+   - A route **imported from another BGP instance**. A VPN leak copies the
+     attribute wholesale -- only route targets are stripped, not the UMH --
+     and discards the sending neighbor, so honouring it would accept an
+     untrusted VPNv4 neighbor's UMH under a local identity.
+   - An **aggregate** built with ``as-set`` (see
+     :clicmd:`aggregate-address A.B.C.D/M as-set`). ``as-set`` merges each
+     component route's extended communities into the aggregate without
+     filtering by sub-type, so a UMH refused on a component would re-enter
+     on the aggregate and steer joins for the whole aggregated prefix.
+
+   The consequence to plan for is that aggregating **your own**
+   UMH-carrying routes with ``as-set`` drops the UMH from the aggregate.
+   That is deliberate -- the aggregate cannot tell your component routes
+   from a neighbor's. Re-originate the UMH on the aggregate through a
+   route-map if you mean to honour it; the same remedy applies to a leaked
+   route.
+
+   Any other way a route acquires ``peer_self`` is refused as well. The rule
+   is an allow-list of the ways this speaker originates a route, so a route
+   source added to bgpd in future is ignored by this gate until it is
+   explicitly listed, rather than trusted by default.
+
+   Changing this knob **resets the session**, so it takes effect on routes
+   already learned rather than only on the neighbor's next update. A route
+   refresh would not be enough: the neighbor re-sends identical attributes
+   and bgpd discards the duplicate without re-running best-path, so the knob
+   would silently fail to apply -- which for a revocation is the dangerous
+   direction. Configure it at turn-up.
+
 .. clicmd:: show bgp <ipv4|ipv6> mvpn [json]
 
    Display the MCAST-VPN table of the default BGP instance for the IPv4 or
