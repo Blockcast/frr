@@ -481,7 +481,19 @@ def inject_netlink_recv_failure(router, when):
     return inject_netlink_syscall_failure(router, "recvmsg", when, errno_name="EAGAIN")
 
 
-def hold_dplane_sendmsg(router, delay_usecs=6000000):
+# topotest.run_and_expect() silently replaces any count*wait under 15s with its
+# own defaults (count=20, wait=3), so a fine-grained poll has to budget at least
+# 15s or it becomes a 3s poll. Granularity is load-bearing for the two
+# held-DELETE syncs, which act inside the hold as soon as they resolve; the
+# convergence polls around them share the budget so it is stated once. 0.2s
+# steps for up to 16s: above the longest runner stall seen in CI (~6.7s), and
+# below HELD_DELETE_USECS, so a window that never opens is reported well
+# before the hold would have expired.
+SYNC_POLL_COUNT = 80
+SYNC_POLL_WAIT = 0.2
+
+
+def hold_dplane_sendmsg(router, delay_usecs):
     """Hold the dplane worker at route-netlink sendmsg ENTRY.
 
     This is the only dplane hold the module has, deliberately. zebra is built
@@ -911,8 +923,8 @@ def test_queued_delete_does_not_remove_reused_ifindex():
         lambda: zebra_ifindex(router, "dimt-00000006")
         not in (None, 0, installed["ifindex"]),
         True,
-        count=25,
-        wait=0.2,
+        count=SYNC_POLL_COUNT,
+        wait=SYNC_POLL_WAIT,
     )
     assert seen, "zebra did not process the replacement link"
 
@@ -923,7 +935,8 @@ def test_queued_delete_does_not_remove_reused_ifindex():
 
 
 # For the tests that hold a DIMT delete at sendmsg entry and act inside the
-# hold. Longer than any runner stall seen in CI (~6.7s) plus the action taken
+# hold. Longer than any runner stall seen in CI (~6.7s) plus the sync that
+# detects the hold (SYNC_POLL_*: 0.2s steps, at most 16s) and the action taken
 # inside it, so the hold cannot expire first; stop_tracer() ends it as soon as
 # the test is done, so the bound costs nothing on the normal path. The held del
 # client's socket timeout sits above it so the client cannot give up first.
@@ -961,8 +974,8 @@ def test_add_during_inflight_delete_is_rejected():
                 router, trace_file, "dimt-00000009", installed["ifindex"]
             ),
             "held",
-            count=25,
-            wait=0.2,
+            count=SYNC_POLL_COUNT,
+            wait=SYNC_POLL_WAIT,
         )
         if state != "held" or pending.poll() is not None:
             raise WindowNeverOpened(
@@ -1010,8 +1023,8 @@ def test_add_during_inflight_delete_is_rejected():
     _, dropped = topotest.run_and_expect(
         lambda: zebra_dropped_interface(router, "dimt-00000009"),
         True,
-        count=25,
-        wait=0.2,
+        count=SYNC_POLL_COUNT,
+        wait=SYNC_POLL_WAIT,
     )
     assert dropped, "zebra still lists dimt-00000009 after the delete"
 
@@ -1049,8 +1062,8 @@ def test_uncertain_create_result_reconciles_surviving_link():
     _, link = topotest.run_and_expect(
         lambda: router.run("ip link show dimt-00000008 2>/dev/null"),
         "",
-        count=25,
-        wait=0.2,
+        count=SYNC_POLL_COUNT,
+        wait=SYNC_POLL_WAIT,
     )
     assert link == "", link
     # The retained lifecycle entry converges over the standard cleanup
@@ -1096,8 +1109,8 @@ def test_delete_encoded_before_replacement_binds_to_ifindex():
                 router, trace_file, "dimt-0000000a", installed["ifindex"]
             ),
             "held",
-            count=25,
-            wait=0.2,
+            count=SYNC_POLL_COUNT,
+            wait=SYNC_POLL_WAIT,
         )
         if state != "held":
             raise WindowNeverOpened(
@@ -1229,8 +1242,8 @@ def test_skipped_delete_result_survives_mixed_batch():
         lambda: zebra_ifindex(router, "dimt-0000000c")
         not in (None, 0, replaced["ifindex"]),
         True,
-        count=25,
-        wait=0.2,
+        count=SYNC_POLL_COUNT,
+        wait=SYNC_POLL_WAIT,
     )
     assert seen, "zebra did not process the replacement link"
 
