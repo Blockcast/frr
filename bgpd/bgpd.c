@@ -5613,6 +5613,15 @@ static const struct peer_flag_action peer_flag_action_list[] = {
 	{ PEER_FLAG_RPKI_STRICT, 0, peer_change_none },
 	{ PEER_FLAG_SEND_NHC_ATTRIBUTE, 0, peer_change_none },
 	{ PEER_FLAG_IP_TRANSPARENT, 0, peer_change_reset },
+	/* Flipping DIMT trust changes how ALREADY-RECEIVED routes are read, so
+	 * the session is reset rather than route-refreshed. A refresh is not
+	 * enough: the peer re-sends identical attributes, bgp_update() classes
+	 * that as "Same attribute comes in" and returns without calling
+	 * bgp_process() (bgp_route.c), so the bgp_route_update hook that drives
+	 * bgp_dimt_route_update() never fires and the knob would silently not
+	 * apply until the peer's next genuine attribute change -- on a stable
+	 * session, never. Revoking trust has to take effect, so it resets. */
+	{ PEER_FLAG_DIMT_TRUSTED, 0, peer_change_reset },
 	{ 0, 0, 0 }
 };
 

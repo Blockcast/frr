@@ -63,7 +63,23 @@ jobs:
   # Documentation-HTML 'success' exactly when docs is 'true'.
   doc-path-filter:
     if: ${{ github.event_name != 'pull_request' || github.actor != 'mergify[bot]' }}
-    runs-on: default
+    # arc-light on pull requests, not `default`.  There this job has no
+    # checkout (see the Checkout step): it is the paths-filter REST call, the
+    # decide script and the MIB cache (a 48 KB restore, or on a miss nine
+    # fetches from IANA/IEEE) -- 14 s in run 36229238558 -- and every other
+    # job waits for it.  On `default`, the saturated DinD pool, a PR run
+    # queued twice, here and again for Build, and this first wait alone was
+    # 4.6-10.7 h in runs 36495098055, 36551077943 and 36464895185
+    # (2026-09-28/29).
+    #
+    # arc-light runs the same runner image (onprem-k8s pins one digest in
+    # arc/arc-{light,default}-values.yaml).  Keep it that way: actions/cache
+    # folds the compression it picks (zstd if the image has it, else gzip)
+    # into an entry's version, so an image that differed there would save a
+    # MIB entry that Build, on `default`, cannot restore.  push and
+    # workflow_dispatch stay on `default`: they do the full-history checkout
+    # below (2.48 min at the median), not seconds of work.
+    runs-on: ${{ github.event_name == 'pull_request' && 'arc-light' || 'default' }}
     name: Documentation path filter
     # The folded MIB population's budget (Prepare-MIB-Cache's 20).
     timeout-minutes: 20
@@ -1369,9 +1385,9 @@ jobs:
     #   * doc-only: doc-path-filter concluded 'success' AND its build output
     #     is the string 'false' AND the raw classification is doc 'true',
     #     non_doc 'false'.  Never an inequality such as `build != 'true'`:
-    #     doc-path-filter runs on the preemptible `default` pool (a pod was
-    #     preempted there in run 35776450503) and now also fetches nine
-    #     MIBs from IANA/IEEE, and a job that fails or loses its runner
+    #     doc-path-filter runs on preemptible ARC pods (a `default` one was
+    #     preempted in run 35776450503) and now also fetches nine MIBs from
+    #     IANA/IEEE, and a job that fails or loses its runner
     #     leaves its outputs empty and skips Build and Test, so an
     #     inequality would pass a run that built and tested nothing.  Never
     #     non_doc 'false' alone either: paths-filter reports doc 'false',

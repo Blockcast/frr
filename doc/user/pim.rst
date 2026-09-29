@@ -378,6 +378,84 @@ VRF where indicated), instead of under the 'router pim' submode.
    :clicmd:`show ip pim [vrf NAME] dimt forwarding [json]` for the per-(S,G)
    readiness it feeds.
 
+.. _pim-dimt-outer-header:
+
+DIMT tunnel outer header, and rolling it out
+--------------------------------------------
+
+Every DIMT netdev zebra creates carries a *fixed* outer header. Neither value
+is configurable, and both exist to close a blackhole that a single-hop lab
+cannot show:
+
+``ttl``/``hoplimit`` 64
+   Never ``inherit``. PIM and IGMP/MLD control packets are link-local with an
+   inner TTL of 1, and an inheriting tunnel copies that onto the outer header,
+   so every Join/Prune dies at the first transit router of a multi-hop
+   underlay.
+
+``encaplimit none`` (ip6gre only)
+   Sets ``IP6_TNL_F_IGN_ENCAP_LIMIT``. Without it Linux prepends a Tunnel
+   Encapsulation Limit destination option to every outer packet, and because
+   the limit defaults to 0 that option instructs any transit router that would
+   have to encapsulate the packet again to discard it and answer ICMPv6
+   Parameter Problem (:rfc:`2473`, section 5.1). It also costs 8 bytes of
+   every packet's MTU for a policy DIMT does not want.
+
+.. note::
+
+   ``mtu`` is not part of the fixed header, and zebra cannot supply one it was
+   not given. A ``dimt tunnel-endpoint`` without ``mtu`` leaves the netdev at
+   the kernel default, which does not subtract the outer header, so full-size
+   payloads fragment or drop. zebra logs a warning naming the interface when
+   this happens; set ``mtu`` explicitly on every endpoint.
+
+Staged rollout onto an existing PoP
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A router upgraded from a release that predates either value still has its old
+``dimt-`` netdevs: zebra deliberately never sweeps DIMT links, so nothing
+removes them at startup. zebra instead *replaces* each one -- delete, then
+create -- the next time that tunnel is requested by pimd or the link changes
+in place. It is never adopted (that would re-report a blackholing netdev as
+installed) and never merely refused (pimd does not retry a failed tunnel on a
+timer, so the router would sit with no tunnel at all).
+
+That makes the rollout inherently staged: one tunnel at a time, driven by
+pimd's own demand edges, never a fleet-wide sweep. The procedure per PoP is:
+
+#. **Before.** Record which netdevs will be replaced. Anything listed here is
+   stale and will be rebuilt::
+
+      ip -d link show type gre    | grep -E 'dimt-|ttl'
+      ip -d link show type ip6gre | grep -E 'dimt-|hoplimit|encaplimit'
+
+   A stale link shows ``ttl inherit``/``hoplimit inherit``, or an ip6gre
+   showing ``encaplimit`` followed by a number rather than ``none``.
+
+#. **Upgrade one router** and restart *zebra* and *pimd*. Replacement happens
+   on demand, so nothing is rebuilt until pimd re-requests its tunnels --
+   which it does on reconnect.
+
+#. **Watch the replacement.** The ifindex changes, which is what proves a
+   replacement rather than an adoption::
+
+      vtysh -c 'show ip pim dimt tunnel json'
+
+   Each row should reach ``installed`` with a *different* ``ifindex`` from the
+   one recorded in step 1.
+
+#. **After.** Re-run the step 1 commands. Every ``dimt-`` link must now show
+   ``ttl 64``/``hoplimit 64``, and every ip6gre ``encaplimit none``. A link
+   still listed is one whose tunnel has not been re-requested yet, not a
+   failure -- it converts on its next demand edge.
+
+#. **Only then** move to the next router.
+
+Each replacement is a brief delete/create of one tunnel netdev, so size the
+stages by how much of a PoP's DIMT traffic may re-converge at once, exactly as
+for any other per-tunnel flap. Measured in the interop lab, a single
+replacement completed in about 30 ms with no receiver-visible gap.
+
 .. _pim-multicast-rib:
 
 Multicast RIB Commands

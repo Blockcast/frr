@@ -6757,6 +6757,27 @@ DEFPY(neighbor_rpki_strict,
 	return peer_flag_set(peer, PEER_FLAG_RPKI_STRICT);
 }
 
+/* DIMT UMH trust */
+DEFPY(neighbor_dimt_trusted,
+      neighbor_dimt_trusted_cmd,
+      "[no$no] neighbor <A.B.C.D|X:X::X:X|WORD>$neighbor dimt-trusted",
+      NO_STR
+      NEIGHBOR_STR
+      NEIGHBOR_ADDR_STR2
+      "Honour this neighbor's DIMT UMH extended community (default: ignored)\n")
+{
+	struct peer *peer;
+
+	peer = peer_and_group_lookup_vty(vty, neighbor);
+	if (!peer)
+		return CMD_WARNING_CONFIG_FAILED;
+
+	if (no)
+		return peer_flag_unset(peer, PEER_FLAG_DIMT_TRUSTED);
+
+	return peer_flag_set(peer, PEER_FLAG_DIMT_TRUSTED);
+}
+
 static int peer_af_flag_modify_vty(struct vty *vty, const char *peer_str,
 				   afi_t afi, safi_t safi, uint64_t flag,
 				   int set)
@@ -18123,6 +18144,7 @@ static void bgp_show_peer(struct vty *vty, struct peer *p, uint16_t sh_flags, bo
 		json_object_int_add(json_pfx_stat, "invalidNextHop", p->stat_pfx_nh_invalid);
 		json_object_int_add(json_pfx_stat, "withdrawn", p->stat_pfx_withdraw);
 		json_object_int_add(json_pfx_stat, "attributesDiscarded", p->stat_pfx_discard);
+		json_object_int_add(json_pfx_stat, "dimtUmhRejected", p->stat_dimt_umh_rejected);
 		json_object_object_add(json_neigh, "prefixStats", json_pfx_stat);
 	} else {
 		atomic_size_t outq_count, inq_count, open_out, open_in,
@@ -18186,7 +18208,9 @@ static void bgp_show_peer(struct vty *vty, struct peer *p, uint16_t sh_flags, bo
 		vty_out(vty, "    Cluster loop: %u\n", p->stat_pfx_cluster_loop);
 		vty_out(vty, "    Invalid next-hop: %u\n", p->stat_pfx_nh_invalid);
 		vty_out(vty, "    Withdrawn: %u\n", p->stat_pfx_withdraw);
-		vty_out(vty, "    Attributes discarded: %u\n\n", p->stat_pfx_discard);
+		vty_out(vty, "    Attributes discarded: %u\n", p->stat_pfx_discard);
+		vty_out(vty, "    DIMT UMH rejected: %" PRIu64 "\n\n",
+			p->stat_dimt_umh_rejected);
 	}
 
 	if (use_json) {
@@ -21652,6 +21676,9 @@ static void bgp_config_write_peer_global(struct vty *vty, struct bgp *bgp,
 	if (peergroup_flag_check(peer, PEER_FLAG_RPKI_STRICT))
 		vty_out(vty, " neighbor %s rpki strict\n", addr);
 
+	if (peergroup_flag_check(peer, PEER_FLAG_DIMT_TRUSTED))
+		vty_out(vty, " neighbor %s dimt-trusted\n", addr);
+
 	/* capability link-local */
 	if (CHECK_FLAG(bgp->flags, BGP_FLAG_LINK_LOCAL_CAPABILITY)) {
 		if (!peergroup_flag_check(peer, PEER_FLAG_CAPABILITY_LINK_LOCAL))
@@ -24533,6 +24560,7 @@ void bgp_vty_init(void)
 
 	/* neighbor rpki ... commands. */
 	install_element(BGP_NODE, &neighbor_rpki_strict_cmd);
+	install_element(BGP_NODE, &neighbor_dimt_trusted_cmd);
 
 	/* "neighbor capability orf prefix-list" commands.*/
 	install_element(BGP_NODE, &neighbor_capability_orf_prefix_hidden_cmd);

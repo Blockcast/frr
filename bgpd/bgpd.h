@@ -1896,6 +1896,10 @@ struct peer {
 #define PEER_FLAG_LS_LOCAL_LINK_ID  (1ULL << 49)
 #define PEER_FLAG_LS_REMOTE_LINK_ID (1ULL << 50)
 #define PEER_FLAG_EBGP_MULTIHOP	    (1ULL << 51) /* explicit ebgp-multihop config */
+/* DIMT: this neighbour's UMH extended community (0x80) may steer our PIM
+ * joins. Default OFF -- the UMH EC is ignored from every unmarked neighbour.
+ * See bgp_dimt_peer_is_trusted(). */
+#define PEER_FLAG_DIMT_TRUSTED	    (1ULL << 52)
 
 	/*
 	 *GR-Disabled mode means unset PEER_FLAG_GRACEFUL_RESTART
@@ -2093,6 +2097,35 @@ struct peer {
 	uint32_t stat_pfx_discard;  /* The number of prefixes with discarded attributes */
 	uint64_t stat_pfx_loc_rib; /* RFC7854 : Number of routes in Loc-RIB */
 	uint64_t stat_pfx_adj_rib_in; /* RFC7854 : Number of routes in Adj-RIBs-In */
+	/* DIMT UMH extended communities refused from this peer: either it is
+	 * not marked dimt-trusted, or it is but the route's origin AS does not
+	 * authorise it to claim a UMH. Counts refused ECs, not refused routes:
+	 * charged once per EC list when the path arrives in the loc-RIB, in
+	 * every instance rather than only the default one, and never again when
+	 * a consumer re-reads that path, so this tracks what the NEIGHBOUR sent
+	 * rather than how often we happened to look. A loc-RIB re-process that
+	 * leaves the path's attributes as they were -- add-path transmit
+	 * included -- does not re-charge it; see bgp_dimt_umh_audit_path().
+	 *
+	 * NEVER charged against peer_self. A refusal on a path bgpd attributes
+	 * to peer_self is real -- that is the laundering case the trust gate
+	 * exists to catch -- but `show bgp neighbors` does not walk peer_self,
+	 * so counting it here would write the detection signal to a sink. Those
+	 * are logged against the prefix and the instance instead, by
+	 * bgp_dimt_umh_refuse_local(). Giving them a counter means giving them
+	 * a per-instance home, not borrowing this field. */
+	uint64_t stat_dimt_umh_rejected;
+	/* Throttle state for the refusal log above (once a minute per peer).
+	 * "Ever logged" is its own flag because monotime() 0 is a real time. */
+	time_t dimt_umh_log_last;
+	bool dimt_umh_log_seen;
+	/* Throttle state for the wrong-address-family UMH hint. Same 60s
+	 * basis, deliberately NOT the two fields above: that pair is a trust
+	 * refusal, this is a configuration hint, and sharing state would let a
+	 * refused neighbour's notice swallow the hint its operator most needs.
+	 * See the decode-only rationale in bgp_dimt_route_update(). */
+	time_t dimt_umh_xfam_log_last;
+	bool dimt_umh_xfam_log_seen;
 
 	/* BGP state count */
 	uint32_t established; /* Established */
