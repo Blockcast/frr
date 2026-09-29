@@ -246,7 +246,6 @@ peers() {
 
 overlay_of() { printf '%s\n' "${1%%=*}"; }
 
-
 # Absent second column means gre-in-fou: every registry written before
 # this knob existed describes GRE-in-FOU peers.
 encap_of() {
