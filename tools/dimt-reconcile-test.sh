@@ -765,8 +765,8 @@ err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
 	--peers-file "$TESTDIR/peers-junk" 2>&1)
 rc=$?
 check "h6b: a trailing field exits nonzero" [ "$rc" -ne 0 ]
-check "h6b: the offending line is echoed back" err_has \
-	"trailing field(s) after encap mode in '100.64.0.47 gre extra'"
+check "h6b: the offending mode is echoed back" err_has \
+	"invalid encap mode 'gre=extra'"
 check "h6b: not mistaken for a valid gre peer" log_lacks "^ip link add dimt-0-47"
 check "h6b: GC suppressed (the entry may be a desired peer)" \
 	log_lacks "^ip link del dimt-9-9"
@@ -777,7 +777,26 @@ err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers '100.64.0.47 gre extra' \
 rc=$?
 check "h6b2: inline trailing field exits nonzero" [ "$rc" -ne 0 ]
 check "h6b2: inline trailing field is named" err_has \
-	"trailing field(s) after encap mode"
+	"invalid encap mode"
+
+# --- (h6b3) a two-column entry whose mode contains "=" -----------------
+# peers() joins fields with "=", so this reaches the same arm as a third
+# column with the field count already gone.  The arm must not assert a
+# trailing field that does not exist, and must echo the mode verbatim:
+# rewriting the operator's literal "=" back to a space produced a string
+# that does not occur anywhere in their peers file.
+new_state h6b3
+printf '100.64.0.47 gre=x\n' > "$TESTDIR/peers-eq"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-eq" 2>&1)
+rc=$?
+check "h6b3: a mode containing = exits nonzero" [ "$rc" -ne 0 ]
+check "h6b3: the mode is echoed verbatim, = intact" err_has \
+	"invalid encap mode 'gre=x'"
+check "h6b3: no trailing field is asserted" err_lacks "trailing field"
+check "h6b3: the echoed mode still matches the peers file" \
+	grep -q "gre=x" "$TESTDIR/peers-eq"
+check "h6b3: not mistaken for a valid gre peer" log_lacks "^ip link add dimt-0-47"
 
 # --- (h6d) a malformed overlay arms no capability gate ----------------
 # encap_of() defaults an absent mode to gre-in-fou, so a bare junk line
