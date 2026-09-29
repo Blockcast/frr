@@ -633,9 +633,13 @@ reconcile() {
 	# this scan, so a collision-losing peer still arms its mode's gate and
 	# is then never built: two peers deriving one dimt-N-M can bind the
 	# FOU port on an otherwise all-plain-GRE box.  Pre-existing (base
-	# 77c3bb30 behaves identically) and bounded, since invalid=1 forces
-	# rc=1 and suppresses GC.  Hoisting the dedupe ahead of this scan
-	# would close it.
+	# 77c3bb30 behaves identically) and bounded -- but NOT by the GC
+	# suppression the other reject paths get: the collision branch sets
+	# rc=1 WITHOUT invalid=1, and GC is gated on invalid alone, so
+	# gc_stale still runs.  What bounds it is that the winning peer puts
+	# the contested device in want before the loser is rejected, so GC
+	# cannot delete it.  Hoisting the dedupe ahead of this scan would
+	# close it.
 	want_fou=0
 	want_plain=0
 	for spec in $all_peers; do

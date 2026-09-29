@@ -790,6 +790,32 @@ check "h6d2: a malformed explicit-mode overlay exits nonzero" [ "$rc" -ne 0 ]
 check "h6d2: no capability probe runs on its behalf" \
 	log_lacks "^ip link add dimt-probe0"
 
+# --- (h6e) the documented collision residual, pinned -------------------
+# The comment above want_fou admits this hole rather than asserting it
+# away: the dedupe runs inside the build loop, so a collision-losing
+# peer arms its mode's gate first and binds the FOU port on a box that
+# builds only plain GRE.  Pinned here so the deferred dedupe-hoist has
+# a failing assertion to flip instead of a paragraph to re-derive.
+# The third assertion pins the BOUND, which is not what it looks like:
+# the collision branch sets rc=1 without invalid=1, so GC is NOT
+# suppressed the way it is for a malformed entry (contrast h6d).  What
+# keeps the contested device safe is the winning peer having already
+# put it in want.
+new_state h6e
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers 100.64.0.47=gre,100.65.0.47=gre-in-fou \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6e: a colliding pair exits nonzero" [ "$rc" -ne 0 ]
+check "h6e: the collision is named" err_has "both derive device dimt-0-47"
+check "h6e: the residual FOU bind happens anyway (documented hole)" \
+	log_has "^ip fou add port 6637 ipproto 47"
+check "h6e: GC is NOT suppressed on the collision path" \
+	log_has "^ip link del dimt-9-9"
+check "h6e: the contested device survives GC (winner put it in want)" \
+	log_lacks "^ip link del dimt-0-47"
+
 # --- (h6c) both valid grammars still build a plain-GRE tunnel ----------
 # Positive control for h6b: the field-joining that makes a third column
 # loud must not break the two documented forms.  The file's two-column
