@@ -460,6 +460,106 @@ bool aspath_check_as_zero(struct aspath *aspath)
 	return false;
 }
 
+/*
+ * True when the segment aspath_get_last_as() ultimately reads from is a
+ * confederation sequence -- i.e. the origin it reports is a confederation-local
+ * member ASN rather than a globally meaningful one.
+ *
+ * This mirrors that function's iteration exactly: it walks every segment and
+ * overwrites its answer from ANY sequence type, so the winner is simply the
+ * last non-empty AS_SEQUENCE or AS_CONFED_SEQUENCE. Counting hops is not
+ * enough -- "AS_SEQUENCE [65010] AS_CONFED_SEQUENCE [65003]" has a nonzero hop
+ * count yet still resolves to the confederation member 65003. RFC 5065 puts
+ * confederation segments leftmost, so that ordering is malformed, but
+ * bgp_attr_aspath_check() only enforces shape for eBGP peers and a plain iBGP
+ * peer can put it on the wire.
+ */
+static bool aspath_origin_is_confed(struct aspath *aspath)
+{
+	struct assegment *seg;
+	bool confed = false;
+
+	for (seg = aspath ? aspath->segments : NULL; seg; seg = seg->next) {
+		if (seg->length == 0)
+			continue;
+		if (seg->type == AS_SEQUENCE)
+			confed = false;
+		else if (seg->type == AS_CONFED_SEQUENCE)
+			confed = true;
+	}
+
+	return confed;
+}
+
+/*
+ * The origin AS of a path -- and, first, whether it is knowable at all.
+ *
+ * Returns aspath_get_last_as() and sets *ambiguous_reason to NULL when the
+ * origin is well defined; on an ambiguous path the return value is
+ * meaningless and *ambiguous_reason names why (a short phrase for the
+ * caller's log). *path_is_empty reports whether the AS_PATH is STRUCTURALLY
+ * empty, which is the only condition under which a caller may substitute its
+ * local AS. Both out-params are mandatory.
+ *
+ * This is the border-scoping primitive behind every "may this speaker claim
+ * an attribute for this route" check (the UMH large community in bgp_mvpn.c,
+ * the DIMT UMH extended community in bgp_dimt.c). It lives here so those
+ * lanes cannot drift apart.
+ *
+ * Three ways the origin fails to be usable:
+ *
+ * 1. An AS_SET/AS_CONFED_SET is an aggregate of routes with several origins,
+ *    so RFC 4271 leaves such a path with no single origin.
+ *    aspath_get_last_as() cannot express that: it returns the last member of
+ *    the last *sequence* segment and skips set segments outright, so it
+ *    reports
+ *
+ *      65010 {65002,65003}  -> 65010, the AGGREGATOR -- the leftmost AS, not
+ *                              an origin. Trusting it would let any AS that
+ *                              merely aggregates a route claim an attribute
+ *                              for an origin it only transits.
+ *      {65002,65003}        -> 0, as does a bare AS_CONFED_SET.
+ *
+ *    So gate on aspath_check_as_sets(). Deliberately not aspath_count_hops()
+ *    -- that counts an AS_SET as one hop but an AS_CONFED_SET as zero,
+ *    leaving a bare AS_CONFED_SET indistinguishable from an empty path.
+ *
+ * 2. AS 0 is an encodable value, not merely an absence sentinel, so
+ *    AS_SEQUENCE [0] and AS_CONFED_SEQUENCE [0] are non-empty paths that
+ *    aspath_get_last_as() also reports as 0 while aspath_check_as_sets() says
+ *    false. Were the caller to key its local-AS substitution on the lookup
+ *    returning 0 rather than on *path_is_empty, either shape could claim
+ *    "originated locally" and have an attribute forged with the local AS
+ *    honoured. bgp_attr_aspath_check() only rejects AS 0 for eBGP peers, so
+ *    both shapes survive parse on a plain iBGP session.
+ *
+ * 3. A confederation member-AS number is local to that confederation
+ *    (RFC 5065, typically a private ASN) and is NOT globally scoped. A path
+ *    that still carries a real AS_SEQUENCE is fine -- "(64512 64513) 65010"
+ *    resolves to 65010. The bad case is a path whose sequence content is
+ *    ENTIRELY confederation, plus the mixed trailing case; see
+ *    aspath_origin_is_confed().
+ *
+ * NB: aspath_check_as_zero() dereferences aspath->segments with no NULL guard
+ * of its own, so the !*path_is_empty short-circuit below is load-bearing
+ * rather than cosmetic.
+ */
+unsigned int aspath_origin_as(struct aspath *aspath, const char **ambiguous_reason,
+			      bool *path_is_empty)
+{
+	*path_is_empty = (aspath == NULL || aspath->segments == NULL);
+	*ambiguous_reason = NULL;
+
+	if (aspath_check_as_sets(aspath))
+		*ambiguous_reason = "AS_PATH bears an AS_SET";
+	else if (!*path_is_empty && aspath_check_as_zero(aspath))
+		*ambiguous_reason = "AS_PATH carries AS 0";
+	else if (!*path_is_empty && aspath_origin_is_confed(aspath))
+		*ambiguous_reason = "AS_PATH origin is a confederation member AS";
+
+	return aspath_get_last_as(aspath);
+}
+
 /* Estimate size aspath /might/ take if encoded into an
  * ASPATH attribute.
  *

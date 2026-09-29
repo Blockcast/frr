@@ -483,6 +483,8 @@ void bgp_path_info_free_with_caller(const char *name,
 {
 	frrtrace(2, frr_bgp, bgp_path_info_free, path, name);
 	bgp_attr_unintern(&path->attr);
+	if (path->dimt_umh_refused)
+		bgp_attr_unintern(&path->dimt_umh_refused);
 
 	bgp_unlink_nexthop(path);
 	bgp_path_info_extra_free(&path->extra);
@@ -6799,6 +6801,24 @@ filtered:
 		bgp_unlink_nexthop(new);
 		bgp_path_info_mark_for_delete(dest, new);
 		bgp_path_info_extra_free(&new->extra);
+		/* Hand-rolled teardown rather than
+		 * bgp_path_info_free_with_caller(), and it has to stay that
+		 * way: every `goto filtered` jumps before
+		 * bgp_path_info_add(), which is where the peer reference is
+		 * taken -- info_make() is a bare XCALLOC that only stores
+		 * new->peer. The helper's peer_unlock() would underflow a
+		 * refcount we never took. Its bgp_attr_unintern(&attr) is not
+		 * the same hazard: new->attr is attr_new, interned once above
+		 * and not referenced again after `goto filtered`, so that
+		 * reference is leaked here. That leak is pre-existing
+		 * (upstream's filtered: block has the same shape) and is not
+		 * addressed by this block. What it does mirror is the refused
+		 * attribute the helper uninterns. NULL on every path reaching here today,
+		 * since only the loc-RIB bgp_route_update hook sets it and
+		 * this `new` never gets that far -- kept so that setting it
+		 * earlier in bgp_update() cannot silently leak. */
+		if (new->dimt_umh_refused)
+			bgp_attr_unintern(&new->dimt_umh_refused);
 		XFREE(MTYPE_BGP_ROUTE, new);
 	}
 

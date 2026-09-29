@@ -328,6 +328,11 @@ struct bgp_path_info {
 	/* Attribute structure.  */
 	struct attr *attr;
 
+	/* DIMT: the attribute set a UMH refusal was last charged for, with one
+	 * interned reference held; NULL if none. See bgp_dimt_umh_audit_path().
+	 */
+	struct attr *dimt_umh_refused;
+
 	/* Extra information */
 	struct bgp_path_info_extra *extra;
 
