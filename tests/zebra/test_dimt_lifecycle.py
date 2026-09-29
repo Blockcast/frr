@@ -100,9 +100,15 @@ class TestDimtLifecycleWiring(unittest.TestCase):
             "ZAPI_DIMT_TUNNEL_KEY_PRESENT",
             "ZAPI_DIMT_TUNNEL_MTU_PRESENT",
             "encap_dport",
-            "check_ttl && gre->ttl != ZEBRA_DIMT_TUNNEL_TTL",
+            "check_outer_hdr &&",
+            "gre->ttl != ZEBRA_DIMT_TUNNEL_TTL",
+            "!(gre->flags & ZEBRA_DIMT_TUNNEL_IP6_FLAGS)",
         ):
             self.assertIn(check, matcher)
+        # Mask, never compare: see test_outer_header_drift_covers_ttl_and_ip6_
+        # encap_limit() for the kernel behaviour that makes the equality form
+        # reject every link.
+        self.assertNotIn("gre->flags != ZEBRA_DIMT_TUNNEL_IP6_FLAGS", matcher)
 
     def test_create_encodes_a_fixed_outer_ttl(self):
         # Without IFLA_GRE_TTL both gre and ip6gre inherit the inner TTL,
@@ -150,14 +156,15 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         request = request.split("void zebra_dimt_tunnel_dplane_result", 1)[0]
         result = dimt.split("void zebra_dimt_tunnel_dplane_result", 1)[1]
 
-        # Adoption is the strict (TTL-checking) match; a same-identity link
-        # with the wrong TTL is deleted and re-created, never adopted and
+        # Adoption is the strict (outer-header-checking) match; a
+        # same-identity link with the wrong outer TTL, or an ip6gre without
+        # "encaplimit none", is deleted and re-created, never adopted and
         # never merely refused.
         self.assertLess(
-            request.index("zebra_dimt_if_stale_ttl(entry, ifp)"),
+            request.index("zebra_dimt_if_stale_outer_hdr(entry, ifp)"),
             request.index("zebra_dimt_if_matches(entry, ifp)"),
         )
-        replace = request.split("zebra_dimt_if_stale_ttl(entry, ifp)", 1)[1]
+        replace = request.split("zebra_dimt_if_stale_outer_hdr(entry, ifp)", 1)[1]
         replace = replace.split("zebra_dimt_if_matches(entry, ifp)", 1)[0]
         self.assertIn("zebra_dimt_tunnel_replace(entry, ifp)", replace)
         helper = dimt.split("zebra_dimt_tunnel_replace(struct zebra_dimt_tunnel", 1)[1]
@@ -169,8 +176,8 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         replacing = replacing.split("cleanup = entry", 1)[0]
         self.assertIn("ZEBRA_DIMT_TUNNEL_CREATE", replacing)
         self.assertIn("dplane_dimt_tunnel_add", replacing)
-        # Delete and cleanup paths use identity only, so a wrong-TTL link of
-        # ours can always be removed.
+        # Delete and cleanup paths use identity only, so a link of ours with
+        # the wrong outer header can always be removed.
         resolve = dimt.split("static bool zebra_dimt_tunnel_resolve_ifindex", 1)[1]
         resolve = resolve.split("static void", 1)[0]
         self.assertIn("zebra_dimt_if_identity_matches(entry, ifp)", resolve)
@@ -180,14 +187,14 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         iface = (ROOT / "zebra" / "interface.c").read_text()
 
         # The UPDATE path (an existing link changed in place) must look at
-        # the refreshed TTL, not only the first sighting of the link.
+        # the refreshed outer header, not only the first sighting of the link.
         update = iface.split("interface_update_l2info(ctx, ifp, zif_type, 0,", 1)[1]
         update = update.split("zebra_l2if_update_bond", 1)[0]
         self.assertIn("zebra_dimt_tunnel_if_change(ifp);", update)
         change = dimt.split("void zebra_dimt_tunnel_if_change(struct interface *ifp)", 1)[1]
         change = change.split("\n}\n", 1)[0]
         self.assertIn("ZEBRA_DIMT_INSTALLED", change)
-        self.assertIn("zebra_dimt_if_stale_ttl(entry, ifp)", change)
+        self.assertIn("zebra_dimt_if_stale_outer_hdr(entry, ifp)", change)
         self.assertIn("zebra_dimt_tunnel_replace(entry, ifp)", change)
 
     def test_failed_replacement_delete_keeps_a_cleanup_tombstone(self):
@@ -370,6 +377,123 @@ class TestDimtLifecycleWiring(unittest.TestCase):
 
         self.assertIn("zebra_dimt_if_matches(entry, ifp)", request)
         self.assertIn("zebra_dimt_if_address_matches(entry, ifp)", request)
+
+    def test_ip6gre_netdevs_are_created_with_encaplimit_none(self):
+        """The create must send IFLA_GRE_FLAGS, and only for ip6gre.
+
+        Omitting IFLA_GRE_ENCAP_LIMIT does not mean "no encap limit":
+        ip6gre_newlink() memsets its parms, so the kernel prepends a Tunnel
+        Encapsulation Limit destination option carrying *0*, which RFC 2473
+        s5.1 makes an instruction to discard any packet a transit router would
+        have to encapsulate again.  Plain gre has no such attribute, so both
+        puts sit behind the IS_IPADDR_V6 guard.
+        """
+        encoder = (ROOT / "zebra" / "if_netlink.c").read_text()
+        create = encoder.split("netlink_dimt_tunnel_msg_encoder", 1)[1].split(
+            "IFLA_GRE_TTL", 1
+        )[1].split("IFLA_GRE_IKEY", 1)[0]
+
+        self.assertIn("IS_IPADDR_V6(&tunnel->outer_local)", create)
+        self.assertIn("IFLA_GRE_ENCAP_LIMIT, 0", create)
+        self.assertIn("IFLA_GRE_FLAGS,", create)
+        self.assertIn("ZEBRA_DIMT_TUNNEL_IP6_FLAGS", create)
+
+        dplane_h = (ROOT / "zebra" / "zebra_dplane.h").read_text()
+        self.assertIn("#define ZEBRA_DIMT_TUNNEL_IP6_FLAGS 0x1", dplane_h)
+
+    def test_gre_flags_are_read_back_from_the_kernel(self):
+        """Without the extractor the drift check reads a constant 0.
+
+        zebra compares the cached l2info against ZEBRA_DIMT_TUNNEL_IP6_FLAGS,
+        so an unparsed IFLA_GRE_FLAGS would make every ip6gre look stale
+        forever: each ADD would delete and recreate a link that was already
+        correct, and the create would never be adopted.
+        """
+        encoder = (ROOT / "zebra" / "if_netlink.c").read_text()
+        extract = encoder.split("static int netlink_extract_gre_info", 1)[1].split(
+            "\n}", 1
+        )[0]
+
+        self.assertIn("attr[IFLA_GRE_FLAGS]", extract)
+        self.assertIn("gre_info->flags", extract)
+
+        l2 = (ROOT / "zebra" / "zebra_l2.h").read_text()
+        gre_info = l2.split("struct zebra_l2info_gre {", 1)[1].split("};", 1)[0]
+        self.assertIn("uint32_t flags;", gre_info)
+
+        # The IN-PLACE update path copies field by field, not by memcpy, so a
+        # flag left out here is invisible to zebra_dimt_tunnel_if_change():
+        # `ip link set dimt-... type ip6gre encaplimit 4` on an installed
+        # tunnel would silently keep reporting INSTALLED.
+        l2c = (ROOT / "zebra" / "zebra_l2.c").read_text()
+        update = l2c.split("void zebra_l2_greif_add_update", 1)[1].split(
+            "if (add) {", 1
+        )[1].split("\n}", 1)[0]
+        self.assertIn("zif->l2info.gre.flags = gre_info->flags;", update)
+
+    def test_outer_header_drift_covers_ttl_and_ip6_encap_limit(self):
+        """Both halves of the fixed outer header gate adoption.
+
+        Split by family on purpose: ipgre_fill_info() never emits
+        IFLA_GRE_FLAGS, so a gre link's cached `flags` is the memset 0 and an
+        unconditional comparison would reject every IPv4-outer tunnel.
+
+        Both readers MASK for the bit.  IFLA_GRE_FLAGS reads back as a
+        superset of what was sent -- ip6_tnl_link_config() recomputes the
+        link's IP6_TNL_F_CAP_* bits into the same word on every config -- so
+        `flags == ZEBRA_DIMT_TUNNEL_IP6_FLAGS` is false even for a netdev
+        zebra has just created with exactly that value.  That equality form
+        shipped in f2c0d7f9 and hung every IPv6-outer ADD: adoption is what
+        answers the client, so a link that can never be adopted produces no
+        reply at all, and the caller times out rather than seeing a failure.
+        Assert the absence of the equality form too -- checking only that the
+        constant is *mentioned* passes on both spellings, which is why the
+        original of this test was green against the bug.
+        """
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+        outer = dimt.split("static bool zebra_dimt_if_outer_hdr_matches", 1)[
+            1
+        ].split("\n}", 1)[0]
+
+        self.assertIn("ZEBRA_DIMT_TUNNEL_TTL", outer)
+        self.assertIn("ZEBRA_IF_IP6GRE", outer)
+        self.assertIn(
+            "(zif->l2info.gre.flags & ZEBRA_DIMT_TUNNEL_IP6_FLAGS)", outer
+        )
+        self.assertNotIn(
+            "zif->l2info.gre.flags == ZEBRA_DIMT_TUNNEL_IP6_FLAGS", outer
+        )
+
+        # Replacement, not refusal: a pre-fix netdev must be rebuilt, and
+        # rebuilt one tunnel at a time off its own demand edge -- zebra never
+        # sweeps DIMT links.
+        self.assertIn("zebra_dimt_if_stale_outer_hdr(entry, ifp)", dimt)
+        self.assertIn("zebra_dimt_if_outer_hdr_matches(ifp)", dimt)
+
+        # The dplane-side identity check gates on the same pair.
+        encoder = (ROOT / "zebra" / "if_netlink.c").read_text()
+        matches = encoder.split("static bool netlink_dimt_if_matches", 1)[1].split(
+            "\n}", 1
+        )[0]
+        self.assertIn("check_outer_hdr", matches)
+        self.assertIn("ZEBRA_DIMT_TUNNEL_IP6_FLAGS", matches)
+
+    def test_missing_mtu_is_warned_on_the_accepted_add(self):
+        """zebra cannot invent an MTU, so the warning is the whole remedy.
+
+        Placed where a new entry is allocated, so it fires once per tunnel
+        rather than on every idempotent re-ADD from a reconnecting pimd.
+        """
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+        request = dimt.split("void zebra_dimt_tunnel_request", 1)[1]
+        warn = request.split("ZAPI_DIMT_TUNNEL_MTU_PRESENT", 1)[1]
+
+        self.assertIn("zlog_warn", warn)
+        self.assertLess(
+            request.index("zlog_warn"),
+            request.index("XCALLOC(MTYPE_DIMT_TUNNEL"),
+        )
+        self.assertIn('#include "lib/log.h"', dimt)
 
 
 if __name__ == "__main__":

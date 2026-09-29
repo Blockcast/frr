@@ -15,6 +15,7 @@ struct bgp_path_info;
 extern void bgp_dimt_init(void);
 extern void bgp_dimt_terminate(void);
 extern int bgp_dimt_umh_replay(ZAPI_CALLBACK_ARGS);
+extern bool bgp_dimt_umh_xfam_should_log(struct peer *peer, time_t now);
 
 /*
  * Pull the best UMH extended community (highest la_pref wins) off one path.
