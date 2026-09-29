@@ -9,6 +9,7 @@
 #include "lib/if.h"
 #include "lib/hook.h"
 #include "lib/linklist.h"
+#include "lib/log.h"
 #include "lib/memory.h"
 #include "lib/nexthop.h"
 #include "lib/stream.h"
@@ -37,8 +38,9 @@ struct zebra_dimt_tunnel {
 		ZEBRA_DIMT_INSTALLED,
 		ZEBRA_DIMT_DELETING,
 		ZEBRA_DIMT_CLEANUP,
-		/* Deleting a link of ours whose outer TTL is not
-		 * ZEBRA_DIMT_TUNNEL_TTL; the create follows the delete. */
+		/* Deleting a link of ours whose outer header is not the
+		 * fixed one (see zebra_dimt_if_outer_hdr_matches); the
+		 * create follows the delete. */
 		ZEBRA_DIMT_REPLACING,
 	} state;
 };
@@ -76,8 +78,9 @@ static bool zebra_dimt_owner_matches(const struct zebra_dimt_tunnel *entry,
 
 /*
  * Is `ifp` this tunnel's link, by name-independent identity: kind, outer
- * endpoints, key, MTU and encapsulation?  Deliberately NOT the outer TTL --
- * see zebra_dimt_if_matches() for the stricter test and why the two differ.
+ * endpoints, key, MTU and encapsulation?  Deliberately NOT the fixed outer
+ * header -- see zebra_dimt_if_matches() for the stricter test and why the two
+ * differ.
  */
 static bool zebra_dimt_if_identity_matches(const struct zebra_dimt_tunnel *entry,
 					   const struct interface *ifp)
@@ -110,36 +113,62 @@ static bool zebra_dimt_if_identity_matches(const struct zebra_dimt_tunnel *entry
 		gre->encap_dport == htons(tunnel->dport));
 }
 
-static bool zebra_dimt_if_ttl_matches(const struct interface *ifp)
+/*
+ * The fixed outer header every DIMT netdev must carry: the outer TTL / hop
+ * limit, plus "encaplimit none" on ip6gre.  See ZEBRA_DIMT_TUNNEL_TTL and
+ * ZEBRA_DIMT_TUNNEL_IP6_FLAGS for why each is load-bearing; both are the
+ * same class of blackhole, invisible to a one-hop lab.
+ *
+ * gre never reports IFLA_GRE_FLAGS, so the flag half is ip6gre-only -- on a
+ * v4 link `flags` is the memset 0 and comparing it would reject every tunnel.
+ *
+ * Test the bit, never the whole word: IFLA_GRE_FLAGS reads back as a superset
+ * of what was requested, because ip6_tnl_link_config() ORs the link's current
+ * IP6_TNL_F_CAP_* capability bits into the same field.  An equality test
+ * therefore rejects zebra's own freshly created netdev, and since the create
+ * path answers the client only once it adopts the link, the request gets no
+ * reply at all rather than a failure.
+ */
+static bool zebra_dimt_if_outer_hdr_matches(const struct interface *ifp)
 {
 	const struct zebra_if *zif = ifp->info;
 
-	return zif && zif->l2info.gre.ttl == ZEBRA_DIMT_TUNNEL_TTL;
+	if (!zif || zif->l2info.gre.ttl != ZEBRA_DIMT_TUNNEL_TTL)
+		return false;
+	return zif->zif_type != ZEBRA_IF_IP6GRE ||
+	       (zif->l2info.gre.flags & ZEBRA_DIMT_TUNNEL_IP6_FLAGS);
 }
 
 /*
- * Identity AND the fixed outer TTL: the test for a link that may be adopted
- * or completed as this tunnel.
+ * Identity AND the fixed outer header: the test for a link that may be
+ * adopted or completed as this tunnel.
  *
- * TTL is split out because the two questions zebra asks of a link have
- * different answers for a DIMT netdev built with the wrong TTL -- in practice
- * one a pre-TTL build created with "inherit", which survives the upgrade
+ * The outer header is split out because the two questions zebra asks of a
+ * link have different answers for a DIMT netdev built with the wrong one --
+ * in practice one an older build created with "inherit", or an ip6gre one
+ * created before "encaplimit none", either of which survives the upgrade
  * because zebra never sweeps DIMT links:
  *
  *  - "may it carry this tunnel?"  No.  An inheriting tunnel sends every
- *    link-local PIM/IGMP packet with outer TTL 1, which is precisely the
- *    blackhole ZEBRA_DIMT_TUNNEL_TTL exists to remove.  Adopting it would
+ *    link-local PIM/IGMP packet with outer TTL 1, and an ip6gre without
+ *    IP6_TNL_F_IGN_ENCAP_LIMIT prepends a zero Tunnel Encapsulation Limit
+ *    option that forbids any further encapsulation in the underlay -- both
+ *    precisely the blackholes ZEBRA_DIMT_TUNNEL_TTL and
+ *    ZEBRA_DIMT_TUNNEL_IP6_FLAGS exist to remove.  Adopting one would
  *    re-notify INSTALLED for a netdev that cannot signal past one hop.
  *  - "is it ours to delete?"  Yes.  Name and endpoints say it is, and a
- *    delete that also demanded the right TTL could never remove it.
+ *    delete that also demanded the right outer header could never remove it.
  *
  * So adoption uses this function and every delete/cleanup path uses the
  * identity-only one, and zebra_dimt_tunnel_request() REPLACES a link that
- * passes identity but fails TTL (delete, then create) rather than refusing
- * it: refusing would answer FAIL_INSTALL, and pimd deliberately never retries
- * a failed tunnel on a timer, so the upgraded router would sit without the
- * tunnel until some unrelated demand edge happened along.  An in-place
- * RTM_NEWLINK change of the TTL was rejected as well: zebra caches GRE
+ * passes identity but fails the outer header (delete, then create) rather
+ * than refusing it: refusing would answer FAIL_INSTALL, and pimd
+ * deliberately never retries a failed tunnel on a timer, so the upgraded
+ * router would sit without the tunnel until some unrelated demand edge
+ * happened along.  That replace is also the staged rollout: an operator
+ * upgrades a PoP, and each existing netdev is replaced only when its own
+ * tunnel is next requested or changes, one at a time, never as a sweep.  An
+ * in-place RTM_NEWLINK change was rejected as well: zebra caches GRE
  * parameters from the notification stream, so the address phase would race
  * the change's own notification, and rtnl changelink for gre re-derives every
  * parameter from the request -- a second full encoding of the tunnel with
@@ -149,17 +178,17 @@ static bool zebra_dimt_if_matches(const struct zebra_dimt_tunnel *entry,
 				  const struct interface *ifp)
 {
 	return zebra_dimt_if_identity_matches(entry, ifp) &&
-	       zebra_dimt_if_ttl_matches(ifp);
+	       zebra_dimt_if_outer_hdr_matches(ifp);
 }
 
-/* A link that is ours but still carries the wrong TTL: never adopt it as the
- * result of a create -- it is the stale link a REPLACING entry just deleted,
- * seen before its RTM_DELLINK has reached zebra. */
-static bool zebra_dimt_if_stale_ttl(const struct zebra_dimt_tunnel *entry,
-				    const struct interface *ifp)
+/* A link that is ours but still carries the wrong outer header: never adopt
+ * it as the result of a create -- it is the stale link a REPLACING entry just
+ * deleted, seen before its RTM_DELLINK has reached zebra. */
+static bool zebra_dimt_if_stale_outer_hdr(const struct zebra_dimt_tunnel *entry,
+					  const struct interface *ifp)
 {
 	return zebra_dimt_if_identity_matches(entry, ifp) &&
-	       !zebra_dimt_if_ttl_matches(ifp);
+	       !zebra_dimt_if_outer_hdr_matches(ifp);
 }
 
 static bool zebra_dimt_prefix_matches_ipaddr(const struct prefix *prefix,
@@ -255,7 +284,7 @@ static void zebra_dimt_tunnel_fail_install(struct zebra_dimt_tunnel *entry)
 		zebra_dimt_tunnel_forget(entry);
 }
 
-/* Replace a link of ours built with the wrong outer TTL (see
+/* Replace a link of ours built with the wrong outer header (see
  * zebra_dimt_if_matches()): delete it here, and the create follows in
  * zebra_dimt_tunnel_dplane_result().  The delete is bound to the stale
  * link's ifindex like any other; entry->ifindex stays 0 so neither its
@@ -293,9 +322,10 @@ zebra_dimt_tunnel_replace_failed(struct zebra_dimt_tunnel *entry,
 }
 
 /* An existing link changed in place.  The one change DIMT acts on is an
- * installed tunnel losing its fixed outer TTL (`ip link set dimt-... type
- * gre ttl 1`, or back to inherit): that is the blackhole
- * ZEBRA_DIMT_TUNNEL_TTL removes, so replace the link rather than keep
+ * installed tunnel losing its fixed outer header (`ip link set dimt-...
+ * type gre ttl 1`, or back to inherit, or an ip6gre regaining a non-zero
+ * encap limit): that is the blackhole ZEBRA_DIMT_TUNNEL_TTL and
+ * ZEBRA_DIMT_TUNNEL_IP6_FLAGS remove, so replace the link rather than keep
  * reporting it INSTALLED.  pimd follows the replacement through the
  * interface events it already handles (the old netdev's delete unpins its
  * riders, the new one is adopted by name) and the INSTALLED that completes
@@ -312,7 +342,7 @@ void zebra_dimt_tunnel_if_change(struct interface *ifp)
 		    entry->ifindex != ifp->ifindex)
 			continue;
 		if (entry->state == ZEBRA_DIMT_INSTALLED &&
-		    zebra_dimt_if_stale_ttl(entry, ifp) &&
+		    zebra_dimt_if_stale_outer_hdr(entry, ifp) &&
 		    zebra_dimt_tunnel_replace(entry, ifp) !=
 			    ZEBRA_DPLANE_REQUEST_QUEUED)
 			zebra_dimt_tunnel_replace_failed(
@@ -344,7 +374,7 @@ void zebra_dimt_tunnel_if_update(struct interface *ifp)
 		}
 		if (entry->state != ZEBRA_DIMT_ADDING)
 			break;
-		if (zebra_dimt_if_stale_ttl(entry, ifp))
+		if (zebra_dimt_if_stale_outer_hdr(entry, ifp))
 			break;
 		entry->ifindex = ifp->ifindex;
 		if (entry->create_acked &&
@@ -534,6 +564,12 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 			zrouter.dimt_tunnels = list_new();
 			zrouter.dimt_tunnels->del = zebra_dimt_tunnel_free;
 		}
+		if (!(ctx.tunnel.options & ZAPI_DIMT_TUNNEL_MTU_PRESENT))
+			zlog_warn("DIMT tunnel %s: no MTU in the request; the netdev inherits the kernel default, which does not account for the %s outer header and fragments or drops full-size payloads",
+				  ctx.ifname,
+				  IS_IPADDR_V6(&ctx.tunnel.outer_local)
+					  ? "IPv6 + GRE"
+					  : "IPv4 + GRE");
 		entry = XCALLOC(MTYPE_DIMT_TUNNEL, sizeof(*entry));
 		entry->ctx = ctx;
 		entry->ctx.phase = ZEBRA_DIMT_TUNNEL_CREATE;
@@ -541,8 +577,8 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 		entry->state = ZEBRA_DIMT_ADDING;
 		listnode_add(zrouter.dimt_tunnels, entry);
 		ifp = if_lookup_by_name(ctx.ifname, entry->vrf_id);
-		if (ifp && zebra_dimt_if_stale_ttl(entry, ifp)) {
-			/* Ours, but built with the wrong outer TTL. */
+		if (ifp && zebra_dimt_if_stale_outer_hdr(entry, ifp)) {
+			/* Ours, but built with the wrong outer header. */
 			if (zebra_dimt_tunnel_replace(entry, ifp) !=
 			    ZEBRA_DPLANE_REQUEST_QUEUED)
 				zebra_dimt_tunnel_replace_failed(
@@ -705,7 +741,7 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 		 * deleted stale-TTL link until its RTM_DELLINK is processed;
 		 * the new link's RTM_NEWLINK follows it in kernel order and
 		 * zebra_dimt_tunnel_if_update() adopts it then. */
-		if (ifp && !zebra_dimt_if_stale_ttl(entry, ifp))
+		if (ifp && !zebra_dimt_if_stale_outer_hdr(entry, ifp))
 			entry->ifindex = ifp->ifindex;
 		if (!entry->ifindex ||
 		    zebra_dimt_tunnel_address(entry) ==
