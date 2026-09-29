@@ -177,8 +177,9 @@ Two separate restrictions, and they are not the same one:
    on every route update, which suits the cross-family EC because it is rare.
    A v6 route carrying an LC-UMH is the common shape on an IX-connected box
    (see "Why this exists"), so it goes to the throttled call-site log with the
-   other call-site reject, at most once a minute per instance (see the counter
-   section).
+   other call-site reject, at most once a minute on the DIMT call site's own
+   throttle pair, not the decoder's (see "The throttled log is per lane too"
+   under the counter section).
 
    **The MVPN lane keeps `p6` working unchanged.** The shared decoder must not
    impose the DIMT family rule on the MVPN caller — the family gate belongs to
@@ -217,7 +218,8 @@ The LC lane today has only a once-a-minute throttled `zlog_notice`, which is
 not countable. Add a per-instance counter **per lane**, incremented for the
 reasons the decoder raises (per tuple or once per route, as set out below) and
 once per route for the two the DIMT call site raises itself, readable from
-`show bgp` with the lane named, keeping the throttled log for detail. The MVPN
+`show bgp` with the lane named, keeping the throttled log for detail on
+per-lane throttle state (see below). The MVPN
 lane has no counter today either, so step 2 adds both: the DIMT one and the
 MVPN one, the latter owned by the MVPN call site
 (`bgp_mvpn_resolve_from_source_route()`, `bgp_mvpn.c:1578`).
@@ -275,6 +277,24 @@ A wrong `Function` is **not** a
 reject — it is an unrelated large community and must not be counted, or every
 route carrying any other LC inflates the number.
 
+**The throttled log is per lane too.** The log kept "for detail" needs the
+counter's ownership rule, because the counter says how many and only the log
+says which tuple (`ga`, `fn`, `param`) and why. Its throttle state today is one
+pair per instance, `bgp->mvpn_umh_untrusted_log_last` and
+`bgp->mvpn_umh_untrusted_log_seen` (`bgpd.h:997`, `:1004`, read and written at
+`bgp_mvpn.c:1355-1367`). Carried over as-is onto a decoder shared by two lanes,
+the first lane to reject in a given minute claims the instance's one slot, and
+the other lane's rejects are counted and never described. That is the masking
+`bgp_mvpn.c:1349-1352` scopes the throttle per instance to prevent ("a probe on
+one VRF cannot mask a distinct probe on another"), reintroduced one lane inside
+the instance. So step 2 splits it: each lane owns its throttle pair, and each
+call site passes a pointer to its own lane's pair alongside the counter
+pointer, exactly as for the counter. The DIMT call-site log (untrusted
+neighbor, wrong address family) holds a third pair of its own rather than
+sharing the DIMT decoder's. A v6 LC-UMH flood, the common shape on an
+IX-connected box, would otherwise silence the decoder's detail on the same
+lane.
+
 ## Test obligations
 
 - LC-only path pins the DIMT UMH, with no EC present on the route.
@@ -326,6 +346,11 @@ route carrying any other LC inflates the number.
   v6 route from an untrusted neighbor carrying two such tuples trips both
   call-site gates and still moves the DIMT counter by exactly 1. A v6 route
   whose only LC carries the MVPN function moves neither counter.
+- With both knobs set to different function code points, a flood of rejects
+  on one lane does not suppress the other lane's throttled log line within the
+  same minute. Nor does a flood of DIMT call-site rejects (v6 routes carrying
+  an LC-UMH) suppress the DIMT decoder's line for a GA-mismatched tuple on a v4
+  route within that minute.
 - Endianness known-answer vector `184549374 -> 10.255.255.254` reused verbatim.
 
 ## References
