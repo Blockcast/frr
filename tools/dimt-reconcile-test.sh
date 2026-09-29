@@ -363,6 +363,28 @@ check "a4: invalid endpoint fails before FOU or GRE probes" \
 check "a4: invalid endpoint cannot mutate FRR" \
 	vtysh_lacks "interface dimt-0-47"
 
+# a4b: validate_endpoints() now shares is_quad() with the peer gate
+# instead of carrying its own shape+range pair, so it inherits the
+# leading-zero rejection.  Refusing here is strictly the safe direction:
+# validate_endpoints returns before any delete, and `ip` would reject
+# 010.0.2.47 downstream anyway (inet_pton has no octal).
+new_state a4b
+cat > "$TESTDIR/underlay-leading-zero" <<'EOF'
+100.64.0.40 192.0.2.1
+100.64.0.47 010.0.2.47
+EOF
+echo "dimt-0-47 192.0.2.1 192.0.2.2 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47 \
+	--peers-file "$TESTDIR/no-such-file" \
+	--endpoints-file "$TESTDIR/underlay-leading-zero" 2>&1)
+rc=$?
+check "a4b: leading-zero endpoint exits nonzero" [ "$rc" -ne 0 ]
+check "a4b: leading-zero endpoint is named" err_has \
+	"invalid managed underlay endpoint '010.0.2.47'"
+check "a4b: it refuses before touching the live tunnel" \
+	log_lacks "^ip link del dimt-0-47$"
+
+
 # --- (b) missing peers file refuses ----------------------------------
 new_state b
 echo "dimt-9-9 100.64.0.40 100.64.9.9" >> "$FAKEIP_DIR/links"
@@ -845,6 +867,83 @@ check "h6c2: the explicit gre peer is unencapsulated" \
 	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
 check "h6c2: the absent-mode peer defaults to gre-in-fou" log_has \
 	"^ip link add dimt-0-48 type gre local 100.64.0.40 remote 100.64.0.48 ttl 64 encap fou "
+
+# --- (h6f) an out-of-range octet is MALFORMED, not a collision --------
+# is_quad() used to check only the shape, so 100.64.999.20 reached the
+# build loop and derived dimt-999-20 plus nonsense inner addresses.
+# The disposition is pinned here, not just the rejection: this takes the
+# invalid=1 path (GC suppressed run-wide), NOT the collision path's
+# rc=1-and-carry-on (h6e).  The difference is that a collision has a
+# WINNER holding the contested device in want; a mangled octet has none,
+# and dev_of() reads octets 3-4, so the device the operator meant is in
+# nobody's want and GC would reap it.
+new_state h6f
+printf '100.64.0.47 gre\n100.64.999.20 gre\n' > "$TESTDIR/peers-oor"
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-oor" 2>&1)
+rc=$?
+check "h6f: an out-of-range octet exits nonzero" [ "$rc" -ne 0 ]
+check "h6f: the offending entry is named" err_has \
+	"ignoring invalid peer entry '100.64.999.20'"
+check "h6f: no tunnel is derived from the bad octet" \
+	log_lacks "^ip link add dimt-999-20"
+check "h6f: GC suppressed (invalid=1, not the collision path)" \
+	log_lacks "^ip link del dimt-9-9"
+check "h6f: the valid peer alongside it still builds" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+
+# --- (h6f2) a leading zero ALIASES, so it is malformed too ------------
+# 100.64.010.20 and 100.64.10.20 are one address written two ways, but
+# dev_of() is textual: they derive dimt-010-20 and dimt-10-20, i.e. two
+# netdevs for one peer.  (010 is also octal to inet_aton.)
+new_state h6f2
+printf '100.64.0.47 gre\n100.64.010.20 gre\n' > "$TESTDIR/peers-lz"
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-lz" 2>&1)
+rc=$?
+check "h6f2: a leading-zero octet exits nonzero" [ "$rc" -ne 0 ]
+check "h6f2: the leading-zero entry is named" err_has \
+	"ignoring invalid peer entry '100.64.010.20'"
+check "h6f2: no aliased device is created" log_lacks "^ip link add dimt-010-20"
+check "h6f2: GC suppressed (invalid=1)" log_lacks "^ip link del dimt-9-9"
+
+# --- (h6f3) an out-of-range overlay arms no capability gate -----------
+# The :is_quad pre-scan twin of h6d, and the only assertion that covers
+# the OTHER is_quad() caller.  encap_of() defaults the absent mode to
+# gre-in-fou, so while is_quad checked shape only, this line set want_fou
+# and ran ensure_fou() -- a real `ip fou add` bind -- on a box whose
+# registry is otherwise all plain GRE, and only then got rejected.
+new_state h6f3
+printf '100.64.0.47 gre\n100.64.999.20\n' > "$TESTDIR/peers-oor-bare"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-oor-bare" 2>&1)
+rc=$?
+check "h6f3: a bare out-of-range overlay exits nonzero" [ "$rc" -ne 0 ]
+check "h6f3: no FOU port is bound on its behalf" log_lacks "^ip fou add"
+check "h6f3: no GRE-in-FOU probe on its behalf" \
+	log_lacks "^ip link add dimt-probe0 .* encap fou"
+check "h6f3: the valid plain-GRE peer still builds" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+
+# --- (h6f4) positive control: the range boundaries still build --------
+# Guards the other direction.  A tightened quad regex that fumbles the
+# 200-255 alternation, or that forbids a bare 0, would silently stop
+# building real peers -- a far worse failure than the one h6f fixes.
+new_state h6f4
+printf '100.64.255.255 gre\n100.64.0.0 gre\n' > "$TESTDIR/peers-bounds"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-bounds" 2>&1)
+rc=$?
+check "h6f4: boundary octets exit zero" [ "$rc" -eq 0 ]
+check "h6f4: 255.255 builds" log_has \
+	"^ip link add dimt-255-255 type gre local 100.64.0.40 remote 100.64.255.255 "
+check "h6f4: a bare 0 octet builds" log_has \
+	"^ip link add dimt-0-0 type gre local 100.64.0.40 remote 100.64.0.0 "
+check "h6f4: nothing was called invalid" err_lacks "ignoring invalid peer entry"
 
 # --- (h7) one overlay listed twice under conflicting modes -------------
 new_state h7

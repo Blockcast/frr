@@ -214,9 +214,24 @@ peers() {
 overlay_of() { echo "${1%%=*}"; }
 
 # The build loop's dotted-quad gate, shared with the capability pre-scan
-# in reconcile() so the two can never disagree about which entries are
-# buildable.
-is_quad() { echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
+# in reconcile() AND with validate_endpoints() so the three can never
+# disagree about which addresses are buildable.
+#
+# A real dotted quad, not just the shape: this used to be
+# '([0-9]{1,3}\.){3}[0-9]{1,3}', which passed 999.999.999.999 through to
+# dev dimt-999-999 and inner addresses 10.99.999.999/32 -- rejected by
+# `ip`, so it failed loudly downstream rather than silently.  Two reasons
+# the shape check is not enough:
+#   - an octet > 255 is a mangled line, and dev_of() reads octets 3-4, so
+#     the device we derive is not the device the operator meant;
+#   - a leading zero ALIASES: 10.99.010.20 and 10.99.10.20 are the same
+#     address but derive dimt-010-20 and dimt-10-20, i.e. two netdevs
+#     fighting over one peer (and 010 is octal to inet_aton besides).
+# [1-9]?[0-9] is what forbids the leading zero while still admitting 0.
+is_quad() {
+	echo "$1" | grep -Eq \
+		'^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
+}
 
 # Absent second column means gre-in-fou: every registry written before
 # this knob existed describes GRE-in-FOU peers.
@@ -262,11 +277,7 @@ validate_endpoints() { # <peer-spec-list>
 			log "ERROR: no managed underlay endpoint for overlay $overlay; refusing cutover"
 			return 1
 		}
-		if ! echo "$endpoint" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' ||
-			! echo "$endpoint" | awk -F. '{
-				for (i = 1; i <= 4; i++)
-					if ($i < 0 || $i > 255) exit 1
-			}'; then
+		if ! is_quad "$endpoint"; then
 			log "ERROR: invalid managed underlay endpoint '$endpoint' for overlay $overlay; refusing cutover"
 			return 1
 		fi
@@ -692,6 +703,19 @@ reconcile() {
 		peer=$(overlay_of "$spec")
 		mode=$(encap_of "$spec")
 		[ "$peer" = "$SELF" ] && continue
+		# DISPOSITION, decided rather than fallen into: an out-of-range
+		# or leading-zero octet is a MALFORMED ENTRY (invalid=1, GC
+		# suppressed run-wide), not a skip-with-rc=1 like the device
+		# collision below.  The two look alike and are not:
+		#   - the collision branch can leave GC running because the
+		#     WINNING peer has already put the contested device in
+		#     want, so gc_stale cannot reap it (pinned by h6e);
+		#   - here there is no winner.  A mangled octet is most often a
+		#     typo of a real peer, and dev_of() reads octets 3-4, so the
+		#     device we would derive is not the one the operator meant.
+		#     The peer's real device is in nobody's want and GC would
+		#     delete a live tunnel.  Same reasoning as the GC gate's own
+		#     comment below -- kept identical on purpose.
 		if ! is_quad "$peer"; then
 			log "ignoring invalid peer entry '$peer'"
 			invalid=1
