@@ -384,7 +384,6 @@ check "a4b: leading-zero endpoint is named" err_has \
 check "a4b: it refuses before touching the live tunnel" \
 	log_lacks "^ip link del dimt-0-47$"
 
-
 # --- (b) missing peers file refuses ----------------------------------
 new_state b
 echo "dimt-9-9 100.64.0.40 100.64.9.9" >> "$FAKEIP_DIR/links"
@@ -944,6 +943,86 @@ check "h6f4: 255.255 builds" log_has \
 check "h6f4: a bare 0 octet builds" log_has \
 	"^ip link add dimt-0-0 type gre local 100.64.0.40 remote 100.64.0.0 "
 check "h6f4: nothing was called invalid" err_lacks "ignoring invalid peer entry"
+
+# --- (h6f5) --self is the FOURTH address consumer --------------------
+# It was only checked non-empty, then flowed into inner_of/inner6_of and
+# the local endpoint.  It also decides the self-skip, which is a TEXTUAL
+# compare (`[ "$peer" = "$SELF" ]`), so an unvalidated --self would not
+# match an equivalent-but-differently-written peer and the box would
+# build a tunnel to itself.
+new_state h6f5
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.999.40 --peers 100.64.0.47 \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6f5: an out-of-range --self exits nonzero" [ "$rc" -ne 0 ]
+check "h6f5: --self is named in the refusal" err_has \
+	"--self must be a dotted quad: '100.64.999.40'"
+check "h6f5: it refuses before touching the live tunnel" \
+	log_lacks "^ip link del dimt-9-9"
+check "h6f5: no tunnel is derived from the bad --self" \
+	log_lacks "^ip link add dimt-0-47"
+
+# h6f5b: the self-skip aliasing case.  --self 100.64.010.40 is the same
+# address as the peers file's 100.64.0.40-equivalent written with a
+# leading zero; textual self-skip would miss it and dimt-0-47 would be
+# built against a self that inner_of() renders as 10.99.010.40.
+new_state h6f5b
+err=$($RUN_SH "$RECONCILE" --self 100.64.010.40 --peers 100.64.0.47 \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6f5b: a leading-zero --self exits nonzero" [ "$rc" -ne 0 ]
+check "h6f5b: the aliased --self is named" err_has \
+	"--self must be a dotted quad: '100.64.010.40'"
+check "h6f5b: no aliased inner address is configured" \
+	log_lacks "10.99.010.40"
+
+# h6f5c: positive control for the gate's PLACEMENT, not its regex.  The
+# obvious home for this check is next to the `-n "$SELF"` test during
+# argument parsing -- but that runs ~70 lines before is_quad() is
+# defined, so the call would be `command not found` -> rc 127 -> the
+# `||` fires and EVERY --self is rejected, valid ones included.  Every
+# other test in this file passes a valid --self and so is also a control
+# for that; this one just says so out loud.
+new_state h6f5c
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47 \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6f5c: a valid --self still exits zero" [ "$rc" -eq 0 ]
+check "h6f5c: a valid --self still builds its peer" log_has \
+	"^ip link add dimt-0-47 "
+check "h6f5c: a valid --self is never called malformed" err_lacks \
+	"--self must be a dotted quad"
+
+# --- (h6f6) the gate is escape-proof under a POSIX echo --------------
+# `echo "$1" | grep -Eq` is escape-sensitive: under dash (advertised at
+# the top of this file as a supported interpreter) `echo "1.2.3.4\c"`
+# emits "1.2.3.4" and swallows the rest, so is_quad returned TRUE for a
+# token that still carried the backslash -- and dev_of() then derived a
+# device name from it.  printf '%s\n' has no such behaviour, which is
+# why every address helper and log() now use it.
+# NOTE: this only fails pre-fix under an interpreter whose echo expands
+# backslashes (dash/ash, not bash), so run the suite under both.
+# The assertions below are deliberately NOT ^-anchored: \c suppresses the
+# newline on the fake ip's own log writes too, so pre-fix the log reads
+# "...get 100.64.0.4ip link show dimt-0-4ip link add dimt-0-4ip link set..."
+# as ONE line and every anchored pattern silently misses.  The blast
+# radius is bigger than a bad return value: a dimt-0-4 netdev is really
+# created, and the reconciler's own log framing is corrupted.
+new_state h6f6
+printf '100.64.0.47 gre\n100.64.0.4\\c gre\n' > "$TESTDIR/peers-esc"
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-esc" 2>&1)
+rc=$?
+check "h6f6: a backslash-bearing token exits nonzero" [ "$rc" -ne 0 ]
+check "h6f6: the escaped entry is named" err_has \
+	"ignoring invalid peer entry"
+check "h6f6: no device is derived from the escaped token" \
+	log_lacks "ip link add dimt-0-4[^7]"
+check "h6f6: GC suppressed (invalid=1)" log_lacks "^ip link del dimt-9-9"
+check "h6f6: the valid peer alongside it still builds" log_has \
+	"^ip link add dimt-0-47 "
 
 # --- (h7) one overlay listed twice under conflicting modes -------------
 new_state h7
