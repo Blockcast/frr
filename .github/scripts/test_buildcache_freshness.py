@@ -646,6 +646,18 @@ class TestVerifyRequiresTheSeedResult(unittest.TestCase):
             block, r"if: \$\{\{ needs\.seed\.result != 'success' \}\}[\s\S]*?exit 1"
         )
 
+    def test_seed_does_not_swallow_a_failed_cache_export(self):
+        """Ally suggestion on #114: the check above is only evidence of a push
+        because a failed `cache-to` export fails its leg. buildx's
+        `ignore-error=true` would break exactly that -- the seed would go green
+        without rewriting the cache and `verify` would certify it, which is the
+        failure the old unconditional exit 1 used to catch. Locked here because
+        the coupling was stated only in a comment.
+        """
+        block = _seeder_job_block(self, "seed")
+        self.assertIn("cache-to:", block)
+        self.assertNotIn("ignore-error", block)
+
 
 class TestEveryJobIsConfinedToTheCanonicalRepo(unittest.TestCase):
     """No job in the seeder may run outside Blockcast/frr.
@@ -929,6 +941,20 @@ class TestFallbackWiring(unittest.TestCase):
             ):
                 bcf._request_json("https://example.invalid/x", {}, 1)
         self.assertEqual(403, caught.exception.status)
+
+    def test_a_bare_string_token_payload_is_never_echoed(self):
+        # Ally suggestion on #114: this message lands in the Actions log, and a
+        # token service answering with a bare JSON string is most likely
+        # handing back the credential itself. Diagnose by type, never by value.
+        secret = "eyJhbGciOiJIUzI1NiJ9.SUPERSECRETTOKEN"
+        with self.assertRaises(bcf.ProbeError) as caught:
+            with mock.patch.object(bcf, "_request_json", return_value=secret):
+                bcf._registry_bearer_token(
+                    {"realm": "https://example.invalid/token"}, "u", "p", 1
+                )
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertIn("str", str(caught.exception))
+
     def test_report_only_baseline_snapshot_survives_the_fallback(self):
         # probe-before must still exit 0 and emit a usable baseline, otherwise
         # the seeding run it guards gets skipped -- the BLO-33101 failure.

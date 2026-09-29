@@ -327,7 +327,13 @@ def _registry_bearer_token(
     basic = base64.b64encode(f"{username}:{password}".encode()).decode()
     payload = _request_json(url, {"Authorization": f"Basic {basic}"}, timeout)
     if not isinstance(payload, dict):
-        raise ProbeError(f"unexpected token payload from {realm}: {payload!r}")
+        # Render the type, never the value: a token service that answers with a
+        # bare JSON string is most likely handing back the credential itself,
+        # and this message lands in the Actions log.
+        raise ProbeError(
+            f"unexpected token payload from {realm}: "
+            f"expected object, got {type(payload).__name__}"
+        )
     # Harbor returns `token`; the OAuth2-shaped alias is accepted by spec.
     token = payload.get("token") or payload.get("access_token")
     if not token or not isinstance(token, str):

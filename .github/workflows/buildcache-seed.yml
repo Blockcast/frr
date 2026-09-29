@@ -273,7 +273,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
-      - name: Fail if any buildcache tag is older than the budget
+      - name: Fail if any buildcache tag is older than the budget (inert while age is unmeasurable)
         env:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
