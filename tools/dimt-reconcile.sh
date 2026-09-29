@@ -701,14 +701,17 @@ reconcile() {
 		case "$mode" in
 		gre | gre-in-fou) : ;;
 		*=*)
-			# peers() joins every field, so a surviving "=" means the
-			# entry had a third column.  Echo it back with the "="
-			# turned back into spaces -- normalized to single spaces,
-			# NOT the entry's original spacing, so an operator grepping
-			# their peers file for this string may not match the line.
-			log "ignoring peer $peer: trailing field(s) after encap mode" \
-				"in '$peer $(echo "$mode" | tr '=' ' ')'" \
-				"(expected '<overlay> <gre|gre-in-fou>')"
+			# peers() joins every field with "=", so "<ip> gre extra"
+			# and "<ip> gre=extra" arrive here as the same spec: the
+			# field count is already gone and a third column cannot be
+			# told apart from an "=" the operator typed inside field 2.
+			# Name both causes rather than asserting one, and echo $mode
+			# verbatim -- rewriting its "=" back to spaces would mangle
+			# the second case.  $peer is exact either way, so it, not
+			# this reconstructed spec, is the grep key for the line.
+			log "ignoring peer $peer: invalid encap mode '$mode'" \
+				"(a third column, or an '=' inside the mode;" \
+				"expected '<overlay> <gre|gre-in-fou>')"
 			invalid=1
 			rc=1
 			continue
