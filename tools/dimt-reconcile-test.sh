@@ -270,6 +270,17 @@ err_has() { printf '%s\n' "$err" | grep -q -- "$1"; }
 err_lacks() { ! printf '%s\n' "$err" | grep -q -- "$1"; }
 # shellcheck disable=SC2329
 vtysh_lacks() { ! grep -q -- "$1" "$FAKEIP_DIR/vtysh.log"; }
+# err_mode_greps_file pulls the mode the script quoted out of $err and greps
+# <file> for exactly that.  Grepping the fixture for a literal the test wrote
+# asserts the fixture against itself; this asserts the message against the
+# fixture, which is the property the message claims -- the echoed mode is a
+# usable grep key -- so rewriting the mode turns it red.
+# shellcheck disable=SC2329
+err_mode_greps_file() {
+	_m=$(printf '%s\n' "$err" |
+		sed -n "s/.*invalid encap mode '\([^']*\)'.*/\1/p" | head -n 1)
+	[ -n "$_m" ] && grep -qF -- "$_m" "$1"
+}
 
 # --- (a) inner derivation, dual-stack create ---------------------------
 new_state a
@@ -773,8 +784,8 @@ check "h6b3: a mode containing = exits nonzero" [ "$rc" -ne 0 ]
 check "h6b3: the mode is echoed verbatim, = intact" err_has \
 	"invalid encap mode 'gre=x'"
 check "h6b3: no trailing field is asserted" err_lacks "trailing field"
-check "h6b3: the echoed mode still matches the peers file" \
-	grep -q "gre=x" "$TESTDIR/peers-eq"
+check "h6b3: the echoed mode is a literal grep key for the peers file" \
+	err_mode_greps_file "$TESTDIR/peers-eq"
 check "h6b3: not mistaken for a valid gre peer" log_lacks "^ip link add dimt-0-47"
 
 # --- (h6d) a malformed overlay arms no capability gate ----------------
