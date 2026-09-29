@@ -39,6 +39,8 @@
 #include "pim_mroute.h"
 #include "pim_str.h"
 #include "pim_zebra.h"
+#include "pim_jp_agg.h"
+#include "pim_neighbor.h"
 #include "pim_dimt.h"
 
 extern struct zclient *pim_zclient;
@@ -372,6 +374,128 @@ static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
 	return pin.ifp;
 }
 
+/* ------------------------------------------------------------------------
+ * Triggered Join/Prune on DIMT RPF moves
+ *
+ * STATIC_IIF makes pim_rpf_update() a no-op for a pinned upstream, and with
+ * it the whole RFC 7761 4.5.7 "RPF'(S,G) changes" path: nothing sends
+ * Join(S,G) toward the new RPF' or Prune(S,G) toward the old one.  An
+ * upstream already in Joined state therefore sat silent on a new pin until
+ * its periodic Join Timer fired -- up to t_periodic (60 s) of blackhole on
+ * every tunnel bring-up and every steer, while the old UMH's copies were
+ * RPF-dropped -- and a steered-away UMH never heard a prune at all, so it
+ * kept forwarding into a deleted tunnel for its full J/P holdtime.  The
+ * helpers below restore both halves for the moves DIMT itself makes.
+ * ------------------------------------------------------------------------
+ */
+
+/* Can a Join/Prune leave on `ifp` right now?  A DIMT netdev is pinned on its
+ * INSTALLED notify, before zebra's inner address has come back round as a
+ * connected route, and pim_if_addr_add() only opens the PIM socket once that
+ * address lands.  Sending before then fails in sendmsg (fd -1) and is simply
+ * lost, which is why a join that cannot go out yet is left pending instead. */
+static bool pim_dimt_jp_sendable(const struct interface *ifp)
+{
+	const struct pim_interface *pim_ifp;
+
+	if (!ifp || !if_is_operative(ifp))
+		return false;
+	pim_ifp = ifp->info;
+	return pim_ifp && pim_ifp->pim_enable && pim_ifp->pim_sock_fd >= 0 &&
+	       !pim_addr_is_any(pim_ifp->primary_address);
+}
+
+/* Send the Join(S,G) a pin move owes the new RPF', if it can go out now.
+ *
+ * Only in Joined state: a NotJoined upstream owes no join, and the
+ * NotJoined -> Joined transition in pim_upstream_switch() sends its own.  The
+ * pending mark survives until a join is actually handed to a usable socket,
+ * so the pin path's socket-ready re-entry (pim_if_addr_add() ->
+ * pim_dimt_iface_up() -> the unchanged-pin branch below) completes it.  A
+ * duplicate Join is harmless -- it is a refresh -- whereas a missing one costs
+ * a full t_periodic of blackhole, so every doubt resolves toward sending. */
+static void pim_dimt_join_flush(struct pim_upstream *up)
+{
+	struct interface *ifp = up->rpf.source_nexthop.interface;
+
+	if (!up->dimt_join_pending || up->join_state != PIM_UPSTREAM_JOINED)
+		return;
+	if (!pim_dimt_jp_sendable(ifp) || pim_addr_is_any(up->rpf.rpf_addr))
+		return;
+
+	up->dimt_join_pending = false;
+
+	if (PIM_DEBUG_PIM_TRACE)
+		zlog_debug("DIMT: triggered Join%s toward %pPAs on %s",
+			   up->sg_str, &up->rpf.rpf_addr, ifp->name);
+
+	pim_upstream_send_join(up);
+	/* Restart the periodic timer from this join, per 4.5.7: the next
+	 * refresh is due t_periodic after the triggered one, not after
+	 * whatever the old RPF' was last sent. */
+	join_timer_start(up);
+}
+
+/* Prune(S,G) toward the RPF' DIMT is moving this upstream away from.
+ *
+ * `old` is a copy taken before the move, because the move overwrites
+ * up->rpf.  The prune goes out synchronously: pim_jp_agg_single_upstream_send()
+ * builds and sendmsg()s it on the old interface's PIM socket before
+ * returning, and a GRE netdev is noqueue, so by the time this returns the
+ * encapsulated packet has been handed to the underlay.  Callers that go on
+ * to request the old tunnel's deletion therefore need no wait: the ZAPI DEL
+ * is written after this returns and zebra deletes the netdev later still, so
+ * the teardown cannot overtake the prune -- and, having no timer, cannot
+ * hang on it either. */
+static void pim_dimt_prune_old(struct pim_upstream *up,
+			       const struct pim_rpf *old)
+{
+	struct pim_rpf rpf = *old;
+
+	if (up->join_state != PIM_UPSTREAM_JOINED)
+		return;
+	if (!pim_dimt_jp_sendable(rpf.source_nexthop.interface) ||
+	    pim_addr_is_any(rpf.rpf_addr))
+		return;
+
+	if (PIM_DEBUG_PIM_TRACE)
+		zlog_debug("DIMT: Prune%s toward %pPAs on %s (RPF moved)",
+			   up->sg_str, &rpf.rpf_addr,
+			   rpf.source_nexthop.interface->name);
+
+	pim_jp_agg_single_upstream_send(&rpf, up, false /* prune */);
+}
+
+/* Take the upstream off the J/P aggregation list of the neighbor `old`
+ * points at.  Every DIMT move must do this BEFORE it overwrites up->rpf.
+ *
+ * join_timer_start() puts an upstream on nbr->upstream_jp_agg whenever a
+ * neighbor exists for its RPF' -- and on a DIMT netdev one does as soon as
+ * the UMH sends us any J/P (pim_pim.c creates a light neighbor for it; the
+ * Prune Echo our own prune provokes is enough).  join_timer_stop() and
+ * pim_rpf_update() only ever look the neighbor up from the CURRENT RPF, so
+ * an entry left behind on the old neighbor is never removed: its jp timer
+ * keeps sending Join(S,G) to the UMH we just pruned, undoing the prune, and
+ * once the upstream is freed it builds that Join from a dangling js->up.
+ * pim_zebra_upstream_rpf_changed() does this same removal for normal RPF
+ * moves; STATIC_IIF keeps DIMT's moves out of that path. */
+static void pim_dimt_jp_agg_detach(struct pim_upstream *up,
+				   const struct pim_rpf *old)
+{
+	struct pim_neighbor *nbr;
+
+	if (!old->source_nexthop.interface)
+		return;
+
+	nbr = pim_neighbor_find(old->source_nexthop.interface, old->rpf_addr,
+				true);
+	if (!nbr)
+		return;
+
+	pim_jp_agg_remove_group(nbr->upstream_jp_agg, up, nbr);
+	pim_jp_agg_upstream_verification(up, false);
+}
+
 /* Pin an upstream's RPF onto the light interface facing its UMH.
  * Mirrors pim_vxlan's orig-mroute handling: fill_static_iif() resets
  * rpf_addr, so the UMH must be written after it; the STATIC_IIF flag
@@ -381,6 +505,9 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 				  struct pim_dimt_umh *umh,
 				  struct interface *ifp)
 {
+	struct pim_rpf old_rpf;
+	enum pim_upstream_state old_state;
+
 	if (PIM_UPSTREAM_FLAG_TEST_STATIC_IIF(up->flags) &&
 	    up->rpf.source_nexthop.interface == ifp &&
 	    !pim_addr_cmp(up->rpf.rpf_addr, umh->umh)) {
@@ -401,6 +528,13 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 		if (up->channel_oil)
 			pim_upstream_mroute_iif_update(up->channel_oil,
 						       __func__);
+		/* The same ordering hazard strands the triggered join: the
+		 * pin was made before the netdev had a PIM socket, so the join
+		 * it owed could not go out.  This branch is where the socket
+		 * becoming usable arrives (pim_if_addr_add() opens it, then
+		 * calls pim_dimt_iface_up()), so finish it here rather than
+		 * leaving it to the 60 s periodic timer. */
+		pim_dimt_join_flush(up);
 		return;
 	}
 
@@ -408,16 +542,56 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 		zlog_debug("DIMT: pinning %s RPF to %s via UMH %pPAs",
 			   up->sg_str, ifp->name, &umh->umh);
 
+	/* Whatever RPF' the upstream had -- a previous DIMT pin (a steer) or
+	 * the normal unicast path (a first pin) -- is being replaced, and
+	 * STATIC_IIF (set below) keeps pim_rpf_update() from ever noticing, so
+	 * this is the only place the old RPF' can be cleaned up.  Detach it
+	 * from the old neighbor's aggregation list now, while up->rpf still
+	 * names that neighbor, and prune it once the new RPF is in place.  On
+	 * a steer the prune must also precede the reconcile pass that follows,
+	 * which may delete the old tunnel once it has no riders left. */
+	old_rpf = up->rpf;
+	pim_dimt_jp_agg_detach(up, &old_rpf);
+
 	PIM_UPSTREAM_FLAG_SET_SRC_DIMT(up->flags);
 	PIM_UPSTREAM_FLAG_SET_STATIC_IIF(up->flags);
 	pim_upstream_fill_static_iif(up, ifp);
 	up->rpf.source_nexthop.mrib_nexthop_addr = umh->umh;
 	up->rpf.rpf_addr = umh->umh;
 
+	/* Not when the "move" lands on the very neighbor we were already
+	 * joined through (a first pin whose unicast RPF' was already the UMH
+	 * on this netdev): a prune immediately followed by the join below
+	 * would only blip the UMH's oif. */
+	if (old_rpf.source_nexthop.interface &&
+	    (old_rpf.source_nexthop.interface != ifp ||
+	     pim_addr_cmp(old_rpf.rpf_addr, umh->umh)))
+		pim_dimt_prune_old(up, &old_rpf);
+
 	pim_upstream_update_use_rpt(up, false /*update_mroute*/);
 	if (up->channel_oil)
 		pim_upstream_mroute_iif_update(up->channel_oil, __func__);
+
+	/* A NotJoined -> Joined edge sends its own join from
+	 * pim_upstream_switch(); only an upstream that was ALREADY Joined
+	 * owes one here, and that is the case the pin used to leave to the
+	 * periodic timer.  If the switch's join could not go out (no socket
+	 * yet) it was lost, so the mark stays set for the flush to redo. */
+	old_state = up->join_state;
+	up->dimt_join_pending = true;
 	pim_upstream_update_join_desired(pim, up);
+	if (old_state != PIM_UPSTREAM_JOINED &&
+	    up->join_state == PIM_UPSTREAM_JOINED && pim_dimt_jp_sendable(ifp))
+		up->dimt_join_pending = false;
+	pim_dimt_join_flush(up);
+
+	/* The detach above may have removed the only periodic refresh this
+	 * upstream had.  If the join is still owed (no socket on the new
+	 * netdev yet), keep a Join Timer running against the new RPF' so a
+	 * socket that never comes up cannot leave a Joined upstream with no
+	 * refresh at all; the socket-ready flush restarts it anyway. */
+	if (up->dimt_join_pending && up->join_state == PIM_UPSTREAM_JOINED)
+		join_timer_start(up);
 }
 
 /* Undo a pin (mapping removed): return the upstream to normal RPF
@@ -426,21 +600,51 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 static void pim_dimt_upstream_unpin(struct pim_instance *pim,
 				    struct pim_upstream *up)
 {
+	enum pim_upstream_state old_state;
+
 	if (!PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags))
 		return;
 
 	if (PIM_DEBUG_PIM_TRACE)
 		zlog_debug("DIMT: unpinning %s RPF", up->sg_str);
 
+	/* The UMH this pin pointed at must hear a prune while the interface
+	 * toward it still exists: an unpin is what a steer toward a tunnel
+	 * that is not built yet, or a withdrawn mapping, looks like, and the
+	 * reconcile pass that follows deletes the old tunnel.  When the unpin
+	 * is BECAUSE the interface went away, it is no longer sendable and
+	 * this is a no-op. */
+	pim_dimt_jp_agg_detach(up, &up->rpf);
+	pim_dimt_prune_old(up, &up->rpf);
+	up->dimt_join_pending = false;
+
 	PIM_UPSTREAM_FLAG_UNSET_SRC_DIMT(up->flags);
 	PIM_UPSTREAM_FLAG_UNSET_STATIC_IIF(up->flags);
+	/* Zeroing rpf_addr forces pim_rpf_update() to see a change, but it
+	 * also blinds it to the old neighbor (it looks it up by the zeroed
+	 * address) -- which is why the detach above cannot be left to it. */
 	up->rpf.rpf_addr = PIMADDR_ANY;
 
 	(void)pim_rpf_update(pim, up, NULL, NULL, __func__);
 	pim_upstream_update_use_rpt(up, false /*update_mroute*/);
 	if (up->channel_oil)
 		pim_upstream_mroute_iif_update(up->channel_oil, __func__);
+
+	old_state = up->join_state;
 	pim_upstream_update_join_desired(pim, up);
+
+	/* RPF'(S,G) changed while Joined (4.5.7): Join the new RPF' and
+	 * restart the Join Timer against it.  The restart is not optional:
+	 * the detach above removed the only periodic refresh an upstream on a
+	 * neighbor's aggregation list had.  A NotJoined -> Joined edge already
+	 * did both from pim_upstream_switch(). */
+	if (old_state == PIM_UPSTREAM_JOINED &&
+	    up->join_state == PIM_UPSTREAM_JOINED) {
+		if (pim_dimt_jp_sendable(up->rpf.source_nexthop.interface) &&
+		    !pim_addr_is_any(up->rpf.rpf_addr))
+			pim_upstream_send_join(up);
+		join_timer_start(up);
+	}
 }
 
 /* Is this upstream DIMT-steered *by intent* -- does a usable pim-type
@@ -972,12 +1176,17 @@ pim_dimt_tunnel_find_by_id(struct pim_instance *pim, uint32_t tunnel_id)
  * like an invariant.  Should a row ever become configurable per-VRF, a
  * hardcoded id would address the ack to the wrong instance rather than fail,
  * which is the kind of bug that surfaces as an unexplained missing notify. */
+static bool pim_dimt_zclient_usable(void)
+{
+	return pim_zclient && pim_zclient->sock >= 0;
+}
+
 static bool pim_dimt_tunnel_send(struct pim_instance *pim,
 				 struct pim_dimt_tunnel *tun, bool add)
 {
 	struct stream *s;
 
-	if (!pim_zclient || pim_zclient->sock < 0)
+	if (!pim_dimt_zclient_usable())
 		return false;
 
 	if (PIM_DEBUG_PIM_TRACE)
@@ -1130,6 +1339,90 @@ static struct pim_dimt_umh *pim_dimt_upstream_demand(struct pim_instance *pim,
 	return pim_dimt_upstream_steered(pim, up, &umh) ? umh : NULL;
 }
 
+static struct interface *
+pim_dimt_tunnel_ifp(struct pim_instance *pim,
+		    const struct pim_dimt_tunnel *tun)
+{
+	struct interface *ifp = NULL;
+
+	/* A stale ifindex can in principle be reused by another netdev, even
+	 * another DIMT tunnel; trust it only while it still carries this
+	 * tunnel's name, so a prune never lands on some other tunnel's
+	 * riders. */
+	if (tun->ifindex)
+		ifp = if_lookup_by_index(tun->ifindex, pim->vrf->vrf_id);
+	if (!ifp || strncmp(ifp->name, tun->ifname, sizeof(tun->ifname)))
+		ifp = if_lookup_by_name(tun->ifname, pim->vrf->vrf_id);
+	return ifp;
+}
+
+/* The tunnel is about to be deleted with upstreams still pinned to it.
+ *
+ * Demand is counted per UMH *with an endpoint row*, so refcount can reach 0
+ * while upstreams remain pinned to the netdev -- `no dimt tunnel-endpoint`
+ * does exactly that.  Those upstreams are not moving anywhere yet (the pin
+ * goes when the netdev does, via pim_dimt_iface_down()), so no RPF-move path
+ * prunes them; without this the UMH keeps forwarding into a tunnel that no
+ * longer exists until its J/P holdtime runs out.  Prune them here, before the
+ * DEL is written.  See pim_dimt_prune_old() for why no wait is needed.
+ *
+ * A one-off prune is not enough on its own: the rider's periodic refresh
+ * (its own Join Timer, or the UMH neighbor's aggregation list) would send
+ * Join(S,G) again if it fired before the netdev is gone, re-joining the UMH
+ * we just pruned.  So take it off the neighbor's list and push its own timer
+ * a full t_periodic out -- deferred, never stopped, so no path can leave a
+ * Joined rider with no refresh at all -- and mark the join owed.  If the DEL
+ * goes through, pim_dimt_iface_down() unpins the rider and restarts its
+ * timer on whatever RPF' it lands on, long before the deferred one fires; if
+ * it does not (the send fails, or zebra answers REMOVE_FAIL),
+ * pim_dimt_tunnel_rejoin_riders() re-joins at once rather than leaving the
+ * UMH pruned until that deferred refresh. */
+static void pim_dimt_tunnel_prune_riders(struct pim_instance *pim,
+					 const struct pim_dimt_tunnel *tun)
+{
+	struct interface *ifp = pim_dimt_tunnel_ifp(pim, tun);
+	struct pim_upstream *up;
+
+	if (!ifp)
+		return;
+
+	frr_each (rb_pim_upstream, &pim->upstream_head, up) {
+		if (!PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags) ||
+		    up->rpf.source_nexthop.interface != ifp)
+			continue;
+		pim_dimt_jp_agg_detach(up, &up->rpf);
+		pim_dimt_prune_old(up, &up->rpf);
+		if (up->join_state == PIM_UPSTREAM_JOINED) {
+			up->dimt_join_pending = true;
+			pim_upstream_join_timer_defer(up);
+		}
+	}
+}
+
+/* The teardown pim_dimt_tunnel_prune_riders() prepared for did not happen
+ * and the netdev survives with riders still pinned to it: send each the
+ * join it is owed and restart its periodic refresh. */
+static void pim_dimt_tunnel_rejoin_riders(struct pim_instance *pim,
+					  const struct pim_dimt_tunnel *tun)
+{
+	struct interface *ifp = pim_dimt_tunnel_ifp(pim, tun);
+	struct pim_upstream *up;
+
+	if (!ifp)
+		return;
+
+	frr_each (rb_pim_upstream, &pim->upstream_head, up) {
+		if (!PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags) ||
+		    up->rpf.source_nexthop.interface != ifp ||
+		    !up->dimt_join_pending ||
+		    up->join_state != PIM_UPSTREAM_JOINED)
+			continue;
+		/* If the socket is not usable the mark stays for the socket-
+		 * ready re-entry, and the deferred timer is still running. */
+		pim_dimt_join_flush(up);
+	}
+}
+
 /* Recompute tunnel demand across every upstream and drive the resulting
  * ADD/DEL edges.  Idempotent by construction: it is safe (and expected) to
  * call this from any event that can change the answer. */
@@ -1218,8 +1511,16 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 		case PIM_DIMT_TUNNEL_INSTALLED:
 		case PIM_DIMT_TUNNEL_REQUESTED:
 			tun->readd_pending = false;
+			/* No DEL can be written without zebra; pruning ahead
+			 * of it would only be undone by the rejoin below, on
+			 * every reconcile pass until zebra returns. */
+			if (!pim_dimt_zclient_usable())
+				break;
+			pim_dimt_tunnel_prune_riders(pim, tun);
 			if (pim_dimt_tunnel_send(pim, tun, false))
 				tun->state = PIM_DIMT_TUNNEL_REMOVING;
+			else
+				pim_dimt_tunnel_rejoin_riders(pim, tun);
 			break;
 		case PIM_DIMT_TUNNEL_IDLE:
 		case PIM_DIMT_TUNNEL_FAILED:
@@ -1235,12 +1536,18 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 				 * REMOVED, which frees the record on the
 				 * notify. */
 				tun->readd_pending = false;
+				/* Socket unusable: keep the record (and the
+				 * name) so the next reconnect can retry. */
+				if (!pim_dimt_zclient_usable())
+					break;
+				pim_dimt_tunnel_prune_riders(pim, tun);
 				if (pim_dimt_tunnel_send(pim, tun, false)) {
 					tun->state = PIM_DIMT_TUNNEL_REMOVING;
 					break;
 				}
-				/* Socket unusable: keep the record (and the
-				 * name) so the next reconnect can retry. */
+				/* The send failed after all: keep the record
+				 * so the next reconnect can retry. */
+				pim_dimt_tunnel_rejoin_riders(pim, tun);
 				break;
 			}
 			listnode_delete(pim->dimt_tunnel_list, tun);
@@ -1365,6 +1672,10 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
 		/* The netdev survives.  Return to INSTALLED so the next
 		 * demand edge re-drives a delete; do not spin. */
 		tun->state = PIM_DIMT_TUNNEL_INSTALLED;
+		/* The riders were pruned and silenced ahead of the DEL; with
+		 * the netdev still here they must be re-joined now, not left
+		 * dark until something else happens to refresh them. */
+		pim_dimt_tunnel_rejoin_riders(pim, tun);
 		break;
 	}
 

@@ -160,17 +160,44 @@ class WindowNeverOpened(Exception):
 # absorbed, so if the hold ever starts working and zebra then misbehaves, that
 # surfaces as a hard failure rather than hiding under this marker. See
 # WindowNeverOpened for why Failed was too wide.
+#
+# strict=False, the one exception to the strict=True rule above, because that
+# rule assumes a marked test fails deterministically and this one no longer
+# does: the hold now takes on some runners and not others. Measured on
+# 2026-09-27/28 -- master run 36278687998 xfailed (window never opened), while
+# the unrelated frr#107 (run 36332531703) and frr#109 (run 36337004794), neither
+# touching zebra, XPASSed: the window opened, readd was rejected, and every
+# behavioural assertion below held. Under strict=True each of those correct
+# runs failed the build. Non-strict keeps what matters: a run whose window
+# opens still fails hard on any AssertionError, and a run whose window never
+# opens is still reported, as xfail, not hidden.
+#
+# "Opened" means only what the guard samples: pending.poll() is None once, at
+# ~0.3s. The readd is processed later (request() spawns a client and waits on a
+# full ZAPI round-trip), so a partial hold can pass the guard and still let the
+# delete finish before zebra sees the ADD. That run returns result=0, which is
+# the ordinary post-delete ADD, and fails hard here although zebra did nothing
+# wrong (frr#101 run 36419490474 is one such run; it does not show an ADD
+# rebinding a live DELETE). BLO-29000 tracks re-checking the guard after the
+# readd returns.
+#
+# What non-strict gives up: strict=True made an XPASS fail the build, which
+# forced this marker off in the PR that fixed the hold. Nothing enforces that
+# now, so the marker no longer removes itself; BLO-29000 owns removing it.
+# Restore strict=True (or drop the marker) when hold_dplane_worker() holds
+# deterministically.
 XFAIL_BLO_29000 = pytest.mark.xfail(
-    strict=True,
+    strict=False,
     raises=WindowNeverOpened,
     reason=(
-        "BLO-29000: this test does not currently exercise its own window -- "
-        "hold_dplane_worker() does not hold the `del 9` client, which exits "
-        "with result=2 (REMOVED) before the readd runs. Measured, not "
-        "inferred: the pending.poll() guard fires. The zebra defect originally "
-        "filed here was a phantom -- a post-delete ADD succeeding is correct, "
-        "and this test's own tail asserts it. Remove this marker when the hold "
-        "works and the guard stops firing."
+        "BLO-29000: hold_dplane_worker() holds the `del 9` client on some "
+        "runners and not others. A run whose window never opens (the "
+        "pending.poll() guard fires) is absorbed here; a run whose window "
+        "opens is not, and fails hard on any AssertionError. The original "
+        "'readd returns result=0' filing is not established as a zebra "
+        "defect: a post-delete ADD succeeding is correct, and this test's own "
+        "tail asserts it. Remove this marker when hold_dplane_worker() holds "
+        "deterministically."
     ),
 )
 
@@ -343,17 +370,20 @@ def _reap_dimt_links():
 TUNNEL_13_OUTER_REMOTE = "192.0.2.3"
 
 
-def request(action, tunnel_id, encap="gre", outer_remote=None):
+def request(action, tunnel_id, encap="gre", outer_remote=None, outer_local=None):
     """Drive one DIMT ZAPI add/del against r1.
 
     outer_remote overrides the GRE tunnel's remote endpoint.  It is only
     needed by a test that must hold two DIMT tunnels up at the same time --
-    see TUNNEL_13_OUTER_REMOTE.  del carries no endpoints, so it is add-only.
+    see TUNNEL_13_OUTER_REMOTE.  outer_local likewise, for the IPv6-outer
+    (ip6gre) test.  del carries no endpoints, so both are add-only.
     """
     client = os.path.join(CWD, "dimt_zapi_client.py")
     command = "python3 {} {} {} --encap {}".format(client, action, tunnel_id, encap)
     if outer_remote is not None:
         command += " --outer-remote {}".format(outer_remote)
+    if outer_local is not None:
+        command += " --outer-local {}".format(outer_local)
     output = get_topogen().gears["r1"].run(command)
     return json.loads(output)
 
@@ -663,12 +693,17 @@ def test_acknowledged_gre_lifecycle_and_owner_reconnect():
     installed = request("add", 1)
     assert installed["result"] == 0, installed
     assert installed["ifindex"] > 0, installed
+    # ttl=64: a DIMT netdev never inherits its outer TTL.  Inheriting copies
+    # the inner TTL 1 of every link-local PIM/IGMP packet onto the outer
+    # header, so control traffic dies at the first transit router of a
+    # multi-hop underlay (zebra/zebra_dplane.h, ZEBRA_DIMT_TUNNEL_TTL).
     kernel_error = check_gre_link(
         router,
         "dimt-00000001",
         local="192.0.2.1",
         remote="192.0.2.2",
         mtu=1476,
+        ttl=64,
     )
     assert kernel_error is None, kernel_error
     address = router.run("ip -o address show dev dimt-00000001")
@@ -1124,6 +1159,106 @@ def test_zebra_restart_adopts_surviving_tunnel():
     assert adopted["ifindex"] == installed["ifindex"], (installed, adopted)
     assert router.run("ip -d link show dimt-00000007") == before
     assert request("del", 7)["result"] == 2
+
+
+# IPv6 outer for the ip6gre case.  On r1-eth0 (r1/zebra.conf); h1 carries no
+# IPv6 address, which is fine -- nothing here sends traffic, and zebra only
+# needs a connected route to the outer remote to accept the request.
+V6_OUTER_LOCAL = "2001:db8:2::1"
+V6_OUTER_REMOTE = "2001:db8:2::2"
+
+
+def test_ip6gre_tunnel_carries_fixed_outer_hop_limit():
+    """An IPv6-outer DIMT tunnel gets the same fixed outer hop limit.
+
+    ip6gre inherits exactly like gre when IFLA_GRE_TTL is absent (hop_limit 0
+    copies the inner packet's), so the fix has to cover both kinds -- a v4-only
+    fix would leave every IPv6 underlay with the multi-hop blackhole.
+    """
+    router = get_topogen().gears["r1"]
+    _, ready = topotest.run_and_expect(
+        lambda: "r1-eth0"
+        in router.vtysh_cmd("show ipv6 route {}".format(V6_OUTER_REMOTE)),
+        True,
+        count=20,
+        wait=0.5,
+    )
+    assert ready, router.vtysh_cmd("show ipv6 route {}".format(V6_OUTER_REMOTE))
+
+    installed = request(
+        "add", 15, outer_local=V6_OUTER_LOCAL, outer_remote=V6_OUTER_REMOTE
+    )
+    assert installed["result"] == 0, installed
+    link = router.run("ip -d link show dimt-0000000f")
+    assert "link/gre6" in link, link
+    kernel_error = check_gre_link(
+        router,
+        "dimt-0000000f",
+        local=V6_OUTER_LOCAL,
+        remote=V6_OUTER_REMOTE,
+        ttl=64,
+    )
+    assert kernel_error is None, kernel_error
+    assert request("del", 15)["result"] == 2
+
+
+def test_stale_ttl_link_is_replaced_not_adopted():
+    """A same-identity link with the wrong outer TTL is rebuilt, not adopted.
+
+    This is the upgrade case: a pre-TTL build left dimt-%08x links with
+    `ttl inherit`, and zebra deliberately never sweeps DIMT links, so they are
+    still there when the fixed zebra starts.  The name, endpoints, key and
+    encapsulation all match -- by the old identity test it is "ours" and would
+    be re-adopted and re-notified INSTALLED, keeping the multi-hop blackhole
+    alive indefinitely.
+
+    Nor may zebra merely refuse it: a refusal is FAIL_INSTALL, and pimd never
+    retries a failed tunnel on a timer, so the upgraded router would sit with
+    no tunnel at all.  The required behaviour is replacement: the stale link
+    is deleted and a fresh one created, so the ifindex changes and the kernel
+    shows the fixed TTL -- all inside one acknowledged ADD.
+    """
+    router = get_topogen().gears["r1"]
+    name = "dimt-0000000e"
+    router.run(
+        "ip link add {} type gre local 192.0.2.1 remote 192.0.2.2 "
+        "ttl inherit".format(name)
+    )
+    stale = check_gre_link(
+        router, name, local="192.0.2.1", remote="192.0.2.2",
+        expected_up=False, ttl="inherit",
+    )
+    assert stale is None, stale
+    # zebra must have learned the link before the ADD, or the request would
+    # take the plain-create path and fail EXCL instead of exercising the
+    # replacement.
+    _, seen = topotest.run_and_expect(
+        lambda: zebra_ifindex(router, name) is not None, True, count=20, wait=0.2
+    )
+    assert seen, "zebra never learned the pre-existing {}".format(name)
+    stale_ifindex = zebra_ifindex(router, name)
+
+    installed = request("add", 14)
+    assert installed["result"] == 0, installed
+    assert installed["ifindex"] != stale_ifindex, (
+        "zebra adopted the ttl-inherit link (ifindex {}) instead of "
+        "replacing it: {}".format(stale_ifindex, installed)
+    )
+    kernel_error = check_gre_link(
+        router, name, local="192.0.2.1", remote="192.0.2.2", ttl=64
+    )
+    assert kernel_error is None, kernel_error
+    address = router.run("ip -o address show dev {}".format(name))
+    assert "10.200.0.1 peer 10.200.0.2/32" in address, address
+
+    assert request("del", 14)["result"] == 2
+    _, gone = topotest.run_and_expect(
+        lambda: router.run("ip link show {} 2>/dev/null".format(name)),
+        "",
+        count=10,
+        wait=0.2,
+    )
+    assert gone == "", gone
 
 
 def test_acknowledged_gre_in_fou_lifecycle():

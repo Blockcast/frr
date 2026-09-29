@@ -20,6 +20,13 @@ import json
 from lib.topogen import Topogen, get_topogen, TopoRouter, topotest
 from lib.topolog import logger
 
+# Must match the addresses in r1/frr.conf and r2/frr.conf.  r1's is not
+# cosmetic: every DSCP assertion here is scoped to it (see
+# _tshark_dscp_and_type).
+R1_ADDR = "192.0.2.1"
+R2_ADDR = "192.0.2.2"
+
+
 def _build_topo(tgen):
     "Simple R1-R2 topology"
     # Create 2 routers
@@ -169,14 +176,26 @@ def _stop_ospf_capture(router, iface, pcap_path):
     topotest.sleep(1, "Saving Capture")
 
 
-def _tshark_dscp_and_type(router, pcap_path):
+def _tshark_dscp_and_type(router, pcap_path, src):
     """
-    Return a list of (dscp, ospf.msg) tuples from the pcap.
+    Return a list of (dscp, ospf.msg) tuples from the pcap, restricted to the
+    packets *sourced by* `src`.
+
+    The ip.src term is load-bearing, not tidiness.  r1-eth0 sees BOTH
+    directions of the p2p link, so a capture taken there contains r2's OSPF
+    packets as well as r1's.  Without the filter, "r1 sent a Hello with DSCP
+    46" is satisfiable by a Hello r2 sent -- i.e. the test can pass while the
+    very marking it exists to assert is broken.  Today the assertions isolate
+    r1 only by accident, because r2-eth0 is unmarked and so emits CS6/48;
+    test_ospf_dscp_source_isolation removes that accident and fails if this
+    term is ever dropped.
+
     Requires tshark installed in the test environment.
     """
     cmd = (
-        "tshark -r {} -Y ospf -T fields " "-e ip.dsfield.dscp -e ospf.msg 2>/dev/null"
-    ).format(pcap_path)
+        'tshark -r {} -Y "ospf && ip.src=={}" -T fields '
+        "-e ip.dsfield.dscp -e ospf.msg 2>/dev/null"
+    ).format(pcap_path, src)
     out = router.cmd(cmd).strip()
     res = []
     if not out:
@@ -195,6 +214,32 @@ def _tshark_dscp_and_type(router, pcap_path):
     return res
 
 
+def _dscp_flags(router, iface, pcap_path, stimulate, src, settle=6):
+    """Capture OSPF on `iface` across one window while `stimulate()` runs.
+
+    Only packets sourced by `src` are counted.  It has no default on purpose:
+    any capture on this p2p link also carries the peer's packets, so the
+    source has to be named at every call site (see _tshark_dscp_and_type).
+
+    Returns (hello_ok, ack_ok, low_ctrl_ok, npackets) as observed in THIS
+    window only; the caller ORs successive windows together.
+    """
+    _capture_ospf_pcap(router, iface, pcap_path)
+    topotest.sleep(2, "Setup packet capture")
+    stimulate()
+    topotest.sleep(settle, "Gathering Packets")
+    _stop_ospf_capture(router, iface, pcap_path)
+
+    hello_ok = ack_ok = low_ctrl_ok = False
+    tuples = _tshark_dscp_and_type(router, pcap_path, src)
+    for dscp, msg in tuples:
+        # msg: 1=Hello, 2=DB-Desc, 3=LS-Req, 4=LS-Upd, 5=LS-Ack
+        hello_ok = hello_ok or (msg == 1 and dscp == 46)
+        ack_ok = ack_ok or (msg == 5 and dscp == 46)
+        low_ctrl_ok = low_ctrl_ok or (msg in (2, 3, 4) and dscp == 40)
+    return hello_ok, ack_ok, low_ctrl_ok, len(tuples)
+
+
 def test_ospf_dscp_all_and_low_control(tgen):
     "Verify per-interface DSCP all/low-control markings on the wire"
     if not tgen.routers():
@@ -203,13 +248,18 @@ def test_ospf_dscp_all_and_low_control(tgen):
     r1 = tgen.gears["r1"]
     r2 = tgen.gears["r2"]
 
-    # Ensure adjacency is up before playing with DSCP
-    assert neighbors_full("r1"), "R1 did not reach Full with R2"
+    # Ensure adjacency is up before playing with DSCP.  WAIT rather than
+    # assert once (BLO-36708): CI reruns a failing file on its own, and this
+    # test then starts seconds after topology start rather than after
+    # test_ospf_dscp_basic has already waited for Full.
+    assert _wait_for_neighbors_full("r1", retries=30, delay=2), (
+        "R1 did not reach Full with R2"
+    )
 
     # Configure DSCP on R1:
     # - all = 46
     # - low-control = 40 (CS5, for example)
-    output = r1.vtysh_cmd(
+    r1.vtysh_cmd(
         """
 configure terminal
 interface r1-eth0
@@ -219,42 +269,160 @@ interface r1-eth0
   exit
 """
     )
-    # print("output is: {}".format(output))
 
-    # Give OSPF a moment to send some control traffic
-    # Flood: add 200 loopbacks on r1 and redistribute connected
+    # Every assertion below is "a packet of this kind flew inside the capture
+    # window", which is a race the CI hosts lose under load -- observed
+    # failing on all three of hello/ack/low-control across runs 36101674598,
+    # 36185422488 and 36196482335.  So: stimulate BOTH directions and retry.
+    #
+    #   * r1's own redistributed loopbacks make r1 flood LS-Upd  -> low-control
+    #   * r2's make r2 flood to r1, which r1 must LS-Ack         -> ack
+    #
+    # Without the r2 half there is nothing on a two-router p2p link that
+    # obliges r1 to send an Ack at all, so ack_ok was pure luck.
+    r1.vtysh_cmd("conf t\nrouter ospf\n redistribute connected\n exit")
+    r2.vtysh_cmd("conf t\nrouter ospf\n redistribute connected\n exit")
+
     pcap = os.path.join(tgen.logdir, "r1-ospf-dscp.pcap")
     logger.info("PCAP DIR: {}".format(pcap))
 
-    _capture_ospf_pcap(r1, "r1-eth0", pcap)
-    topotest.sleep(2, "Setup packet capture")
-    r1.vtysh_cmd("conf t\nrouter ospf\n redistribute connected\n exit")
-    for i in range(1, 10):
-        r1.cmd(f"ip addr add 198.51.100.{i}/32 dev lo")
-    # Capture packets on R1's interface
-    topotest.sleep(3, "Gathering Packets")
-    _stop_ospf_capture(r1, "r1-eth0", pcap)
+    hello_ok = ack_ok = low_ctrl_ok = False
+    npackets = 0
+    for rnd in range(5):
 
-    tuples = _tshark_dscp_and_type(r1, pcap)
-    assert tuples, "No OSPF packets captured on r1-eth0"
+        def stimulate(rnd=rnd):
+            for i in range(1, 10):
+                octet = rnd * 10 + i
+                r1.cmd(f"ip addr add 198.51.100.{octet}/32 dev lo")
+                r2.cmd(f"ip addr add 203.0.113.{octet}/32 dev lo")
 
-    hello_ok = False
-    low_ctrl_ok = False
-    ack_ok = False
-    # print(tuples)
+        # Hellos are cheap here (hello-interval 1); a full LSU/Ack exchange is
+        # not, and a single 8s window can simply miss one on a loaded CI host.
+        #
+        # The cause is host scheduling jitter, NOT MinLSInterval: each round
+        # adds a fresh batch of /32s, so every LSU it provokes carries a NEW
+        # Link State ID, and MinLSInterval only rate-limits re-originating the
+        # SAME LSA.  Do not tune this window against a throttle that never
+        # applies to it.
+        hello, ack, low_ctrl, seen = _dscp_flags(
+            r1, "r1-eth0", pcap, stimulate, src=R1_ADDR
+        )
+        hello_ok = hello_ok or hello
+        ack_ok = ack_ok or ack
+        low_ctrl_ok = low_ctrl_ok or low_ctrl
+        npackets += seen
+        if hello_ok and ack_ok and low_ctrl_ok:
+            break
 
-    for dscp, msg in tuples:
-        # msg: 1=Hello, 2=DB-Desc, 3=LS-Req, 4=LS-Upd, 5=LS-Ack
-        if msg == 1 and dscp == 46:
-            hello_ok = True
-        if msg == 5 and dscp == 46:
-            ack_ok = True
-        if msg in (2, 3, 4) and dscp == 40:
-            low_ctrl_ok = True
-
+    # Keep this distinguishable from the three below: zero packets across all
+    # windows means tshark or the capture is broken, not that DSCP is wrong.
+    assert npackets, "No OSPF packets from R1 captured on r1-eth0"
     assert hello_ok, "No Hello packet from R1 with DSCP 46 observed"
     assert ack_ok, "No Ack packet from R1 with DSCP 46 observed"
     assert low_ctrl_ok, "No DB-Desc/LS-Req/LS-Upd from R1 with DSCP 40 observed"
+
+
+def test_ospf_dscp_source_isolation(tgen):
+    """The r1 DSCP assertions must not be satisfiable by r2's packets.
+
+    r1-eth0 carries both directions, so every assertion in
+    test_ospf_dscp_all_and_low_control rests on _tshark_dscp_and_type's
+    ip.src term to mean "from r1" rather than "on this link".  That is
+    invisible while r2 is unmarked: r2 emits CS6/48, which matches none of
+    the values asserted for r1, so the test isolates r1 by accident.
+
+    Remove the accident.  Mark r2 with the exact value r1's Hello assertion
+    looks for (46) and move r1 to a different one (34), then require r1's
+    filtered view to contain r1's value and NONE of r2's.  Drop the ip.src
+    term and r2's Hellos land in r1's view, so this fails.
+    """
+    if not tgen.routers():
+        pytest.skip("Topology not created")
+
+    r1 = tgen.gears["r1"]
+    r2 = tgen.gears["r2"]
+
+    assert _wait_for_neighbors_full("r1", retries=30, delay=2), (
+        "R1 did not reach Full with R2"
+    )
+
+    # r1 -> 34 only (clear the inherited low-control 40 so r1 emits one
+    # value); r2 -> 46, the value the Hello/Ack assertions look for on r1.
+    r1.vtysh_cmd(
+        """
+configure terminal
+interface r1-eth0
+  no ip ospf dscp low-control
+  ip ospf dscp all 34
+  exit
+  exit
+"""
+    )
+    r2.vtysh_cmd(
+        """
+configure terminal
+interface r2-eth0
+  ip ospf dscp all 46
+  exit
+  exit
+"""
+    )
+
+    pcap = os.path.join(tgen.logdir, "r1-ospf-dscp-isolation.pcap")
+
+    # Let the reconfig take effect before capturing, so no pre-change r1
+    # packet still marked 46 can land in the window and look like leakage.
+    topotest.sleep(3, "Applying DSCP reconfiguration")
+
+    r1_dscps = r2_dscps = set()
+    for _ in range(3):
+        _capture_ospf_pcap(r1, "r1-eth0", pcap)
+        topotest.sleep(2, "Setup packet capture")
+        topotest.sleep(6, "Gathering Packets")
+        _stop_ospf_capture(r1, "r1-eth0", pcap)
+
+        r1_dscps = {d for d, _ in _tshark_dscp_and_type(r1, pcap, src=R1_ADDR)}
+        r2_dscps = {d for d, _ in _tshark_dscp_and_type(r1, pcap, src=R2_ADDR)}
+        # Both preconditions must hold in the SAME window for the negative
+        # assertion below to mean anything.
+        if 34 in r1_dscps and 46 in r2_dscps:
+            break
+
+    logger.info("isolation window: r1 dscps={} r2 dscps={}".format(r1_dscps, r2_dscps))
+
+    # Captures are done; put r2-eth0 back to unmarked so the invariant
+    # _tshark_dscp_and_type documents (r2 emits CS6/48) holds for any test
+    # after this one.  r1 is reset by test_ospf_dscp_display's Case 1.
+    r2.vtysh_cmd(
+        """
+configure terminal
+interface r2-eth0
+  no ip ospf dscp all
+  exit
+  exit
+"""
+    )
+
+    # Preconditions.  Without these the real assertion is vacuous: "no 46
+    # from r1" is trivially true if r2 never transmitted, or if the capture
+    # caught nothing at all.
+    assert 34 in r1_dscps, (
+        "No OSPF packet from R1 with DSCP 34 observed, so this window cannot "
+        "say anything about source isolation (saw {})".format(sorted(r1_dscps))
+    )
+    assert 46 in r2_dscps, (
+        "R2 emitted no DSCP-46 OSPF packet on this link, so the isolation "
+        "check below would pass vacuously (saw {})".format(sorted(r2_dscps))
+    )
+
+    # The property.
+    assert 46 not in r1_dscps, (
+        "R2's DSCP-46 packets appeared in R1's filtered view: the ip.src term "
+        "in _tshark_dscp_and_type is not constraining, so an assertion about "
+        "R1's marking can be satisfied by R2's packets. Saw {} for {}.".format(
+            sorted(r1_dscps), R1_ADDR
+        )
+    )
 
 
 def test_ospf_dscp_display(tgen):
@@ -265,7 +433,7 @@ def test_ospf_dscp_display(tgen):
 
     r1 = tgen.gears["r1"]
 
-    assert neighbors_full("r1"), "R1 did not reach Full with R2"
+    assert _wait_for_neighbors_full("r1"), "R1 did not reach Full with R2"
 
     #
     # Case 1: no DSCP config => display should not be present

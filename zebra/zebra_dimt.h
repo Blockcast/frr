@@ -14,6 +14,7 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 			       struct stream *msg, struct zebra_vrf *zvrf);
 void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *ctx);
 void zebra_dimt_tunnel_if_update(struct interface *ifp);
+void zebra_dimt_tunnel_if_change(struct interface *ifp);
 void zebra_dimt_tunnel_init(void);
 void zebra_dimt_tunnel_cleanup(void);
 
