@@ -1161,7 +1161,8 @@ jobs:
             exit 1
           fi
           if ! python3 .github/scripts/verify_rerun_coverage.py \
-                 --expected /tmp/rerun-expected.txt --results "${rerun_xml}"; then
+                 --expected /tmp/rerun-expected.txt --results "${rerun_xml}" \
+                 --parallel-results "${RUNNER_TEMP}/parallel.xml"; then
             exit 1
           fi
 

@@ -70,6 +70,21 @@ def parse_results(path):
     return executed, skipped
 
 
+def parse_errored(path):
+    """Return the set of node IDs the parallel run reported as <error>.
+
+    An <error> is a setup/teardown failure, not a test verdict: the test body
+    never ran.  That distinction is what makes an excused skip sound in
+    verify() below.
+    """
+    errored = set()
+    for testcase in ET.parse(path).iter("testcase"):
+        tid = testcase_id(testcase)
+        if tid is not None and testcase.find("error") is not None:
+            errored.add(tid)
+    return errored
+
+
 def covers(expected, actual_ids):
     """True if `expected` was accounted for by some ID in `actual_ids`.
 
@@ -126,7 +141,7 @@ def _accounted_for(failure, expected_ids):
     return any(e.startswith(prefix) for e in expected_ids)
 
 
-def verify(expected_ids, executed, skipped):
+def verify(expected_ids, executed, skipped, parallel_errored=frozenset()):
     """Return a list of human-readable problems; empty means the rerun is trustworthy."""
     problems = []
 
@@ -146,6 +161,23 @@ def verify(expected_ids, executed, skipped):
         if covers(expected, executed):
             continue
         if covers(expected, skipped):
+            # BLO-36708: a skip only fails to vindicate a real FAILURE.  When
+            # the parallel run reported this ID as an <error> the test body
+            # never ran there either, so the rerun skipping it leaves it in
+            # exactly the state a healthy parallel run would have: not run,
+            # by its own choice.
+            #
+            # Without this, a module-scoped fixture failure was unclearable.
+            # pytest errors EVERY item in the file, and every topotest file
+            # carries a test_memory_leak that is skipped unconditionally in
+            # CI (is_memleak_enabled() is false), so that ID entered the
+            # expected set and could never come back executed however clean
+            # the rerun was.  Run 36343914099 u22 s2: srv6_sid_manager hit
+            # "error mounting new sysfs", all 7 items errored, the whole-file
+            # rerun went 6 passed / 1 skipped in 3m26s, and the shard was
+            # still failed over test_memory_leak.  Master had no green path.
+            if covers(expected, parallel_errored):
+                continue
             problems.append(
                 "{}: was SKIPPED in the rerun, so the parallel-run failure is "
                 "unverified (a skip is not a pass)".format(expected)
@@ -175,6 +207,14 @@ def main():
         required=True,
         help="junit XML written by the rerun (topotests.xml)",
     )
+    parser.add_argument(
+        "--parallel-results",
+        help=(
+            "junit XML from the parallel run.  Optional; when given, a target "
+            "that ERRORED there may come back skipped from the rerun without "
+            "failing this check (see verify())."
+        ),
+    )
     args = parser.parse_args()
 
     with open(args.expected) as f:
@@ -192,7 +232,20 @@ def main():
         )
         return 1
 
-    problems = verify(expected_ids, executed, skipped)
+    parallel_errored = frozenset()
+    if args.parallel_results:
+        try:
+            parallel_errored = parse_errored(args.parallel_results)
+        except (ET.ParseError, OSError) as e:
+            # Fail closed: without it we simply lose the excuse, so fall back
+            # to the strict rule rather than dropping the whole check.
+            print(
+                "WARNING: cannot read parallel results {}: {} -- no skip will "
+                "be excused".format(args.parallel_results, e),
+                file=sys.stderr,
+            )
+
+    problems = verify(expected_ids, executed, skipped, parallel_errored)
 
     verified = len(expected_ids) - len(problems) if expected_ids else 0
     print(
