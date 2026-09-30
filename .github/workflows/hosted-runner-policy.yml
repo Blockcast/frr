@@ -23,6 +23,18 @@ jobs:
     # arc-light, not `default`: checkout plus one stdlib Python script, the
     # same shape CI-Verdict runs there on every push and PR (github-ci.yml).
     runs-on: arc-light
+    # A template roll of arc-light takes no new jobs until every pending or
+    # running one finishes (ARC updateStrategy eventual, onprem-k8s
+    # arc/controller-values.yaml), so at the 360-minute default one hung job
+    # could hold the lane, and the required Ally review gate on it, for up
+    # to 6 h.  5 is the lane's sizing rule (onprem-k8s
+    # arc/arc-light-values.yaml) on its floor term alone, as cadvisor cannot
+    # measure W95 for so short-lived a pod: ceil(6 * 43 / 60), with T_best
+    # taken from this job's arc-light runs only (43 s: run 36631509946, the
+    # fastest of its first four, range 43-101 s).  Wall-clock is work over
+    # supply, so its 17 s best on `default` does not transfer: a healthy
+    # arc-light run took 101 s, 5.9 times that.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
       - name: Reject GitHub-hosted runner labels
