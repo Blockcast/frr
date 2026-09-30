@@ -813,18 +813,19 @@ class TestGateWiring(unittest.TestCase):
         self.assertRegex(
             co, r"(?m)^        if: \$\{\{ github\.event_name != 'pull_request' \}\}$"
         )
-        self.assertIn("fetch-depth: 0", co)
+        self.assertRegex(_code(co), r"(?m)^          fetch-depth: 2$")
+        # A partial clone would lazily fetch `before`'s whole history
+        # (see the comment on the step).
+        self.assertNotRegex(_code(co), r"(?m)^\s+(filter|sparse-checkout):")
         self.assertRegex(self.filter, r"(?m)^      pull-requests: read$")
 
-    def test_filter_runs_on_arc_light_exactly_when_it_skips_the_checkout(self):
-        """pull_request, the one event whose full-history Checkout is skipped,
-        runs the filter on arc-light; push and workflow_dispatch check out
-        and stay on `default` (the comment on its runs-on has the numbers)."""
+    def test_filter_runs_on_arc_light_for_every_event(self):
+        """Seconds of work on every event now that push and workflow_dispatch
+        check out shallow, so never on `default`, where it queued for hours
+        before Build queued again (the comment on its runs-on has the
+        numbers)."""
         (runs_on,) = re.findall(r"(?m)^    runs-on: (.*)$", self.filter)
-        self.assertEqual(
-            runs_on,
-            "${{ github.event_name == 'pull_request' && 'arc-light' || 'default' }}",
-        )
+        self.assertEqual(runs_on, "arc-light")
 
     def test_one_lost_build_leg_does_not_skip_the_other_platform(self):
         for name in ("Unit-Test", "Test"):

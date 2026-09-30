@@ -63,28 +63,32 @@ jobs:
   # Documentation-HTML 'success' exactly when docs is 'true'.
   doc-path-filter:
     if: ${{ github.event_name != 'pull_request' || github.actor != 'mergify[bot]' }}
-    # arc-light on pull requests, not `default`.  There this job has no
-    # checkout (see the Checkout step): it is the paths-filter REST call, the
-    # decide script and the MIB cache (a 48 KB restore, or on a miss nine
-    # fetches from IANA/IEEE) -- 14 s in run 36229238558 -- and every other
-    # job waits for it.  On `default`, the saturated DinD pool, a PR run
-    # queued twice, here and again for Build, and this first wait alone was
-    # 4.6-10.7 h in runs 36495098055, 36551077943 and 36464895185
-    # (2026-09-28/29).
+    # arc-light, not `default`, for every event.  The job is seconds of
+    # work: the paths-filter call, the decide script and the MIB cache (a
+    # 48 KB restore, or on a miss nine fetches from IANA/IEEE) -- 14 s in
+    # run 36229238558 -- and every other job waits for it.  On `default`,
+    # the saturated DinD pool, a run queued twice, here and again for
+    # Build.  This first wait alone was 4.6-10.7 h for pull requests (runs
+    # 36495098055, 36551077943 and 36464895185, 2026-09-28/29) and 5 h 50
+    # min for master push run 36588232306 (2026-09-29).  In master runs
+    # 36631509982, 36699547876 and 36716970058 it had been queued 12 h 46
+    # min, 2 h 39 min and 1 h 57 min when the run was cancelled.
     #
-    # push and workflow_dispatch stay on `default`: they do the full-history
-    # checkout below (2.48 min at the median), not seconds of work.  Both
-    # pools are pinned to one runner image digest (onprem-k8s
+    # push and workflow_dispatch used to stay on `default` for a
+    # full-history checkout: fetch-depth 0 pulls every branch and tag, 2.48
+    # min at the median and 5 min 41 s in run 36588232306.  Their checkout
+    # is shallow now (see the Checkout step).
+    #
+    # Both pools are pinned to one runner image digest (onprem-k8s
     # arc/runner-image-pins.rb holds every ARC pool's pin to
     # arc/arc-runner-image.txt).  actions/cache folds the compression it
-    # picks (zstd if the image has it, else gzip) into an entry's version,
-    # so were the two images ever to differ on zstd, Build, on `default`,
-    # could not restore an entry this job saved on arc-light.  It would fall
-    # back to its own version's entry on the base or default branch, which
-    # only those push and workflow_dispatch runs save: the likely cost is a
-    # miss here and the nine fetches once per pull request, not a broken
-    # Build.
-    runs-on: ${{ github.event_name == 'pull_request' && 'arc-light' || 'default' }}
+    # picks (zstd if the image has it, else gzip) into an entry's version.
+    # Were the two images ever to differ on zstd, Build, Build-LTTng and
+    # buildcache-seed.yml, all on `default`, could restore no entry this
+    # job saves, and no other job saves one.  The image's own fetch_mib
+    # (docker/ubuntu-ci/Dockerfile) then downloads the MIBs, as on any
+    # miss: slower, not broken.
+    runs-on: arc-light
     name: Documentation path filter
     # The folded MIB population's budget (Prepare-MIB-Cache's 20).
     timeout-minutes: 20
@@ -98,18 +102,31 @@ jobs:
       docs: ${{ steps.decide.outputs.docs }}
     steps:
       - name: Checkout
-        # BLO-35428: pull requests skip this full-history checkout (2.48 min
-        # at the median).  For a pull_request event dorny/paths-filter lists
-        # the changed files through the REST API with its `token` input,
-        # which defaults to the job token (hence `pull-requests: read`
-        # above), and reads no working tree, so a PR's classification is the
-        # same with or without it.  push and workflow_dispatch diff with git
-        # and keep the checkout.  The MIB steps below need none: they only
-        # write docker/ubuntu-ci/mib-cache under the workspace.
+        # BLO-35428: pull requests skip it.  For a pull_request event
+        # dorny/paths-filter lists the changed files through the REST API
+        # with its `token` input, which defaults to the job token (hence
+        # `pull-requests: read` above), and reads no working tree.
+        #
+        # push and workflow_dispatch diff with git, which needs only a
+        # shallow clone (paths-filter v4 src/main.ts getChangedFilesFromGit,
+        # src/git.ts).  On master a push diffs `before`..HEAD, fetching
+        # `before` itself (`git fetch --depth=1`) when a multi-commit push
+        # leaves it outside these two commits, and a workflow_dispatch lists
+        # HEAD's own changes (`git log -n 1 --name-status`: against the
+        # parent depth 2 keeps, or nothing for a merge commit, which then
+        # builds everything but skips the HTML docs).  On any other branch
+        # both find the merge base with master by fetching deeper.
+        #
+        # A plain shallow clone, not a blobless or sparse one: in a partial
+        # clone the `git cat-file -e <before>^{commit}` paths-filter runs
+        # first would lazily fetch a missing `before` with every ancestor's
+        # commits and trees, instead of its own depth-1 fetch.  The MIB
+        # steps below need no checkout: they only write
+        # docker/ubuntu-ci/mib-cache under the workspace.
         if: ${{ github.event_name != 'pull_request' }}
         uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          fetch-depth: 2
       - uses: dorny/paths-filter@v4
         id: filter
         # A filter that errors must not decide anything: the next step turns
