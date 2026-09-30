@@ -457,6 +457,16 @@ static FRR_NORETURN void ldpd_shutdown(void)
 	close(iev_ldpe->ibuf.fd);
 	msgbuf_clear(&iev_lde->ibuf.w);
 	close(iev_lde->ibuf.fd);
+	/*
+	 * And the sync pipes.  In the foreground the children are ours, and
+	 * one blocked in ldp_acl_request() would otherwise never get back to
+	 * its event loop to see the closes above: the wait() below would
+	 * wait for it forever.
+	 */
+	msgbuf_clear(&iev_ldpe_sync->ibuf.w);
+	close(iev_ldpe_sync->ibuf.fd);
+	msgbuf_clear(&iev_lde_sync->ibuf.w);
+	close(iev_lde_sync->ibuf.fd);
 
 	config_clear(ldpd_conf);
 
