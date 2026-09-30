@@ -80,10 +80,9 @@
 # gate runs and GC reaps every tunnel this script owns; the old
 # unconditional ensure_fou() used to refuse first whenever FOU was
 # unavailable, which was incidental protection rather than a contract.
-# An MTU below
-# 1280 leaves the tunnels v4-only (the kernel disables IPv6 on such
-# links) and is warned about loudly, as is an MTU that overflows the
-# outer path to the peer.
+# An MTU below 1280 leaves the tunnels v4-only (the kernel disables IPv6
+# on such links) and is warned about loudly, as is an MTU that overflows
+# the outer path to the peer.
 #
 # Managed-underlay cutover:
 #   --endpoints-file (or DIMT_ENDPOINTS_FILE) names a rendered file with
@@ -196,15 +195,28 @@ dev_of() {
 # Interior whitespace is NOT deleted any more (it used to be, which
 # silently repaired "100.64. 0.47" into a different valid address);
 # a mangled entry now fails the dotted-quad check loudly instead.
+# EVERY field is joined, not just the first two: a third column used to
+# be dropped on the floor, so "100.64.0.47 gre extra" parsed as a valid
+# gre peer.  Joining it makes the mode "gre=extra", which the build loop
+# rejects loudly.  One silent drop remains by design: the self line is
+# skipped before the mode check, so a third column on it is ignored with
+# no diagnostic -- nothing is built for self either way.
 peers() {
 	{
 		[ -n "$PEERS_INLINE" ] && echo "$PEERS_INLINE" | tr ',' '\n'
 		[ -r "$PEERS_FILE" ] && sed 's/#.*//' "$PEERS_FILE"
 	} | tr -d '\r' |
-		awk 'NF { print (NF > 1 ? $1 "=" $2 : $1) }' | sort -u
+		awk 'NF { spec = $1
+			for (i = 2; i <= NF; i++) spec = spec "=" $i
+			print spec }' | sort -u
 }
 
 overlay_of() { echo "${1%%=*}"; }
+
+# The build loop's dotted-quad gate, shared with the capability pre-scan
+# in reconcile() so the two can never disagree about which entries are
+# buildable.
+is_quad() { echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
 
 # Absent second column means gre-in-fou: every registry written before
 # this knob existed describes GRE-in-FOU peers.
@@ -607,12 +619,33 @@ reconcile() {
 
 	# Which encap modes does the registry actually ask for?  Decided
 	# before the peer loop, because every capability gate below must run
-	# before the first delete.  Unrecognised modes are left out: the loop
-	# rejects those peers, so nothing should be probed on their behalf.
+	# before the first delete.  Three classes are skipped here because the
+	# build loop rejects them too, and nothing should be probed or bound
+	# on their behalf: self, a malformed overlay, and an unrecognised
+	# mode.  The overlay check is what keeps a bare junk line ("garbage")
+	# from breaking the all-plain-GRE-needs-no-FOU contract in the header:
+	# encap_of() defaults its absent mode to gre-in-fou, and want_fou runs
+	# ensure_fou(), which BINDS the FOU port (`ip fou add`) rather than
+	# merely probing.
+	#
+	# Known residual -- this is NOT "only entries the loop could build".
+	# The device-collision check runs inside the build loop, i.e. after
+	# this scan, so a collision-losing peer still arms its mode's gate and
+	# is then never built: two peers deriving one dimt-N-M can bind the
+	# FOU port on an otherwise all-plain-GRE box.  Pre-existing (base
+	# 77c3bb30 behaves identically) and bounded -- but NOT by the GC
+	# suppression the other reject paths get: the collision branch sets
+	# rc=1 WITHOUT invalid=1, and GC is gated on invalid alone, so
+	# gc_stale still runs.  What bounds it is that the winning peer puts
+	# the contested device in want before the loser is rejected, so GC
+	# cannot delete it.  Hoisting the dedupe ahead of this scan would
+	# close it.
 	want_fou=0
 	want_plain=0
 	for spec in $all_peers; do
-		[ "$(overlay_of "$spec")" = "$SELF" ] && continue
+		peer=$(overlay_of "$spec")
+		[ "$peer" = "$SELF" ] && continue
+		is_quad "$peer" || continue
 		case "$(encap_of "$spec")" in
 		gre-in-fou) want_fou=1 ;;
 		gre) want_plain=1 ;;
@@ -659,7 +692,7 @@ reconcile() {
 		peer=$(overlay_of "$spec")
 		mode=$(encap_of "$spec")
 		[ "$peer" = "$SELF" ] && continue
-		if ! echo "$peer" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+		if ! is_quad "$peer"; then
 			log "ignoring invalid peer entry '$peer'"
 			invalid=1
 			rc=1
@@ -667,6 +700,22 @@ reconcile() {
 		fi
 		case "$mode" in
 		gre | gre-in-fou) : ;;
+		*=*)
+			# peers() joins every field with "=", so "<ip> gre extra"
+			# and "<ip> gre=extra" arrive here as the same spec: the
+			# field count is already gone and a third column cannot be
+			# told apart from an "=" the operator typed inside field 2.
+			# Name both causes rather than asserting one, and echo $mode
+			# verbatim -- rewriting its "=" back to spaces would mangle
+			# the second case.  $peer is exact either way, so it, not
+			# this reconstructed spec, is the grep key for the line.
+			log "ignoring peer $peer: invalid encap mode '$mode'" \
+				"(a third column, or an '=' inside the mode;" \
+				"expected '<overlay> <gre|gre-in-fou>')"
+			invalid=1
+			rc=1
+			continue
+			;;
 		*)
 			log "ignoring peer $peer: unknown encap mode '$mode'" \
 				"(expected gre or gre-in-fou)"

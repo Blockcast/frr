@@ -270,6 +270,52 @@ err_has() { printf '%s\n' "$err" | grep -q -- "$1"; }
 err_lacks() { ! printf '%s\n' "$err" | grep -q -- "$1"; }
 # shellcheck disable=SC2329
 vtysh_lacks() { ! grep -q -- "$1" "$FAKEIP_DIR/vtysh.log"; }
+# err_mode pulls the mode the script quoted out of $err -- empty if it quoted
+# none, which is what lets the two assertions below fail closed rather than
+# silently asserting nothing.
+err_mode() {
+	printf '%s\n' "$err" |
+		sed -n "s/.*invalid encap mode '\([^']*\)'.*/\1/p" | head -n 1
+}
+# err_mode_greps_file greps <file> for exactly the mode the script quoted.
+# Grepping the fixture for a literal the test wrote asserts the fixture against
+# itself; this asserts the message against the fixture, which is the property
+# the message claims -- the echoed mode is a usable grep key -- so rewriting the
+# mode turns it red.
+# shellcheck disable=SC2329
+err_mode_greps_file() {
+	_m=$(err_mode)
+	[ -n "$_m" ] && grep -qF -- "$_m" "$1"
+}
+# The negative direction needs its own helper rather than negating the above:
+# err_mode_greps_file is ALSO false when nothing was extracted, so
+# "not err_mode_greps_file" passed VACUOUSLY under any mutation that emits no
+# message at all -- asserting nothing about the file at the one moment it
+# mattered.  Measured on BOTH mutations that suppress the message, so both
+# table rows moved by one: reverting the awk field joiner goes 7 -> 8 red, and
+# removing the "*=*" arm goes 4 -> 5 (it falls through to the unknown-mode
+# arm, whose wording err_mode cannot parse, so nothing is extracted).  The new
+# red is this assertion in each case.
+# The [ -n "$_m" ] is the explicit precondition, mirroring the positive helper;
+# on THIS fixture dropping it still fails closed, because grep -F with an empty
+# pattern matches every line of a non-empty file.  It is not load-bearing here,
+# only in the empty-fixture case -- claimed as symmetry, not as a proven guard.
+# shellcheck disable=SC2329
+err_mode_lacks_file() {
+	_m=$(err_mode)
+	[ -n "$_m" ] && ! grep -qF -- "$_m" "$1"
+}
+# The counterpart: which half of the message is the grep key depends on the
+# form, and the message cannot say which it got.  For a third column the "="
+# is synthesised by peers() and is absent from the operator's file, so only
+# $peer greps it; for an operator-typed "=" the mode greps it too.  Pinning
+# both halves is what keeps that distinction from being "fixed" away.
+# shellcheck disable=SC2329
+err_peer_greps_file() {
+	_p=$(printf '%s\n' "$err" |
+		sed -n "s/.*ignoring peer \([^:]*\):.*/\1/p" | head -n 1)
+	[ -n "$_p" ] && grep -qF -- "$_p" "$1"
+}
 
 # --- (a) inner derivation, dual-stack create ---------------------------
 new_state a
@@ -733,6 +779,154 @@ check "h6: no tunnel created for it" log_lacks "^ip link add dimt-0-47"
 check "h6: GC suppressed (the entry may be a desired peer)" \
 	log_lacks "^ip link del dimt-9-9"
 
+# --- (h6b) a THIRD column is loud, not silently dropped ----------------
+# The parser used to keep $1/$2 and discard the rest, so this parsed as a
+# perfectly valid plain-GRE peer.  It is the last silent repair that was
+# left after "100.64. 0.47" was made to fail the dotted-quad check.
+new_state h6b
+printf '100.64.0.47 gre extra\n' > "$TESTDIR/peers-junk"
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-junk" 2>&1)
+rc=$?
+check "h6b: a trailing field exits nonzero" [ "$rc" -ne 0 ]
+check "h6b: the offending mode is echoed back" err_has \
+	"invalid encap mode 'gre=extra'"
+check "h6b: not mistaken for a valid gre peer" log_lacks "^ip link add dimt-0-47"
+# Negative control for h6b3.  There the operator typed the "=", so the echoed
+# mode greps their file; here peers() synthesised it from a field separator,
+# so it does not -- $peer is the grep key, exactly as the script says at
+# dimt-reconcile.sh:710-711.  Pinning both directions is what makes the
+# distinction deliberate, and each direction has its own mutation rather than
+# a shared one: truncating the mode at the first "=" reddens "the echoed mode
+# is NOT one" while h6b3's grep-key assertion stays green, because the
+# shortened mode ("gre") still greps an "="-typed file -- h6b3 alone cannot
+# see a message that DROPS information, only this fixture can.  Dropping $peer
+# from the message reddens "the peer address is the grep key" and nothing
+# else.  (A mutation that rewrites the "=" back to a space is NOT the
+# discriminating one -- it reddens h6b3 too.)
+check "h6b: the peer address is the grep key for the line" \
+	err_peer_greps_file "$TESTDIR/peers-junk"
+check "h6b: the echoed mode is NOT one (its = is synthesised)" \
+	err_mode_lacks_file "$TESTDIR/peers-junk"
+check "h6b: GC suppressed (the entry may be a desired peer)" \
+	log_lacks "^ip link del dimt-9-9"
+# Same line from --peers, where the field separator is a comma.
+new_state h6b2
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers '100.64.0.47 gre extra' \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6b2: inline trailing field exits nonzero" [ "$rc" -ne 0 ]
+check "h6b2: inline trailing field is named" err_has \
+	"invalid encap mode"
+
+# --- (h6b3) a two-column entry whose mode contains "=" -----------------
+# peers() joins fields with "=", so this reaches the same arm as a third
+# column with the field count already gone.  The arm must not assert a
+# trailing field that does not exist, and must echo the mode verbatim:
+# rewriting the operator's literal "=" back to a space produced a string
+# that does not occur anywhere in their peers file.
+new_state h6b3
+printf '100.64.0.47 gre=x\n' > "$TESTDIR/peers-eq"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-eq" 2>&1)
+rc=$?
+check "h6b3: a mode containing = exits nonzero" [ "$rc" -ne 0 ]
+check "h6b3: the mode is echoed verbatim, = intact" err_has \
+	"invalid encap mode 'gre=x'"
+check "h6b3: no trailing field is asserted" err_lacks "trailing field"
+check "h6b3: the echoed mode is a literal grep key for the peers file" \
+	err_mode_greps_file "$TESTDIR/peers-eq"
+check "h6b3: not mistaken for a valid gre peer" log_lacks "^ip link add dimt-0-47"
+
+# --- (h6d) a malformed overlay arms no capability gate ----------------
+# encap_of() defaults an absent mode to gre-in-fou, so a bare junk line
+# used to set want_fou and run ensure_fou() -- a real `ip fou add` bind,
+# not a probe -- on a box whose registry is otherwise all plain GRE, and
+# only then be rejected by the dotted-quad check.  h6/h6b cannot see
+# this: their junk yields modes ("0.47", "gre=extra") that arm nothing.
+new_state h6d
+printf '100.64.0.47 gre\ngarbage\n' > "$TESTDIR/peers-garbage"
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-garbage" 2>&1)
+rc=$?
+check "h6d: a bare junk line exits nonzero" [ "$rc" -ne 0 ]
+check "h6d: the junk line is rejected by name" err_has \
+	"ignoring invalid peer entry 'garbage'"
+check "h6d: no FOU port is bound on its behalf" log_lacks "^ip fou add"
+check "h6d: no GRE-in-FOU probe on its behalf" \
+	log_lacks "^ip link add dimt-probe0 .* encap fou"
+check "h6d: the valid plain-GRE peer still builds" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+check "h6d: GC suppressed (the entry may be a desired peer)" \
+	log_lacks "^ip link del dimt-9-9"
+# The explicit-mode twin: "garbage=gre" must not run the plain-GRE probe.
+new_state h6d2
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers garbage=gre \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6d2: a malformed explicit-mode overlay exits nonzero" [ "$rc" -ne 0 ]
+check "h6d2: no capability probe runs on its behalf" \
+	log_lacks "^ip link add dimt-probe0"
+
+# --- (h6e) the documented collision residual, pinned -------------------
+# The comment above want_fou admits this hole rather than asserting it
+# away: the dedupe runs inside the build loop, so a collision-losing
+# peer arms its mode's gate first and binds the FOU port on a box that
+# builds only plain GRE.  Pinned here so the deferred dedupe-hoist has
+# a failing assertion to flip instead of a paragraph to re-derive.
+# The BOUND is pinned by two assertions, named here rather than
+# numbered because an ordinal breaks the moment one is inserted:
+#   "GC is NOT suppressed on the collision path"
+#   "the contested device survives GC"
+# It is not what it looks like: the collision branch sets rc=1 without
+# invalid=1, so GC is NOT suppressed the way it is for a malformed
+# entry (contrast h6d).  What keeps the contested device safe is the
+# winning peer having already put it in want.  By contrast
+#   "the residual FOU bind happens anyway"
+# is the HOLE this block exists to disclose -- not the safety property.
+new_state h6e
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers 100.64.0.47=gre,100.65.0.47=gre-in-fou \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6e: a colliding pair exits nonzero" [ "$rc" -ne 0 ]
+check "h6e: the collision is named" err_has "both derive device dimt-0-47"
+check "h6e: the residual FOU bind happens anyway (documented hole)" \
+	log_has "^ip fou add port 6637 ipproto 47"
+check "h6e: GC is NOT suppressed on the collision path" \
+	log_has "^ip link del dimt-9-9"
+check "h6e: the contested device survives GC (winner put it in want)" \
+	log_lacks "^ip link del dimt-0-47"
+
+# --- (h6c) both valid grammars still build a plain-GRE tunnel ----------
+# Positive control for h6b: the field-joining that makes a third column
+# loud must not break the two documented forms.  The file's two-column
+# form is exercised throughout (peers-plain); this pins the inline form,
+# where the mode arrives already glued on with "=".
+new_state h6c
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47=gre \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6c: inline <overlay>=<mode> exits zero" [ "$rc" -eq 0 ]
+check "h6c: inline form creates an unencapsulated GRE tunnel" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+new_state h6c2
+printf '100.64.0.47 gre\n100.64.0.48\n' > "$TESTDIR/peers-mixed"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-mixed" 2>&1)
+rc=$?
+check "h6c2: mixed explicit/absent modes exit zero" [ "$rc" -eq 0 ]
+check "h6c2: the explicit gre peer is unencapsulated" \
+	awk '/^ip link add dimt-0-47 type gre / { if ($0 !~ /encap/) ok = 1 }
+	     END { exit !ok }' "$FAKEIP_DIR/ip.log"
+check "h6c2: the absent-mode peer defaults to gre-in-fou" log_has \
+	"^ip link add dimt-0-48 type gre local 100.64.0.40 remote 100.64.0.48 ttl 64 encap fou "
+
 # --- (h7) one overlay listed twice under conflicting modes -------------
 new_state h7
 printf '100.64.0.47 gre\n100.64.0.47 gre-in-fou\n' > "$TESTDIR/peers-conflict"
@@ -843,6 +1037,11 @@ rc=$?
 check "g: unknown flag exits nonzero" [ "$rc" -ne 0 ]
 check "g: usage mentions the refuse-outright safety" err_has "REFUSED outright"
 check "g: usage prints the last header line" err_has "\[--allow-empty\]"
+# usage() prints the header block verbatim, so a reflow artifact in the
+# comment is user-visible in `-h`.  Pins the sentence that was stranded
+# as a three-word line mid-paragraph.
+check "g: the MTU sentence is not broken mid-clause" err_has \
+	"An MTU below 1280 leaves the tunnels v4-only"
 
 echo
 if [ "$FAILS" -gt 0 ]; then
