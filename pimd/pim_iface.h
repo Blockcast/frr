@@ -80,6 +80,12 @@ struct pim_interface {
 	 * hello adjacency (draft-zzhang dynamic internet multicast tunnels).
 	 */
 	bool pim_light_enable : 1;
+	/* This is a DIMT netdev whose endpoint row carries `pim-mode normal`.
+	 * Mutually exclusive with pim_light_enable by construction (both are
+	 * written together in pim_dimt_ifp_adopt()), and it is what lets a
+	 * DIMT pin land on an interface that is deliberately NOT light.
+	 */
+	bool pim_dimt_normal : 1;
 
 	bool gm_enable : 1;
 	bool gm_proxy : 1; /* proxy IGMP joins/prunes */

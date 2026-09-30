@@ -120,10 +120,19 @@ static struct pim_dimt_umh *pim_dimt_umh_lookup(struct pim_instance *pim,
 
 static struct pim_dimt_tunnel *pim_dimt_tunnel_find(struct pim_instance *pim,
 						    pim_addr umh);
+static struct pim_dimt_endpoint *pim_dimt_endpoint_find(struct pim_instance *pim,
+							pim_addr umh);
 
 /* Is this interface usable as an RPF pin target?  pim_enable filters out
  * interfaces that cannot send joins and interfaces mid-teardown by
- * `no ip pim`; pim_light_enable is what makes a neighborless pin legal. */
+ * `no ip pim`; pim_light_enable is what makes a neighborless pin legal.
+ *
+ * pim_dimt_normal is the other way a pin becomes legal: a `pim-mode normal`
+ * DIMT netdev runs hellos and holds a real adjacency, so its pin is legal for
+ * the ordinary RFC 7761 reason instead of the RFC 9739 one.  Testing the DIMT
+ * flag rather than dropping the light requirement outright keeps
+ * pim_dimt_covering_iface()'s no-tunnel search unchanged: an interface pimd
+ * did not build for a UMH is still only pinnable when it is light. */
 static bool pim_dimt_iface_pinnable(struct interface *ifp)
 {
 	struct pim_interface *pim_ifp;
@@ -133,7 +142,8 @@ static bool pim_dimt_iface_pinnable(struct interface *ifp)
 
 	pim_ifp = ifp->info;
 
-	return pim_ifp && pim_ifp->pim_enable && pim_ifp->pim_light_enable &&
+	return pim_ifp && pim_ifp->pim_enable &&
+	       (pim_ifp->pim_light_enable || pim_ifp->pim_dimt_normal) &&
 	       if_is_operative(ifp);
 }
 
@@ -496,6 +506,43 @@ static void pim_dimt_jp_agg_detach(struct pim_upstream *up,
 	pim_jp_agg_upstream_verification(up, false);
 }
 
+/*
+ * The address a pin on `ifp` must write into rpf_addr -- i.e. the address the
+ * Join(S,G) names as its upstream neighbour.
+ *
+ * Light mode: the UMH itself.  RFC 9739 allows a J/P with no adjacency behind
+ * it, and the UMH is the only address of the far end we know.
+ *
+ * Normal mode: the neighbour's hello source address, which is NOT the UMH.
+ * The UMH is a loopback on the far side, and RFC 7761 4.9 requires the
+ * upstream-neighbour field to be RPF'(S,G) -- a *link* address.  A join
+ * addressed to the loopback is dropped silently by Junos (lab T1c-1/T1c-3)
+ * and counted as a Join/Prune Rx Error by cEOS (T4e).
+ *
+ * With no neighbour the answer is PIMADDR_ANY: deliberately unresolved, never
+ * the UMH.  That is FRR's existing convention for an unresolved RPF' (see
+ * pim_rpf_find_rpf_addr()), and the temptation it refuses -- "fall back to the
+ * configured UMH, at least it is an address" -- reintroduces exactly the
+ * silent-drop bug above, in the form that is hardest to see: a wrong address
+ * and a right one are indistinguishable from the box.
+ *
+ * pim_neighbor_find_if() returns NULL unless there is exactly one neighbour,
+ * so an ambiguous netdev also fails closed rather than picking arbitrarily.
+ */
+static pim_addr pim_dimt_pin_rpf_addr(struct interface *ifp,
+				      const struct pim_dimt_umh *umh)
+{
+	const struct pim_interface *pim_ifp = ifp->info;
+	struct pim_neighbor *nbr;
+
+	if (!pim_ifp || !pim_ifp->pim_dimt_normal)
+		return umh->umh;
+
+	nbr = pim_neighbor_find_if(ifp);
+
+	return nbr ? nbr->source_addr : PIMADDR_ANY;
+}
+
 /* Pin an upstream's RPF onto the light interface facing its UMH.
  * Mirrors pim_vxlan's orig-mroute handling: fill_static_iif() resets
  * rpf_addr, so the UMH must be written after it; the STATIC_IIF flag
@@ -507,10 +554,11 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 {
 	struct pim_rpf old_rpf;
 	enum pim_upstream_state old_state;
+	pim_addr rpf_addr = pim_dimt_pin_rpf_addr(ifp, umh);
 
 	if (PIM_UPSTREAM_FLAG_TEST_STATIC_IIF(up->flags) &&
 	    up->rpf.source_nexthop.interface == ifp &&
-	    !pim_addr_cmp(up->rpf.rpf_addr, umh->umh)) {
+	    !pim_addr_cmp(up->rpf.rpf_addr, rpf_addr)) {
 		/* The pin is unchanged, but the vif index backing it may not
 		 * be.  pim_if_add_vif() refuses an interface whose primary
 		 * address is still unset (pim_iface.c, -4), and a DIMT netdev
@@ -539,8 +587,8 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 	}
 
 	if (PIM_DEBUG_PIM_TRACE)
-		zlog_debug("DIMT: pinning %s RPF to %s via UMH %pPAs",
-			   up->sg_str, ifp->name, &umh->umh);
+		zlog_debug("DIMT: pinning %s RPF to %s via UMH %pPAs (RPF' %pPAs)",
+			   up->sg_str, ifp->name, &umh->umh, &rpf_addr);
 
 	/* Whatever RPF' the upstream had -- a previous DIMT pin (a steer) or
 	 * the normal unicast path (a first pin) -- is being replaced, and
@@ -556,16 +604,25 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 	PIM_UPSTREAM_FLAG_SET_SRC_DIMT(up->flags);
 	PIM_UPSTREAM_FLAG_SET_STATIC_IIF(up->flags);
 	pim_upstream_fill_static_iif(up, ifp);
-	up->rpf.source_nexthop.mrib_nexthop_addr = umh->umh;
-	up->rpf.rpf_addr = umh->umh;
+	up->rpf.source_nexthop.mrib_nexthop_addr = rpf_addr;
+	up->rpf.rpf_addr = rpf_addr;
 
 	/* Not when the "move" lands on the very neighbor we were already
 	 * joined through (a first pin whose unicast RPF' was already the UMH
 	 * on this netdev): a prune immediately followed by the join below
-	 * would only blip the UMH's oif. */
-	if (old_rpf.source_nexthop.interface &&
+	 * would only blip the UMH's oif.
+	 *
+	 * And never when the new RPF' is unresolved.  In normal mode that is a
+	 * neighbour expiry, and the pin is deliberately held across it (see
+	 * pim_dimt_neighbor_change()).  A prune there would be an active
+	 * instruction to stop exactly the traffic we still want, addressed to
+	 * a router that by definition is not listening -- and the likeliest
+	 * cause of an expiry is transient (a far-end pimd restart, or hello
+	 * loss on a congested transit hop) while the GRE data path, being
+	 * stateless, never went away. */
+	if (!pim_addr_is_any(rpf_addr) && old_rpf.source_nexthop.interface &&
 	    (old_rpf.source_nexthop.interface != ifp ||
-	     pim_addr_cmp(old_rpf.rpf_addr, umh->umh)))
+	     pim_addr_cmp(old_rpf.rpf_addr, rpf_addr)))
 		pim_dimt_prune_old(up, &old_rpf);
 
 	pim_upstream_update_use_rpt(up, false /*update_mroute*/);
@@ -580,6 +637,24 @@ static void pim_dimt_upstream_pin(struct pim_instance *pim,
 	old_state = up->join_state;
 	up->dimt_join_pending = true;
 	pim_upstream_update_join_desired(pim, up);
+
+	/*
+	 * Normal mode with no neighbour: the pin is held, the upstream keeps
+	 * whatever join state its downstream interest justifies -- dropping to
+	 * NotJoined would discard that interest and make re-deriving it on the
+	 * neighbour's return a second bug -- but there is nobody to address a
+	 * J/P to.  So stop only the periodic Join Timer and leave the join
+	 * owed; pim_dimt_neighbor_change() sends it the moment hellos return.
+	 *
+	 * Leaving the timer armed would have it fire every t_periodic into
+	 * pim_upstream_send_join() with an unresolved RPF', which is a wasted
+	 * wakeup at best.
+	 */
+	if (pim_addr_is_any(up->rpf.rpf_addr)) {
+		event_cancel(&up->t_join_timer);
+		return;
+	}
+
 	if (old_state != PIM_UPSTREAM_JOINED &&
 	    up->join_state == PIM_UPSTREAM_JOINED && pim_dimt_jp_sendable(ifp))
 		up->dimt_join_pending = false;
@@ -731,7 +806,8 @@ void pim_dimt_iface_up(struct pim_instance *pim, struct interface *ifp)
 	struct pim_interface *pim_ifp = ifp->info;
 	struct pim_upstream *up;
 
-	if (!pim_ifp || !pim_ifp->pim_light_enable)
+	if (!pim_ifp ||
+	    !(pim_ifp->pim_light_enable || pim_ifp->pim_dimt_normal))
 		return;
 	if (!pim->dimt_umh_list || !listcount(pim->dimt_umh_list))
 		return;
@@ -752,6 +828,55 @@ void pim_dimt_iface_up(struct pim_instance *pim, struct interface *ifp)
 	 * Edge-triggered downstream (pim_gtm_forwarding_update() returns
 	 * immediately when the state is unchanged), so this is cheap and safe
 	 * to call on every interface-up. */
+	pim_dimt_readiness_update(pim);
+}
+
+/*
+ * A PIM neighbour appeared on, or expired from, `ifp`.
+ *
+ * Only normal-mode DIMT netdevs react.  There rpf_addr IS the neighbour's
+ * hello source address, so the neighbour arriving or going away is an
+ * RPF'(S,G) transition -- and STATIC_IIF makes pim_rpf_update() a no-op for a
+ * pinned upstream, so none of the normal 4.5.7 machinery will notice.  Rerunning
+ * the apply pass recomputes rpf_addr for each pinned upstream and, on the
+ * neighbour's return, sends the triggered Join 4.5.7 owes it and restarts the
+ * periodic timer (the RPF'(S,G) NULL -> neighbour case).
+ *
+ * The pin itself is NOT dropped on expiry.  It is config-derived --
+ * `dimt tunnel-endpoint ... pim-mode normal` is an operator statement about
+ * where this (S,G) comes from -- and a control-plane observation does not
+ * revoke config, the same way a static `ip mroute` RPF override survives an
+ * adjacency timing out.  Falling back to native RPF instead would flap the RPF
+ * interface, and "native RPF" does not mean "no upstream" but *a different*
+ * one: if that path can deliver, the overlap joins a second live source of the
+ * same (S,G).  See doc/user/pim.rst.
+ *
+ * Deliberately no prune toward the departing neighbour: see the comment in
+ * pim_dimt_upstream_pin().
+ */
+void pim_dimt_neighbor_change(struct pim_instance *pim, struct interface *ifp)
+{
+	struct pim_interface *pim_ifp = ifp ? ifp->info : NULL;
+	struct pim_upstream *up;
+
+	if (!pim || !pim_ifp || !pim_ifp->pim_dimt_normal)
+		return;
+	if (!pim->dimt_umh_list || !listcount(pim->dimt_umh_list))
+		return;
+
+	frr_each (rb_pim_upstream, &pim->upstream_head, up) {
+		if (!PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags))
+			continue;
+		if (up->rpf.source_nexthop.interface != ifp)
+			continue;
+
+		pim_dimt_upstream_apply(pim, up);
+	}
+
+	/* An unresolved RPF' is not a forwarding-readiness change in itself --
+	 * the netdev, the pin and the MFC entry all survive -- but the apply
+	 * pass above can still have moved something, and the update is
+	 * edge-triggered, so this is cheap when nothing changed. */
 	pim_dimt_readiness_update(pim);
 }
 
@@ -997,6 +1122,7 @@ bool pim_dimt_endpoint_set(struct pim_instance *pim,
 			   const struct pim_dimt_endpoint *in)
 {
 	struct pim_dimt_endpoint *ep;
+	struct pim_dimt_tunnel *tun;
 
 	/* The outer pair must agree on family -- an IPv4 local with an IPv6
 	 * remote is not a tunnel, it is a typo.  The inner/outer families are
@@ -1023,6 +1149,19 @@ bool pim_dimt_endpoint_set(struct pim_instance *pim,
 	 * alone cannot do this: it builds the request only when it creates the
 	 * tunnel, so an edited row would otherwise never reach the netdev. */
 	pim_dimt_endpoint_apply_change(pim, ep);
+
+	/* pim_normal is pimd-local and deliberately absent from the zapi
+	 * request, so apply_change()'s memcmp cannot see a mode flip and --
+	 * rightly -- does not rebuild an identical netdev for it.  Re-adopt so
+	 * the interface flags follow the row instead. */
+	tun = pim_dimt_tunnel_find(pim, ep->umh);
+	if (tun && tun->ifindex) {
+		struct interface *ifp =
+			if_lookup_by_index(tun->ifindex, pim->vrf->vrf_id);
+
+		if (ifp)
+			pim_dimt_ifp_adopt(pim, ifp);
+	}
 
 	pim_dimt_reconcile(pim);
 	return true;
@@ -1070,6 +1209,11 @@ int pim_dimt_endpoint_config_write(struct pim_instance *pim, struct vty *vty)
 			vty_out(vty, " key %u", ep->key);
 		if (ep->mtu_set)
 			vty_out(vty, " mtu %u", ep->mtu);
+		/* Only when normal: `light` is the default, so an untouched
+		 * row round-trips byte-identically to what it was before this
+		 * keyword existed. */
+		if (ep->pim_normal)
+			vty_out(vty, " pim-mode normal");
 		vty_out(vty, "\n");
 		written++;
 	}
@@ -1573,6 +1717,9 @@ void pim_dimt_ifp_adopt(struct pim_instance *pim, struct interface *ifp)
 		return;
 
 	for (ALL_LIST_ELEMENTS_RO(pim->dimt_tunnel_list, node, tun)) {
+		const struct pim_dimt_endpoint *ep;
+		bool normal, changed;
+
 		if (strncmp(tun->ifname, ifp->name, sizeof(tun->ifname)))
 			continue;
 
@@ -1586,12 +1733,37 @@ void pim_dimt_ifp_adopt(struct pim_instance *pim, struct interface *ifp)
 		if (!pim_ifp)
 			return;
 
+		ep = pim_dimt_endpoint_find(pim, tun->umh);
+		normal = ep && ep->pim_normal;
+		changed = pim_ifp->pim_dimt_normal != normal;
+
 		pim_ifp->pim_enable = true;
-		pim_ifp->pim_light_enable = true;
+		/* Mutually exclusive, and written together so they cannot
+		 * drift: pim_hello_send() suppresses hellos on any interface
+		 * with pim_light_enable set, so normal mode is precisely the
+		 * absence of that flag. */
+		pim_ifp->pim_dimt_normal = normal;
+		pim_ifp->pim_light_enable = !normal;
+
+		/* The adjacency model itself changed, so anything learned
+		 * under the old one is stale: a light neighbour is created
+		 * from a received J/P and carries no hello state, while a
+		 * hello neighbour outlives the hellos we just stopped sending.
+		 * Either would be read by pim_dimt_pin_rpf_addr() as if it
+		 * belonged to the new mode.
+		 *
+		 * After the flag writes, not before: pim_neighbor_delete()
+		 * calls back into pim_dimt_neighbor_change(), which keys off
+		 * pim_dimt_normal.  Doing it first would run that re-resolve
+		 * under the mode being abandoned.  No-op on a first adopt into
+		 * light mode, and on an empty neighbour list either way. */
+		if (changed)
+			pim_neighbor_delete_all(ifp, "DIMT pim-mode changed");
 
 		if (PIM_DEBUG_PIM_TRACE)
-			zlog_debug("DIMT: adopted %s (ifindex %d) for UMH %pPAs",
-				   ifp->name, ifp->ifindex, &tun->umh);
+			zlog_debug("DIMT: adopted %s (ifindex %d) for UMH %pPAs in %s mode",
+				   ifp->name, ifp->ifindex, &tun->umh,
+				   normal ? "normal" : "light");
 
 		pim_dimt_iface_up(pim, ifp);
 		return;

@@ -345,7 +345,7 @@ VRF where indicated), instead of under the 'router pim' submode.
    groups. The ``no`` form of the command disables the warning generation.
    This command is VRF-aware.
 
-.. clicmd:: dimt tunnel-endpoint A.B.C.D inner-local A.B.C.D outer-local <A.B.C.D|X:X::X:X> outer <A.B.C.D|X:X::X:X> encap <gre|gre-in-fou> [dport (1-65535)] [key (0-4294967295)] [mtu (68-65535)]
+.. clicmd:: dimt tunnel-endpoint A.B.C.D inner-local A.B.C.D outer-local <A.B.C.D|X:X::X:X> outer <A.B.C.D|X:X::X:X> encap <gre|gre-in-fou> [dport (1-65535)] [key (0-4294967295)] [mtu (68-65535)] [pim-mode <normal|light>]
 
    Configure the tunnel used to reach one DIMT Upstream Multicast Hop (UMH),
    for dynamic multicast tunneling
@@ -356,6 +356,9 @@ VRF where indicated), instead of under the 'router pim' submode.
    remote underlay addresses; ``encap`` selects plain GRE or GRE-in-UDP
    (FOU). ``key`` sets the GRE key and ``mtu`` the tunnel MTU; when either is
    omitted it is left unset and the tunnel provider's default applies.
+
+   ``pim-mode`` selects which flavour of PIM runs on the ``dimt-`` netdev,
+   and defaults to ``light``. See :ref:`pim-dimt-pim-mode` below.
 
    Two constraints are enforced, and violating either rejects the command
    with ``% Invalid DIMT tunnel endpoint``:
@@ -377,6 +380,82 @@ VRF where indicated), instead of under the 'router pim' submode.
    request/acknowledgement state, and
    :clicmd:`show ip pim [vrf NAME] dimt forwarding [json]` for the per-(S,G)
    readiness it feeds.
+
+.. _pim-dimt-pim-mode:
+
+DIMT tunnel PIM mode, and what neighbor expiry does
+---------------------------------------------------
+
+``pim-mode`` on a :clicmd:`dimt tunnel-endpoint A.B.C.D inner-local A.B.C.D
+outer-local <A.B.C.D|X:X::X:X> outer <A.B.C.D|X:X::X:X> encap <gre|gre-in-fou>
+[dport (1-65535)] [key (0-4294967295)] [mtu (68-65535)] [pim-mode
+<normal|light>]` row chooses which flavour of PIM runs on that UMH's
+``dimt-`` netdev.
+
+``light`` (the default)
+   PIM Light, RFC 9739. No hellos are sent, no adjacency forms, and the
+   Join/Prune names the UMH itself as its upstream neighbor. This is the
+   right mode toward another FRR speaker, and it is what every endpoint row
+   written before ``pim-mode`` existed does.
+
+``normal``
+   Ordinary PIM. Hellos are sent on the netdev, a real adjacency forms, and
+   the Join/Prune names *that adjacency's hello source address* -- not the
+   UMH. Use this toward a vendor implementation.
+
+   The distinction is not cosmetic. The UMH is a loopback on the far side,
+   and RFC 7761 section 4.9 requires the upstream-neighbor field of a J/P to
+   be RPF'(S,G), which is a link address. Neither Junos nor EOS accepts a
+   Join naming the loopback: Junos discards it silently, and EOS counts it as
+   a Join/Prune receive error. Both also require a hello adjacency before
+   they will accept a J/P at all, which ``light`` by definition never
+   provides.
+
+Because the two modes differ only in pimd's treatment of the interface, and
+not in the netdev zebra builds, changing ``pim-mode`` on a live row does not
+rebuild the tunnel. It re-adopts the interface and discards any neighbor
+learned under the previous mode.
+
+When the neighbor expires
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+In ``normal`` mode the pinned upstream's RPF' is the neighbor, so the
+neighbor timing out is an RPF'(S,G) change. FRR **holds the pin**:
+
+- The RPF interface stays pinned to the ``dimt-`` netdev.
+- ``rpf_addr`` becomes explicitly unresolved -- it does *not* fall back to
+  the UMH. ``show ip pim upstream`` reports no upstream address for the
+  channel while this lasts.
+- No Join/Prune is generated toward the tunnel, and the periodic Join Timer
+  is stopped. The upstream keeps whatever join state its downstream interest
+  justifies; it is not moved to NotJoined.
+- **No Prune is sent to the departing neighbor.** A prune is an instruction
+  to stop forwarding, and the traffic is still wanted; the neighbor is also,
+  by definition, no longer listening.
+- When hellos return, the pin re-arms immediately: a triggered Join(S,G) goes
+  out to the new neighbor and the periodic timer restarts, per RFC 7761
+  section 4.5.7 for an RPF'(S,G) transition from NULL to a neighbor.
+
+Holding the pin is deliberate, and follows from the pin being *config*. A
+``dimt tunnel-endpoint`` row is an operator statement about where an (S,G)
+comes from; neighbor expiry is a control-plane observation, and an
+observation does not revoke configuration -- the same reason a static ``ip
+mroute`` RPF override is not withdrawn when an adjacency times out.
+
+The alternative -- dropping the pin and falling back to native RPF -- is
+worse in three separate ways. It flaps the RPF interface on what is usually a
+transient event (GRE is stateless, so a far-end pimd restart or hello loss on
+a congested transit hop expires the adjacency while the data path is
+untouched). "Native RPF" does not mean *no* upstream but *a different* one,
+so if that path can deliver, the overlap joins a second live source of the
+same (S,G) and duplicates delivery. And it would add a second prune-ordering
+problem, on the native path, alongside the one the tunnel path already has.
+
+Note that the pin holding says nothing about the netdev. The ``dimt-``
+interface's lifecycle is owned by the endpoint configuration and zebra, not
+by adjacency state: a far-end pimd restart does not tear down the data path,
+and losing the pin is not a reason to remove a tunnel. The interface going
+*down* is a different event, and does unpin.
 
 .. _pim-dimt-outer-header:
 
