@@ -231,6 +231,19 @@ jobs:
             --tag amd64_u24_lttng-buildcache \
             --max-age-hours "${MAX_CACHE_AGE_HOURS}" \
             --baseline /tmp/buildcache-before.json
+      # In digest mode (BLO-33101) an unchanged digest is a warning, not a
+      # failure: a no-op re-seed on an unchanged master re-pushes identical
+      # content under the same digest, and the digest cannot tell that apart
+      # from no push at all. The push evidence is therefore the seed legs'
+      # own result -- `cache-to` has no ignore-error, so a failed export fails
+      # the leg. Checked last so the per-tag table above is still reported.
+      - name: Fail closed unless every seed leg succeeded
+        if: ${{ needs.seed.result != 'success' }}
+        env:
+          SEED_RESULT: ${{ needs.seed.result }}
+        run: |
+          echo "::error::seed concluded '${SEED_RESULT}'; an unchanged digest cannot prove the cache was rewritten, so this gate will not certify it."
+          exit 1
 
   freshness-gate:
     needs: verify
@@ -260,14 +273,28 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
-      - name: Fail if any buildcache tag is older than the budget
+      - name: Fail if any buildcache tag is older than the budget (inert while age is unmeasurable)
         env:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: |
-          set -euo pipefail
+          # Exit 3 here means "age could not be measured" (BLO-33101: the CI
+          # credential holds registry push/pull but not the Harbor project role
+          # the artifacts API demands). That is tolerable *only* because the
+          # step above already established that `verify` succeeded -- i.e.
+          # every seed leg exported its cache in this very run and every tag
+          # is present, which is a stronger claim than any age reading. Exit
+          # 2 (a Harbor defect, or both surfaces unreachable) stays fatal, as
+          # does every other nonzero exit.
+          set -uo pipefail
+          rc=0
           python3 .github/scripts/buildcache_freshness.py \
             --tag amd64_u22-buildcache \
             --tag amd64_u24-buildcache \
             --tag amd64_u24_lttng-buildcache \
-            --max-age-hours "${MAX_CACHE_AGE_HOURS}"
+            --max-age-hours "${MAX_CACHE_AGE_HOURS}" || rc=$?
+          if [ "${rc}" -eq 3 ]; then
+            echo "::warning::absolute cache age is unmeasured (see BLO-33101); accepting this run on the strength of 'verify' (every seed leg exported its cache in this run)."
+            exit 0
+          fi
+          exit "${rc}"

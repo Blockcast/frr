@@ -19,6 +19,8 @@ import os
 import re
 import tempfile
 import unittest
+import urllib.error
+from unittest import mock
 
 _SPEC = importlib.util.spec_from_file_location(
     "buildcache_freshness",
@@ -613,6 +615,50 @@ class TestFreshnessGateFailsClosedOnFailedVerify(unittest.TestCase):
         self.assertIn("always()", block)
 
 
+def _seeder_job_block(test, job_id):
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "buildcache-seed.yml"
+    )
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    match = re.search(rf"^  {re.escape(job_id)}:\n(.*?)(?=^  \S|\Z)", text, re.S | re.M)
+    test.assertIsNotNone(match, f"{job_id} job not found in buildcache-seed.yml")
+    return match.group(1)
+
+
+class TestFreshnessGateToleratesOnlyUnmeasurableAge(unittest.TestCase):
+    """Ally Important on #114: tolerating every exit 2 turned a Harbor defect
+    (the case AUTHZ_STATUSES exists to keep loud) into a green gate."""
+
+    def test_gate_tolerates_exactly_the_age_unmeasurable_exit(self):
+        block = _seeder_job_block(self, "freshness-gate")
+        tolerated = re.findall(r'\[ "\$\{rc\}" -eq (\d+) \]', block)
+        self.assertEqual([str(bcf.EXIT_AGE_UNMEASURABLE)], tolerated)
+
+
+class TestVerifyRequiresTheSeedResult(unittest.TestCase):
+    """An unchanged digest is a warning, so it cannot prove a push happened;
+    `verify` must take that evidence from the seed legs' own result."""
+
+    def test_verify_fails_closed_on_a_non_success_seed(self):
+        block = _seeder_job_block(self, "verify")
+        self.assertRegex(
+            block, r"if: \$\{\{ needs\.seed\.result != 'success' \}\}[\s\S]*?exit 1"
+        )
+
+    def test_seed_does_not_swallow_a_failed_cache_export(self):
+        """Ally suggestion on #114: the check above is only evidence of a push
+        because a failed `cache-to` export fails its leg. buildx's
+        `ignore-error=true` would break exactly that -- the seed would go green
+        without rewriting the cache and `verify` would certify it, which is the
+        failure the old unconditional exit 1 used to catch. Locked here because
+        the coupling was stated only in a comment.
+        """
+        block = _seeder_job_block(self, "seed")
+        self.assertIn("cache-to:", block)
+        self.assertNotIn("ignore-error", block)
+
+
 class TestEveryJobIsConfinedToTheCanonicalRepo(unittest.TestCase):
     """No job in the seeder may run outside Blockcast/frr.
 
@@ -713,6 +759,314 @@ class TestEveryJobIsConfinedToTheCanonicalRepo(unittest.TestCase):
         )
         self.assertIn(self.BOUNDARY, self._condition(jobs["seed"]))
 
+
+
+class TestEvaluateDigests(unittest.TestCase):
+    """The digest fallback must answer advancement and refuse to answer age.
+
+    This path exists because Harbor authorizes /api/v2.0 and /v2 separately and
+    the CI credential only holds the latter (BLO-33101). The risk it carries is
+    the same silent one the whole gate guards: reporting a cache advanced when
+    nothing was actually measured.
+    """
+
+    A = "sha256:" + "a" * 64
+    B = "sha256:" + "b" * 64
+
+    def test_unchanged_digest_is_a_warning_not_a_failure(self):
+        # A no-op re-seed on an unchanged master re-pushes identical content
+        # under the same digest. That is the successful steady state, so it
+        # must not go red -- but it must not claim "advanced" either.
+        rows = bcf.evaluate_digests({"t": self.A}, {"t": self.A})
+        self.assertEqual("unchanged", rows[0]["status"])
+        self.assertIn("unchanged", bcf.WARN_STATUSES)
+
+    def test_changed_digest_advances(self):
+        rows = bcf.evaluate_digests({"t": self.B}, {"t": self.A})
+        self.assertEqual("ok", rows[0]["status"])
+
+    def test_absent_tag_is_missing_not_ok(self):
+        rows = bcf.evaluate_digests({"t": None}, {"t": self.A})
+        self.assertEqual("missing", rows[0]["status"])
+
+    def test_no_prior_tag_counts_as_seeded(self):
+        rows = bcf.evaluate_digests({"t": self.A}, {})
+        self.assertEqual("ok", rows[0]["status"])
+
+    def test_digest_rows_never_claim_an_age(self):
+        # render_summary prints whatever is in the row; a non-None age here
+        # would put an unmeasured number into the job summary.
+        for baseline in ({}, {"t": self.A}):
+            rows = bcf.evaluate_digests({"t": self.B}, baseline)
+            self.assertIsNone(rows[0]["age_hours"])
+            self.assertIsNone(rows[0]["push_time"])
+
+
+class TestDigestSummary(unittest.TestCase):
+    def test_summary_does_not_advertise_a_budget_it_did_not_measure(self):
+        rows = bcf.evaluate_digests({"t": "sha256:" + "c" * 64}, None)
+        out = bcf.render_summary(rows, 72.0, mode="digest")
+        self.assertNotIn("budget: 72h", out)
+        self.assertIn("age NOT measured", out)
+
+    def test_push_time_summary_is_unchanged(self):
+        rows = bcf.evaluate({"t": hours_ago(1)}, NOW, 72.0, None)
+        out = bcf.render_summary(rows, 72.0)
+        self.assertIn("budget: 72h", out)
+
+
+class TestAuthChallengeParsing(unittest.TestCase):
+    """Parsed, not hard-coded, so a registry or token-service rename cannot
+    silently break the only fallback surface."""
+
+    # Captured verbatim from registry.blockcast.net on 2026-09-29.
+    LIVE = (
+        'Bearer realm="https://registry.blockcast.net/service/token",'
+        'service="harbor-registry",scope="repository:cache/frr-ci:pull"'
+    )
+
+    def test_parses_the_live_harbor_challenge(self):
+        got = bcf._parse_auth_challenge(self.LIVE)
+        self.assertEqual(
+            "https://registry.blockcast.net/service/token", got["realm"]
+        )
+        self.assertEqual("harbor-registry", got["service"])
+        self.assertEqual("repository:cache/frr-ci:pull", got["scope"])
+
+    def test_rejects_a_non_bearer_challenge(self):
+        with self.assertRaises(bcf.ProbeError):
+            bcf._parse_auth_challenge('Basic realm="harbor"')
+
+    def test_rejects_an_empty_challenge(self):
+        with self.assertRaises(bcf.ProbeError):
+            bcf._parse_auth_challenge("")
+
+
+def _refuse_harbor(*_a, **_k):
+    raise bcf.ProbeError("HTTP 403 from artifacts API", status=403)
+
+
+def _harbor_returns_garbage(*_a, **_k):
+    # No status: a parse failure, not an authorization failure.
+    raise bcf.ProbeError("artifact for t has no push_time field")
+
+
+class TestFallbackWiring(unittest.TestCase):
+    """End-to-end exit codes for the degraded path.
+
+    A digest baseline and a push_time baseline are not comparable, and neither
+    can answer absolute age; both confusions would certify an unmeasured cache.
+    """
+
+    CREDS = {"HARBOR_USERNAME": "u", "HARBOR_PASSWORD": "p"}
+
+    def _main(self, argv, digests):
+        with mock.patch.dict(os.environ, self.CREDS), \
+                mock.patch.object(bcf, "fetch_push_times", _refuse_harbor), \
+                mock.patch.object(bcf, "fetch_digests", digests):
+            return bcf.main(argv)
+
+    def _with_baseline(self, baseline_obj, digests):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(baseline_obj, fh)
+            return self._main(["--tag", "t", "--baseline", path], digests)
+
+    def test_digest_run_against_push_time_baseline_is_a_probe_error(self):
+        rc = self._with_baseline(
+            {"t": "2026-08-22T11:00:00Z"},
+            lambda *a, **k: {"t": "sha256:" + "d" * 64},
+        )
+        self.assertEqual(bcf.EXIT_PROBE_ERROR, rc)
+
+    def test_unchanged_digest_after_a_reseed_does_not_go_red(self):
+        # Ally Critical on #114: a successful no-op re-seed keeps the digest,
+        # and exit 1 here was tolerated nowhere in buildcache-seed.yml, so the
+        # gate went red on success. The push evidence is the seed job result,
+        # asserted in TestVerifyRequiresTheSeedResult.
+        same = "sha256:" + "d" * 64
+        rc = self._with_baseline({"t": same}, lambda *a, **k: {"t": same})
+        self.assertEqual(bcf.EXIT_OK, rc)
+
+    def test_absent_tag_against_a_digest_baseline_still_goes_red(self):
+        # The warning is for "unchanged" only; a tag that vanished (Harbor
+        # retention, the thing this gate guards) must stay exit 1.
+        rc = self._with_baseline(
+            {"t": "sha256:" + "d" * 64}, lambda *a, **k: {"t": None}
+        )
+        self.assertEqual(bcf.EXIT_STALE, rc)
+
+    def test_digest_run_reports_advancement(self):
+        rc = self._with_baseline(
+            {"t": "sha256:" + "d" * 64},
+            lambda *a, **k: {"t": "sha256:" + "e" * 64},
+        )
+        self.assertEqual(bcf.EXIT_OK, rc)
+
+    def test_age_question_is_refused_when_only_digests_are_available(self):
+        # No --baseline: the only remaining question is absolute age, which a
+        # digest cannot answer. This must NOT come back green.
+        # Its own exit code, so freshness-gate can tolerate exactly this and
+        # still fail on exit 2 (a Harbor defect).
+        rc = self._main(["--tag", "t"], lambda *a, **k: {"t": "sha256:" + "e" * 64})
+        self.assertEqual(bcf.EXIT_AGE_UNMEASURABLE, rc)
+        self.assertNotEqual(bcf.EXIT_PROBE_ERROR, bcf.EXIT_AGE_UNMEASURABLE)
+
+    def test_both_surfaces_down_is_a_probe_error(self):
+        rc = self._main(["--tag", "t"], _refuse_harbor)
+        self.assertEqual(bcf.EXIT_PROBE_ERROR, rc)
+
+    def test_a_harbor_defect_does_not_silently_switch_surfaces(self):
+        # The fallback exists for 403 only. A malformed Harbor response is a
+        # Harbor fault; degrading to digests there would hide it behind a run
+        # that still goes green, which is the blind spot this gate exists to
+        # close. The digest fetcher must never be reached.
+        def _boom(*_a, **_k):  # pragma: no cover - must not be called
+            raise AssertionError("fell back on a non-authorization error")
+
+        with mock.patch.dict(os.environ, self.CREDS), \
+                mock.patch.object(bcf, "fetch_push_times",
+                                  _harbor_returns_garbage), \
+                mock.patch.object(bcf, "fetch_digests", _boom):
+            self.assertEqual(bcf.EXIT_PROBE_ERROR, bcf.main(["--tag", "t"]))
+
+    def test_http_errors_carry_their_status(self):
+        # The narrowing above is only as good as this field being populated.
+        with self.assertRaises(bcf.ProbeError) as caught:
+            with mock.patch.object(
+                bcf.urllib.request, "urlopen",
+                mock.Mock(side_effect=urllib.error.HTTPError(
+                    "u", 403, "Forbidden", None, None)),
+            ):
+                bcf._request_json("https://example.invalid/x", {}, 1)
+        self.assertEqual(403, caught.exception.status)
+
+    def test_a_bare_string_token_payload_is_never_echoed(self):
+        # Ally suggestion on #114: this message lands in the Actions log, and a
+        # token service answering with a bare JSON string is most likely
+        # handing back the credential itself. Diagnose by type, never by value.
+        secret = "eyJhbGciOiJIUzI1NiJ9.SUPERSECRETTOKEN"
+        with self.assertRaises(bcf.ProbeError) as caught:
+            with mock.patch.object(bcf, "_request_json", return_value=secret):
+                bcf._registry_bearer_token(
+                    {"realm": "https://example.invalid/token"}, "u", "p", 1
+                )
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertIn("str", str(caught.exception))
+
+    def test_report_only_baseline_snapshot_survives_the_fallback(self):
+        # probe-before must still exit 0 and emit a usable baseline, otherwise
+        # the seeding run it guards gets skipped -- the BLO-33101 failure.
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "before.json")
+            rc = self._main(
+                ["--tag", "t", "--report-only", "--json-out", out],
+                lambda *a, **k: {"t": "sha256:" + "f" * 64},
+            )
+            self.assertEqual(bcf.EXIT_OK, rc)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual({"t": "sha256:" + "f" * 64}, json.load(fh))
+
+
+class TestFetchDigests(unittest.TestCase):
+    """A 200 that carries no digest is 'could not tell', not 'tag absent'.
+
+    The file's whole exit-code contract rests on that distinction: 'missing'
+    exits 1 and sends someone to reseed a cache that may be perfectly fine,
+    while a probe error exits 2 and says the measurement failed.
+    """
+
+    @staticmethod
+    def _response(headers):
+        resp = mock.MagicMock()
+        resp.headers = headers
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda s, *a: False
+        return resp
+
+    def test_missing_digest_header_is_a_probe_error_not_a_missing_tag(self):
+        with mock.patch.object(
+            bcf.urllib.request, "urlopen",
+            mock.Mock(return_value=self._response({})),
+        ):
+            with self.assertRaises(bcf.ProbeError):
+                bcf.fetch_digests("r", "p", "repo", ["t"], "u", "pw")
+
+    def test_digest_header_is_returned(self):
+        digest = "sha256:" + "1" * 64
+        with mock.patch.object(
+            bcf.urllib.request, "urlopen",
+            mock.Mock(return_value=self._response(
+                {"Docker-Content-Digest": digest})),
+        ):
+            self.assertEqual(
+                {"t": digest},
+                bcf.fetch_digests("r", "p", "repo", ["t"], "u", "pw"),
+            )
+
+    def test_404_is_a_missing_tag(self):
+        with mock.patch.object(
+            bcf.urllib.request, "urlopen",
+            mock.Mock(side_effect=urllib.error.HTTPError(
+                "u", 404, "Not Found", None, None)),
+        ):
+            self.assertEqual(
+                {"t": None},
+                bcf.fetch_digests("r", "p", "repo", ["t"], "u", "pw"),
+            )
+
+    @staticmethod
+    def _challenge_401():
+        exc = urllib.error.HTTPError("u", 401, "Unauthorized", None, None)
+        exc.headers = {
+            "Www-Authenticate": TestAuthChallengeParsing.LIVE,
+        }
+        return exc
+
+    def test_404_after_the_token_exchange_is_a_missing_tag(self):
+        # The realistic flow: anonymous HEAD -> 401 -> token -> HEAD -> 404.
+        # The pre-auth 404 branch never sees this, so it needs its own case.
+        with mock.patch.object(
+            bcf.urllib.request, "urlopen",
+            mock.Mock(side_effect=[
+                self._challenge_401(),
+                urllib.error.HTTPError("u", 404, "Not Found", None, None),
+            ]),
+        ), mock.patch.object(
+            bcf, "_request_json", mock.Mock(return_value={"token": "t0k"})
+        ):
+            self.assertEqual(
+                {"t": None},
+                bcf.fetch_digests("r", "p", "repo", ["t"], "u", "pw"),
+            )
+
+    def test_a_rejected_token_is_a_probe_error_not_a_second_challenge(self):
+        with mock.patch.object(
+            bcf.urllib.request, "urlopen",
+            mock.Mock(side_effect=[self._challenge_401(), self._challenge_401()]),
+        ), mock.patch.object(
+            bcf, "_request_json", mock.Mock(return_value={"token": "t0k"})
+        ):
+            with self.assertRaises(bcf.ProbeError) as caught:
+                bcf.fetch_digests("r", "p", "repo", ["t"], "u", "pw")
+        self.assertEqual(401, caught.exception.status)
+
+    def test_digest_is_read_after_a_successful_token_exchange(self):
+        digest = "sha256:" + "2" * 64
+        with mock.patch.object(
+            bcf.urllib.request, "urlopen",
+            mock.Mock(side_effect=[
+                self._challenge_401(),
+                self._response({"Docker-Content-Digest": digest}),
+            ]),
+        ), mock.patch.object(
+            bcf, "_request_json", mock.Mock(return_value={"token": "t0k"})
+        ):
+            self.assertEqual(
+                {"t": digest},
+                bcf.fetch_digests("r", "p", "repo", ["t"], "u", "pw"),
+            )
 
 if __name__ == "__main__":
     unittest.main()
