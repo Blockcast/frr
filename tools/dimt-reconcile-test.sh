@@ -936,7 +936,7 @@ check "h6f: the valid peer alongside it still builds" \
 # dev_of() is textual: they derive dimt-010-20 and dimt-10-20, i.e. two
 # netdevs for one peer.  (010 is also octal to inet_aton.)
 new_state h6f2
-printf '100.64.0.47 gre\n100.64.010.20 gre\n' > "$TESTDIR/peers-lz"
+printf '100.64.0.47 gre\n100.64.010.20 gre\n100.64.01.20 gre\n' > "$TESTDIR/peers-lz"
 echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
 err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
 	--peers-file "$TESTDIR/peers-lz" 2>&1)
@@ -945,6 +945,15 @@ check "h6f2: a leading-zero octet exits nonzero" [ "$rc" -ne 0 ]
 check "h6f2: the leading-zero entry is named" err_has \
 	"ignoring invalid peer entry '100.64.010.20'"
 check "h6f2: no aliased device is created" log_lacks "^ip link add dimt-010-20"
+# 010 is caught by the alternation's LENGTH whatever the first-digit
+# class is, so the three-digit form alone leaves [1-9]?[0-9] unpinned:
+# measured, [1-9]?[0-9] -> [0-9]?[0-9] builds dimt-01-20 with inner
+# 10.99.01.20 and the whole suite passes.  Two digits is the only form
+# that first-digit class decides.
+check "h6f2: the TWO-digit leading zero is named too" err_has \
+	"ignoring invalid peer entry '100.64.01.20'"
+check "h6f2: no two-digit aliased device is created" \
+	log_lacks "^ip link add dimt-01-20"
 check "h6f2: GC suppressed (invalid=1)" log_lacks "^ip link del dimt-9-9"
 
 # --- (h6f3) an out-of-range overlay arms no capability gate -----------
@@ -1315,8 +1324,8 @@ fi
 # same treatment.  Raise the floor when you add assertions.
 # The floor EQUALS the live count on purpose -- no slack, so a
 # deletion is caught the same run it happens.  Do not relax -lt.
-if [ "$RAN" -lt 237 ]; then
-	echo "FAIL: assertion count fell to $RAN (floor 237) -- a block was deleted"
+if [ "$RAN" -lt 239 ]; then
+	echo "FAIL: assertion count fell to $RAN (floor 239) -- a block was deleted"
 	exit 1
 fi
 echo "all tests passed ($RAN assertions)"
