@@ -1071,13 +1071,21 @@ check "h6f6: the valid peer alongside it still builds" log_has \
 # line.
 #
 # Which assertion pins which guard, measured one revert per run:
-#   encap_of  -> 1 2 3 4 5 6 fail
+#   encap_of  -> 1 2 3 5 6 fail
 #   log       -> 3 and 4 fail, and nothing else
+# 4 is log's alone: encap_of's failure mode ACCEPTS the mode, so nothing is
+# ever malformed, no second diagnostic follows, and no newline is lost.
 # 3 and 4 are NOT a redundant pair: 3 dies when the message tail is lost,
-# 4 when the newline is, and 4 does not depend on the wording or word
-# order of the message 3 greps for.  Keep both.  Assertion 2 belongs to
-# encap_of -- trimming it "because 2 and 3 both assert the diagnostic"
-# would leave log() pinned by 3 alone.
+# 4 when the newline is.  4 asserts the MECHANISM rather than a neighbour
+# -- a lost newline concatenates whatever is emitted next onto the
+# truncated line, so that line carries two "dimt-reconcile: " prefixes --
+# and so it dies regardless of 3's wording AND regardless of what follows.
+# It was previously anchored on the WARNING being the next emission, which
+# made it go INERT (silently pass) if any diagnostic was inserted between
+# the two, while the newline loss was still happening.  Ally caught that at
+# frr#117 review 5360486212; don't re-introduce an adjacency assumption.
+# Keep both.  Assertion 2 belongs to encap_of -- trimming it "because 2
+# and 3 both assert the diagnostic" would leave log() pinned by 3 alone.
 #
 # These fail only when the SCRIPT UNDER TEST runs under an interpreter
 # whose echo expands backslashes -- that is $RUN_SH, not the shell
@@ -1095,8 +1103,8 @@ check "h6f7: the mode is rejected, not silently accepted as gre" err_has \
 	"unknown encap mode"
 check "h6f7: the message survives the backslash intact" err_has \
 	"(expected gre or gre-in-fou)"
-check "h6f7: the GC warning keeps its own line" err_has \
-	"^dimt-reconcile: WARNING: registry contained invalid entries"
+check "h6f7: no diagnostic loses its newline" err_lacks \
+	"dimt-reconcile: .*dimt-reconcile: "
 check "h6f7: no device is derived from the escaped mode" \
 	log_lacks "ip link add dimt-0-48"
 check "h6f7: GC suppressed (invalid=1)" log_lacks "^ip link del dimt-9-9"
