@@ -581,8 +581,14 @@ static void main_dispatch_ldpe(struct event *event)
 	ssize_t			 n;
 	int			 shut = 0;
 
-	if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-		fatal("imsg_read error");
+	n = imsg_read(ibuf);
+	if (n == -1) {
+		/* peer closed with our data unread: same as EOF */
+		if (errno == ECONNRESET)
+			n = 0;
+		else if (errno != EAGAIN)
+			fatal("imsg_read error");
+	}
 
 	if (n == 0)	/* connection closed */
 		shut = 1;
@@ -644,8 +650,14 @@ static void main_dispatch_lde(struct event *event)
 	int		 shut = 0;
 	struct zapi_rlfa_response *rlfa_labels;
 
-	if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-		fatal("imsg_read error");
+	n = imsg_read(ibuf);
+	if (n == -1) {
+		/* peer closed with our data unread: same as EOF */
+		if (errno == ECONNRESET)
+			n = 0;
+		else if (errno != EAGAIN)
+			fatal("imsg_read error");
+	}
 
 	if (n == 0)	/* connection closed */
 		shut = 1;
@@ -744,8 +756,21 @@ void ldp_write_handler(struct event *event)
 	struct imsgbuf	*ibuf = &iev->ibuf;
 	ssize_t		 n;
 
-	if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-		fatal("msgbuf_write");
+	n = msgbuf_write(&ibuf->w);
+	if (n == -1) {
+		/*
+		 * The peer is gone (SIGPIPE is ignored).  Drop what is
+		 * queued and let the read handler see the close and
+		 * take the normal shutdown path.
+		 */
+		if (errno == EPIPE || errno == ECONNRESET) {
+			msgbuf_clear(&ibuf->w);
+			imsg_event_add(iev);
+			return;
+		}
+		if (errno != EAGAIN)
+			fatal("msgbuf_write");
+	}
 	if (n == 0) {
 		/* this pipe is dead, so remove the event handlers */
 		event_cancel(&iev->ev_read);
@@ -897,6 +922,7 @@ ldp_acl_request(struct imsgev *iev, char *acl_name, int af,
 {
 	struct imsg	 imsg;
 	struct acl_check acl_check;
+	ssize_t		 n;
 	int result;
 
 	if (acl_name[0] == '\0')
@@ -914,8 +940,17 @@ ldp_acl_request(struct imsgev *iev, char *acl_name, int af,
 	imsg_flush(&iev->ibuf);
 
 	/* receive (blocking) and parse result */
-	if (imsg_read(&iev->ibuf) == -1)
+	n = imsg_read(&iev->ibuf);
+	if (n == -1 && errno != ECONNRESET)
 		fatal("imsg_read error");
+
+	/*
+	 * The parent closes the sync pipe only when it exits, so a close
+	 * here means no reply is coming and this process is about to be
+	 * torn down.  Deny rather than read an imsg that was never received.
+	 */
+	if (n <= 0)
+		return FILTER_DENY;
 
 	if (imsg_get(&iev->ibuf, &imsg) == -1)
 		fatal("imsg_get");
