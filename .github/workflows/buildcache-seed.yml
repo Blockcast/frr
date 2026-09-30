@@ -4,30 +4,33 @@ name: buildcache-seed
 #
 # Why this is a separate workflow instead of a `cache-to` inside github-ci.yml
 # ---------------------------------------------------------------------------
-# github-ci.yml sets `cancel-in-progress: true` on a group keyed only on
-# `github.ref`, so every master push shares one lane and supersedes the previous
-# master run. When `cache-to` lived in that workflow, master runs were the only
-# cache writers *and* the most cancellable ones: measured over 44 master push
-# runs (2026-07-02 -> 2026-08-21), 23 were cancelled and 16 of those were
-# provably killed by the next master push, several within 2 seconds. A cancelled
-# run publishes no cache, so the tags went unwritten for stretches of 8-18 days
-# and every PR built cold. The busier master got, the more reliably the cache
-# stayed stale -- a self-sustaining trap, and a silent one, because a cancelled
-# run is not a red check.
+# github-ci.yml keys its concurrency group only on `github.ref`, so every
+# master push shares one lane. Until 2026-09-30 it also cancelled in progress
+# on master, so each push superseded the previous master run. When `cache-to`
+# lived in that workflow, master runs were the only cache writers *and* the
+# most cancellable ones: measured over 44 master push runs (2026-07-02 ->
+# 2026-08-21), 23 were cancelled and 16 of those were provably killed by the
+# next master push, several within 2 seconds. A cancelled run publishes no
+# cache, so the tags went unwritten for stretches of 8-18 days and every PR
+# built cold. The busier master got, the more reliably the cache stayed stale
+# -- a self-sustaining trap, and a silent one, because a cancelled run is not
+# a red check.
 #
-# The obvious one-line fix -- exempting master from cancellation -- was
-# measured and rejected: a full master github-ci run takes 6-11 hours wall
-# clock (the arc-e2e topotest lane dominates), and Build jobs already queue up
-# to 2.5 hours under pool contention. Making those uncancellable would let a
-# burst of back-to-back merges (3 pushes in 41s on 2026-08-10) pin three
-# multi-hour runs onto a capacity-capped pool at once -- the exact
-# oversubscription shape BLO-21606 moved this lane off arc-default to avoid.
+# Exempting master from cancellation was first rejected here on the belief
+# that a burst of back-to-back merges (3 pushes in 41s on 2026-08-10) would
+# pin three multi-hour runs onto the pool at once. That is not how a
+# concurrency group behaves: it holds one running and one pending run, and a
+# newer run replaces the pending one. github-ci.yml now does exempt master
+# (see its top-level `concurrency` comment), because cancellation left master
+# with no CI verdict at all. It still does not write the cache: a full master
+# github-ci run takes 6-11 hours wall clock (the arc-e2e topotest lane
+# dominates), which is too slow and too failure-prone a path to hang cache
+# freshness on.
 #
-# So instead: decouple cache freshness from push cadence entirely. This
-# workflow runs *only* the three Build legs (~12-28 min each, no unit tests, no
-# topotests, no arc-e2e) and is the one place `cache-to` lives. github-ci.yml
-# keeps `cancel-in-progress: true` for every ref and its runner savings, and
-# nothing it does can leave the cache stale.
+# So: decouple cache freshness from push cadence entirely. This workflow runs
+# *only* the three Build legs (~12-28 min each, no unit tests, no topotests,
+# no arc-e2e) and is the one place `cache-to` lives. Nothing github-ci.yml
+# does can leave the cache stale.
 #
 # `cancel-in-progress: false` here is the load-bearing line: a cache writer
 # must never be cancelled by a newer one. GitHub keeps at most one run queued

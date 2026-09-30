@@ -10,17 +10,45 @@ on:
       - 'rc/**'
       - 'ci/**'
 
-# Cancel older in-progress runs for the same ref to save runners.
+# Cancel older in-progress runs for the same ref to save runners, except on
+# master, where a run is left to finish.
 #
-# This applies to master too, and deliberately so: nothing in this workflow
-# writes the buildcache (see the `cache-from` comment on the Build job), so
-# cancelling a master run can no longer strand the cache. Do not add a
-# `cache-to` here to "make master useful" -- that is precisely the coupling
-# that kept the cache stale for 8-18 days at a stretch. Cache writes belong in
+# Master was cancellable too until 2026-09-30, and that meant master CI almost
+# never produced a verdict. Of the 32 github-ci push runs on master from
+# 2026-09-15 to 2026-09-30, 28 were cancelled by the next merge's run, 3
+# completed with a harness/infra failure (not a code failure, see BLO-36708),
+# 1 was still pending and 0 succeeded. With `default` queue waits of 10 h+ a
+# master run rarely outlives the gap to the next merge, so every head was
+# superseded before anyone learned whether it was green.
+#
+# With `cancel-in-progress` false, GitHub still keeps at most one running and
+# one pending run per concurrency group, and a new run replaces the PENDING
+# one, never the running one. A merge burst therefore collapses to "current
+# master run finishes, newest head runs next"; it cannot stack several
+# multi-hour master runs onto the pool. Intermediate heads are skipped: only
+# the newest pending head runs next.
+#
+# The cost is runner time spent finishing a master head that has already been
+# superseded: at most one superseded run per running master run, namely the
+# rest of a full run (6-11 h wall clock, arc-e2e dominating) whenever a merge
+# lands while a master run is executing and no newer head is already pending.
+# That run used to be cancelled at once. A merge that only replaces a pending
+# run costs nothing extra. At the current merge rate (about 2 a day) this
+# keeps roughly one master run in flight on `default` and arc-e2e almost all
+# the time, which adds to PR queue waits. A master verdict can also trail the
+# tip by about one run plus the queue wait; it belongs to the SHA it ran on,
+# not to the current tip.
+#
+# Pull requests and stable/**, rc/** and ci/** pushes keep cancelling, since
+# nobody needs the verdict of a superseded PR head.
+#
+# Nothing in this workflow writes the buildcache (see the `cache-from` comment
+# on the Build job). Do not add a `cache-to` here now that master runs finish:
+# a finished run is still hours behind the push, and cache writes belong in
 # buildcache-seed.yml, which is never cancelled.
 concurrency:
   group: github-ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 # Restrict default GITHUB_TOKEN to read-only repository contents.
 permissions:
@@ -328,14 +356,14 @@ jobs:
           # Harbor connectivity is intentionally required for heavy image builds.
           #
           # Read-only, on every ref including master. `cache-to` deliberately
-          # lives in buildcache-seed.yml instead, because this workflow sets
-          # `cancel-in-progress: true` on a group keyed only on `github.ref`:
-          # when master was the sole cache writer it was also the most
-          # cancellable run, so a second master push killed the write. Measured
-          # over 44 master push runs (2026-07-02 -> 2026-08-21), 23 were
-          # cancelled, 16 of them provably by the next master push. See
-          # buildcache-seed.yml for the full reasoning and why exempting master
-          # from cancellation was rejected instead.
+          # lives in buildcache-seed.yml instead, because this workflow used to
+          # set `cancel-in-progress: true` on master as well: when master was
+          # the sole cache writer it was also the most cancellable run, so a
+          # second master push killed the write. Measured over 44 master push
+          # runs (2026-07-02 -> 2026-08-21), 23 were cancelled, 16 of them
+          # provably by the next master push. Master runs now finish (see the
+          # top-level `concurrency` comment), but a 6-11 h run is still no way
+          # to keep a 72 h cache budget fresh. See buildcache-seed.yml.
           #
           # Keeping exactly one writer also avoids the concurrent-writer hazard
           # the matrix comment above records: two runs exporting to one
