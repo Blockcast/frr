@@ -66,13 +66,17 @@ def main():
     # vary one of them. Defaults match every other test in the module.
     parser.add_argument("--outer-local", default="192.0.2.1")
     parser.add_argument("--outer-remote", default="192.0.2.2")
+    # A client whose request is deliberately held in zebra's dataplane waits
+    # as long as the hold; the default only has to cover an ordinary round
+    # trip.
+    parser.add_argument("--timeout", type=float, default=10)
     args = parser.parse_args()
 
     session_id = 0xD1000000 | (os.getpid() & 0xFFFF)
     hello = struct.pack("!BHIB", ZEBRA_ROUTE_PIM, 0, session_id, 1)
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(10)
+        sock.settimeout(args.timeout)
         sock.connect(args.socket)
         sock.sendall(header(ZEBRA_HELLO, hello))
         if args.action == "add":
