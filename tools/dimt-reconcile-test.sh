@@ -1057,6 +1057,36 @@ check "h6f6: GC suppressed (invalid=1)" log_lacks "^ip link del dimt-9-9"
 check "h6f6: the valid peer alongside it still builds" log_has \
 	"^ip link add dimt-0-47 "
 
+# --- (h6f7) the MODE field is escape-proof under a POSIX echo ---------
+# h6f6 pins the peer token; the mode field reaches the same hazard by a
+# different route.  encap_of() and log() both use printf for this reason,
+# and neither had a failing mutation until now (Ally, frr#117 review at
+# c5533c16).  Reverting encap_of() to `echo "${1#*=}"` under dash turns
+# the spec "100.64.0.48=gre\c" into mode "gre", which matches the valid
+# `gre` arm -- a malformed mode is ACCEPTED and a netdev really built,
+# with the suite otherwise green.  Reverting log() instead leaves the
+# mode intact but truncates the message at the backslash, so the
+# operator is told the mode is "gre" -- a value that is not in their
+# file.  One case pins both: assertion 1 dies with encap_of, assertion 2
+# with log.  Both only fail under an interpreter whose echo expands
+# backslashes (dash/ash, not bash), so run the suite under both.
+new_state h6f7
+printf '100.64.0.47 gre\n100.64.0.48 gre\\c\n' > "$TESTDIR/peers-mode-esc"
+echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-mode-esc" 2>&1)
+rc=$?
+check "h6f7: a backslash-bearing mode exits nonzero" [ "$rc" -ne 0 ]
+check "h6f7: the mode is rejected, not silently accepted as gre" err_has \
+	"unknown encap mode"
+check "h6f7: the message survives the backslash intact" err_has \
+	"(expected gre or gre-in-fou)"
+check "h6f7: no device is derived from the escaped mode" \
+	log_lacks "ip link add dimt-0-48"
+check "h6f7: GC suppressed (invalid=1)" log_lacks "^ip link del dimt-9-9"
+check "h6f7: the valid peer alongside it still builds" log_has \
+	"^ip link add dimt-0-47 "
+
 # --- (h7) one overlay listed twice under conflicting modes -------------
 new_state h7
 printf '100.64.0.47 gre\n100.64.0.47 gre-in-fou\n' > "$TESTDIR/peers-conflict"
