@@ -922,6 +922,7 @@ ldp_acl_request(struct imsgev *iev, char *acl_name, int af,
 {
 	struct imsg	 imsg;
 	struct acl_check acl_check;
+	ssize_t		 n;
 	int result;
 
 	if (acl_name[0] == '\0')
@@ -939,8 +940,17 @@ ldp_acl_request(struct imsgev *iev, char *acl_name, int af,
 	imsg_flush(&iev->ibuf);
 
 	/* receive (blocking) and parse result */
-	if (imsg_read(&iev->ibuf) == -1)
+	n = imsg_read(&iev->ibuf);
+	if (n == -1 && errno != ECONNRESET)
 		fatal("imsg_read error");
+
+	/*
+	 * The parent closes the sync pipe only when it exits, so a close
+	 * here means no reply is coming and this process is about to be
+	 * torn down.  Deny rather than read an imsg that was never received.
+	 */
+	if (n <= 0)
+		return FILTER_DENY;
 
 	if (imsg_get(&iev->ibuf, &imsg) == -1)
 		fatal("imsg_get");
