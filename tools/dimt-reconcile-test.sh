@@ -291,8 +291,11 @@ err_mode_greps_file() {
 # err_mode_greps_file is ALSO false when nothing was extracted, so
 # "not err_mode_greps_file" passed VACUOUSLY under any mutation that emits no
 # message at all -- asserting nothing about the file at the one moment it
-# mattered.  Measured: revert the awk field joiner (which suppresses the
-# message) and the old form leaves h6b at 7 red, this one at 8.
+# mattered.  Measured on BOTH mutations that suppress the message, so both
+# table rows moved by one: reverting the awk field joiner goes 7 -> 8 red, and
+# removing the "*=*" arm goes 4 -> 5 (it falls through to the unknown-mode
+# arm, whose wording err_mode cannot parse, so nothing is extracted).  The new
+# red is this assertion in each case.
 # The [ -n "$_m" ] is the explicit precondition, mirroring the positive helper;
 # on THIS fixture dropping it still fails closed, because grep -F with an empty
 # pattern matches every line of a non-empty file.  It is not load-bearing here,
@@ -794,11 +797,14 @@ check "h6b: not mistaken for a valid gre peer" log_lacks "^ip link add dimt-0-47
 # mode greps their file; here peers() synthesised it from a field separator,
 # so it does not -- $peer is the grep key, exactly as the script says at
 # dimt-reconcile.sh:710-711.  Pinning both directions is what makes the
-# distinction deliberate: truncating the mode at the first "=" reddens this
-# pair while h6b3's grep-key assertion stays green, because the shortened mode
-# ("gre") still greps an "="-typed file.  h6b3 alone cannot see a message that
-# DROPS information; only this fixture can.  (A mutation that rewrites the "="
-# back to a space is NOT the discriminating one -- it reddens h6b3 too.)
+# distinction deliberate, and each direction has its own mutation rather than
+# a shared one: truncating the mode at the first "=" reddens "the echoed mode
+# is NOT one" while h6b3's grep-key assertion stays green, because the
+# shortened mode ("gre") still greps an "="-typed file -- h6b3 alone cannot
+# see a message that DROPS information, only this fixture can.  Dropping $peer
+# from the message reddens "the peer address is the grep key" and nothing
+# else.  (A mutation that rewrites the "=" back to a space is NOT the
+# discriminating one -- it reddens h6b3 too.)
 check "h6b: the peer address is the grep key for the line" \
 	err_peer_greps_file "$TESTDIR/peers-junk"
 check "h6b: the echoed mode is NOT one (its = is synthesised)" \
