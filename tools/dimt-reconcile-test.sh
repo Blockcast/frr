@@ -982,6 +982,26 @@ check "h6f4: a bare 0 octet builds" log_has \
 	"^ip link add dimt-0-0 type gre local 100.64.0.40 remote 100.64.0.0 "
 check "h6f4: nothing was called invalid" err_lacks "ignoring invalid peer entry"
 
+# --- (h6f4b) negative control for the SAME alternation ----------------
+# h6f4 pins only the build direction, and h6f's 999 is caught by every
+# plausible typo.  256 is the tight boundary: measured, 25[0-5] ->
+# 25[0-9] (or 2[0-4][0-9] -> 2[0-5][0-9]) builds dimt-256-20 with inner
+# 10.99.256.20 -- the exact defect this PR fixes -- and the whole suite
+# still passes.  One character, no failing assertion.
+# The disposition itself (GC suppressed, sibling still builds) is
+# class-invariant and already pinned by h6f/h6f2; this block only pins
+# the range arms.
+new_state h6f4b
+printf '100.64.0.47 gre\n100.64.256.20 gre\n' > "$TESTDIR/peers-256"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers-file "$TESTDIR/peers-256" 2>&1)
+rc=$?
+check "h6f4b: octet 256 exits nonzero" [ "$rc" -ne 0 ]
+check "h6f4b: the 256 entry is named" err_has \
+	"ignoring invalid peer entry '100.64.256.20'"
+check "h6f4b: no device is derived from octet 256" \
+	log_lacks "^ip link add dimt-256-20"
+
 # --- (h6f5) --self is the FOURTH address consumer --------------------
 # It was only checked non-empty, then flowed into inner_of/inner6_of and
 # the local endpoint.  It also decides the self-skip, which is a TEXTUAL
@@ -1293,8 +1313,10 @@ fi
 # "all tests passed" at 226 as at 233.  This whole PR is about guards
 # going inert while the run reports success, so the harness gets the
 # same treatment.  Raise the floor when you add assertions.
-if [ "$RAN" -lt 234 ]; then
-	echo "FAIL: assertion count fell to $RAN (floor 234) -- a block was deleted"
+# The floor EQUALS the live count on purpose -- no slack, so a
+# deletion is caught the same run it happens.  Do not relax -lt.
+if [ "$RAN" -lt 237 ]; then
+	echo "FAIL: assertion count fell to $RAN (floor 237) -- a block was deleted"
 	exit 1
 fi
 echo "all tests passed ($RAN assertions)"
