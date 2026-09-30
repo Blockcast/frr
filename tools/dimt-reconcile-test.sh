@@ -1122,12 +1122,18 @@ check "h6f7: the valid peer alongside it still builds" log_has \
 # every peer after the bad token vanishes silently.  Nothing is
 # malformed, so invalid is never set, so GC is NOT suppressed -- and the
 # live tunnel of a peer that IS in the registry is reaped on a run that
-# exits 0.  That is exactly the outcome the DISPOSITION comment at
-# dimt-reconcile.sh:719-731 says the design exists to prevent, reached by
-# the one path that bypasses the gate rather than failing it; the
-# build-loop reject path cannot help, because the entry never arrives.
-# Assertion 3 is the one that dies for that reason -- keep it even if the
-# others look redundant.  Interpreter caveat is h6f6's: this only fails
+# exits 0.  That is exactly the outcome the DISPOSITION comment in
+# dimt-reconcile.sh's build loop says the design exists to prevent,
+# reached by the one path that bypasses the gate rather than failing it;
+# the build-loop reject path cannot help, because the entry never
+# arrives.  Assertion 3 is what demonstrates the reap under THIS
+# mutation -- but do not read that as trimming advice.  Assertions 1, 3
+# and 4 all go vacuous on any path that refuses BEFORE the build loop
+# (measured: drop the [ -z "$PEERS_INLINE" ] short-circuit in
+# reconcile()'s missing-registry refusal as well, and 1/3/4 go inert
+# together while 2 is the sole survivor).  2 is the only one asserting
+# positive evidence, so it is the one to keep if anything is cut.
+# Interpreter caveat is h6f6's: this only fails
 # when $RUN_SH's echo expands backslashes (dash/ash, not bash).
 new_state h6f8
 echo "dimt-0-48 100.64.0.40 100.64.0.48 gre" >> "$FAKEIP_DIR/links"

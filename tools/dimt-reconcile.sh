@@ -201,8 +201,9 @@ fi
 # whose `case "$1" in *[!0-9.]*) return 1` leaves no backslash for a
 # POSIX echo to expand -- so reverting their printf to echo is a
 # survivable mutation BY CONSTRUCTION, not a coverage hole.  Don't try
-# to pin them.  peers() at :239 is the exception and the only one worth
-# pinning: it sees raw --peers argv before the gate does (h6f8).
+# to pin them.  The printf in peers() is the exception and the only one
+# worth pinning: it sees raw --peers argv before the gate does (h6f8).
+
 # 10.99.<oct3>.<oct4> of an overlay IPv4 (unique while the fleet lives in
 # one overlay /16; revisit before that stops being true).
 inner_of() {
