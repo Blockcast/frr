@@ -233,8 +233,9 @@ PATH="$BIN:$PATH"
 export PATH
 
 FAILS=0
-ok() { echo "ok $*"; }
-fail() { echo "FAIL $*"; FAILS=$((FAILS + 1)); }
+RAN=0
+ok() { RAN=$((RAN + 1)); echo "ok $*"; }
+fail() { RAN=$((RAN + 1)); echo "FAIL $*"; FAILS=$((FAILS + 1)); }
 check() { # <desc> <cmd...>
 	desc="$1"; shift
 	if "$@"; then ok "$desc"; else fail "$desc"; fi
@@ -1052,7 +1053,7 @@ check "h6f6: a backslash-bearing token exits nonzero" [ "$rc" -ne 0 ]
 check "h6f6: the escaped entry is named" err_has \
 	"ignoring invalid peer entry"
 check "h6f6: no device is derived from the escaped token" \
-	log_lacks "ip link add dimt-0-4[^7]"
+	log_lacks "ip link add dimt-0-4[^0-9]"
 check "h6f6: GC suppressed (invalid=1)" log_lacks "^ip link del dimt-9-9"
 check "h6f6: the valid peer alongside it still builds" log_has \
 	"^ip link add dimt-0-47 "
@@ -1270,5 +1271,13 @@ if [ "$FAILS" -gt 0 ]; then
 	echo "$FAILS test(s) FAILED"
 	exit 1
 fi
-echo "all tests passed"
+# A deleted block is otherwise invisible: the suite prints the same
+# "all tests passed" at 226 as at 233.  This whole PR is about guards
+# going inert while the run reports success, so the harness gets the
+# same treatment.  Raise the floor when you add assertions.
+if [ "$RAN" -lt 233 ]; then
+	echo "FAIL: assertion count fell to $RAN (floor 233) -- a block was deleted"
+	exit 1
+fi
+echo "all tests passed ($RAN assertions)"
 exit 0

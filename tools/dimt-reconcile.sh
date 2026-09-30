@@ -197,12 +197,25 @@ if [ "$MTU" -lt 1280 ]; then
 		"the kernel disables IPv6 on the tunnels (v4-only)"
 fi
 
-# Every helper below takes a value that has ALREADY cleared is_quad,
-# whose `case "$1" in *[!0-9.]*) return 1` leaves no backslash for a
-# POSIX echo to expand -- so reverting their printf to echo is a
-# survivable mutation BY CONSTRUCTION, not a coverage hole.  Don't try
-# to pin them.  The printf in peers() is the exception and the only one
-# worth pinning: it sees raw --peers argv before the gate does (h6f8).
+# Two classes of helper in this file, and what separates them is which
+# side of the is_quad gate their input arrives from -- NOT where they
+# sit relative to this comment.
+#
+# inner_of/inner6_of/dev_of/endpoint_of take a value that has ALREADY
+# cleared is_quad, whose `case "$1" in *[!0-9.]*) return 1` leaves no
+# backslash for a POSIX echo to expand.  Reverting their printf to echo
+# is survivable BY CONSTRUCTION, not a coverage hole, so don't try to
+# pin them: all four reverted together is 0 failures.
+#
+# Four others see PRE-GATE text and ARE pinned, deliberately.  Revert
+# one printf to echo and the suite reports, one revert per run:
+#   peers()       raw --peers argv            -> h6f8 1 2 3 4
+#   overlay_of()  raw spec; both peer loops   -> h6f6 x4, h6f8 x3
+#   encap_of()    call it BEFORE their own    -> h6f7 1 2 3 5 6
+#                 `is_quad "$peer"` gate
+#   log()         arbitrary message text      -> h6f7 3 and 4
+# log() is defined above this comment, not below it; it is in the list
+# because the exception set is a property of the inputs, not the layout.
 
 # 10.99.<oct3>.<oct4> of an overlay IPv4 (unique while the fleet lives in
 # one overlay /16; revisit before that stops being true).
