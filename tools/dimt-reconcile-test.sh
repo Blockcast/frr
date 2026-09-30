@@ -366,16 +366,27 @@ check "a4: invalid endpoint cannot mutate FRR" \
 
 # a4b: validate_endpoints() now shares is_quad() with the peer gate
 # instead of carrying its own shape+range pair, so it inherits the
-# leading-zero rejection.  Refusing here is strictly the safe direction:
-# validate_endpoints returns before any delete, and `ip` would reject
-# 010.0.2.47 downstream anyway (inet_pton has no octal).
+# leading-zero rejection.  Note the DISPOSITION differs from the peer
+# gate's on purpose: validate_endpoints returns on the FIRST bad entry
+# (:313) and its caller aborts the run (:658), so one malformed
+# endpoint blocks every OTHER peer too -- unlike a malformed peer,
+# which is per-entry (invalid=1, siblings still build; :739-751).
+# That is the safe direction for DESTRUCTIVENESS -- it returns before
+# any delete, and `ip` would reject 010.0.2.47 downstream anyway
+# (inet_pton has no octal) -- but it is not free: it trades a
+# partial-success run for a total no-op.  Measured at this head with
+# the 100.64.0.48 row below: rc=1 and ip.log is EMPTY (0 invocations),
+# where the pre-fix shape+awk pair gave rc=0 and built both tunnels.
+# The third assertion below pins that blast radius so the trade stays
+# visible; without a valid peer in the fixture it would be untestable.
 new_state a4b
 cat > "$TESTDIR/underlay-leading-zero" <<'EOF'
 100.64.0.40 192.0.2.1
 100.64.0.47 010.0.2.47
+100.64.0.48 192.0.2.48
 EOF
 echo "dimt-0-47 192.0.2.1 192.0.2.2 gre" >> "$FAKEIP_DIR/links"
-err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47 \
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 --peers 100.64.0.47,100.64.0.48 \
 	--peers-file "$TESTDIR/no-such-file" \
 	--endpoints-file "$TESTDIR/underlay-leading-zero" 2>&1)
 rc=$?
@@ -384,6 +395,13 @@ check "a4b: leading-zero endpoint is named" err_has \
 	"invalid managed underlay endpoint '010.0.2.47'"
 check "a4b: it refuses before touching the live tunnel" \
 	log_lacks "^ip link del dimt-0-47$"
+# 100.64.0.48 is a wholly valid peer with a valid endpoint.  It still
+# does not build: the refusal is run-wide, not per-entry.  This is the
+# assertion every sibling malformed-entry block carries (h6f :912,
+# h6f3 :947, h6f6 :1058, h6f7 :1112, h6d :820) -- with the sign
+# flipped, because here the survivor does NOT survive.
+check "a4b: the valid peer alongside it does NOT build (run-wide refusal)" \
+	log_lacks "^ip link add dimt-0-48[^0-9]"
 
 # --- (b) missing peers file refuses ----------------------------------
 new_state b
@@ -1275,8 +1293,8 @@ fi
 # "all tests passed" at 226 as at 233.  This whole PR is about guards
 # going inert while the run reports success, so the harness gets the
 # same treatment.  Raise the floor when you add assertions.
-if [ "$RAN" -lt 233 ]; then
-	echo "FAIL: assertion count fell to $RAN (floor 233) -- a block was deleted"
+if [ "$RAN" -lt 234 ]; then
+	echo "FAIL: assertion count fell to $RAN (floor 234) -- a block was deleted"
 	exit 1
 fi
 echo "all tests passed ($RAN assertions)"
