@@ -120,7 +120,37 @@ ALLOW_EMPTY="${DIMT_ALLOW_EMPTY:-0}"
 VTYSH_WARNED=0
 VTYSH6_WARNED=0
 
-log() { echo "dimt-reconcile: $*" >&2; }
+log() { printf '%s\n' "dimt-reconcile: $*" >&2; }
+
+# The build loop's dotted-quad gate, shared with the capability pre-scan
+# in reconcile() AND with validate_endpoints() so the three can never
+# disagree about which addresses are buildable.
+#
+# A real dotted quad, not just the shape: this used to be
+# '([0-9]{1,3}\.){3}[0-9]{1,3}', which passed 999.999.999.999 through to
+# dev dimt-999-999 and inner addresses 10.99.999.999/32 -- rejected by
+# `ip`, so it failed loudly downstream rather than silently.  Two reasons
+# the shape check is not enough:
+#   - an octet > 255 is a mangled line, and dev_of() reads octets 3-4, so
+#     the device we derive is not the device the operator meant;
+#   - a leading zero ALIASES: 10.99.010.20 and 10.99.10.20 are the same
+#     address but derive dimt-010-20 and dimt-10-20, i.e. two netdevs
+#     fighting over one peer (and 010 is octal to inet_aton besides).
+# [1-9]?[0-9] is what forbids the leading zero while still admitting 0.
+# Every arm of the alternation has a failing mutation in the test suite
+# -- widen one and h6f/h6f2/h6f4b catch it, narrow one and h6f4 catches
+# it -- so a tightening typo here fails the suite rather than silently
+# building, or silently refusing, a peer.  Keep it that way: an arm with
+# no failing mutation is a comment, not a guard.
+is_quad() {
+	# grep -Eq is LINE-oriented, so the anchors alone accept an embedded
+	# newline (they match the first line and grep -q succeeds on any
+	# matching line).  A quad is digits and dots, so rejecting anything
+	# else first closes that hole and every other embedded-junk one.
+	case "$1" in *[!0-9.]*) return 1 ;; esac
+	printf '%s\n' "$1" | grep -Eq \
+		'^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
+}
 
 run() {
 	if [ "$DRY" = 1 ]; then
@@ -159,15 +189,43 @@ done
 
 [ -n "$SELF" ] || { log "--self <overlay-ipv4> is required"; exit 1; }
 
+# --self is the fourth address consumer and was the one left outside the
+# gate: it was only checked non-empty, then flowed into inner_of/inner6_of
+# ("10.99.<o3>.<o4>") and the local endpoint.  It also decides the
+# self-skip, which is a TEXTUAL compare against each peer, so an
+# unvalidated --self 100.64.010.40 would not match a peers-file
+# 100.64.10.40 and the box would build a tunnel to itself.
+is_quad "$SELF" || { log "--self must be a dotted quad: '$SELF'"; exit 1; }
+
 if [ "$MTU" -lt 1280 ]; then
 	log "WARNING: MTU $MTU is below the IPv6 minimum of 1280;" \
 		"the kernel disables IPv6 on the tunnels (v4-only)"
 fi
 
+# Two classes of helper in this file, and what separates them is which
+# side of the is_quad gate their input arrives from -- NOT where they
+# sit relative to this comment.
+#
+# inner_of/inner6_of/dev_of/endpoint_of take a value that has ALREADY
+# cleared is_quad, whose `case "$1" in *[!0-9.]*) return 1` leaves no
+# backslash for a POSIX echo to expand.  Reverting their printf to echo
+# is survivable BY CONSTRUCTION, not a coverage hole, so don't try to
+# pin them: all four reverted together is 0 failures.
+#
+# Four others see PRE-GATE text and ARE pinned, deliberately.  Revert
+# one printf to echo and the suite reports, one revert per run:
+#   peers()       raw --peers argv            -> h6f8 1 2 3 4
+#   overlay_of()  raw spec; both peer loops   -> h6f6 x4, h6f8 x3
+#   encap_of()    call it BEFORE their own    -> h6f7 1 2 3 5 6
+#                 `is_quad "$peer"` gate
+#   log()         arbitrary message text      -> h6f7 3 and 4
+# log() is defined above this comment, not below it; it is in the list
+# because the exception set is a property of the inputs, not the layout.
+
 # 10.99.<oct3>.<oct4> of an overlay IPv4 (unique while the fleet lives in
 # one overlay /16; revisit before that stops being true).
 inner_of() {
-	echo "$1" | awk -F. '{ printf "10.99.%s.%s", $3, $4 }'
+	printf '%s\n' "$1" | awk -F. '{ printf "10.99.%s.%s", $3, $4 }'
 }
 
 # fd99::<oct3>:<oct4>, the decimal octets written as literal groups
@@ -176,7 +234,7 @@ inner_of() {
 # exists-check below would never match and every cycle would churn:
 # a zero oct3 collapses (fd99::0:47 is shown as fd99::47).
 inner6_of() {
-	echo "$1" | awk -F. '{
+	printf '%s\n' "$1" | awk -F. '{
 		if ($3 == 0 && $4 == 0) printf "fd99::"
 		else if ($3 == 0)       printf "fd99::%s", $4
 		else                    printf "fd99::%s:%s", $3, $4
@@ -186,7 +244,7 @@ inner6_of() {
 # Interface name from the overlay address: dimt-<oct3>-<oct4> (fits
 # IFNAMSIZ for any dotted quad).
 dev_of() {
-	echo "$1" | awk -F. '{ printf "dimt-%s-%s", $3, $4 }'
+	printf '%s\n' "$1" | awk -F. '{ printf "dimt-%s-%s", $3, $4 }'
 }
 
 # Emits one whitespace-free "<overlay>[=<mode>]" spec per desired peer,
@@ -203,7 +261,7 @@ dev_of() {
 # no diagnostic -- nothing is built for self either way.
 peers() {
 	{
-		[ -n "$PEERS_INLINE" ] && echo "$PEERS_INLINE" | tr ',' '\n'
+		[ -n "$PEERS_INLINE" ] && printf '%s\n' "$PEERS_INLINE" | tr ',' '\n'
 		[ -r "$PEERS_FILE" ] && sed 's/#.*//' "$PEERS_FILE"
 	} | tr -d '\r' |
 		awk 'NF { spec = $1
@@ -211,19 +269,14 @@ peers() {
 			print spec }' | sort -u
 }
 
-overlay_of() { echo "${1%%=*}"; }
-
-# The build loop's dotted-quad gate, shared with the capability pre-scan
-# in reconcile() so the two can never disagree about which entries are
-# buildable.
-is_quad() { echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
+overlay_of() { printf '%s\n' "${1%%=*}"; }
 
 # Absent second column means gre-in-fou: every registry written before
 # this knob existed describes GRE-in-FOU peers.
 encap_of() {
 	case "$1" in
-	*=*) echo "${1#*=}" ;;
-	*) echo "gre-in-fou" ;;
+	*=*) printf '%s\n' "${1#*=}" ;;
+	*) printf '%s\n' "gre-in-fou" ;;
 	esac
 }
 
@@ -232,7 +285,7 @@ encap_of() {
 # transport changes must not alter the UMH resolution key.
 endpoint_of() {
 	if [ -z "$ENDPOINTS_FILE" ]; then
-		echo "$1"
+		printf '%s\n' "$1"
 		return 0
 	fi
 	awk -v overlay="$1" '
@@ -262,11 +315,7 @@ validate_endpoints() { # <peer-spec-list>
 			log "ERROR: no managed underlay endpoint for overlay $overlay; refusing cutover"
 			return 1
 		}
-		if ! echo "$endpoint" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' ||
-			! echo "$endpoint" | awk -F. '{
-				for (i = 1; i <= 4; i++)
-					if ($i < 0 || $i > 255) exit 1
-			}'; then
+		if ! is_quad "$endpoint"; then
 			log "ERROR: invalid managed underlay endpoint '$endpoint' for overlay $overlay; refusing cutover"
 			return 1
 		fi
@@ -692,6 +741,19 @@ reconcile() {
 		peer=$(overlay_of "$spec")
 		mode=$(encap_of "$spec")
 		[ "$peer" = "$SELF" ] && continue
+		# DISPOSITION, decided rather than fallen into: an out-of-range
+		# or leading-zero octet is a MALFORMED ENTRY (invalid=1, GC
+		# suppressed run-wide), not a skip-with-rc=1 like the device
+		# collision below.  The two look alike and are not:
+		#   - the collision branch can leave GC running because the
+		#     WINNING peer has already put the contested device in
+		#     want, so gc_stale cannot reap it (pinned by h6e);
+		#   - here there is no winner.  A mangled octet is most often a
+		#     typo of a real peer, and dev_of() reads octets 3-4, so the
+		#     device we would derive is not the one the operator meant.
+		#     The peer's real device is in nobody's want and GC would
+		#     delete a live tunnel.  Same reasoning as the GC gate's own
+		#     comment below -- kept identical on purpose.
 		if ! is_quad "$peer"; then
 			log "ignoring invalid peer entry '$peer'"
 			invalid=1
