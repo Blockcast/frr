@@ -58,7 +58,29 @@ permissions:
 jobs:
   selftest:
     name: Rerun coverage guard self-test
-    runs-on: default
+    # arc-light, not `default`: checkout plus test_*.py suites that
+    # review-gate-selftest.yml already runs there (its discover pattern
+    # covers both below).  On 2026-09-28 this job queued 1.3-2.3 h on
+    # `default` (runs 36441104995, 36464895267, 36423351119; jobs API
+    # created_at to started_at) and review-gate-selftest at most 2.6 min on
+    # arc-light for the same three commits.
+    runs-on: arc-light
+    # A template roll of arc-light takes no new jobs until every pending or
+    # running one finishes (ARC updateStrategy eventual, onprem-k8s
+    # arc/controller-values.yaml), so at the 360-minute default one hung job
+    # could hold the lane, and the required Ally review gate on it, for up
+    # to 6 h.  3 is the lane's sizing rule (onprem-k8s
+    # arc/arc-light-values.yaml) on its floor term alone, as cadvisor cannot
+    # measure W95 for so short-lived a pod: ceil(6 * 27 / 60), with T_best
+    # taken from arc-light runs only, as on hosted-runner-policy's enforce.
+    # This job has none yet, so it comes from review-gate-selftest, whose
+    # discover covers it (27 s: run 36480429392, the fastest of its twelve
+    # successful runs on 2026-09-28/29, all on arc-light, range 27-129 s).
+    # The slowest, 129 s, spent 88 s in the depth-1 fetch, network time the
+    # rule's CPU term does not model, and leaves 51 s under the cap: if a
+    # healthy run is ever killed here, re-size against the rule rather
+    # than bumping the cap.
+    timeout-minutes: 3
     steps:
       - name: Checkout
         uses: actions/checkout@v5

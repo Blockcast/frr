@@ -72,13 +72,18 @@ jobs:
     # 4.6-10.7 h in runs 36495098055, 36551077943 and 36464895185
     # (2026-09-28/29).
     #
-    # arc-light runs the same runner image (onprem-k8s pins one digest in
-    # arc/arc-{light,default}-values.yaml).  Keep it that way: actions/cache
-    # folds the compression it picks (zstd if the image has it, else gzip)
-    # into an entry's version, so an image that differed there would save a
-    # MIB entry that Build, on `default`, cannot restore.  push and
-    # workflow_dispatch stay on `default`: they do the full-history checkout
-    # below (2.48 min at the median), not seconds of work.
+    # push and workflow_dispatch stay on `default`: they do the full-history
+    # checkout below (2.48 min at the median), not seconds of work.  Both
+    # pools are pinned to one runner image digest (onprem-k8s
+    # arc/runner-image-pins.rb holds every ARC pool's pin to
+    # arc/arc-runner-image.txt).  actions/cache folds the compression it
+    # picks (zstd if the image has it, else gzip) into an entry's version,
+    # so were the two images ever to differ on zstd, Build, on `default`,
+    # could not restore an entry this job saved on arc-light.  It would fall
+    # back to its own version's entry on the base or default branch, which
+    # only those push and workflow_dispatch runs save: the likely cost is a
+    # miss here and the nine fetches once per pull request, not a broken
+    # Build.
     runs-on: ${{ github.event_name == 'pull_request' && 'arc-light' || 'default' }}
     name: Documentation path filter
     # The folded MIB population's budget (Prepare-MIB-Cache's 20).
@@ -467,18 +472,41 @@ jobs:
     # ~20%, matching the observed 3-success/7-cancelled rate.
     #
     # Replacing that artifact round-trip with a registry pull (below) is what
-    # makes a finite cap meaningful again. 16 (bounded inner work) + 14 (pull
-    # budget) = 30. The pull budget is a ceiling, not a measurement -- there is
-    # no pull-time data for this lane yet, by construction. Re-derive it from
-    # the "Fetch docker image" step across the first 5 post-merge runs and
-    # tighten; if pulls land where the buildcache reads do, this should come
-    # down a lot.
+    # makes a finite cap meaningful again. 16 (bounded inner work) + 8 (pull
+    # budget) = 24.
+    #
+    # The 14-min pull budget that first stood here was a ceiling, not a
+    # measurement, and said so.  Re-derived 2026-09-28 (BLO-34778 AC3) over
+    # every "Fetch docker image" step that completed on a post-merge master
+    # run -- 11 legs across runs 35535415701 / 36101674598 / 36212578845 /
+    # 36278687998 / 36343914099 / 36423351163:
+    #
+    #   Fetch docker image   p50 3.9 min   p100 5.2 min  (120..312 s, n=11)
+    #   Run unit tests       p50 2.5 min   p100 3.2 min  -- never near its 15m
+    #   whole job            p50 7.3 min   p100 8.6 min
+    #
+    # 8 min is 1.54x the measured p100, so the cap stays satisfiable if pulls
+    # degrade the way GHA artifact throughput did (3.4 -> 0.96 MiB/s over four
+    # days, which is what killed the old 20).  Unlike then, a pull that does
+    # blow the budget is now visible: the 3-attempt loop below fails loudly and
+    # CI-Verdict (`needs: Unit-Test`) goes red, instead of the lane reporting
+    # `cancelled` and nobody looking.  Excluded from the sample: the 22.04 leg
+    # of 36278687998, killed at 40 s by "The runner has received a shutdown
+    # signal" -- an ARC eviction (BLO-25404), not a pull-time datum.
     #
     # Note this is NOT the `Test` lane's "just raise the cap" move, which was
     # tried and regressed inside 16 days: there the suite itself is unbounded
     # and grew past any cap. Here the suite is capped from the inside and the
     # variance term is being deleted rather than budgeted for.
-    timeout-minutes: 30
+    #
+    # This job is deliberately NOT a required check (BLO-34778 AC4).  A matrix
+    # leg is the wrong context to require -- it is skipped on doc-only runs,
+    # and a skipped required context wedges merge.  CI-Verdict is the context
+    # to require when the time comes: it already consumes this job through
+    # `needs`, and topotest_verdict.py already encodes which skips are legal.
+    # Requiring it today would gate every merge on the `Test` pair, which is
+    # still cap-killing (BLO-29817) under runner starvation (BLO-25404).
+    timeout-minutes: 24
     env:
       UNIT_TEST_CONTAINER: frr-${{ matrix.cfg.platform }}-unit-${{ github.run_id }}-${{ github.run_attempt }}
       UNIT_TEST_IMAGE: registry.blockcast.net/cache/frr-ci:img-${{ github.sha }}-${{ matrix.cfg.platform }}
@@ -1156,7 +1184,8 @@ jobs:
             exit 1
           fi
           if ! python3 .github/scripts/verify_rerun_coverage.py \
-                 --expected /tmp/rerun-expected.txt --results "${rerun_xml}"; then
+                 --expected /tmp/rerun-expected.txt --results "${rerun_xml}" \
+                 --parallel-results "${RUNNER_TEMP}/parallel.xml"; then
             exit 1
           fi
 

@@ -26,7 +26,8 @@
 #                build=false for; re-checked here so a drift in that step
 #                cannot exempt anything else).  NOT `build != 'true'`: a
 #                filter job that failed, was cancelled, or lost its runner
-#                (arc-default pods are preemptible; one was preempted in run
+#                (arc-light and arc-default runner pods alike are
+#                preemptible; an arc-default one was preempted in run
 #                35776450503) before writing outputs leaves them empty,
 #                Build/Test are then skipped, and an inequality test would
 #                pass a run that built and tested nothing.  And NOT non_doc

@@ -29,7 +29,36 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DEFAULT_ALLY_LOGINS = ["allyblockcast[bot]", "app/allyblockcast", "allyblockcast"]
+# The App seat's spellings. The bare `allyblockcast` User seat is deliberately
+# absent -- it is an author credential, not a reviewer; see
+# DEFAULT_AUTHOR_ONLY_LOGINS.
+#
+# Ally EVIDENCE is still read across every spelling of these identities
+# (login_matches_any), so the App's normalized bare login (`allyblockcast`,
+# type Bot) is still the App, and the User seat's machine-readable blocking
+# findings still fail closed on every PR. Positive evidence was already
+# App-seat-only (type Bot). What the split removes is every TRUST grant: the
+# seat can no longer be a distinct reviewer, bind an override, or author a
+# deferral (BLO-18926/BLO-18965). One consequence is deliberate: on a PR the
+# App authored, the seat's bare formal CHANGES_REQUESTED is a self-review
+# signal like any other, so it no longer vetoes -- only its body findings do.
+# (Production-neutral ON THIS REPO ONLY: the seat holds `read` on Blockcast/frr,
+# so that veto never bound here. This file exists in divergent copies across
+# the gate repos, and the premise is per-repo: as of 2026-09-26 the seat holds
+# `write` on Blockcast/onprem-k8s, where its veto DOES bind and this change
+# would remove a live merge control. Re-verify the seat's permission --
+# `gh api repos/<owner>/<repo>/collaborators/allyblockcast/permission` --
+# before porting this there or anywhere else.)
+DEFAULT_ALLY_LOGINS = ["allyblockcast[bot]", "app/allyblockcast"]
+
+# Identities that act on PRs but are never reviewers. This list, not the Ally
+# list, is what demotes the seat: every Ally-membership test uses
+# login_matches_any, under which the bare seat is a spelling of
+# `allyblockcast[bot]`, so leaving it out of DEFAULT_ALLY_LOGINS is cosmetic.
+# Naming it here is what strips its distinct-reviewer standing and its
+# override and deferral trust. Matched with login_matches_any, never a raw
+# compare: this list WITHHOLDS trust, and GitHub logins are case-insensitive.
+DEFAULT_AUTHOR_ONLY_LOGINS = ["allyblockcast"]
 
 # author_association on a review is computed relative to the *requesting
 # token's* visibility of org membership, not the reviewer's actual repo
@@ -849,7 +878,6 @@ def ally_finding_artifacts(reviews, comments, ally_logins):
     where the finding was first raised and keeps covering it across every later
     head Ally carries it forward to.
     """
-    ally = set(ally_logins)
     artifacts = []
     for review in reviews or []:
         user = review.get("user") or {}
@@ -858,7 +886,7 @@ def ally_finding_artifacts(reviews, comments, ally_logins):
         attested = parse_reviewed_head(body)
         if (
             isinstance(login, str)
-            and login_matches_any(login, ally)
+            and login_matches_any(login, ally_logins)
             # An APPROVED artifact can still carry blocking findings; the
             # review signal path fails closed on those findings before it
             # considers the approval state. It must therefore mint the same
@@ -874,7 +902,7 @@ def ally_finding_artifacts(reviews, comments, ally_logins):
         attested = parse_reviewed_head(body)
         if (
             isinstance(login, str)
-            and login_matches_any(login, ally)
+            and login_matches_any(login, ally_logins)
             and attested is not None
             and (
                 is_consolidated_ally_comment_for_head(body, attested)
@@ -1054,6 +1082,7 @@ def trusted_deferrals(
     collaborator_permissions,
     finding_visibility,
     pr_author_login=None,
+    author_only_logins=DEFAULT_AUTHOR_ONLY_LOGINS,
 ):
     """Trust-filter the raw deferral records.
 
@@ -1100,6 +1129,11 @@ def trusted_deferrals(
             continue
         if login_matches_any(author, ally_logins):
             continue
+        # An author credential defers nothing, for the same reason no Ally
+        # seat may: named separately so the refusal does not depend on the
+        # credential happening to be a spelling of a configured Ally login.
+        if login_matches_any(author, author_only_logins):
+            continue
         if pr_author_login is not None and login_matches_any(author, [pr_author_login]):
             continue
         held = (collaborator_permissions or {}).get(author)
@@ -1145,7 +1179,6 @@ def deferral_candidate_logins(comments):
 
 def qualifying_ally_bodies_for_head(reviews, comments, head_sha, ally_logins):
     """Ally bodies whose own attestation names THIS head."""
-    ally = set(ally_logins)
     normalized = str(head_sha or "").lower()
     bodies = []
     for review in reviews or []:
@@ -1154,7 +1187,7 @@ def qualifying_ally_bodies_for_head(reviews, comments, head_sha, ally_logins):
         body = str(review.get("body") or "")
         if (
             isinstance(login, str)
-            and login_matches_any(login, ally)
+            and login_matches_any(login, ally_logins)
             # Keep this in lockstep with ally_finding_artifacts(): a finding
             # on an APPROVED review is still blocking evidence and may be the
             # finding a load-bearing deferral needs to name in its audit trail.
@@ -1168,7 +1201,7 @@ def qualifying_ally_bodies_for_head(reviews, comments, head_sha, ally_logins):
         body = str(comment.get("body") or "")
         if (
             isinstance(login, str)
-            and login_matches_any(login, ally)
+            and login_matches_any(login, ally_logins)
             and parse_reviewed_head(body) == normalized
             and (
                 is_consolidated_ally_comment_for_head(body, head_sha)
@@ -1364,13 +1397,12 @@ def review_signals_for_head(
     deferred_finding_ids=None,
     ambiguous_severities=None,
 ):
-    ally = set(ally_logins)
     signals = []
 
     for review in reviews:
         user = review.get("user") or {}
         login = user.get("login")
-        if not login_matches_any(login, ally):
+        if not isinstance(login, str) or not login_matches_any(login, ally_logins):
             continue
         if review.get("state") == "DISMISSED":
             continue
@@ -1381,10 +1413,11 @@ def review_signals_for_head(
         # accepting it here would let ONE User review satisfy BOTH controls
         # while the required App review is absent. Blocking evidence stays
         # identity-agnostic below -- dropping a User-seat CHANGES_REQUESTED
-        # or blocking count would be fail-open. The User seat still
-        # participates as a DISTINCT REVIEWER on App-authored PRs via the
-        # permission-checked distinct_reviewer path, which is a separate
-        # control.
+        # or blocking count would be fail-open. That is ALL the User seat
+        # still does: since BLO-18965 it is an author credential, never a
+        # distinct reviewer (see is_distinct_reviewer). On a self-review the
+        # demotion below applies to the seat too, so there only its
+        # machine-readable blocking findings bind, not a bare formal state.
         is_app_seat = user.get("type") == "Bot"
         # Round 2 of the #47 review: signals carry the SEAT alongside the
         # login. GitHub REST may normalize the App login to the same string
@@ -1659,21 +1692,55 @@ def review_signals_for_head(
     return signals
 
 
-def distinct_reviewer_candidate_logins(reviews, head_sha, ally_logins, pr_author_login):
+def is_self_review_author(pr_author_login, ally_logins, author_only_logins):
+    """A PR authored by an Ally identity OR an author credential is a
+    self-review. The author credential is the same actor as Ally, so its PRs
+    must demand a distinct reviewer rather than being treated as third-party
+    work needing only an Ally verdict."""
+    return login_matches_any(pr_author_login, ally_logins) or login_matches_any(
+        pr_author_login, author_only_logins
+    )
+
+
+def is_distinct_reviewer(user, ally_logins, pr_author_login, author_only_logins):
+    """Whether a review's author is a genuinely separate actor from the PR
+    author. Shared by the candidate and signal passes so the permission lookup
+    and the verdict can never disagree about who qualifies.
+
+    An author-only login is excluded FIRST and unconditionally. That ordering
+    is the point: clause (a) below admits a login merely for being absent from
+    the Ally set, so without this guard, demoting a seat out of that set would
+    widen its trust rather than remove it (BLO-18926/BLO-18965).
+
+    What remains qualifies in two cases:
+      (a) a login outside the Ally set -- an ordinary trusted human; or
+      (b) a real GitHub *User* seat inside the Ally set that is not an author
+          credential. Bot/App Ally identities stay excluded (case (b) requires
+          type == "User"), so the App can never self-clear the gate.
+    Both Ally tests compare across spelling variants: the App's normalized
+    bare login must not read as "outside the Ally set" and so qualify via (a).
+    """
+    login = (user or {}).get("login")
+    return (
+        isinstance(login, str)
+        and not login_matches_any(login, author_only_logins)
+        and login != pr_author_login
+        and (not login_matches_any(login, ally_logins) or (user or {}).get("type") == "User")
+    )
+
+
+def distinct_reviewer_candidate_logins(
+    reviews, head_sha, ally_logins, pr_author_login, author_only_logins=DEFAULT_AUTHOR_ONLY_LOGINS
+):
     """Structural-only pass (no trust check): every login that would qualify as
     a distinct reviewer for this head if it turns out to be trusted. Scopes the
     collaborator-permission lookups to the logins that matter.
     """
-    ally = set(ally_logins)
     logins = set()
     for review in reviews:
         user = review.get("user") or {}
         login = user.get("login")
-        is_distinct = (
-            isinstance(login, str)
-            and login != pr_author_login
-            and (not login_matches_any(login, ally) or user.get("type") == "User")
-        )
+        is_distinct = is_distinct_reviewer(user, ally_logins, pr_author_login, author_only_logins)
         # commit_id match OR a body attestation of this head: the signal pass
         # accepts either as head-relevance, so the permission lookup must cover
         # both or an attested-but-drifted approval could never become trusted.
@@ -1692,8 +1759,8 @@ def distinct_reviewer_signals_for_head(
     pr_author_login,
     permission_trusted_logins,
     head_authorized_logins=None,
+    author_only_logins=DEFAULT_AUTHOR_ONLY_LOGINS,
 ):
-    ally = set(ally_logins)
     head_authorized_logins = head_authorized_logins or set()
     signals = []
 
@@ -1701,19 +1768,9 @@ def distinct_reviewer_signals_for_head(
         user = review.get("user") or {}
         login = user.get("login")
 
-        # A reviewer counts as "distinct" from the PR author when its login
-        # differs AND it is a genuinely separate actor. Two cases qualify:
-        #   (a) a login outside the Ally set -- an ordinary trusted human; or
-        #   (b) a real GitHub *User* seat inside the Ally set, e.g. the
-        #       `allyblockcast` maintainer user, a distinct actor from the
-        #       `app/allyblockcast` App that authors agent PRs.
-        # Bot/App Ally identities stay excluded (case (b) requires
-        # type == "User"), so the App can never self-clear the gate.
-        is_distinct = (
-            isinstance(login, str)
-            and login != pr_author_login
-            and (not login_matches_any(login, ally) or user.get("type") == "User")
-        )
+        # See is_distinct_reviewer: an author credential is never distinct,
+        # so it can neither approve nor request changes on this path.
+        is_distinct = is_distinct_reviewer(user, ally_logins, pr_author_login, author_only_logins)
         # The permission lookup is AUTHORITATIVE, and an unresolved lookup is
         # UNTRUSTED. Falling back to author_association on error failed open:
         # COLLABORATOR can mean read or triage, so a transient API, auth or
@@ -1796,7 +1853,6 @@ def comment_signals_for_head(
     deferred_finding_ids=None,
     ambiguous_severities=None,
 ):
-    ally = set(ally_logins)
     short_head = short_sha(head_sha)
     signals = []
 
@@ -1804,7 +1860,7 @@ def comment_signals_for_head(
         user = comment.get("user") or {}
         login = user.get("login")
         body = str(comment.get("body") or "")
-        if not login_matches_any(login, ally):
+        if not isinstance(login, str) or not login_matches_any(login, ally_logins):
             continue
         # No positive seat gating here: since #45 the comment path carries
         # no positive branch, and its blocking evidence is deliberately
@@ -2052,7 +2108,7 @@ def reduce_distinct_reviewer_signals(signals):
     return latest_signal(current_states)
 
 
-def override_attestation_logins(comments, head_sha):
+def override_attestation_logins(comments, head_sha, author_only_logins=DEFAULT_AUTHOR_ONLY_LOGINS):
     """Logins that authorized an override of THIS exact head.
 
     The label alone is PR-scoped and survives `synchronize`, so on its own it
@@ -2079,7 +2135,9 @@ def override_attestation_logins(comments, head_sha):
     )
     for comment in comments or []:
         login = (comment.get("user") or {}).get("login")
-        if not isinstance(login, str):
+        # An author credential cannot authorize an override any more than it
+        # can review.
+        if not isinstance(login, str) or login_matches_any(login, author_only_logins):
             continue
         if not pattern.search(str(comment.get("body") or "")):
             continue
@@ -2119,6 +2177,7 @@ def decide(
     override_label,
     permission_trusted_logins=None,
     deferrals=None,
+    author_only_logins=DEFAULT_AUTHOR_ONLY_LOGINS,
 ):
     """Pure decision core: returns (state, description).
 
@@ -2132,8 +2191,7 @@ def decide(
     """
     permission_trusted_logins = permission_trusted_logins or set()
     deferrals = deferrals or {}
-    ally = set(ally_logins)
-    is_self_review = login_matches_any(pr_author_login, ally)
+    is_self_review = is_self_review_author(pr_author_login, ally_logins, author_only_logins)
 
     # Severity-level ambiguity is resolved once, for the LIVE head, from the
     # Ally bodies that attest to it -- two same-head reports that disagree about
@@ -2173,7 +2231,10 @@ def decide(
             ally_logins,
             pr_author_login,
             permission_trusted_logins,
-            head_authorized_logins=override_attestation_logins(comments, head_sha),
+            head_authorized_logins=override_attestation_logins(
+                comments, head_sha, author_only_logins
+            ),
+            author_only_logins=author_only_logins,
         )
         if is_self_review
         else []
@@ -2211,15 +2272,15 @@ def decide(
         # green a self-review PR). This context's positive authority is now
         # EITHER Ally's own App-seat APPROVED (handled above via successes)
         # OR a distinct, permission-trusted, NON-ALLY login's exact-head-attested
-        # APPROVED. The Ally User seat structurally still qualifies as a
-        # "distinct" participant here (case (b) of
-        # distinct_reviewer_signals_for_head's is_distinct, needed so its own
-        # CHANGES_REQUESTED keeps binding), but BLO-24056 found it supplying 661
-        # App-authored approvals org-wide -- it is Ally's second hat, not an
-        # independent reviewer, so it must never be the identity that turns this
-        # green. Adopting `reduced` unconditionally on failure (as before) keeps
-        # a trusted distinct reviewer's CHANGES_REQUESTED fail-closed regardless
-        # of identity; adopting success only requires a SEPARATE reduction
+        # APPROVED. The shared `allyblockcast` User seat is an author
+        # credential (BLO-24056 found it supplying 661 App-authored approvals
+        # org-wide; BLO-18965 split it out of the Ally set), so
+        # is_distinct_reviewer never admits it and it is filtered again here:
+        # it must never be the identity that turns this green, whichever list
+        # an operator happens to name it in. Adopting `reduced`
+        # unconditionally on failure (as before) keeps a trusted distinct
+        # reviewer's CHANGES_REQUESTED fail-closed regardless of identity;
+        # adopting success only requires a SEPARATE reduction
         # restricted to non-Ally authors, so a chronologically-later Ally-seat
         # success cannot shadow an earlier, still-current non-Ally approval. A
         # reviewer's later approval still withdraws THEIR OWN earlier change
@@ -2231,7 +2292,10 @@ def decide(
                 chosen = reduced
             elif reduced is not None and reduced["status"] == "success":
                 non_ally_signals = [
-                    s for s in distinct_signals if not login_matches_any(s["author"], ally)
+                    s
+                    for s in distinct_signals
+                    if not login_matches_any(s["author"], ally_logins)
+                    and not login_matches_any(s["author"], author_only_logins)
                 ]
                 reduced_non_ally = reduce_distinct_reviewer_signals(non_ally_signals)
                 if reduced_non_ally is not None and reduced_non_ally["status"] == "success":
@@ -3157,8 +3221,16 @@ def main():
 
     pull_number = pull_request["number"]
     ally_logins = parse_list(os.environ.get("ALLY_REVIEWER_LOGINS"), DEFAULT_ALLY_LOGINS)
+    # Author credentials, held out of every trust path. Configured separately
+    # from ALLY_REVIEWER_LOGINS because removing a login from that list demotes
+    # nothing -- it promotes the login to an ordinary distinct reviewer. Naming
+    # it here is what strips its reviewer standing. parse_list's fallback keeps
+    # an empty or `,` value from silently disabling the exclusion.
+    author_only_logins = parse_list(
+        os.environ.get("PR_AUTHOR_ONLY_LOGINS"), DEFAULT_AUTHOR_ONLY_LOGINS
+    )
     pr_author_login = (pull_request.get("user") or {}).get("login")
-    is_self_review = login_matches_any(pr_author_login, ally_logins)
+    is_self_review = is_self_review_author(pr_author_login, ally_logins, author_only_logins)
 
     # Claim the context as `pending` BEFORE the fallible reads below. Everything
     # from here on can raise (network, rate limit, malformed payload), and a
@@ -3216,14 +3288,16 @@ def main():
     candidates = set()
     if is_self_review:
         candidates |= set(
-            distinct_reviewer_candidate_logins(reviews, head_sha, ally_logins, pr_author_login)
+            distinct_reviewer_candidate_logins(
+                reviews, head_sha, ally_logins, pr_author_login, author_only_logins
+            )
         )
         # Head-bound authorization comments can positively bind a distinct
         # approval even without the override label, so their authors need
         # permission resolution whenever the distinct-reviewer path is live.
-        candidates |= override_attestation_logins(comments, head_sha)
+        candidates |= override_attestation_logins(comments, head_sha, author_only_logins)
     if override_label and override_label in labels:
-        candidates |= override_attestation_logins(comments, head_sha)
+        candidates |= override_attestation_logins(comments, head_sha, author_only_logins)
     if candidates:
         permission_trusted_logins = fetch_trusted_permission_logins(
             api_base_url, owner, repo, token, sorted(candidates)
@@ -3248,6 +3322,7 @@ def main():
             ),
             finding_visibility=finding_visibility,
             pr_author_login=pr_author_login,
+            author_only_logins=author_only_logins,
         )
     # ACCEPTED deferrals are logged unconditionally, not only when the gate is
     # red. The status description is budgeted to 140 chars and elides rulings
@@ -3268,6 +3343,7 @@ def main():
         override_label=override_label,
         permission_trusted_logins=permission_trusted_logins,
         deferrals=deferrals,
+        author_only_logins=author_only_logins,
     )
 
     # The copy-paste line a maintainer needs to defer a still-outstanding
