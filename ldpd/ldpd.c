@@ -939,7 +939,7 @@ ldp_acl_request(struct imsgev *iev, char *acl_name, int af,
 {
 	struct imsg	 imsg;
 	struct acl_check acl_check;
-	ssize_t n;
+	ssize_t		 n;
 	int result;
 
 	if (acl_name[0] == '\0')
@@ -965,6 +965,11 @@ ldp_acl_request(struct imsgev *iev, char *acl_name, int af,
 			break;
 
 		n = ldp_imsg_read(&iev->ibuf);
+		/*
+		 * Unlike the dispatch handlers, no EAGAIN exemption: only the
+		 * parent's end of the sync pipe is nonblocking, so this read
+		 * (on LDPD_FD_SYNC) blocks and any -1 is a real error.
+		 */
 		if (n == -1)
 			fatal("imsg_read error");
 		if (n == 0) {

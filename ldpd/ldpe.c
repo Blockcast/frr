@@ -297,7 +297,8 @@ static void ldpe_dispatch_main(struct event *event)
 #ifdef __OpenBSD__
 	struct nbr_params	*nbrp;
 #endif
-	int			 n, shut = 0;
+	ssize_t n;
+	int shut = 0;
 	struct ldp_access       *laccess;
 	struct ldp_igp_sync_if_state_req *ldp_sync_if_state_req;
 	struct ldp_rlfa_node	 *rnode, *rntmp;
@@ -626,7 +627,8 @@ static void ldpe_dispatch_lde(struct event *event)
 	struct map		*map;
 	struct notify_msg	*nm;
 	struct nbr		*nbr;
-	int			 n, shut = 0;
+	ssize_t n;
+	int shut = 0;
 
 	n = ldp_imsg_read(ibuf);
 	if (n == -1 && errno != EAGAIN)
