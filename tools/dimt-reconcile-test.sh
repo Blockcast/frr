@@ -270,16 +270,37 @@ err_has() { printf '%s\n' "$err" | grep -q -- "$1"; }
 err_lacks() { ! printf '%s\n' "$err" | grep -q -- "$1"; }
 # shellcheck disable=SC2329
 vtysh_lacks() { ! grep -q -- "$1" "$FAKEIP_DIR/vtysh.log"; }
-# err_mode_greps_file pulls the mode the script quoted out of $err and greps
-# <file> for exactly that.  Grepping the fixture for a literal the test wrote
-# asserts the fixture against itself; this asserts the message against the
-# fixture, which is the property the message claims -- the echoed mode is a
-# usable grep key -- so rewriting the mode turns it red.
+# err_mode pulls the mode the script quoted out of $err -- empty if it quoted
+# none, which is what lets the two assertions below fail closed rather than
+# silently asserting nothing.
+err_mode() {
+	printf '%s\n' "$err" |
+		sed -n "s/.*invalid encap mode '\([^']*\)'.*/\1/p" | head -n 1
+}
+# err_mode_greps_file greps <file> for exactly the mode the script quoted.
+# Grepping the fixture for a literal the test wrote asserts the fixture against
+# itself; this asserts the message against the fixture, which is the property
+# the message claims -- the echoed mode is a usable grep key -- so rewriting the
+# mode turns it red.
 # shellcheck disable=SC2329
 err_mode_greps_file() {
-	_m=$(printf '%s\n' "$err" |
-		sed -n "s/.*invalid encap mode '\([^']*\)'.*/\1/p" | head -n 1)
+	_m=$(err_mode)
 	[ -n "$_m" ] && grep -qF -- "$_m" "$1"
+}
+# The negative direction needs its own helper rather than negating the above:
+# err_mode_greps_file is ALSO false when nothing was extracted, so
+# "not err_mode_greps_file" passed VACUOUSLY under any mutation that emits no
+# message at all -- asserting nothing about the file at the one moment it
+# mattered.  Measured: revert the awk field joiner (which suppresses the
+# message) and the old form leaves h6b at 7 red, this one at 8.
+# The [ -n "$_m" ] is the explicit precondition, mirroring the positive helper;
+# on THIS fixture dropping it still fails closed, because grep -F with an empty
+# pattern matches every line of a non-empty file.  It is not load-bearing here,
+# only in the empty-fixture case -- claimed as symmetry, not as a proven guard.
+# shellcheck disable=SC2329
+err_mode_lacks_file() {
+	_m=$(err_mode)
+	[ -n "$_m" ] && ! grep -qF -- "$_m" "$1"
 }
 # The counterpart: which half of the message is the grep key depends on the
 # form, and the message cannot say which it got.  For a third column the "="
@@ -292,10 +313,6 @@ err_peer_greps_file() {
 		sed -n "s/.*ignoring peer \([^:]*\):.*/\1/p" | head -n 1)
 	[ -n "$_p" ] && grep -qF -- "$_p" "$1"
 }
-# `check` runs "$@" as a command, where a leading "!" is a literal argv[0]
-# rather than the shell keyword, so negation needs a real command.
-# shellcheck disable=SC2329
-not() { ! "$@"; }
 
 # --- (a) inner derivation, dual-stack create ---------------------------
 new_state a
@@ -777,12 +794,15 @@ check "h6b: not mistaken for a valid gre peer" log_lacks "^ip link add dimt-0-47
 # mode greps their file; here peers() synthesised it from a field separator,
 # so it does not -- $peer is the grep key, exactly as the script says at
 # dimt-reconcile.sh:710-711.  Pinning both directions is what makes the
-# distinction deliberate: rewriting the "=" back to a space to "fix" the
-# message reddens this pair, and h6b3 alone would not see it.
+# distinction deliberate: truncating the mode at the first "=" reddens this
+# pair while h6b3's grep-key assertion stays green, because the shortened mode
+# ("gre") still greps an "="-typed file.  h6b3 alone cannot see a message that
+# DROPS information; only this fixture can.  (A mutation that rewrites the "="
+# back to a space is NOT the discriminating one -- it reddens h6b3 too.)
 check "h6b: the peer address is the grep key for the line" \
 	err_peer_greps_file "$TESTDIR/peers-junk"
 check "h6b: the echoed mode is NOT one (its = is synthesised)" \
-	not err_mode_greps_file "$TESTDIR/peers-junk"
+	err_mode_lacks_file "$TESTDIR/peers-junk"
 check "h6b: GC suppressed (the entry may be a desired peer)" \
 	log_lacks "^ip link del dimt-9-9"
 # Same line from --peers, where the field separator is a comma.
