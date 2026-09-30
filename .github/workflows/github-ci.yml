@@ -35,12 +35,26 @@ on:
 # That run used to be cancelled at once. A merge that only replaces a pending
 # run costs nothing extra. At the current merge rate (about 2 a day) this
 # keeps roughly one master run in flight on `default` and arc-e2e almost all
-# the time, which adds to PR queue waits. A master verdict can also trail the
-# tip by about one run plus the queue wait; it belongs to the SHA it ran on,
-# not to the current tip.
+# the time, which adds to PR queue waits. Each such run puts 6 jobs on
+# `default` (the path filter, the 2 Build legs and Build-LTTng, the 2
+# Unit-Test legs, plus Documentation-HTML when docs change) and 4 Test legs on
+# arc-e2e, next to a `default` backlog of about 800 queued jobs org-wide on
+# 2026-09-29. A master verdict can also trail the tip by about one run plus
+# the queue wait; it belongs to the SHA it ran on, not to the current tip.
 #
-# Pull requests and stable/**, rc/** and ci/** pushes keep cancelling, since
-# nobody needs the verdict of a superseded PR head.
+# A run holds the lane from the moment it is created, including while its
+# jobs wait for a runner, and `timeout-minutes` does not count that wait. So a
+# master run that is stuck queued (a runner-template roll, a pool with no
+# capacity) is no longer cleared by the next merge: it holds the lane until
+# GitHub cancels the stuck job at its 24 h self-hosted queue limit, or until
+# someone cancels it (`gh run cancel <id> --repo Blockcast/frr`). The newest
+# pending head then runs. Cancelling by hand is the recovery path.
+#
+# Pull requests keep cancelling, since nobody needs the verdict of a
+# superseded PR head, and so do ci/** pushes, which are scratch branches.
+# stable/** and rc/** keep it only because no such branch exists today. If
+# release branches start taking regular pushes, exempt them the same way: a
+# lost verdict matters there as much as on master.
 #
 # Nothing in this workflow writes the buildcache (see the `cache-from` comment
 # on the Build job). Do not add a `cache-to` here now that master runs finish:
