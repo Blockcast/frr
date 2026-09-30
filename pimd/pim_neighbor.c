@@ -31,6 +31,7 @@
 #include "pim_register.h"
 #include "pim_oil.h"
 #include "pim_dm.h"
+#include "pim_dimt.h"
 
 static void dr_election_by_addr(struct interface *ifp)
 {
@@ -564,6 +565,12 @@ pim_neighbor_add(struct interface *ifp, pim_addr source_addr,
 	pim_rp_setup(pim_ifp->pim);
 
 	sched_rpf_cache_refresh(pim_ifp->pim);
+
+	/* A DIMT normal-mode pin's RPF' IS this neighbor's address, and
+	 * STATIC_IIF keeps that pin out of every path above.  Nothing else
+	 * would resolve it. */
+	pim_dimt_neighbor_change(pim_ifp->pim, ifp);
+
 	return neigh;
 }
 
@@ -704,6 +711,11 @@ void pim_neighbor_delete(struct interface *ifp, struct pim_neighbor *neigh,
 	pim_neighbor_free(neigh);
 
 	sched_rpf_cache_refresh(pim_ifp->pim);
+
+	/* After the free and the list removal, so a DIMT normal-mode pin
+	 * re-resolves against a neighbor table that no longer holds this
+	 * entry.  The pin is held with an unresolved RPF', not dropped. */
+	pim_dimt_neighbor_change(pim_ifp->pim, ifp);
 }
 
 void pim_neighbor_delete_all(struct interface *ifp, const char *delete_message)

@@ -56,6 +56,22 @@ struct pim_dimt_endpoint {
 	uint32_t mtu;
 	bool key_set;
 	bool mtu_set;
+	/*
+	 * `pim-mode normal` on the row: run ordinary PIM on this UMH's netdev
+	 * -- hellos on, a real adjacency, and a Join/Prune addressed to that
+	 * adjacency rather than to the UMH loopback.
+	 *
+	 * Default false, i.e. PIM Light, so every row written before this
+	 * keyword existed keeps its exact behaviour.  Normal mode exists
+	 * because no vendor tested accepts a light join on a tunnel: Junos
+	 * ignores it silently (lab T1c-1/T1c-3) and cEOS counts a Join/Prune
+	 * Rx Error (T4e), both because they require a hello adjacency.
+	 *
+	 * Deliberately NOT part of struct zapi_dimt_tunnel: the netdev zebra
+	 * builds is identical either way, so a mode change must not rebuild
+	 * the tunnel.  pim_dimt_endpoint_set() re-adopts the interface instead.
+	 */
+	bool pim_normal;
 };
 
 /*
@@ -161,6 +177,16 @@ void pim_dimt_iface_down(struct pim_instance *pim, struct interface *ifp);
 /* Re-run pin resolution when a light interface becomes usable (up,
  * addressed, or light-enabled after the mapping arrived). */
 void pim_dimt_iface_up(struct pim_instance *pim, struct interface *ifp);
+
+/*
+ * A PIM neighbor appeared on, or expired from, `ifp`.
+ *
+ * Only normal-mode DIMT netdevs react: there rpf_addr IS the neighbor's hello
+ * source address, so the neighbor's arrival and departure are RPF'(S,G)
+ * transitions -- and STATIC_IIF hides them from every normal repair path, so
+ * DIMT has to drive them itself.  No-op on any other interface.
+ */
+void pim_dimt_neighbor_change(struct pim_instance *pim, struct interface *ifp);
 
 void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json);
 void pim_dimt_show_tunnel(struct pim_instance *pim, struct vty *vty, bool json);

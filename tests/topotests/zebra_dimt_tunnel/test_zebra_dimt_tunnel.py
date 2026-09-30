@@ -4,6 +4,7 @@
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -59,9 +60,11 @@ def require_strace(router):
 
 # Nine of these tests executed for the first time once strace was installed and
 # require_strace() started failing hard instead of skipping -- and nine failed.
-# Seven were one leaked link; three tickets remain, and only one of those was a
-# zebra question. (The reasoning that reclassified them is in the commit log,
-# not here.)
+# Seven were one leaked link. Three tickets were filed: two for the failures
+# outside that cascade, and BLO-29000 for a cascade test whose own window
+# problem surfaced once the reaper unwedged it. Only one of the three was a
+# zebra question, and all three are now closed. (The reasoning that
+# reclassified them is in the commit log, not here.)
 #
 #   BLO-28405  HARNESS, not zebra. FIXED -- marker removed. The assertion is
 #              unchanged; what changed is that the injection now lands on the
@@ -90,14 +93,21 @@ def require_strace(router):
 #              raises Failed, not AssertionError, so an uninjected run fails
 #              hard rather than passing for the wrong reason.
 #
-#   BLO-29000  HARNESS, not zebra. hold_dplane_worker() does not hold the
-#              `del 9` client: it exits with result=2 (REMOVED) before the readd
-#              runs, so the test has never opened the window it is named for.
-#              The zebra defect first filed here -- "readd returns result=0" --
-#              was a phantom: a post-delete ADD succeeding is correct, and this
-#              test's own tail asserts exactly that. The two observables are
-#              bit-for-bit identical, which is why the precondition guard is the
-#              only thing that can tell them apart.
+#   BLO-29000  HARNESS, not zebra. FIXED -- marker removed. The hold never
+#              held anything. hold_dplane_worker() delayed ppoll/poll, but zebra
+#              is built with USE_EPOLL, so every event loop -- the zebra_dplane
+#              pthread's included -- blocks in epoll_pwait (lib/event.c
+#              fd_poll) and the strace filter never matched. Every run was an
+#              unheld race. Of 45 CI executions, 26 saw the del finish before
+#              the guard sampled it, 9 saw the DEL reach zebra first (readd
+#              rejected, "XPASS"), and 10 served the readd outside the window:
+#              before the DEL reached zebra (the ORIGINAL ifindex came back) or
+#              after it completed (a fresh create, ifindex+1). zebra answered
+#              correctly for the state it was in every time -- an ADD against a
+#              DELETING entry gets FAIL_INSTALL on every path. The test now
+#              holds the dplane worker's route-netlink sendmsgs at entry and
+#              proves, both before and after the readd, that the held one is
+#              this link's RTM_DELLINK (dellink_state()).
 #
 # Why reap_stray_dimt_links() exists: the seven cascade failures were a GRE
 # TUPLE collision on the shared 192.0.2.1 -> 192.0.2.2 endpoints, not a name
@@ -109,21 +119,21 @@ def require_strace(router):
 # dimt-00000004 as a dummy on purpose and removes it on its last line. Do not
 # read that early EEXIST as a leak.
 #
-# These are marked xfail rather than skipped so the harness fix could land
+# These were marked xfail rather than skipped so the harness fixes could land
 # without waiting on the zebra work -- a skip would recreate the very blind spot
-# BLO-28043 exists to close. strict=True is load-bearing: the build FAILS the
-# moment a defect is fixed and its test starts passing, which forces the marker
-# off in the same PR that fixes it. Corollary worth keeping: anything that
-# unwedges a marked test -- a fixture like the reaper below, as much as a zebra
-# fix -- must remove that test's marker in the SAME commit, or strict turns the
-# new pass into an XPASS failure.
+# BLO-28043 exists to close. None remain. Any new one follows the same rules.
+# strict=True is load-bearing: the build FAILS the moment a defect is fixed and
+# its test starts passing, which forces the marker off in the same PR that fixes
+# it. Corollary worth keeping: anything that unwedges a marked test -- a fixture
+# like the reaper below, as much as a zebra fix -- must remove that test's
+# marker in the SAME commit, or strict turns the new pass into an XPASS failure.
 #
-# Remove each REMAINING marker in its blocker's fix PR, never in a cleanup.
+# Remove a marker in its blocker's fix PR, never in a cleanup.
 # raises= narrows each marker to the failure it actually predicts, so an
 # unrelated topology error or a no-op injection surfaces as a hard failure
 # instead of being absorbed as expected. Neither pytest.fail()'s Failed nor
 # WindowNeverOpened is an AssertionError, which is what lets
-# assert_injection_fired() and the precondition guard break out of an xfail
+# assert_injection_fired() and the precondition guards break out of an xfail
 # rather than be swallowed by it.
 
 
@@ -137,9 +147,12 @@ class WindowNeverOpened(Exception):
     paths ("zebra_dplane worker not found", "strace attach failed") and
     assert_injection_fired() -- so a marker written raises=pytest.fail.Exception
     absorbs all of them as a green xfail, a *setup-time* fixture failure
-    included. Only this class can reach XFAIL_BLO_29000, so a missing strace, a
-    dirty kernel, a missing dplane worker or a failed attach still fails the job
-    loudly instead of reading as "expected failure, blocker still open".
+    included. No marker absorbs this class today either: a window that cannot
+    be proven open fails the job, because a test that never opened its window
+    has not run. It stays a bespoke type so that any future marker can be
+    narrowed to exactly these guards, and a missing strace, a dirty kernel, a
+    missing dplane worker or a failed attach still fails loudly instead of
+    reading as "expected failure, blocker still open".
 
     It keeps the property that made pytest.fail() right in the first place: it
     is NOT an AssertionError, so a raises=AssertionError marker cannot swallow
@@ -149,58 +162,10 @@ class WindowNeverOpened(Exception):
     One asymmetry to know before wrapping a guard site in a handler: Failed
     derives from BaseException, not Exception, so `except Exception` does not
     catch it -- this class it would. Verified at the time of writing that the
-    only try enclosing the guard is a bare try/finally with no handlers, so
-    nothing swallows it today. Keep it that way, or re-narrow the handler.
+    only try blocks enclosing the guards are bare try/finally with no
+    handlers, so nothing swallows it today. Keep it that way, or re-narrow the
+    handler.
     """
-
-
-# raises=WindowNeverOpened -- NOT AssertionError, and deliberately NOT
-# pytest.fail.Exception: the expected failure here is the precondition guard,
-# and exactly one site raises that type, so nothing else can be absorbed. The
-# behavioural assertion below the guard is an AssertionError and is NOT
-# absorbed, so if the hold ever starts working and zebra then misbehaves, that
-# surfaces as a hard failure rather than hiding under this marker. See
-# WindowNeverOpened for why Failed was too wide.
-#
-# strict=False, the one exception to the strict=True rule above, because that
-# rule assumes a marked test fails deterministically and this one no longer
-# does: the hold now takes on some runners and not others. Measured on
-# 2026-09-27/28 -- master run 36278687998 xfailed (window never opened), while
-# the unrelated frr#107 (run 36332531703) and frr#109 (run 36337004794), neither
-# touching zebra, XPASSed: the window opened, readd was rejected, and every
-# behavioural assertion below held. Under strict=True each of those correct
-# runs failed the build. Non-strict keeps what matters: a run whose window
-# opens still fails hard on any AssertionError, and a run whose window never
-# opens is still reported, as xfail, not hidden.
-#
-# "Opened" means only what the guard samples: pending.poll() is None once, at
-# ~0.3s. The readd is processed later (request() spawns a client and waits on a
-# full ZAPI round-trip), so a partial hold can pass the guard and still let the
-# delete finish before zebra sees the ADD. That run returns result=0, which is
-# the ordinary post-delete ADD, and fails hard here although zebra did nothing
-# wrong (frr#101 run 36419490474 is one such run; it does not show an ADD
-# rebinding a live DELETE). BLO-29000 tracks re-checking the guard after the
-# readd returns.
-#
-# What non-strict gives up: strict=True made an XPASS fail the build, which
-# forced this marker off in the PR that fixed the hold. Nothing enforces that
-# now, so the marker no longer removes itself; BLO-29000 owns removing it.
-# Restore strict=True (or drop the marker) when hold_dplane_worker() holds
-# deterministically.
-XFAIL_BLO_29000 = pytest.mark.xfail(
-    strict=False,
-    raises=WindowNeverOpened,
-    reason=(
-        "BLO-29000: hold_dplane_worker() holds the `del 9` client on some "
-        "runners and not others. A run whose window never opens (the "
-        "pending.poll() guard fires) is absorbed here; a run whose window "
-        "opens is not, and fails hard on any AssertionError. The original "
-        "'readd returns result=0' filing is not established as a zebra "
-        "defect: a post-delete ADD succeeding is correct, and this test's own "
-        "tail asserts it. Remove this marker when hold_dplane_worker() holds "
-        "deterministically."
-    ),
-)
 
 
 def build_topo(tgen):
@@ -516,40 +481,89 @@ def inject_netlink_recv_failure(router, when):
     return inject_netlink_syscall_failure(router, "recvmsg", when, errno_name="EAGAIN")
 
 
-def hold_dplane_worker(router, delay_usecs=6000000):
-    """Hold only the dplane worker task at its event-loop wakeup.
+# topotest.run_and_expect() silently replaces any count*wait under 15s with its
+# own defaults (count=20, wait=3), so a fine-grained poll has to budget at least
+# 15s or it becomes a 3s poll. Granularity is load-bearing for the two
+# held-DELETE syncs, which act inside the hold as soon as they resolve; the
+# convergence polls around them share the budget so it is stated once. 0.2s
+# steps for up to 16s: above the longest runner stall seen in CI (~6.7s), and
+# below HELD_DELETE_USECS, so a window that never opens is reported well
+# before the hold would have expired.
+SYNC_POLL_COUNT = 80
+SYNC_POLL_WAIT = 0.2
 
-    ptrace stops just the traced task, so zebra's main thread keeps
-    processing ZAPI requests and netlink notifications while any context
-    already handed to the dataplane provably stays queued until the tracer
-    detaches.
+
+def hold_dplane_sendmsg(router, delay_usecs):
+    """Hold the dplane worker at route-netlink sendmsg ENTRY.
+
+    This is the only dplane hold the module has, deliberately. zebra is built
+    with USE_EPOLL, so its event loops block in epoll_pwait; a hold on the
+    worker's wakeup (the since-removed hold_dplane_worker() delayed ppoll/poll,
+    which this build never calls) engages nothing, and would not help if it
+    did: link notifications arrive on netlink_dplane_in, which this same
+    pthread reads, so freezing it freezes main's view of the kernel too.
+
+    At sendmsg entry the netlink message is fully encoded (all identity checks
+    have run) but not yet delivered, so the kernel has not acted on it and no
+    result exists -- zebra's main thread still holds the entry in the state it
+    set before enqueueing. -e trace-fds= confines the hold to route-netlink
+    sockets: unnarrowed, the ethtool probes zebra sends on the genetlink
+    ge_netlink_cmd socket could be held instead of, or ahead of, the message a
+    test is waiting for (2 of 36 CI runs synced on one, BLO-28405's mis-aim
+    again). Returns (tracer, trace_file); the -o trace file records each
+    decoded sendmsg, so callers synchronize positively with dellink_state()
+    instead of guessing with sleeps.
     """
-    return _hold_dplane_syscalls(router, "ppoll,poll", "delay_exit", delay_usecs)
-
-
-def hold_dplane_sendmsg(router, delay_usecs=6000000):
-    """Hold the dplane worker at sendmsg ENTRY.
-
-    At that point the netlink message is fully encoded (all identity checks
-    have run) but not yet delivered to the kernel -- the exact
-    encode-to-kernel window. Returns (tracer, trace_file); the trace file
-    records each sendmsg entry, so callers can positively synchronize on
-    the syscall having been entered instead of guessing with sleeps.
-    """
+    worker = dplane_tid(router)
     trace_file = "/tmp/dimt-sendmsg-trace-{}.log".format(os.getpid())
     router.run("rm -f {}".format(trace_file))
     tracer = _hold_dplane_syscalls(
-        router, "sendmsg", "delay_enter", delay_usecs, trace_file
+        router, "sendmsg", "delay_enter", delay_usecs, trace_file,
+        trace_fds=_route_netlink_fds(router, worker) if worker else None,
     )
     return tracer, trace_file
 
 
-def sendmsg_entered(router, trace_file):
-    return "sendmsg(" in router.run("cat {} 2>/dev/null".format(trace_file))
+def dellink_state(router, trace_file, ifname, ifindex):
+    """Where the dplane's RTM_DELLINK for `ifname` is: None, "held", "returned".
+
+    strace -o writes a traced call's line at syscall ENTRY and completes it
+    with ") = <ret>" only when the call returns; with a single traced task
+    nothing interleaves, so a matching line with no ") = " is a delete that
+    has entered sendmsg and is being held there (measured on strace 5.16 and
+    6.8: the line stays open for the whole delay_enter hold, the link is still
+    in the kernel throughout, and it closes as ") = 32 (DELAYED)" on release).
+    "held" therefore proves main has already moved the entry to DELETING
+    (zebra_dimt.c sets it before dplane_dimt_tunnel_del() enqueues) and that
+    the kernel has not yet deleted the link, so no REMOVED can exist yet.
+
+    In CI's trace lines strace names the link as if_nametoindex("<name>")
+    while the index still resolves; the bare ifi_index=<n> form is matched
+    too, anchored so ifi_index=2 cannot match ifi_index=20. If strace cannot
+    tell the socket is NETLINK_ROUTE it prints nlmsg_type=0x11 and the
+    ifinfomsg as raw bytes (seen in a container, never in CI); that matches
+    nothing here, so a caller's sync times out and reports the trace rather
+    than passing on a guess.
+    """
+    text = router.run("cat {} 2>/dev/null".format(trace_file))
+    by_name = 'if_nametoindex("{}")'.format(ifname)
+    by_index = re.compile(r"ifi_index={}(?![0-9])".format(int(ifindex)))
+    state = None
+    for line in text.splitlines():
+        if "nlmsg_type=RTM_DELLINK" not in line:
+            continue
+        if by_name not in line and not by_index.search(line):
+            continue
+        state = "returned" if ") = " in line else "held"
+    return state
+
+
+def _trace_text(router, trace_file):
+    return router.run("cat {} 2>/dev/null".format(trace_file)).strip()
 
 
 def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
-                          trace_file=None):
+                          trace_file=None, trace_fds=None):
     require_strace(router)
     worker = dplane_tid(router)
     if not worker:
@@ -561,11 +575,17 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
         "-qq",
         "-e",
         "trace={}".format(syscalls),
-        "-e",
-        "inject={}:{}={}".format(syscalls, inject_kind, delay_usecs),
-        "-p",
-        worker,
     ]
+    if trace_fds:
+        cmd.extend(["-e", "trace-fds={}".format(trace_fds)])
+    cmd.extend(
+        [
+            "-e",
+            "inject={}:{}={}".format(syscalls, inject_kind, delay_usecs),
+            "-p",
+            worker,
+        ]
+    )
     if trace_file:
         cmd[1:1] = ["-o", trace_file]
     tracer = router.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -576,27 +596,21 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
             "strace attach failed: {}".format(_text(stderr).strip())
         )
     # Same contract as inject_netlink_syscall_failure() above, and derived from
-    # the same arguments that built the command for the same anti-drift reason.
-    # Without it, any hold site that adopts assert_injection_fired() -- the
-    # natural next step, since strace tags delay injections (INJECTED) too --
-    # gets AttributeError instead of a diagnostic.
+    # the same arguments that built the command for the same anti-drift reason:
+    # a diagnostic that names the hold cannot drift from the hold.
     tracer.injection_label = "{} {}={} hold".format(
         syscalls, inject_kind, delay_usecs
     )
     # NOT "(INJECTED)" -- strace tags a delay "(DELAYED)". See
     # assert_injection_fired() for the measurement.
     #
-    # Published so a hold site CAN adopt assert_injection_fired(), but the hold
-    # sites deliberately do not yet: unlike an error injection, strace emits the
-    # line when the delayed syscall RETURNS, so whether "(DELAYED)" is already
-    # in stderr when the test terminates the tracer is a timing property that
-    # was NOT confirmed. It could not be measured outside CI -- attaching with
-    # -p needs root or ptrace_scope=0, and the dev host has ptrace_scope=1, so
-    # the attempt produced an empty trace that proves nothing either way.
-    # Asserting on an unconfirmed tag would trade a silent pass for a flake.
-    # The hold sites synchronize on observable effects instead
-    # (sendmsg_entered() reading the -o trace file, and "zebra did not process
-    # the replacement link").
+    # Published for symmetry, but a hold site must NOT feed stop_tracer()'s
+    # output to assert_injection_fired(): with -o the trace goes to the file,
+    # so stderr is empty by construction, and a hold released early by
+    # stop_tracer() never completes its line at all. Measured on strace 5.16 and
+    # 6.8 in a privileged container: terminating strace mid-delay releases the
+    # tracee at once, for delay_enter and delay_exit alike. The hold sites
+    # prove the hold from the trace file instead, with dellink_state().
     tracer.injection_tag = "(DELAYED)"
     return tracer
 
@@ -849,91 +863,147 @@ def zebra_ifindex(router, name):
     return entry.get("index") if entry else None
 
 
+def zebra_dropped_interface(router, name):
+    """True only once zebra's own table no longer holds `name` at an index.
+
+    Not `zebra_ifindex() in (None, 0)`: that maps unparseable vtysh output (a
+    connection error, a banner, a partial read) to None and so would read as
+    "dropped" before zebra processed anything. Here only parsed JSON counts:
+    "{}" (no such interface), or an entry with no "index" -- a configured
+    interface zebra keeps at IFINDEX_INTERNAL is dumped as "pseudoInterface"
+    and if_dump_vty_json() returns before writing any index.
+    """
+    try:
+        data = json.loads(
+            router.vtysh_cmd("show interface {} json".format(name))
+        )
+    except ValueError:
+        return False
+    entry = data.get(name)
+    return entry is None or "index" not in entry
+
+
 def test_queued_delete_does_not_remove_reused_ifindex():
+    """A delete must not remove a same-name link that replaced ours.
+
+    The link is replaced out-of-band first, and the DEL is sent only once
+    zebra has processed the replacement. The entry is still INSTALLED at that
+    point, holding the vanished ifindex. zebra_dimt_if_del() does run for a
+    kernel delete, but only after if_delete_update() has reset the ifindex to
+    IFINDEX_INTERNAL, so its ifindex match can never succeed (BLO-38034). The
+    DEL therefore takes the INSTALLED branch,
+    zebra_dimt_tunnel_resolve_ifindex() misses on the vanished index, and zebra
+    must answer REMOVED and forget the entry with no dataplane operation --
+    leaving the same-name dummy alone. Everything here runs on zebra's main
+    thread, so it is deterministic.
+
+    What this does NOT cover, despite the name it has kept: a delete already
+    QUEUED in the dataplane when the replacement lands, reaching the pre-encode
+    identity skip in netlink_put_dimt_tunnel_msg(). The test used to claim it,
+    through hold_dplane_worker(), which never held anything (BLO-29000). No
+    dplane hold can open that window deterministically either. Link
+    notifications are read on the zebra_dplane pthread itself
+    (netlink_dplane_in), so main learns of the replacement only when that
+    thread runs; whether it has by the time the queued delete is encoded then
+    depends on the order that thread's event loop services the two (queued
+    events are posted before a pass's I/O, and one notification read makes at
+    most five recvmsg() calls), which a syscall hold cannot pin. BLO-38026
+    tracks covering the skip path. The
+    encoded-before-replacement half is covered for real by
+    test_delete_encoded_before_replacement_binds_to_ifindex.
+    """
     router = get_topogen().gears["r1"]
     installed = request("add", 6)
     assert installed["result"] == 0, installed
 
-    # Hold only the dplane worker task: the delete context is provably
-    # queued in the dataplane while zebra's main thread keeps processing
-    # the netlink notifications for the replacement link. Only then is the
-    # worker released to encode the delete against the updated tables.
-    tracer = hold_dplane_worker(router)
-    client = os.path.join(CWD, "dimt_zapi_client.py")
-    try:
-        pending = router.popen(
-            ["python3", client, "del", "6", "--encap", "gre"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        time.sleep(0.3)
-        router.run(
-            "ip link del dimt-00000006; ip link add dimt-00000006 type dummy"
-        )
-        _, seen = topotest.run_and_expect(
-            lambda: zebra_ifindex(router, "dimt-00000006")
-            not in (None, installed["ifindex"]),
-            True,
-            count=15,
-            wait=0.2,
-        )
-        assert seen, "zebra did not process the replacement link"
-    finally:
-        stop_tracer(tracer)
-    stdout, stderr = pending.communicate(timeout=10)
-    assert pending.returncode == 0, _text(stderr)
-    assert json.loads(_text(stdout))["result"] == 2
+    router.run(
+        "ip link del dimt-00000006; ip link add dimt-00000006 type dummy"
+    )
+    _, seen = topotest.run_and_expect(
+        lambda: zebra_ifindex(router, "dimt-00000006")
+        not in (None, 0, installed["ifindex"]),
+        True,
+        count=SYNC_POLL_COUNT,
+        wait=SYNC_POLL_WAIT,
+    )
+    assert seen, "zebra did not process the replacement link"
+
+    removed = request("del", 6)
+    assert removed["result"] == 2, removed
     assert "dummy" in router.run("ip -d link show dimt-00000006")
     router.run("ip link del dimt-00000006")
 
 
-@XFAIL_BLO_29000
+# For the tests that hold a DIMT delete at sendmsg entry and act inside the
+# hold. Longer than any runner stall seen in CI (~6.7s) plus the sync that
+# detects the hold (SYNC_POLL_*: 0.2s steps, at most 16s) and the action taken
+# inside it, so the hold cannot expire first; stop_tracer() ends it as soon as
+# the test is done, so the bound costs nothing on the normal path. The held del
+# client's socket timeout sits above it so the client cannot give up first.
+HELD_DELETE_USECS = 30000000
+HELD_DELETE_CLIENT_TIMEOUT = 45
+
+
 def test_add_during_inflight_delete_is_rejected():
     router = get_topogen().gears["r1"]
     installed = request("add", 9)
     assert installed["result"] == 0, installed
 
-    tracer = hold_dplane_worker(router)
+    tracer, trace_file = hold_dplane_sendmsg(
+        router, delay_usecs=HELD_DELETE_USECS
+    )
     client = os.path.join(CWD, "dimt_zapi_client.py")
     try:
         pending = router.popen(
-            ["python3", client, "del", "9", "--encap", "gre"],
+            ["python3", client, "del", "9", "--encap", "gre",
+             "--timeout", str(HELD_DELETE_CLIENT_TIMEOUT)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        time.sleep(0.3)
-        # The whole test is "an ADD *while a DELETE is in flight*". If the
-        # worker hold silently no-ops, the del completes during the sleep above
-        # and the add below then succeeds for the ORDINARY reason -- which this
-        # test's own tail asserts is correct post-delete behaviour. That failure
-        # is bit-for-bit the same observable as the defect BLO-29000 claims, and
-        # raises=AssertionError would absorb it into a green xfail. So establish
-        # the precondition before asserting on it.
-        #
-        # raise WindowNeverOpened, not assert and not pytest.fail(): it is not
-        # an AssertionError, so the marker this guard exists to keep honest
-        # cannot swallow it; and unlike Failed exactly this one site raises it,
-        # so XFAIL_BLO_29000 cannot absorb a missing strace, a dirty kernel, a
-        # missing dplane worker or a failed attach.
-        if pending.poll() is not None:
-            out, err = pending.communicate(timeout=5)
+        # The whole test is "an ADD *while a DELETE is in flight*", so prove
+        # the delete is in flight before asserting anything about the ADD. A
+        # held RTM_DELLINK for this link means main has set DELETING and the
+        # kernel has not acted (see dellink_state()). Without this proof a
+        # readd served before the DEL reaches zebra (INSTALLED, original
+        # ifindex) or after it completes (fresh create, ifindex+1) returns 0
+        # for the ORDINARY reason; both happened in CI under the old no-op
+        # hold and read as a zebra defect. WindowNeverOpened, not assert: the
+        # test did not run, which is not evidence about zebra.
+        _, state = topotest.run_and_expect(
+            lambda: dellink_state(
+                router, trace_file, "dimt-00000009", installed["ifindex"]
+            ),
+            "held",
+            count=SYNC_POLL_COUNT,
+            wait=SYNC_POLL_WAIT,
+        )
+        if state != "held" or pending.poll() is not None:
             raise WindowNeverOpened(
-                "the `del 9` client already exited (rc={}), so nothing was in "
-                "flight when the readd below ran. The dplane worker hold did "
-                "not take, and anything asserted past this point describes an "
-                "ordinary post-delete ADD, not an ADD racing a live DELETE. "
-                "Treat this as the test not having executed.\nstdout: {}\n"
-                "stderr: {}".format(pending.returncode,
-                                    _text(out).strip() or "(empty)",
-                                    _text(err).strip() or "(empty)"))
+                "no RTM_DELLINK for dimt-00000009 was held (state={}, del "
+                "client rc={}), so nothing was in flight for the readd to "
+                "race.\ntrace:\n{}".format(
+                    state, pending.poll(), _trace_text(router, trace_file)))
+        readd = request("add", 9)
+        # ...and prove it was STILL in flight when zebra answered the readd:
+        # the reply is in hand, so a delete still held now was held then.
+        after = dellink_state(
+            router, trace_file, "dimt-00000009", installed["ifindex"]
+        )
+        if after != "held":
+            raise WindowNeverOpened(
+                "the RTM_DELLINK hold ended (state={}) before the readd's reply "
+                "was in hand, so the readd may have been served after the "
+                "delete completed. readd={}\ntrace:\n{}".format(
+                    after, readd, _trace_text(router, trace_file)))
         # An identical ADD while the delete is in flight must be rejected
         # instead of rebinding ownership: the delete completion belongs to
-        # the delete requester.
-        readd = request("add", 9)
+        # the delete requester. The ifindex is the entry's, untouched.
         assert readd["result"] == 1, readd
+        assert readd["ifindex"] == installed["ifindex"], readd
     finally:
         stop_tracer(tracer)
-    stdout, stderr = pending.communicate(timeout=10)
+        router.run("rm -f {}".format(trace_file))
+    stdout, stderr = pending.communicate(timeout=15)
     assert pending.returncode == 0, _text(stderr)
     assert json.loads(_text(stdout))["result"] == 2
     _, link = topotest.run_and_expect(
@@ -943,9 +1013,27 @@ def test_add_during_inflight_delete_is_rejected():
         wait=0.2,
     )
     assert link == "", link
+    # REMOVED is sent when the DEL's result reaches main, but main learns the
+    # link is gone only when the zebra_dplane pthread reads the RTM_DELLINK
+    # notification. An ADD landing between the two adopts the dead netdev by
+    # name and answers INSTALLED with its ifindex -- a real zebra defect,
+    # BLO-38034, and not what this test is about. Wait for zebra's own table
+    # to drop the link so the reinstall below is a clean create, and assert
+    # that it is one.
+    _, dropped = topotest.run_and_expect(
+        lambda: zebra_dropped_interface(router, "dimt-00000009"),
+        True,
+        count=SYNC_POLL_COUNT,
+        wait=SYNC_POLL_WAIT,
+    )
+    assert dropped, "zebra still lists dimt-00000009 after the delete"
 
     reinstalled = request("add", 9)
     assert reinstalled["result"] == 0, reinstalled
+    assert reinstalled["ifindex"] != installed["ifindex"], reinstalled
+    assert "gre remote 192.0.2.2 local 192.0.2.1" in router.run(
+        "ip -d link show dimt-00000009"
+    )
     assert request("del", 9)["result"] == 2
 
 
@@ -974,8 +1062,8 @@ def test_uncertain_create_result_reconciles_surviving_link():
     _, link = topotest.run_and_expect(
         lambda: router.run("ip link show dimt-00000008 2>/dev/null"),
         "",
-        count=25,
-        wait=0.2,
+        count=SYNC_POLL_COUNT,
+        wait=SYNC_POLL_WAIT,
     )
     assert link == "", link
     # The retained lifecycle entry converges over the standard cleanup
@@ -1005,27 +1093,64 @@ def test_delete_encoded_before_replacement_binds_to_ifindex():
     # CAP_NET_ADMIN plus a deliberate index claim and can delete any
     # interface directly; rtnetlink has no compare-and-delete to defend
     # against that.)
-    tracer, trace_file = hold_dplane_sendmsg(router)
+    tracer, trace_file = hold_dplane_sendmsg(
+        router, delay_usecs=HELD_DELETE_USECS
+    )
     client = os.path.join(CWD, "dimt_zapi_client.py")
     try:
         pending = router.popen(
-            ["python3", client, "del", "10", "--encap", "gre"],
+            ["python3", client, "del", "10", "--encap", "gre",
+             "--timeout", str(HELD_DELETE_CLIENT_TIMEOUT)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        _, entered = topotest.run_and_expect(
-            lambda: sendmsg_entered(router, trace_file), True, count=20, wait=0.2
+        _, state = topotest.run_and_expect(
+            lambda: dellink_state(
+                router, trace_file, "dimt-0000000a", installed["ifindex"]
+            ),
+            "held",
+            count=SYNC_POLL_COUNT,
+            wait=SYNC_POLL_WAIT,
         )
-        assert entered, "dplane worker never entered sendmsg for the delete"
-        router.run(
-            "ip link del dimt-0000000a; ip link add dimt-0000000a type dummy"
+        if state != "held":
+            raise WindowNeverOpened(
+                "no RTM_DELLINK for dimt-0000000a was held (state={}), so the "
+                "replacement below would not land inside the encode-to-kernel "
+                "window.\ntrace:\n{}".format(
+                    state, _trace_text(router, trace_file)))
+        # The replacement must land INSIDE the window: the original link is
+        # still there to delete (the held RTM_DELLINK has not reached the
+        # kernel), and the hold is still in place once it is done. If the hold
+        # had expired first the original would already be gone, the kernel
+        # would have deleted it by ifindex, and REMOVED (2) below would read as
+        # "the delete was not bound to the ifindex".
+        removed = router.run("ip link del dimt-0000000a && echo REMOVED")
+        if "REMOVED" not in removed:
+            raise WindowNeverOpened(
+                "the original dimt-0000000a was already gone when the "
+                "replacement ran ({!r}), so the held delete had reached the "
+                "kernel.\ntrace:\n{}".format(
+                    removed.strip(), _trace_text(router, trace_file)))
+        added = router.run(
+            "ip link add dimt-0000000a type dummy && echo ADDED"
         )
+        assert "ADDED" in added, "replacement create failed: {!r}".format(
+            added.strip())
+        after = dellink_state(
+            router, trace_file, "dimt-0000000a", installed["ifindex"]
+        )
+        if after != "held":
+            raise WindowNeverOpened(
+                "the RTM_DELLINK hold ended (state={}) before the replacement "
+                "was in place.\ntrace:\n{}".format(
+                    after, _trace_text(router, trace_file)))
     finally:
         stop_tracer(tracer)
+        router.run("rm -f {}".format(trace_file))
     stdout, stderr = pending.communicate(timeout=15)
     assert pending.returncode == 0, _text(stderr)
-    # The encode happened before the replacement (proven by the sendmsg
-    # sync), so the pre-encode skip path is unreachable: the delete must
+    # The encode happened before the replacement (proven by the held
+    # RTM_DELLINK), so the pre-encode skip path is unreachable: the delete must
     # fail on the stale index and the replacement must survive.
     assert json.loads(_text(stdout))["result"] == 3, stdout
     assert "dummy" in router.run("ip -d link show dimt-0000000a")
@@ -1077,6 +1202,24 @@ def test_lost_delete_ack_reconciles_instead_of_resurrecting():
 
 
 def test_skipped_delete_result_survives_mixed_batch():
+    """A delete with no link left and a real delete, together, both REMOVED.
+
+    Tunnel 12's link is replaced out-of-band and zebra is left to process that
+    first, so 12's entry holds a vanished ifindex (see
+    test_queued_delete_does_not_remove_reused_ifindex) while 13's link is
+    live. The two DELs are then issued together: 13's is a real dataplane
+    delete, and 12's is answered at once because resolve_ifindex() misses.
+    Both must report REMOVED, and 12's must leave the same-name dummy alone.
+
+    What this does NOT cover, despite the name it has kept: a SKIPPED delete
+    sharing one dataplane batch with a real one, the case where the
+    end-of-responses drain used to flip the no-message context's synthetic
+    success into a failure. That needs 12's delete queued behind 13's and then
+    skipped at encode time, and no dplane hold can arrange it: see
+    test_queued_delete_does_not_remove_reused_ifindex. The test used to claim
+    it through hold_dplane_worker(), which never held anything (BLO-29000), so
+    both deletes simply ran one after the other. BLO-38026 tracks covering it.
+    """
     router = get_topogen().gears["r1"]
     replaced = request("add", 12)
     assert replaced["result"] == 0, replaced
@@ -1092,47 +1235,43 @@ def test_skipped_delete_result_survives_mixed_batch():
     normal = request("add", 13, outer_remote=TUNNEL_13_OUTER_REMOTE)
     assert normal["result"] == 0, normal
 
-    # Queue the REAL delete first and the skipped one second: the
-    # no-message context then sits behind the only correlatable response,
-    # exactly where the end-of-responses drain used to flip its synthetic
-    # success into a failure.
-    tracer = hold_dplane_worker(router)
+    router.run(
+        "ip link del dimt-0000000c; ip link add dimt-0000000c type dummy"
+    )
+    _, seen = topotest.run_and_expect(
+        lambda: zebra_ifindex(router, "dimt-0000000c")
+        not in (None, 0, replaced["ifindex"]),
+        True,
+        count=SYNC_POLL_COUNT,
+        wait=SYNC_POLL_WAIT,
+    )
+    assert seen, "zebra did not process the replacement link"
+
     client = os.path.join(CWD, "dimt_zapi_client.py")
-    try:
-        pending13 = router.popen(
-            ["python3", client, "del", "13", "--encap", "gre"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        time.sleep(0.2)
-        pending12 = router.popen(
-            ["python3", client, "del", "12", "--encap", "gre"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        time.sleep(0.2)
-        router.run(
-            "ip link del dimt-0000000c; ip link add dimt-0000000c type dummy"
-        )
-        _, seen = topotest.run_and_expect(
-            lambda: zebra_ifindex(router, "dimt-0000000c")
-            not in (None, replaced["ifindex"]),
-            True,
-            count=15,
-            wait=0.2,
-        )
-        assert seen, "zebra did not process the replacement link"
-    finally:
-        stop_tracer(tracer)
-    out13, err13 = pending13.communicate(timeout=10)
-    out12, err12 = pending12.communicate(timeout=10)
+    pending13 = router.popen(
+        ["python3", client, "del", "13", "--encap", "gre"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    pending12 = router.popen(
+        ["python3", client, "del", "12", "--encap", "gre"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    out13, err13 = pending13.communicate(timeout=15)
+    out12, err12 = pending12.communicate(timeout=15)
     assert pending13.returncode == 0, _text(err13)
     assert pending12.returncode == 0, _text(err12)
     assert json.loads(_text(out13))["result"] == 2, out13
-    # The skipped delete must report REMOVED even though it shared the
-    # batch with a real delete whose ack is the only response.
     assert json.loads(_text(out12))["result"] == 2, out12
     assert "dummy" in router.run("ip -d link show dimt-0000000c")
+    _, link = topotest.run_and_expect(
+        lambda: router.run("ip link show dimt-0000000d 2>/dev/null"),
+        "",
+        count=10,
+        wait=0.2,
+    )
+    assert link == "", link
     router.run("ip link del dimt-0000000c")
 
 
