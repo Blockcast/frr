@@ -1065,11 +1065,25 @@ check "h6f6: the valid peer alongside it still builds" log_has \
 # the spec "100.64.0.48=gre\c" into mode "gre", which matches the valid
 # `gre` arm -- a malformed mode is ACCEPTED and a netdev really built,
 # with the suite otherwise green.  Reverting log() instead leaves the
-# mode intact but truncates the message at the backslash, so the
-# operator is told the mode is "gre" -- a value that is not in their
-# file.  One case pins both: assertion 1 dies with encap_of, assertion 2
-# with log.  Both only fail under an interpreter whose echo expands
-# backslashes (dash/ash, not bash), so run the suite under both.
+# mode intact, but dash's echo eats the backslash AND the newline it
+# would have printed: the tail of the message vanishes and the next
+# diagnostic -- the GC-suppression WARNING -- is swallowed onto the same
+# line.
+#
+# Which assertion pins which guard, measured one revert per run:
+#   encap_of  -> 1 2 3 4 5 6 fail
+#   log       -> 3 and 4 fail, and nothing else
+# 3 and 4 are NOT a redundant pair: 3 dies when the message tail is lost,
+# 4 when the newline is, and 4 does not depend on the wording or word
+# order of the message 3 greps for.  Keep both.  Assertion 2 belongs to
+# encap_of -- trimming it "because 2 and 3 both assert the diagnostic"
+# would leave log() pinned by 3 alone.
+#
+# These fail only when the SCRIPT UNDER TEST runs under an interpreter
+# whose echo expands backslashes -- that is $RUN_SH, not the shell
+# running this harness.  The CI job sets DIMT_TEST_SH explicitly per step
+# for exactly that reason: with /bin/sh -> bash and DIMT_TEST_SH unset,
+# this whole class goes inert while the suite still prints green.
 new_state h6f7
 printf '100.64.0.47 gre\n100.64.0.48 gre\\c\n' > "$TESTDIR/peers-mode-esc"
 echo "dimt-9-9 100.64.0.40 100.64.9.9 gre" >> "$FAKEIP_DIR/links"
@@ -1081,6 +1095,8 @@ check "h6f7: the mode is rejected, not silently accepted as gre" err_has \
 	"unknown encap mode"
 check "h6f7: the message survives the backslash intact" err_has \
 	"(expected gre or gre-in-fou)"
+check "h6f7: the GC warning keeps its own line" err_has \
+	"^dimt-reconcile: WARNING: registry contained invalid entries"
 check "h6f7: no device is derived from the escaped mode" \
 	log_lacks "ip link add dimt-0-48"
 check "h6f7: GC suppressed (invalid=1)" log_lacks "^ip link del dimt-9-9"
