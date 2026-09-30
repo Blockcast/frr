@@ -114,8 +114,8 @@ jobs:
         # leaves it outside these two commits, and a workflow_dispatch lists
         # HEAD's own changes (`git log -n 1 --name-status`: against the
         # parent depth 2 keeps, or nothing for a merge commit, which then
-        # builds everything).  On any other branch both find the merge base
-        # with master by fetching deeper.
+        # builds everything but skips the HTML docs).  On any other branch
+        # both find the merge base with master by fetching deeper.
         #
         # A plain shallow clone, not a blobless or sparse one: in a partial
         # clone the `git cat-file -e <before>^{commit}` paths-filter runs
