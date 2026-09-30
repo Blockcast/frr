@@ -137,6 +137,11 @@ log() { printf '%s\n' "dimt-reconcile: $*" >&2; }
 #     address but derive dimt-010-20 and dimt-10-20, i.e. two netdevs
 #     fighting over one peer (and 010 is octal to inet_aton besides).
 # [1-9]?[0-9] is what forbids the leading zero while still admitting 0.
+# Every arm of the alternation has a failing mutation in the test suite
+# -- widen one and h6f/h6f2/h6f4b catch it, narrow one and h6f4 catches
+# it -- so a tightening typo here fails the suite rather than silently
+# building, or silently refusing, a peer.  Keep it that way: an arm with
+# no failing mutation is a comment, not a guard.
 is_quad() {
 	# grep -Eq is LINE-oriented, so the anchors alone accept an embedded
 	# newline (they match the first line and grep -q succeeds on any

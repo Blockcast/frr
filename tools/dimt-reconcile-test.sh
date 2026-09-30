@@ -980,7 +980,7 @@ check "h6f3: the valid plain-GRE peer still builds" \
 # 200-255 alternation, or that forbids a bare 0, would silently stop
 # building real peers -- a far worse failure than the one h6f fixes.
 new_state h6f4
-printf '100.64.255.255 gre\n100.64.0.0 gre\n' > "$TESTDIR/peers-bounds"
+printf '100.64.255.255 gre\n100.64.0.0 gre\n100.64.199.20 gre\n100.64.245.20 gre\n' > "$TESTDIR/peers-bounds"
 err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
 	--peers-file "$TESTDIR/peers-bounds" 2>&1)
 rc=$?
@@ -989,14 +989,25 @@ check "h6f4: 255.255 builds" log_has \
 	"^ip link add dimt-255-255 type gre local 100.64.0.40 remote 100.64.255.255 "
 check "h6f4: a bare 0 octet builds" log_has \
 	"^ip link add dimt-0-0 type gre local 100.64.0.40 remote 100.64.0.0 "
+# 199 and 245 cover the NARROWING direction of the 1[0-9][0-9] and
+# 2[0-4][0-9] arms.  Widening either is loud, but until these two
+# peers existed no fixture octet fell in 100-199 ending in 9, or in
+# 240-249 at all -- so measured, 1[0-9][0-9] -> 1[0-9][0-8] and
+# 2[0-4][0-9] -> 2[0-3][0-9] each refused a whole class of real peers
+# with the suite still green.  A false refusal is loud in production
+# and silent here, which is the shape this block exists to catch.
+check "h6f4: a 100-199 octet ending in 9 builds" log_has \
+	"^ip link add dimt-199-20 type gre local 100.64.0.40 remote 100.64.199.20 "
+check "h6f4: a 240-249 octet builds" log_has \
+	"^ip link add dimt-245-20 type gre local 100.64.0.40 remote 100.64.245.20 "
 check "h6f4: nothing was called invalid" err_lacks "ignoring invalid peer entry"
 
 # --- (h6f4b) negative control for the SAME alternation ----------------
 # h6f4 pins only the build direction, and h6f's 999 is caught by every
-# plausible typo.  256 is the tight boundary: measured, 25[0-5] ->
-# 25[0-9] (or 2[0-4][0-9] -> 2[0-5][0-9]) builds dimt-256-20 with inner
-# 10.99.256.20 -- the exact defect this PR fixes -- and the whole suite
-# still passes.  One character, no failing assertion.
+# plausible typo.  256 is the tight boundary: before this block existed,
+# 25[0-5] -> 25[0-9] (or 2[0-4][0-9] -> 2[0-5][0-9]) built dimt-256-20
+# with inner 10.99.256.20 -- the exact defect this PR fixes -- and the
+# whole suite still passed.  One character, no failing assertion.
 # The disposition itself (GC suppressed, sibling still builds) is
 # class-invariant and already pinned by h6f/h6f2; this block only pins
 # the range arms.
@@ -1324,8 +1335,8 @@ fi
 # same treatment.  Raise the floor when you add assertions.
 # The floor EQUALS the live count on purpose -- no slack, so a
 # deletion is caught the same run it happens.  Do not relax -lt.
-if [ "$RAN" -lt 239 ]; then
-	echo "FAIL: assertion count fell to $RAN (floor 239) -- a block was deleted"
+if [ "$RAN" -lt 241 ]; then
+	echo "FAIL: assertion count fell to $RAN (floor 241) -- a block was deleted"
 	exit 1
 fi
 echo "all tests passed ($RAN assertions)"
