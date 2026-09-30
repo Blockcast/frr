@@ -281,6 +281,21 @@ err_mode_greps_file() {
 		sed -n "s/.*invalid encap mode '\([^']*\)'.*/\1/p" | head -n 1)
 	[ -n "$_m" ] && grep -qF -- "$_m" "$1"
 }
+# The counterpart: which half of the message is the grep key depends on the
+# form, and the message cannot say which it got.  For a third column the "="
+# is synthesised by peers() and is absent from the operator's file, so only
+# $peer greps it; for an operator-typed "=" the mode greps it too.  Pinning
+# both halves is what keeps that distinction from being "fixed" away.
+# shellcheck disable=SC2329
+err_peer_greps_file() {
+	_p=$(printf '%s\n' "$err" |
+		sed -n "s/.*ignoring peer \([^:]*\):.*/\1/p" | head -n 1)
+	[ -n "$_p" ] && grep -qF -- "$_p" "$1"
+}
+# `check` runs "$@" as a command, where a leading "!" is a literal argv[0]
+# rather than the shell keyword, so negation needs a real command.
+# shellcheck disable=SC2329
+not() { ! "$@"; }
 
 # --- (a) inner derivation, dual-stack create ---------------------------
 new_state a
@@ -758,6 +773,16 @@ check "h6b: a trailing field exits nonzero" [ "$rc" -ne 0 ]
 check "h6b: the offending mode is echoed back" err_has \
 	"invalid encap mode 'gre=extra'"
 check "h6b: not mistaken for a valid gre peer" log_lacks "^ip link add dimt-0-47"
+# Negative control for h6b3.  There the operator typed the "=", so the echoed
+# mode greps their file; here peers() synthesised it from a field separator,
+# so it does not -- $peer is the grep key, exactly as the script says at
+# dimt-reconcile.sh:710-711.  Pinning both directions is what makes the
+# distinction deliberate: rewriting the "=" back to a space to "fix" the
+# message reddens this pair, and h6b3 alone would not see it.
+check "h6b: the peer address is the grep key for the line" \
+	err_peer_greps_file "$TESTDIR/peers-junk"
+check "h6b: the echoed mode is NOT one (its = is synthesised)" \
+	not err_mode_greps_file "$TESTDIR/peers-junk"
 check "h6b: GC suppressed (the entry may be a desired peer)" \
 	log_lacks "^ip link del dimt-9-9"
 # Same line from --peers, where the field separator is a comma.
