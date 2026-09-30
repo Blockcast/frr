@@ -457,6 +457,16 @@ static FRR_NORETURN void ldpd_shutdown(void)
 	close(iev_ldpe->ibuf.fd);
 	msgbuf_clear(&iev_lde->ibuf.w);
 	close(iev_lde->ibuf.fd);
+	/*
+	 * And the sync pipes.  In the foreground the children are ours, and
+	 * one blocked in ldp_acl_request() would otherwise never get back to
+	 * its event loop to see the closes above: the wait() below would
+	 * wait for it forever.
+	 */
+	msgbuf_clear(&iev_ldpe_sync->ibuf.w);
+	close(iev_ldpe_sync->ibuf.fd);
+	msgbuf_clear(&iev_lde_sync->ibuf.w);
+	close(iev_lde_sync->ibuf.fd);
 
 	config_clear(ldpd_conf);
 
@@ -581,14 +591,9 @@ static void main_dispatch_ldpe(struct event *event)
 	ssize_t			 n;
 	int			 shut = 0;
 
-	n = imsg_read(ibuf);
-	if (n == -1) {
-		/* peer closed with our data unread: same as EOF */
-		if (errno == ECONNRESET)
-			n = 0;
-		else if (errno != EAGAIN)
-			fatal("imsg_read error");
-	}
+	n = ldp_imsg_read(ibuf);
+	if (n == -1 && errno != EAGAIN)
+		fatal("imsg_read error");
 
 	if (n == 0)	/* connection closed */
 		shut = 1;
@@ -650,14 +655,9 @@ static void main_dispatch_lde(struct event *event)
 	int		 shut = 0;
 	struct zapi_rlfa_response *rlfa_labels;
 
-	n = imsg_read(ibuf);
-	if (n == -1) {
-		/* peer closed with our data unread: same as EOF */
-		if (errno == ECONNRESET)
-			n = 0;
-		else if (errno != EAGAIN)
-			fatal("imsg_read error");
-	}
+	n = ldp_imsg_read(ibuf);
+	if (n == -1 && errno != EAGAIN)
+		fatal("imsg_read error");
 
 	if (n == 0)	/* connection closed */
 		shut = 1;
@@ -747,6 +747,23 @@ static void main_dispatch_lde(struct event *event)
 		else
 			kill(ldpe_pid, SIGTERM);
 	}
+}
+
+/*
+ * imsg_read() for the pipes between the ldpd processes.  A peer that
+ * closes its end while data we sent it is still unread makes Linux
+ * report ECONNRESET instead of EOF, once our own queue is drained.
+ * It is the same close, so report it as one.
+ */
+ssize_t ldp_imsg_read(struct imsgbuf *ibuf)
+{
+	ssize_t n;
+
+	n = imsg_read(ibuf);
+	if (n == -1 && errno == ECONNRESET)
+		n = 0;
+
+	return n;
 }
 
 /* ARGSUSED */
@@ -940,20 +957,32 @@ ldp_acl_request(struct imsgev *iev, char *acl_name, int af,
 	imsg_flush(&iev->ibuf);
 
 	/* receive (blocking) and parse result */
-	n = imsg_read(&iev->ibuf);
-	if (n == -1 && errno != ECONNRESET)
-		fatal("imsg_read error");
+	for (;;) {
+		n = imsg_get(&iev->ibuf, &imsg);
+		if (n == -1)
+			fatal("imsg_get");
+		if (n > 0)
+			break;
 
-	/*
-	 * The parent closes the sync pipe only when it exits, so a close
-	 * here means no reply is coming and this process is about to be
-	 * torn down.  Deny rather than read an imsg that was never received.
-	 */
-	if (n <= 0)
-		return FILTER_DENY;
-
-	if (imsg_get(&iev->ibuf, &imsg) == -1)
-		fatal("imsg_get");
+		n = ldp_imsg_read(&iev->ibuf);
+		/*
+		 * Unlike the dispatch handlers, no EAGAIN exemption: only the
+		 * parent's end of the sync pipe is nonblocking, so this read
+		 * (on LDPD_FD_SYNC) blocks and any -1 is a real error.
+		 */
+		if (n == -1)
+			fatal("imsg_read error");
+		if (n == 0) {
+			/*
+			 * The parent is gone (ldpd_shutdown() closes this
+			 * pipe).  The answer no longer matters: deny, and let
+			 * the event loop see the main pipe close and shut down.
+			 * Say so, in case the pipe ever closes for another reason.
+			 */
+			log_warnx("%s: parent pipe closed, denying acl %s", __func__, acl_name);
+			return FILTER_DENY;
+		}
+	}
 
 	if (imsg.hdr.type != IMSG_ACL_CHECK ||
 	    imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(int))

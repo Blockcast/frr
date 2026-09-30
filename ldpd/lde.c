@@ -253,14 +253,9 @@ static void lde_dispatch_imsg(struct event *event)
 	ssize_t			 n;
 	int			 shut = 0;
 
-	n = imsg_read(ibuf);
-	if (n == -1) {
-		/* peer closed with our data unread: same as EOF */
-		if (errno == ECONNRESET)
-			n = 0;
-		else if (errno != EAGAIN)
-			fatal("imsg_read error");
-	}
+	n = ldp_imsg_read(ibuf);
+	if (n == -1 && errno != EAGAIN)
+		fatal("imsg_read error");
 	if (n == 0)	/* connection closed */
 		shut = 1;
 
@@ -482,14 +477,9 @@ static void lde_dispatch_parent(struct event *event)
 	struct zapi_rlfa_request *rlfa_req;
 	struct zapi_rlfa_igp	 *rlfa_igp;
 
-	n = imsg_read(ibuf);
-	if (n == -1) {
-		/* peer closed with our data unread: same as EOF */
-		if (errno == ECONNRESET)
-			n = 0;
-		else if (errno != EAGAIN)
-			fatal("imsg_read error");
-	}
+	n = ldp_imsg_read(ibuf);
+	if (n == -1 && errno != EAGAIN)
+		fatal("imsg_read error");
 	if (n == 0)	/* connection closed */
 		shut = 1;
 
