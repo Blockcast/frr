@@ -414,9 +414,9 @@ check "a4: invalid endpoint cannot mutate FRR" \
 # instead of carrying its own shape+range pair, so it inherits the
 # leading-zero rejection.  Note the DISPOSITION differs from the peer
 # gate's on purpose: validate_endpoints returns on the FIRST bad entry
-# (:313) and its caller aborts the run (:658), so one malformed
+# (:318) and its caller aborts the run (:663), so one malformed
 # endpoint blocks every OTHER peer too -- unlike a malformed peer,
-# which is per-entry (invalid=1, siblings still build; :739-751).
+# which is per-entry (invalid=1, siblings still build; :744-756).
 # That is the safe direction for DESTRUCTIVENESS -- it returns before
 # any delete, and `ip` would reject 010.0.2.47 downstream anyway
 # (inet_pton has no octal) -- but it is not free: it trades a
@@ -443,8 +443,8 @@ check "a4b: it refuses before touching the live tunnel" \
 	log_lacks "^ip link del dimt-0-47$"
 # 100.64.0.48 is a wholly valid peer with a valid endpoint.  It still
 # does not build: the refusal is run-wide, not per-entry.  This is the
-# assertion every sibling malformed-entry block carries (h6f :912,
-# h6f3 :947, h6f6 :1058, h6f7 :1112, h6d :820) -- with the sign
+# assertion every sibling malformed-entry block carries (h6f :992,
+# h6f3 :1036, h6f6 :1186, h6f7 :1240, h6d :900) -- with the sign
 # flipped, because here the survivor does NOT survive.
 check "a4b: the valid peer alongside it does NOT build (run-wide refusal)" \
 	log_lacks "^ip link add dimt-0-48[^0-9]"
@@ -836,7 +836,7 @@ check "h6b: not mistaken for a valid gre peer" log_lacks "^ip link add dimt-0-47
 # Negative control for h6b3.  There the operator typed the "=", so the echoed
 # mode greps their file; here peers() synthesised it from a field separator,
 # so it does not -- $peer is the grep key, exactly as the script says at
-# dimt-reconcile.sh:710-711.  Pinning both directions is what makes the
+# dimt-reconcile.sh:772-773.  Pinning both directions is what makes the
 # distinction deliberate, and each direction has its own mutation rather than
 # a shared one: truncating the mode at the first "=" reddens "the echoed mode
 # is NOT one" while h6b3's grep-key assertion stays green, because the
@@ -1244,7 +1244,7 @@ check "h6f7: the valid peer alongside it still builds" log_has \
 # h6f6 pins the same hazard on the --peers-file path.  This is the
 # --peers twin, and it is the ONLY conversion in this class whose input
 # is genuinely unvalidated: PEERS_INLINE is raw argv (dimt-reconcile.sh
-# :169), so it reaches the echo in peers() BEFORE is_quad ever sees it.
+# :174), so it reaches the echo in peers() BEFORE is_quad ever sees it.
 # Reverting that one line to `echo "$PEERS_INLINE"` left the whole suite
 # green until this block existed (Ally, frr#117 review at 5e7a8c15).
 # The failure mode is the worst of the set: \c truncates the LIST, so
@@ -1405,8 +1405,8 @@ fi
 # same treatment.  Raise the floor when you add assertions.
 # The floor EQUALS the live count on purpose -- no slack, so a
 # deletion is caught the same run it happens.  Do not relax -lt.
-if [ "$RAN" -lt 242 ]; then
-	echo "FAIL: assertion count fell to $RAN (floor 242) -- a block was deleted"
+if [ "$RAN" -lt 244 ]; then
+	echo "FAIL: assertion count fell to $RAN (floor 244) -- a block was deleted"
 	exit 1
 fi
 echo "all tests passed ($RAN assertions)"
