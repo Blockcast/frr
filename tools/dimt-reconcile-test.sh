@@ -1111,6 +1111,38 @@ check "h6f7: GC suppressed (invalid=1)" log_lacks "^ip link del dimt-9-9"
 check "h6f7: the valid peer alongside it still builds" log_has \
 	"^ip link add dimt-0-47 "
 
+# --- (h6f8) the INLINE peer list is escape-proof under a POSIX echo ---
+# h6f6 pins the same hazard on the --peers-file path.  This is the
+# --peers twin, and it is the ONLY conversion in this class whose input
+# is genuinely unvalidated: PEERS_INLINE is raw argv (dimt-reconcile.sh
+# :169), so it reaches the echo in peers() BEFORE is_quad ever sees it.
+# Reverting that one line to `echo "$PEERS_INLINE"` left the whole suite
+# green until this block existed (Ally, frr#117 review at 5e7a8c15).
+# The failure mode is the worst of the set: \c truncates the LIST, so
+# every peer after the bad token vanishes silently.  Nothing is
+# malformed, so invalid is never set, so GC is NOT suppressed -- and the
+# live tunnel of a peer that IS in the registry is reaped on a run that
+# exits 0.  That is exactly the outcome the DISPOSITION comment at
+# dimt-reconcile.sh:719-731 says the design exists to prevent, reached by
+# the one path that bypasses the gate rather than failing it; the
+# build-loop reject path cannot help, because the entry never arrives.
+# Assertion 3 is the one that dies for that reason -- keep it even if the
+# others look redundant.  Interpreter caveat is h6f6's: this only fails
+# when $RUN_SH's echo expands backslashes (dash/ash, not bash).
+new_state h6f8
+echo "dimt-0-48 100.64.0.40 100.64.0.48 gre" >> "$FAKEIP_DIR/links"
+err=$($RUN_SH "$RECONCILE" --self 100.64.0.40 \
+	--peers "100.64.0.47,100.64.0.4\\c,100.64.0.48" \
+	--peers-file "$TESTDIR/no-such-file" 2>&1)
+rc=$?
+check "h6f8: a backslash-bearing inline peer exits nonzero" [ "$rc" -ne 0 ]
+check "h6f8: the escaped inline entry is named" err_has \
+	"ignoring invalid peer entry"
+check "h6f8: the peers AFTER it are not silently dropped" \
+	log_lacks "^ip link del dimt-0-48$"
+check "h6f8: no device is derived from the truncated token" \
+	log_lacks "^ip link add dimt-0-4 "
+
 # --- (h7) one overlay listed twice under conflicting modes -------------
 new_state h7
 printf '100.64.0.47 gre\n100.64.0.47 gre-in-fou\n' > "$TESTDIR/peers-conflict"

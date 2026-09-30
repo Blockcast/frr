@@ -56,6 +56,8 @@ jobs:
         run: bash tools/dimt-reconcile-test.sh
 
       - name: Run dimt-reconcile tests under dash (OpenWrt ash proxy)
+        env:
+          DIMT_TEST_SH: dash
         run: |
           # Whether this runner image gives the job root or a sudo-capable user
           # is not guaranteed across pools, and the bare `sudo` this used to
@@ -63,4 +65,4 @@ jobs:
           SUDO=''; [ "$(id -u)" -eq 0 ] || SUDO=sudo
           command -v dash >/dev/null 2>&1 || {
             $SUDO apt-get update -qq && $SUDO apt-get install -y -qq dash; }
-          DIMT_TEST_SH=dash dash tools/dimt-reconcile-test.sh
+          dash tools/dimt-reconcile-test.sh
