@@ -1531,6 +1531,31 @@ def _held_delete(router, tunnel_id):
     return removed, delete.returncode, _text(stderr).strip()
 
 
+def _direct_answer(router, action, tunnel_id, *extra):
+    """Send one request with a barrier; (answers, rest, returncode, stderr).
+
+    `answers` are the tunnel's notifies printed before {"barrier": true} --
+    zebra's direct reply to the request (see dimt_zapi_client.py's
+    --barrier) -- and `rest` is everything printed from the barrier on, so a
+    caller can tell a refused request from one that went unanswered.
+    """
+    proc = router.popen(
+        client_argv(action, tunnel_id, "--barrier", BARRIER_TUNNEL_ID,
+                    *extra),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate(timeout=5)
+    lines = [json.loads(line) for line in _text(stdout).splitlines() if line]
+    cut = next((i for i, line in enumerate(lines) if line == {"barrier": True}),
+               len(lines))
+    return lines[:cut], lines[cut:], proc.returncode, _text(stderr).strip()
+
+
 def _held_before_delete_result(router, name, trace_file, removed):
     """Why the hold caught the worker before the DEL's result reached main.
 
@@ -1611,6 +1636,14 @@ def test_add_after_removed_before_dellink_is_parked():
     the tunnel before the barrier's REMOVED -- before the fix, INSTALLED with
     the dead index did. Released, the parked ADD must be served as a fresh
     create, on the new link's index.
+
+    While the ADD is parked, a second PIM client (instance 1) sends an ADD
+    and then a DEL for the same tunnel. The tombstone belongs to the owner,
+    so each must be refused at once -- FAIL_INSTALL and REMOVE_FAIL, before
+    its barrier -- and neither may touch the parked ADD. Without the owner
+    check at the top of zebra_dimt_tunnel_park(), the stranger's ADD would
+    replace the parked one unanswered and its DEL would be told REMOVED and
+    drop it, so the owner's replay would never come.
     """
     router = get_topogen().gears["r1"]
     tunnel_id = 20
@@ -1690,6 +1723,24 @@ def test_add_after_removed_before_dellink_is_parked():
             assert not early, (
                 "zebra answered an ADD landing before it processed the "
                 "RTM_DELLINK instead of parking it: {}".format(early)
+            )
+
+            # The tombstone answers only its owner (BLO-38883). The owner
+            # key is proto + instance and every request is pinned to PIM,
+            # so the stranger is PIM instance 1.
+            for action, refused in (("add", 1), ("del", 3)):
+                answers, rest, rc, stderr = _direct_answer(
+                    router, action, tunnel_id, "--instance", 1
+                )
+                assert rc == 0 and rest == [{"barrier": True}], (
+                    action, answers, rest, rc, stderr)
+                assert [(a["tunnel_id"], a["result"]) for a in answers] == [
+                    (tunnel_id, refused)
+                ], ("a non-owner {} against the tombstone was not refused "
+                    "before its barrier: {}".format(action, answers))
+            _prove_dellink_unread(
+                router, name, ifindex, trace_file,
+                "after the non-owner's requests",
             )
         finally:
             if tracer is not None:
