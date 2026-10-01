@@ -1367,8 +1367,11 @@ def test_queued_delete_does_not_remove_reused_ifindex():
     thread runs; whether it has by the time the queued delete is encoded then
     depends on the order that thread's event loop services the two (queued
     events are posted before a pass's I/O, and one notification read makes at
-    most five recvmsg() calls), which a syscall hold cannot pin. BLO-38026
-    tracks covering the skip path. The
+    most five recvmsg() calls), which a syscall hold cannot pin. The skip
+    path itself is covered without a kernel by tests/zebra/test_dimt_netlink.c:
+    case (a) put-skip calls netlink_put_dimt_tunnel_msg() with a
+    delete_ifindex the namespace does not list, cases C-F run it through
+    kernel_update_multi(), and case J pins the encode-time recheck. The
     encoded-before-replacement half is covered for real by
     test_delete_encoded_before_replacement_binds_to_ifindex.
     """
@@ -1951,7 +1954,10 @@ def test_skipped_delete_result_survives_mixed_batch():
     skipped at encode time, and no dplane hold can arrange it: see
     test_queued_delete_does_not_remove_reused_ifindex. The test used to claim
     it through hold_dplane_worker(), which never held anything (BLO-29000), so
-    both deletes simply ran one after the other. BLO-38026 tracks covering it.
+    both deletes simply ran one after the other. That case is covered without
+    a kernel by tests/zebra/test_dimt_netlink.c cases G (the [real, skipped]
+    order, which is the only one the old drain flipped), H and I (the
+    read-failure drain).
     """
     router = get_topogen().gears["r1"]
     replaced = request("add", 12)

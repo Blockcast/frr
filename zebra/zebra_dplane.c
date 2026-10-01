@@ -6500,15 +6500,17 @@ done:
 	return result;
 }
 
-static enum zebra_dplane_result dplane_dimt_tunnel_update(
-	enum dplane_op_e op, vrf_id_t vrf_id,
-	const struct zebra_dimt_tunnel_ctx *tunnel)
+/*
+ * Encode a DIMT tunnel request into a dataplane context. Consumes one
+ * netlink sequence number from zns. Split out of
+ * dplane_dimt_tunnel_update() so a unit test can build the exact context
+ * zebra enqueues without a VRF or a running dataplane.
+ */
+int dplane_ctx_dimt_tunnel_init(struct zebra_dplane_ctx *ctx,
+				enum dplane_op_e op, vrf_id_t vrf_id,
+				struct zebra_ns *zns,
+				const struct zebra_dimt_tunnel_ctx *tunnel)
 {
-	struct zebra_dplane_ctx *ctx;
-	struct zebra_ns *zns;
-	struct zebra_vrf *zvrf;
-
-	ctx = dplane_ctx_alloc();
 	ctx->zd_op = op;
 	ctx->zd_status = ZEBRA_DPLANE_REQUEST_SUCCESS;
 	ctx->zd_vrf_id = vrf_id;
@@ -6518,13 +6520,26 @@ static enum zebra_dplane_result dplane_dimt_tunnel_update(
 	if (op == DPLANE_OP_DIMT_TUNNEL_DEL)
 		dplane_ctx_set_ifindex(ctx, tunnel->delete_ifindex);
 
+	return dplane_ctx_ns_init(ctx, zns, false);
+}
+
+static enum zebra_dplane_result dplane_dimt_tunnel_update(
+	enum dplane_op_e op, vrf_id_t vrf_id,
+	const struct zebra_dimt_tunnel_ctx *tunnel)
+{
+	struct zebra_dplane_ctx *ctx;
+	struct zebra_ns *zns;
+	struct zebra_vrf *zvrf;
+
+	ctx = dplane_ctx_alloc();
+
 	zvrf = zebra_vrf_lookup_by_id(vrf_id);
 	zns = zvrf ? zvrf->zns : NULL;
 	if (!zns) {
 		dplane_ctx_free(&ctx);
 		return ZEBRA_DPLANE_REQUEST_FAILURE;
 	}
-	dplane_ctx_ns_init(ctx, zns, false);
+	dplane_ctx_dimt_tunnel_init(ctx, op, vrf_id, zns, tunnel);
 
 	if (dplane_update_enqueue(ctx) != AOK) {
 		dplane_ctx_free(&ctx);
