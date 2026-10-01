@@ -244,9 +244,12 @@ RUN set -eux; \
 # right after FROM it forked the LTTng leg at the very first RUN and none of the
 # layers above could be shared. This placement is the precondition, not the
 # sharing itself: it shows up within one BuildKit cache, but each CI leg runs a
-# fresh builder that reads only its own per-platform -buildcache ref. Sharing in
-# CI also needs a cache both legs read, e.g. the amd64_u24 ref as a second
-# cache-from on the LTTng legs.
+# fresh builder that reads only the -buildcache refs it names, so Build-LTTng in
+# github-ci.yml names the amd64_u24 ref as a second cache-from.  The ARG stays
+# in scope to the end of the stage (USER does not end it), so the configure step
+# below sees it too -- and fails the build if it ever does not: a FROM inserted
+# in between would otherwise drop --enable-lttng silently, and Build-LTTng would
+# go on passing while building an image without LTTng.
 ARG ENABLE_LTTNG=false
 RUN if [ "$ENABLE_LTTNG" = "true" ]; then \
         apt-get install -y liblttng-ust-dev; \
@@ -254,8 +257,6 @@ RUN if [ "$ENABLE_LTTNG" = "true" ]; then \
 
 USER frr:frr
 
-# Re-declare ARG after USER to make it available
-ARG ENABLE_LTTNG=false
 # CI build arg used to invalidate the compile layer when source revision changes.
 ARG FRR_SOURCE_REV=unknown
 
@@ -265,6 +266,7 @@ RUN cd ~/frr && \
     echo "Building FRR source revision: ${FRR_SOURCE_REV}" && \
     ./bootstrap.sh && \
     LTTNG_OPT="" && \
+    : "${ENABLE_LTTNG:?is not in scope: declare ARG ENABLE_LTTNG in this stage}" && \
     if [ "$ENABLE_LTTNG" = "true" ]; then LTTNG_OPT="--enable-lttng"; fi && \
     ./configure \
        --prefix=/usr \

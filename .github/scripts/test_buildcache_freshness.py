@@ -478,10 +478,11 @@ class TestLttngBuildMirrorsBuild(unittest.TestCase):
     It left Build's matrix so the LTTng leg (which delayed the Build gate in
     16 of 39 runs, by up to 47.1 min) no longer holds Test back.  The copy
     may differ from Build only where the move requires: it exports
-    `type=cacheonly` (nothing pulls an LTTng image) and has none of Build's
-    seed/cleanup steps.  Any other drift -- a different cache-from, build
-    arg, MIB key or timeout -- would test a build CI no longer runs for u24,
-    so it fails here.  Comment lines are ignored.
+    `type=cacheonly` (nothing pulls an LTTng image), has none of Build's
+    seed/cleanup steps, and reads Build's 24.04 cache after its own (see
+    test_lttng_also_reads_the_2404_cache).  Any other drift -- another
+    cache-from, build arg, MIB key or timeout -- would test a build CI no
+    longer runs for u24, so it fails here.  Comment lines are ignored.
     """
 
     WORKFLOW = os.path.join(
@@ -552,27 +553,77 @@ class TestLttngBuildMirrorsBuild(unittest.TestCase):
             with self.subTest(step=name):
                 self.assertEqual(lttng[name], build[name])
 
-    def test_build_step_differs_only_in_its_exporter(self):
+    @staticmethod
+    def _without(code, key):
+        """`code` minus the step input `key`, a scalar or a `|` block."""
+        out, skipping = [], False
+        for line in code:
+            if line == f"          {key}: |":
+                skipping = True
+                continue
+            if skipping and line.startswith(" " * 12):
+                continue
+            skipping = False
+            if line.startswith(f"          {key}:"):
+                continue
+            out.append(line)
+        return out
+
+    @staticmethod
+    def _input(code, key):
+        """The value lines of step input `key`: one for a scalar, each line
+        of a `|` block otherwise; None when the step does not set it."""
+        for i, line in enumerate(code):
+            if line == f"          {key}: |":
+                values = []
+                for nxt in code[i + 1 :]:
+                    if not nxt.startswith(" " * 12):
+                        break
+                    values.append(nxt.strip())
+                return values
+            if line.startswith(f"          {key}: "):
+                return [line.split(": ", 1)[1].strip()]
+        return None
+
+    @staticmethod
+    def _matrix_rows(block):
+        return [
+            dict(re.findall(r"(\w+)\s*:\s*'([^']*)'", line))
+            for line in block.splitlines()
+            if re.match(r"^\s*-\s*\{.*\}\s*$", line)
+        ]
+
+    def test_build_step_differs_only_in_its_exporter_and_cache_sources(self):
         name = "Build docker image (cached)"
         build, lttng = self._steps(self.build)[name], self._steps(self.lttng)[name]
 
-        def without_outputs(code):
-            out, skipping = [], False
-            for line in code:
-                if line == "          outputs: |":
-                    skipping = True
-                    continue
-                if skipping and line.startswith(" " * 12):
-                    continue
-                skipping = False
-                if line.startswith("          outputs:"):
-                    continue
-                out.append(line)
-            return out
+        def rest(code):
+            return self._without(self._without(code, "outputs"), "cache-from")
 
-        self.assertEqual(without_outputs(lttng), without_outputs(build))
+        self.assertEqual(rest(lttng), rest(build))
         self.assertIn("          outputs: type=cacheonly", lttng)
         self.assertNotIn("push=true", "\n".join(lttng))
+
+    def test_lttng_also_reads_the_2404_cache(self):
+        # Every layer above the LTTng one keys the same in both 24.04 legs
+        # (the Dockerfile declares ENABLE_LTTNG only at that layer), but each
+        # leg runs on a fresh builder and reads only the refs it names, so a
+        # second ref is the only way this leg reuses them.  It must be the
+        # ref Build reads for the same release with LTTng off: the seeder
+        # writes exactly the refs Build reads (TestSeederMatrixMatchesCI).
+        name = "Build docker image (cached)"
+        build, lttng = self._steps(self.build)[name], self._steps(self.lttng)[name]
+        own = self._input(build, "cache-from")
+        self.assertEqual(len(own), 1, own)
+        self.assertIn("${{ matrix.cfg.platform }}", own[0])
+        self.assertEqual(
+            self._input(lttng, "cache-from"),
+            [own[0], own[0].replace("${{ matrix.cfg.platform }}", "amd64_u24")],
+        )
+        (leg,) = self._matrix_rows(self.lttng)
+        (u24,) = [r for r in self._matrix_rows(self.build) if r.get("platform") == "amd64_u24"]
+        self.assertEqual(u24.get("lttng", "false"), "false")
+        self.assertEqual(u24["rel"], leg["rel"])
 
     def test_lttng_uploads_nothing(self):
         self.assertNotIn("actions/upload-artifact", "\n".join(self._code(self.lttng)))
