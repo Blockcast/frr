@@ -863,12 +863,24 @@ def assert_injection_fired(trace_output, what, tag="(INJECTED)"):
 
 
 def dplane_tid(router):
-    zebra_pid = router.run("cat /var/run/frr/zebra.pid").strip()
-    return router.run(
+    """The zebra_dplane pthread's TID, or "" when it cannot be found.
+
+    router.run() returns stderr with stdout, so each read here discards its
+    own. A zebra thread that exits between the task glob and its comm read
+    used to make `cat` print its error into the result, and _dplane_in_fd()
+    then spliced "<tid>\\ncat: ..." into its shell loop, which died as a bash
+    syntax error near `cat:' instead of naming the problem. Anything but one
+    numeric TID is "not found", which every caller reports.
+    """
+    zebra_pid = router.run("cat /var/run/frr/zebra.pid 2>/dev/null").strip()
+    if not zebra_pid.isdigit():
+        return ""
+    tids = router.run(
         f"for task in /proc/{zebra_pid}/task/*; do "
-        '[ "$(cat $task/comm)" = zebra_dplane ] && basename "$task"; '
+        '[ "$(cat $task/comm 2>/dev/null)" = zebra_dplane ] && basename "$task"; '
         "done"
-    ).strip()
+    ).split()
+    return tids[0] if len(tids) == 1 and tids[0].isdigit() else ""
 
 
 def gre_in_fou_supported(router):
@@ -1512,23 +1524,29 @@ def _prove_dellink_unread(router, name, ifindex, trace_file, when):
                 _trace_text(router, trace_file)))
 
 
+def _run_client(router, argv):
+    """Run one dimt_zapi_client.py; (stdout text, stderr text, returncode).
+
+    A client still waiting after 15s is killed, so a reply that never comes
+    cannot hold the test past the hold that is waiting on it.
+    """
+    proc = router.popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        stdout, stderr = proc.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate(timeout=5)
+    return _text(stdout), _text(stderr).strip(), proc.returncode
+
+
 def _held_delete(router, tunnel_id):
     """DEL `tunnel_id`; (parsed reply or None, returncode, stderr text)."""
-    delete = router.popen(
-        client_argv("del", tunnel_id),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    stdout, stderr, rc = _run_client(router, client_argv("del", tunnel_id))
     try:
-        stdout, stderr = delete.communicate(timeout=15)
-    except subprocess.TimeoutExpired:
-        delete.kill()
-        stdout, stderr = delete.communicate(timeout=5)
-    try:
-        removed = json.loads(_text(stdout))
+        removed = json.loads(stdout)
     except ValueError:
         removed = None
-    return removed, delete.returncode, _text(stderr).strip()
+    return removed, rc, stderr
 
 
 def _direct_answer(router, action, tunnel_id, *extra):
@@ -1539,21 +1557,14 @@ def _direct_answer(router, action, tunnel_id, *extra):
     --barrier) -- and `rest` is everything printed from the barrier on, so a
     caller can tell a refused request from one that went unanswered.
     """
-    proc = router.popen(
-        client_argv(action, tunnel_id, "--barrier", BARRIER_TUNNEL_ID,
-                    *extra),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    stdout, stderr, rc = _run_client(
+        router,
+        client_argv(action, tunnel_id, "--barrier", BARRIER_TUNNEL_ID, *extra),
     )
-    try:
-        stdout, stderr = proc.communicate(timeout=15)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate(timeout=5)
-    lines = [json.loads(line) for line in _text(stdout).splitlines() if line]
+    lines = [json.loads(line) for line in stdout.splitlines() if line]
     cut = next((i for i, line in enumerate(lines) if line == {"barrier": True}),
                len(lines))
-    return lines[:cut], lines[cut:], proc.returncode, _text(stderr).strip()
+    return lines[:cut], lines[cut:], rc, stderr
 
 
 def _held_before_delete_result(router, name, trace_file, removed):
@@ -1728,20 +1739,25 @@ def test_add_after_removed_before_dellink_is_parked():
             # The tombstone answers only its owner (BLO-38883). The owner
             # key is proto + instance and every request is pinned to PIM,
             # so the stranger is PIM instance 1.
+            #
+            # A refusal must carry the dead link's index: the tombstone
+            # keeps it until main processes the RTM_DELLINK. Had the hold
+            # lapsed and the owner's ADD replayed, a live entry would
+            # refuse with the same codes but with 0 (still creating) or the
+            # new link's index, so the index is what proves these came
+            # from the tombstone -- without another vtysh round trip
+            # inside the hold.
             for action, refused in (("add", 1), ("del", 3)):
                 answers, rest, rc, stderr = _direct_answer(
                     router, action, tunnel_id, "--instance", 1
                 )
                 assert rc == 0 and rest == [{"barrier": True}], (
                     action, answers, rest, rc, stderr)
-                assert [(a["tunnel_id"], a["result"]) for a in answers] == [
-                    (tunnel_id, refused)
-                ], ("a non-owner {} against the tombstone was not refused "
-                    "before its barrier: {}".format(action, answers))
-            _prove_dellink_unread(
-                router, name, ifindex, trace_file,
-                "after the non-owner's requests",
-            )
+                assert answers == [{
+                    "tunnel_id": tunnel_id, "ifindex": ifindex,
+                    "result": refused,
+                }], ("a non-owner {} against the tombstone was not refused "
+                     "before its barrier: {}".format(action, answers))
         finally:
             if tracer is not None:
                 stop_tracer(tracer)
