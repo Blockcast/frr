@@ -311,6 +311,26 @@ static struct zebra_dplane_ctx *mk_del(ifindex_t ifindex, const char *ifname)
 	return ctx;
 }
 
+/* A create: no link yet, so delete_ifindex stays 0 and matches nothing. */
+static struct zebra_dplane_ctx *mk_add(uint32_t tunnel_id, const char *ifname)
+{
+	struct zebra_dimt_tunnel_ctx t = {};
+	struct zebra_dplane_ctx *ctx = dplane_ctx_alloc();
+
+	t.tunnel.tunnel_id = tunnel_id;
+	ipv4(&t.tunnel.outer_local, TEST_LOCAL);
+	ipv4(&t.tunnel.outer_remote, TEST_REMOTE);
+	t.tunnel.encap = ZAPI_DIMT_TUNNEL_ENCAP_GRE;
+	t.tunnel.options = ZAPI_DIMT_TUNNEL_KEY_PRESENT;
+	t.tunnel.key = TEST_KEY;
+	strlcpy(t.ifname, ifname, sizeof(t.ifname));
+	t.phase = ZEBRA_DIMT_TUNNEL_CREATE;
+	dplane_ctx_dimt_tunnel_init(ctx, DPLANE_OP_DIMT_TUNNEL_ADD, VRF_DEFAULT,
+				    &tzns, &t);
+
+	return ctx;
+}
+
 static uint32_t seq_of(const struct zebra_dplane_ctx *ctx)
 {
 	return dplane_ctx_get_ns(ctx)->seq;
@@ -620,6 +640,22 @@ static void case_encode_recheck(void)
 	netlink_set_batch_buffer_size(16, 4096, true);
 	link_add(0, IF_REAL, NAME_REAL, TEST_REMOTE, TEST_KEY);
 	ctx[0] = mk_del(IF_REAL, NAME_REAL);
+	check("returned", update_multi(ctx, 1));
+	check("nothing sent", wire_cnt == 0);
+	check("FAILURE", !ok_of(ctx[0]));
+	check("authoritative", auth_of(ctx[0]));
+	netlink_set_batch_buffer_size(0, 0, false);
+	end(ctx, 1);
+
+	/*
+	 * K2: the same for a create. Its delete_ifindex is 0, so the
+	 * identity recheck can never match it; only the recheck's
+	 * DIMT_TUNNEL_DEL condition keeps a create that never reached the
+	 * kernel from being answered SUCCESS.
+	 */
+	begin("K2 encode-too-big-add");
+	netlink_set_batch_buffer_size(16, 4096, true);
+	ctx[0] = mk_add(IF_GONE, NAME_GONE);
 	check("returned", update_multi(ctx, 1));
 	check("nothing sent", wire_cnt == 0);
 	check("FAILURE", !ok_of(ctx[0]));

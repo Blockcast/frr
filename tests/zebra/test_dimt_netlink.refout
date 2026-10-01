@@ -66,3 +66,7 @@ K encode-too-big: returned: OK
 K encode-too-big: nothing sent: OK
 K encode-too-big: FAILURE: OK
 K encode-too-big: authoritative: OK
+K2 encode-too-big-add: returned: OK
+K2 encode-too-big-add: nothing sent: OK
+K2 encode-too-big-add: FAILURE: OK
+K2 encode-too-big-add: authoritative: OK
