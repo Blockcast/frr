@@ -35,11 +35,14 @@ struct zebra_dimt_tunnel {
 	bool replace_cancelled;
 	/* zebra processed the RTM_DELLINK of the link this entry was building
 	 * (ADDING, ADDRESSING) or cleaning up (CLEANUP with cleanup_pending)
-	 * while that op was still in flight.  Nothing of zebra's deletes a link
-	 * in the first two states, and a pending cleanup's own delete has not
-	 * been answered yet, so the delete was out of band and the link
-	 * provably existed; see zebra_dimt_tunnel_fail_install() and the
-	 * cleanup branch of zebra_dimt_tunnel_dplane_result(). */
+	 * while that op was still in flight, so the link provably existed.
+	 * Nothing of zebra's deletes a link in the first two states, so there
+	 * the delete was out of band; see zebra_dimt_tunnel_fail_install().
+	 * For a pending cleanup it may also be the cleanup's own delete, whose
+	 * RTM_DELLINK can be read before its result reaches main.  The cleanup
+	 * branch of zebra_dimt_tunnel_dplane_result() tells the two apart by
+	 * result_authoritative and must keep doing so: answering REMOVED for
+	 * zebra's own delete would loop a create that always fails. */
 	bool link_deleted;
 	enum {
 		ZEBRA_DIMT_ADDING,
@@ -473,7 +476,8 @@ zebra_dimt_tunnel_lookup_ifindex(vrf_id_t vrf_id, ifindex_t ifindex)
  * address phase fails against it; REPLACING is already at ifindex 0.
  * ADDRESSING and ADDING also set link_deleted, so their failed install is
  * followed by REMOVED (zebra_dimt_tunnel_fail_install()); so does a pending
- * CLEANUP, whose delete is then answered REMOVED even if the dplane skips it.
+ * CLEANUP, whose delete is then answered REMOVED if it fails or the dplane
+ * skips it, but not if the kernel ACKs it.
  * DELETED drops the ifindex and defers the parked-ADD replay.
  */
 void zebra_dimt_tunnel_if_delete(struct interface *ifp)

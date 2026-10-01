@@ -1852,7 +1852,7 @@ def test_delete_encoded_before_replacement_binds_to_ifindex():
     # it heard REMOVE_FAIL and nothing more, and the entry stayed INSTALLED on
     # an index no link has.
     removed = {"tunnel_id": 10, "ifindex": 0, "result": 2}
-    if lines and lines[0]["result"] == 3:
+    if lines and lines[0].get("result") == 3:
         # The usual order. The held sendmsg passes the 10ms yield slot, so
         # the failed delete's result is handed to main in the rescheduled
         # dplane pass, which event_fetch() runs before the dplane_in read the
