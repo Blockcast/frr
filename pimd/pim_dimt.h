@@ -214,7 +214,9 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
 			    const struct zapi_dimt_tunnel_notify *notify);
 
 /* Recompute tunnel demand and readiness across every upstream.  Called on a
- * UMH change, an interface event, and on zebra reconnect. */
+ * UMH mapping change or resync, an endpoint row change, an upstream add or
+ * delete, zebra reconnect, and an unsolicited REMOVED (the netdev vanished).
+ * Not on interface events: those only move pins (pim_dimt_iface_up/down). */
 void pim_dimt_reconcile(struct pim_instance *pim);
 
 /* Drop acknowledgement state for every tunnel without sending anything --

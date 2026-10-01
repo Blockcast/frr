@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import struct
+import sys
 
 
 MARKER = 254
@@ -17,6 +18,9 @@ ZEBRA_HELLO = 19
 ZEBRA_DIMT_TUNNEL_ADD = 153
 ZEBRA_DIMT_TUNNEL_DEL = 154
 ZEBRA_DIMT_TUNNEL_NOTIFY_OWNER = 155
+
+# Exit status of a --follow/--barrier session that gave up waiting.
+EXIT_TIMEOUT = 3
 
 
 def header(command, payload=b""):
@@ -39,7 +43,8 @@ def recv_exact(sock, length):
     return data
 
 
-def recv_notify(sock, tunnel_id):
+def recv_notify(sock, tunnel_ids):
+    """Return the next owner notify for any tunnel id in `tunnel_ids`."""
     while True:
         raw_header = recv_exact(sock, 10)
         length, marker, version, _vrf, command = struct.unpack("!HBBIH", raw_header)
@@ -49,8 +54,45 @@ def recv_notify(sock, tunnel_id):
         if command != ZEBRA_DIMT_TUNNEL_NOTIFY_OWNER:
             continue
         response_id, ifindex, result = struct.unpack("!IIB", payload)
-        if response_id == tunnel_id:
+        if response_id in tunnel_ids:
             return {"tunnel_id": response_id, "ifindex": ifindex, "result": result}
+
+
+def emit(record):
+    print(json.dumps(record), flush=True)
+
+
+def follow(sock, tunnel_id, barrier, count):
+    """Print notifies for `tunnel_id`, one JSON line each, as they arrive.
+
+    The anchor is the barrier's own notify when --barrier was given, and the
+    tunnel's first notify otherwise; `count` more tunnel notifies are printed
+    after it.  zebra serves one session's messages in order, so every notify
+    for the tunnel printed before {"barrier": true} was sent before zebra had
+    even read the barrier DEL -- i.e. it answered the request directly.
+    """
+    # The barrier's REMOVED must not be mistaken for the tunnel's own notify.
+    assert barrier != tunnel_id, "--barrier must differ from the tunnel id"
+    ids = {tunnel_id} if barrier is None else {tunnel_id, barrier}
+    anchored = False
+    remaining = count
+    try:
+        while not anchored or remaining > 0:
+            notify = recv_notify(sock, ids)
+            if barrier is not None and notify["tunnel_id"] == barrier:
+                # Only the first answer for the barrier id is the barrier.
+                ids.discard(barrier)
+                anchored = True
+                emit({"barrier": True})
+                continue
+            emit(notify)
+            if anchored:
+                remaining -= 1
+            elif barrier is None:
+                anchored = True
+    except socket.timeout:
+        emit({"timeout": True})
+        sys.exit(EXIT_TIMEOUT)
 
 
 def main():
@@ -68,8 +110,18 @@ def main():
     parser.add_argument("--outer-remote", default="192.0.2.2")
     # A client whose request is deliberately held in zebra's dataplane waits
     # as long as the hold; the default only has to cover an ordinary round
-    # trip.
+    # trip.  Under --follow/--barrier it bounds each wait for the next notify.
     parser.add_argument("--timeout", type=float, default=10)
+    # Keep the owner session open after the first notify and print this many
+    # more for the tunnel, one JSON line each.  On timeout {"timeout": true}
+    # is printed and the client exits 3.
+    parser.add_argument("--follow", type=int, default=0, metavar="N")
+    # After the request, send a DEL for this id -- one zebra does not track,
+    # so it is answered REMOVED at once from the no-entry branch -- and treat
+    # that REMOVED as an ordering barrier: tunnel notifies printed before
+    # {"barrier": true} are zebra's direct answer to the request, and --follow
+    # counts from the barrier instead of from the first notify.
+    parser.add_argument("--barrier", type=int, metavar="ID")
     args = parser.parse_args()
 
     session_id = 0xD1000000 | (os.getpid() & 0xFFFF)
@@ -91,7 +143,14 @@ def main():
             payload = struct.pack("!I", args.tunnel_id)
             command = ZEBRA_DIMT_TUNNEL_DEL
         sock.sendall(header(command, payload))
-        print(json.dumps(recv_notify(sock, args.tunnel_id)))
+        if args.barrier is not None:
+            sock.sendall(
+                header(ZEBRA_DIMT_TUNNEL_DEL, struct.pack("!I", args.barrier))
+            )
+        if args.follow or args.barrier is not None:
+            follow(sock, args.tunnel_id, args.barrier, args.follow)
+            return
+        print(json.dumps(recv_notify(sock, {args.tunnel_id})))
 
 
 if __name__ == "__main__":
