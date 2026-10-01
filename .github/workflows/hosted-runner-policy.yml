@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/scripts/check-runner-labels.py'
+      - '.github/scripts/test_check_runner_labels.py'
   push:
     branches:
       - master
@@ -14,6 +15,7 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/scripts/check-runner-labels.py'
+      - '.github/scripts/test_check_runner_labels.py'
 
 permissions:
   contents: read
@@ -39,3 +41,5 @@ jobs:
       - uses: actions/checkout@v5
       - name: Reject GitHub-hosted runner labels
         run: python3 .github/scripts/check-runner-labels.py
+      - name: Multi-exporter rule fixtures
+        run: python3 -m unittest discover -s .github/scripts -p 'test_check_runner_labels.py' -v

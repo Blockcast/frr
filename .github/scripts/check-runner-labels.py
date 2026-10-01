@@ -10,7 +10,33 @@ HOSTED_LABEL = re.compile(r"\b(?:ubuntu|macos|windows)-(?:latest|\d[\w.-]*)\b", 
 # A YAML list item ("- name: ...", "- uses: ...", "- { rel: ... }"). Splitting on
 # these gives one chunk per step, which is all the exporter check below needs.
 LIST_ITEM = re.compile(r"^\s*-\s", re.MULTILINE)
-EXPORTER = re.compile(r"^\s*type=(\w+)", re.MULTILINE)
+EXPORTER = re.compile(r"^\s*type=(\w+)")
+# A step input such as "outputs: |" or "cache-from: type=...". Block-scalar
+# lines ("type=registry,ref=...", "UBUNTU_VERSION=...") never match: the text
+# before their first ':' is not a bare key.
+INPUT_KEY = re.compile(r"^\s*([A-Za-z0-9_-]+):(.*)$")
+
+
+def step_exporters(chunk: str) -> list:
+    """Lines of one step that declare a buildx `--output` exporter.
+
+    Only the `outputs:` input becomes `--output`, inline or one exporter per
+    block-scalar line. `cache-from:`/`cache-to:` use the same `type=...`
+    syntax, but `tags:` does not touch cache refs, so counting them made a
+    two-line `cache-from: |` read as two unnamed exporters (frr#129).
+    """
+    exporters, key = [], None
+    for line in chunk.splitlines():
+        if line.strip().startswith("#"):
+            continue
+        match = INPUT_KEY.match(line)
+        if match:
+            key, value = match.group(1), match.group(2)
+        else:
+            value = line
+        if key == "outputs" and EXPORTER.match(value):
+            exporters.append(line)
+    return exporters
 
 
 def check_exporter_names(path: pathlib.Path, text: str) -> list:
@@ -23,7 +49,7 @@ def check_exporter_names(path: pathlib.Path, text: str) -> list:
     """
     violations = []
     for chunk in LIST_ITEM.split(text):
-        exporters = [line for line in chunk.splitlines() if EXPORTER.match(line)]
+        exporters = step_exporters(chunk)
         if len(exporters) < 2:
             continue
         step = chunk.splitlines()[0].strip()
