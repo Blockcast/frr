@@ -247,7 +247,9 @@ RUN set -eux; \
 # fresh builder that reads only the -buildcache refs it names, so Build-LTTng in
 # github-ci.yml names the amd64_u24 ref as a second cache-from.  The ARG stays
 # in scope to the end of the stage (USER does not end it), so the configure step
-# below sees it too.
+# below sees it too -- and fails the build if it ever does not: a FROM inserted
+# in between would otherwise drop --enable-lttng silently, and Build-LTTng would
+# go on passing while building an image without LTTng.
 ARG ENABLE_LTTNG=false
 RUN if [ "$ENABLE_LTTNG" = "true" ]; then \
         apt-get install -y liblttng-ust-dev; \
@@ -264,6 +266,7 @@ RUN cd ~/frr && \
     echo "Building FRR source revision: ${FRR_SOURCE_REV}" && \
     ./bootstrap.sh && \
     LTTNG_OPT="" && \
+    : "${ENABLE_LTTNG:?is not in scope: declare ARG ENABLE_LTTNG in this stage}" && \
     if [ "$ENABLE_LTTNG" = "true" ]; then LTTNG_OPT="--enable-lttng"; fi && \
     ./configure \
        --prefix=/usr \
