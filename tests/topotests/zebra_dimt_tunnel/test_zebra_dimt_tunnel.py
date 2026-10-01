@@ -465,6 +465,33 @@ def _route_netlink_fds(router, thread_id):
     return ",".join(fds)
 
 
+def _await_strace_attached(router, worker, tracer):
+    """Return once strace is tracing the dplane worker; fail if it never is.
+
+    A fixed sleep after starting strace was the only sync, and under load
+    strace attached after the worker's first sendmsg: with when=2 the
+    address-add became the FIRST traced call, nothing was injected, and the
+    test stopped on assert_injection_fired() as not having executed. The
+    worker's TracerPid turns non-zero on PTRACE_SEIZE, which strace follows
+    with its interrupt at once; the short settle covers that gap.
+    """
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if tracer.poll() is not None:
+            _stdout, stderr = tracer.communicate()
+            pytest.fail(
+                "strace attach failed: {}".format(_text(stderr).strip())
+            )
+        status = router.run(
+            "awk '/^TracerPid:/ {{print $2}}' /proc/{}/status".format(worker)
+        ).strip()
+        if status not in ("", "0"):
+            time.sleep(0.1)
+            return
+        time.sleep(0.05)
+    pytest.fail("strace never attached to the zebra_dplane worker")
+
+
 def inject_netlink_syscall_failure(
     router, syscall, when, errno_name="EIO", route_netlink_fds=False
 ):
@@ -497,12 +524,7 @@ def inject_netlink_syscall_failure(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    time.sleep(0.2)
-    if tracer.poll() is not None:
-        _stdout, stderr = tracer.communicate()
-        pytest.fail(
-            "strace attach failed: {}".format(_text(stderr).strip())
-        )
+    _await_strace_attached(router, worker, tracer)
     # Derived from the same arguments that built the strace command, so the
     # diagnostic cannot drift from the injection.  It drifted once: the recv
     # site said EIO while inject_netlink_recv_failure() deliberately injects
@@ -756,12 +778,7 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
     if trace_file:
         cmd[1:1] = ["-o", trace_file]
     tracer = router.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    time.sleep(0.3)
-    if tracer.poll() is not None:
-        _stdout, stderr = tracer.communicate()
-        pytest.fail(
-            "strace attach failed: {}".format(_text(stderr).strip())
-        )
+    _await_strace_attached(router, worker, tracer)
     # Same contract as inject_netlink_syscall_failure() above, and derived from
     # the same arguments that built the command for the same anti-drift reason:
     # a diagnostic that names the hold cannot drift from the hold.
@@ -1728,10 +1745,20 @@ def test_uncertain_create_result_reconciles_surviving_link():
         wait=SYNC_POLL_WAIT,
     )
     assert link == "", link
+    # The kernel deleting the link is not zebra processing its RTM_DELLINK.
+    # Until it does, the tombstone still lists the link, so under load both
+    # retries below could land on it and be answered FAIL_INSTALL.
+    _, dropped = topotest.run_and_expect(
+        lambda: zebra_dropped_interface(router, "dimt-00000008"),
+        True,
+        count=SYNC_POLL_COUNT,
+        wait=SYNC_POLL_WAIT,
+    )
+    assert dropped, "zebra still lists dimt-00000008 after the cleanup"
     # The retained lifecycle entry converges over the standard cleanup
     # retry. Stale-ack correlation poisoning is fixed (dropped by sequence
     # comparison); the only remaining variance is reconcile timing -- the
-    # retry may land while the entry is still a cleanup tombstone.
+    # retry may land while the cleanup delete's result is still in flight.
     retry = request("add", 8)
     assert retry["result"] in (0, 1), retry
     if retry["result"] == 1:
