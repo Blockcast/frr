@@ -392,7 +392,7 @@ static void check_skipped(struct zebra_dplane_ctx *ctx)
 static void case_put(void)
 {
 	struct dplane_ctx_list_head out;
-	struct zebra_dplane_ctx *ctx[1];
+	struct zebra_dplane_ctx *ctx[2];
 	struct nl_batch bth;
 	enum netlink_msg_status res;
 
@@ -417,17 +417,26 @@ static void case_put(void)
 	 * (a) The namespace is registered but does not list the ifindex.
 	 * kernel_update_multi() presets a DIMT context to FAILURE before
 	 * the put, so do the same: the skip must overwrite it.
+	 *
+	 * A real delete is batched first, and the skip must leave it
+	 * pending. That is the one thing only the put-time check does:
+	 * without it the post-encode recheck reaches the same verdict, but
+	 * only after the encoder's 0 has flushed the batch (BLO-38882).
 	 */
 	begin("a put-skip");
-	ctx[0] = mk_del(IF_GONE, NAME_GONE);
-	dplane_ctx_set_status(ctx[0], ZEBRA_DPLANE_REQUEST_FAILURE);
+	link_add(0, IF_REAL, NAME_REAL, TEST_REMOTE, TEST_KEY);
+	ctx[0] = mk_del(IF_REAL, NAME_REAL);
+	ctx[1] = mk_del(IF_GONE, NAME_GONE);
+	dplane_ctx_set_status(ctx[1], ZEBRA_DPLANE_REQUEST_FAILURE);
 	nl_batch_init(&bth, &out);
-	res = netlink_put_dimt_tunnel_msg(&bth, ctx[0]);
+	check("real delete queued",
+	      netlink_put_dimt_tunnel_msg(&bth, ctx[0]) == FRR_NETLINK_QUEUED);
+	res = netlink_put_dimt_tunnel_msg(&bth, ctx[1]);
 	check("handled without a message", res == FRR_NETLINK_SUCCESS);
-	check("batch empty", bth.msgcnt == 0);
-	check_skipped(ctx[0]);
+	check("real delete still batched", bth.msgcnt == 1);
+	check_skipped(ctx[1]);
 	nl_batch_reset(&bth);
-	end(ctx, 1);
+	end(ctx, 2);
 }
 
 static void case_multi_single(void)
@@ -464,9 +473,10 @@ static void case_multi_single(void)
 
 	/*
 	 * C-F: each way the link at delete_ifindex can stop being ours.
-	 * With the put-time skip removed the encoder's recheck fails the
-	 * delete as FAILURE + authoritative; with both removed, a stale
-	 * RTM_DELLINK goes out.
+	 * With the put-time skip removed these still pass -- the encoder's
+	 * recheck keeps the message off the wire and the put answers it as
+	 * a skip after all, so only "a put-skip" tells the two apart; with
+	 * the encoder's recheck removed too, a stale RTM_DELLINK goes out.
 	 */
 	begin("C skip-absent");
 	ctx[0] = mk_del(IF_GONE, NAME_GONE);
@@ -576,10 +586,10 @@ static void case_encode_recheck(void)
 	 * again after the flush -- by which time its link is gone, so only
 	 * the encoder's own recheck keeps a stale delete off the wire.
 	 *
-	 * The second context's status is deliberately not checked: the
-	 * encoder's 0 reads as "no room", so it ends FAILURE +
-	 * authoritative for a link that is already gone. That is a
-	 * separate question from this test.
+	 * The encoder's 0 reads as "no room", so netlink_batch_add_msg()
+	 * gives up with an error; the second delete must still end like a
+	 * put-time skip, not as an authoritative failure for a link that is
+	 * already gone (BLO-38882).
 	 */
 	begin("J encode-recheck");
 	netlink_set_batch_buffer_size(48, 4096, true);
@@ -595,8 +605,27 @@ static void case_encode_recheck(void)
 	      sent_one_del(IF_REAL, seq_of(ctx[0])));
 	check("first SUCCESS", ok_of(ctx[0]));
 	check("first authoritative", auth_of(ctx[0]));
+	check("second SUCCESS", ok_of(ctx[1]));
+	check("second not authoritative", !auth_of(ctx[1]));
 	netlink_set_batch_buffer_size(0, 0, false);
 	end(ctx, 2);
+
+	/*
+	 * K: the negative control for J. A 16-byte batch cannot hold any
+	 * RTM_DELLINK, so the encode fails twice for a link that still
+	 * matches: that error is real and must stay an authoritative
+	 * FAILURE, never a skip.
+	 */
+	begin("K encode-too-big");
+	netlink_set_batch_buffer_size(16, 4096, true);
+	link_add(0, IF_REAL, NAME_REAL, TEST_REMOTE, TEST_KEY);
+	ctx[0] = mk_del(IF_REAL, NAME_REAL);
+	check("returned", update_multi(ctx, 1));
+	check("nothing sent", wire_cnt == 0);
+	check("FAILURE", !ok_of(ctx[0]));
+	check("authoritative", auth_of(ctx[0]));
+	netlink_set_batch_buffer_size(0, 0, false);
+	end(ctx, 1);
 }
 
 int main(int argc, char **argv)

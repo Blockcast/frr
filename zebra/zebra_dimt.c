@@ -1140,8 +1140,9 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 		 *    RTM_DELLINK is processed.
 		 *  - The RTM_DELLINK first, then the ENODEV result.
 		 *  - The RTM_DELLINK processed before the dplane worker put the
-		 *    delete: netlink_put_dimt_tunnel_msg() skips it and answers
-		 *    success with no kernel answer (link_deleted records the
+		 *    delete, or before the encoder's own recheck of it:
+		 *    netlink_put_dimt_tunnel_msg() skips it and answers success
+		 *    with no kernel answer (link_deleted records the
 		 *    RTM_DELLINK).
 		 *
 		 * The last two land here: answer REMOVED and forget, so all
