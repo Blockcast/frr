@@ -122,10 +122,14 @@ def main():
     # {"barrier": true} are zebra's direct answer to the request, and --follow
     # counts from the barrier instead of from the first notify.
     parser.add_argument("--barrier", type=int, metavar="ID")
+    # The HELLO's instance.  zebra keys a tunnel's owner on proto + instance
+    # and pins the proto to PIM, so a client with another instance is the
+    # only way a test can be a second, non-owning PIM client.
+    parser.add_argument("--instance", type=int, default=0)
     args = parser.parse_args()
 
     session_id = 0xD1000000 | (os.getpid() & 0xFFFF)
-    hello = struct.pack("!BHIB", ZEBRA_ROUTE_PIM, 0, session_id, 1)
+    hello = struct.pack("!BHIB", ZEBRA_ROUTE_PIM, args.instance, session_id, 1)
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(args.timeout)
