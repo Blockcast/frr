@@ -1095,6 +1095,7 @@ netlink_put_dimt_tunnel_msg(struct nl_batch *bth,
 			    struct zebra_dplane_ctx *ctx)
 {
 	const struct zebra_dimt_tunnel_ctx *dimt;
+	enum netlink_msg_status res;
 
 	assert(dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_ADD ||
 	       dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL);
@@ -1104,8 +1105,24 @@ netlink_put_dimt_tunnel_msg(struct nl_batch *bth,
 		dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_SUCCESS);
 		return FRR_NETLINK_SUCCESS;
 	}
-	return netlink_batch_add_msg(bth, ctx,
-				     netlink_dimt_tunnel_msg_encoder, false);
+	res = netlink_batch_add_msg(bth, ctx, netlink_dimt_tunnel_msg_encoder,
+				    false);
+	/* The encoder answers 0 for a delete whose link no longer matches,
+	 * and netlink_batch_add_msg() reads 0 as "no room": it flushes the
+	 * batch, encodes again and gives up.  A link that went away before
+	 * either encode -- reading the flush's responses takes long enough
+	 * for zebra to process its RTM_DELLINK -- leaves this delete nothing
+	 * to do, exactly as the check above would have found.  Answer it the
+	 * same way: the error would be an authoritative REMOVE_FAIL for a
+	 * link that is gone.  An encode that failed for another reason still
+	 * matches here and keeps its error. */
+	if (res == FRR_NETLINK_ERROR &&
+	    dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL &&
+	    !netlink_dimt_if_matches(ctx, dimt, false)) {
+		dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_SUCCESS);
+		return FRR_NETLINK_SUCCESS;
+	}
+	return res;
 }
 
 /* Interface lookup by netlink socket. */

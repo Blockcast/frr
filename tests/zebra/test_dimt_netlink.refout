@@ -1,8 +1,9 @@
 P0 ns: lookup finds the test namespace: OK
 A put-match: queued: OK
 A put-match: one message batched: OK
+a put-skip: real delete queued: OK
 a put-skip: handled without a message: OK
-a put-skip: batch empty: OK
+a put-skip: real delete still batched: OK
 a put-skip: nothing sent: OK
 a put-skip: skipped SUCCESS: OK
 a put-skip: skipped not authoritative: OK
@@ -59,3 +60,13 @@ J encode-recheck: link removed during the flush: OK
 J encode-recheck: one RTM_DELLINK for the first link: OK
 J encode-recheck: first SUCCESS: OK
 J encode-recheck: first authoritative: OK
+J encode-recheck: second SUCCESS: OK
+J encode-recheck: second not authoritative: OK
+K encode-too-big: returned: OK
+K encode-too-big: nothing sent: OK
+K encode-too-big: FAILURE: OK
+K encode-too-big: authoritative: OK
+K2 encode-too-big-add: returned: OK
+K2 encode-too-big-add: nothing sent: OK
+K2 encode-too-big-add: FAILURE: OK
+K2 encode-too-big-add: authoritative: OK
