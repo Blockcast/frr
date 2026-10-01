@@ -71,6 +71,8 @@ def follow(sock, tunnel_id, barrier, count):
     for the tunnel printed before {"barrier": true} was sent before zebra had
     even read the barrier DEL -- i.e. it answered the request directly.
     """
+    # The barrier's REMOVED must not be mistaken for the tunnel's own notify.
+    assert barrier != tunnel_id, "--barrier must differ from the tunnel id"
     ids = {tunnel_id} if barrier is None else {tunnel_id, barrier}
     anchored = False
     remaining = count

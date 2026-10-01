@@ -649,6 +649,17 @@ static void zebra_dimt_notify(const struct zebra_dimt_tunnel_ctx *ctx,
  * in netlink_put_dimt_tunnel_msg() answers success without touching the
  * kernel -- the link no longer matched what zebra lists -- and leaves
  * result_authoritative unset; a tombstone there could wait forever.
+ *
+ * That RTM_DELLINK is then the tombstone's only release, and it cannot be
+ * lost: netlink_recv_msg() exits zebra on any netlink_dplane_in read error
+ * but EAGAIN/EINTR/EMSGSIZE (an overrun included), and EMSGSIZE cannot
+ * happen after its MSG_PEEK|MSG_TRUNC sizing.  On delivery the RTM_DELLINK
+ * reaches zebra_dimt_tunnel_if_delete() for the tombstone's ifindex: the
+ * entry was ACTIVE when made and only if_delete_update() clears that; the
+ * kernel announces the link down before deleting it, on the same socket;
+ * and DIMT is default-VRF only, so the move to VRF_DEFAULT changes nothing.
+ * A same-name link at another ifindex cannot be seen first either, as the
+ * kernel queues its RTM_NEWLINK after our link's RTM_DELLINK.
  */
 static void zebra_dimt_tunnel_deleted(struct zebra_dimt_tunnel *entry,
 				      const struct zebra_dimt_tunnel_ctx *ctx)
@@ -833,9 +844,14 @@ static void zebra_dimt_tunnel_add(const struct zebra_dimt_tunnel_ctx *ctx,
  * REMOVED lands, so this is an ordinary sequence, not a corner case.  Park
  * it, whatever its owner or bytes -- pimd's endpoint-change re-ADD differs
  * from the request just deleted -- and answer it when the link is gone.
- * Only the latest ADD is kept: it is the one its owner is waiting on.
+ * Only the latest ADD is kept: it is the one its owner is waiting on.  Its
+ * owner is checked when it is replayed, through zebra_dimt_tunnel_add().
  *
- * A DEL finds nothing left to remove, and cancels a parked ADD of its own.
+ * A DEL is answered now, so it is judged as for a live entry: the tombstone
+ * stands for the link until zebra stops listing it, and a DEL from another
+ * owner is refused REMOVE_FAIL rather than told the tunnel is gone.  The
+ * owner's DEL finds nothing left to remove and cancels a parked ADD of its
+ * own.
  */
 static void zebra_dimt_tunnel_park(struct zebra_dimt_tunnel *entry,
 				   const struct zebra_dimt_tunnel_ctx *ctx,
@@ -847,6 +863,11 @@ static void zebra_dimt_tunnel_park(struct zebra_dimt_tunnel *entry,
 				   ctx->ifname, entry->ifindex);
 		entry->parked = *ctx;
 		entry->parked_add = true;
+		return;
+	}
+	if (!zebra_dimt_owner_matches(entry, ctx)) {
+		zebra_dimt_notify(ctx, entry->vrf_id, entry->ifindex,
+				  ZAPI_DIMT_TUNNEL_REMOVE_FAIL);
 		return;
 	}
 	zebra_dimt_notify(ctx, entry->vrf_id, 0, ZAPI_DIMT_TUNNEL_REMOVED);

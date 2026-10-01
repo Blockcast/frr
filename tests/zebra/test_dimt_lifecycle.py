@@ -85,6 +85,16 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         self.assertIn("event_add_event(", if_delete)
         self.assertNotIn("zebra_dimt_tunnel_add(", if_delete)
         self.assertIn("event_cancel(&zebra_dimt_replay_ev)", dimt)
+        # A DEL against the tombstone is answered at once, so it gets the
+        # owner check a live entry's DEL gets, ahead of the REMOVED.
+        park = dimt.split("static void zebra_dimt_tunnel_park(", 1)[1]
+        park_del = park.split("\n}\n", 1)[0].split("return;\n\t}", 1)[1]
+        owner = park_del.index("zebra_dimt_owner_matches(entry, ctx)")
+        self.assertLess(owner, park_del.index("ZAPI_DIMT_TUNNEL_REMOVE_FAIL"))
+        self.assertLess(
+            park_del.index("ZAPI_DIMT_TUNNEL_REMOVE_FAIL"),
+            park_del.index("ZAPI_DIMT_TUNNEL_REMOVED"),
+        )
 
     def test_new_dataplane_api_version_and_vrf_scope_are_explicit(self):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
