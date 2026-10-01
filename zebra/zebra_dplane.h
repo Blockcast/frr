@@ -1225,6 +1225,12 @@ enum zebra_dplane_result dplane_dimt_tunnel_add(
 	vrf_id_t vrf_id, const struct zebra_dimt_tunnel_ctx *tunnel);
 enum zebra_dplane_result dplane_dimt_tunnel_del(
 	vrf_id_t vrf_id, const struct zebra_dimt_tunnel_ctx *tunnel);
+/* Encode a DIMT tunnel request into a context; the add/del enqueue paths
+ * use this, and so does tests/zebra/test_dimt_netlink.c. */
+int dplane_ctx_dimt_tunnel_init(struct zebra_dplane_ctx *ctx,
+				enum dplane_op_e op, vrf_id_t vrf_id,
+				struct zebra_ns *zns,
+				const struct zebra_dimt_tunnel_ctx *tunnel);
 
 /*
  * Enqueue an SRv6 encap source address set

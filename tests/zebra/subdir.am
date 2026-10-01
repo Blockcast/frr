@@ -16,8 +16,32 @@ tests_zebra_test_netlink_seq_CFLAGS = $(TESTS_CFLAGS)
 tests_zebra_test_netlink_seq_CPPFLAGS = $(TESTS_CPPFLAGS)
 tests_zebra_test_netlink_seq_LDADD = $(ALL_TESTS_LDADD)
 tests_zebra_test_netlink_seq_SOURCES = tests/zebra/test_netlink_seq.c
+
+# test_dimt_netlink drives the real netlink batch code against a fake kernel
+# (BLO-38026).  It #includes zebra/kernel_netlink.c to reach its statics and
+# swap out its three socket calls, so it links every other zebra object, with
+# main.o replaced by stubs in the test.  Netlink only, hence LINUX.
+if ZEBRA
+if LINUX
+check_PROGRAMS += tests/zebra/test_dimt_netlink
+endif
+endif
+if !LINUX
+PYTEST_IGNORE += --ignore=zebra/test_dimt_netlink.py
+endif
+ZEBRA_DIMT_TEST_OBJS = $(filter-out zebra/main.$(OBJEXT) \
+	zebra/kernel_netlink.$(OBJEXT),$(zebra_zebra_OBJECTS))
+tests_zebra_test_dimt_netlink_CFLAGS = $(TESTS_CFLAGS)
+tests_zebra_test_dimt_netlink_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_zebra_test_dimt_netlink_LDADD = $(ZEBRA_DIMT_TEST_OBJS) \
+	$(zebra_zebra_LDADD)
+tests_zebra_test_dimt_netlink_DEPENDENCIES = $(ZEBRA_DIMT_TEST_OBJS) \
+	$(zebra_zebra_DEPENDENCIES)
+tests_zebra_test_dimt_netlink_SOURCES = tests/zebra/test_dimt_netlink.c
 EXTRA_DIST += \
 	tests/zebra/test_dimt_lifecycle.py \
+	tests/zebra/test_dimt_netlink.py \
+	tests/zebra/test_dimt_netlink.refout \
 	tests/zebra/test_lm_plugin.py \
 	tests/zebra/test_lm_plugin.refout \
 	tests/zebra/test_netlink_seq.py \

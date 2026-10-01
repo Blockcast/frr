@@ -124,10 +124,26 @@ class TestDimtLifecycleWiring(unittest.TestCase):
 
     def test_delete_worker_revalidates_dimt_link_identity(self):
         encoder = (ROOT / "zebra" / "if_netlink.c").read_text()
-        delete_put = encoder.split("netlink_put_dimt_tunnel_msg", 1)[1]
+        # Anchor on the definition, not the first mention: the encoder's own
+        # comment names netlink_put_dimt_tunnel_msg() first, and a slice from
+        # there took in the encoder's recheck, so it passed with the put-time
+        # skip neutered.  Stop at the batch add so only the skip is in view.
+        delete_put = encoder.split(
+            "\nnetlink_put_dimt_tunnel_msg(struct nl_batch *bth,", 1
+        )[1].split("netlink_batch_add_msg(", 1)[0]
+        # Collapse whitespace so the whole condition is matched as one
+        # string: an extra "&& 0" (or any other term) anywhere in it fails.
+        delete_put = " ".join(delete_put.split())
 
-        self.assertIn("netlink_dimt_if_matches(ctx, dimt, false)", delete_put)
-        self.assertIn("ZEBRA_DPLANE_REQUEST_SUCCESS", delete_put)
+        self.assertIn(
+            "if (dplane_ctx_get_op(ctx) == DPLANE_OP_DIMT_TUNNEL_DEL && "
+            "!netlink_dimt_if_matches(ctx, dimt, false)) { "
+            "dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_SUCCESS); "
+            "return FRR_NETLINK_SUCCESS; }",
+            delete_put,
+        )
+        # A skip is a synthetic verdict, never an authoritative one.
+        self.assertNotIn("set_authoritative", delete_put)
 
     def test_delete_encoder_revalidates_and_binds_to_ifindex(self):
         encoder = (ROOT / "zebra" / "if_netlink.c").read_text()
@@ -373,6 +389,10 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         # the end-of-responses drain could overwrite its verdict -- and the
         # pending batch is flushed FIRST so it cannot overtake earlier
         # requests' results.
+        # This only pins the shape of the source; the behaviour itself is
+        # driven through the real kernel_update_multi() against a fake kernel
+        # by tests/zebra/test_dimt_netlink.c, cases G (drain) and I (read
+        # failure).
         self.assertIn(
             "dplane_ctx_enqueue_tail(&handled_list, ctx)", update_multi
         )

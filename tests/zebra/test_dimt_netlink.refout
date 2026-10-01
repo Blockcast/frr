@@ -1,0 +1,61 @@
+P0 ns: lookup finds the test namespace: OK
+A put-match: queued: OK
+A put-match: one message batched: OK
+a put-skip: handled without a message: OK
+a put-skip: batch empty: OK
+a put-skip: nothing sent: OK
+a put-skip: skipped SUCCESS: OK
+a put-skip: skipped not authoritative: OK
+B multi-match: returned: OK
+B multi-match: one RTM_DELLINK for the link: OK
+B multi-match: SUCCESS: OK
+B multi-match: authoritative: OK
+B2 multi-enodev: returned: OK
+B2 multi-enodev: one RTM_DELLINK for the link: OK
+B2 multi-enodev: FAILURE: OK
+B2 multi-enodev: authoritative: OK
+C skip-absent: returned: OK
+C skip-absent: nothing sent: OK
+C skip-absent: skipped SUCCESS: OK
+C skip-absent: skipped not authoritative: OK
+D skip-renamed: returned: OK
+D skip-renamed: nothing sent: OK
+D skip-renamed: skipped SUCCESS: OK
+D skip-renamed: skipped not authoritative: OK
+E skip-remote: returned: OK
+E skip-remote: nothing sent: OK
+E skip-remote: skipped SUCCESS: OK
+E skip-remote: skipped not authoritative: OK
+F skip-key: returned: OK
+F skip-key: nothing sent: OK
+F skip-key: skipped SUCCESS: OK
+F skip-key: skipped not authoritative: OK
+G mixed real,skip: results in input order: OK
+G mixed real,skip: one RTM_DELLINK for the real link: OK
+G mixed real,skip: real SUCCESS: OK
+G mixed real,skip: real authoritative: OK
+G mixed real,skip: skipped SUCCESS: OK
+G mixed real,skip: skipped not authoritative: OK
+H mixed skip,real: results in input order: OK
+H mixed skip,real: one RTM_DELLINK for the real link: OK
+H mixed skip,real: real SUCCESS: OK
+H mixed skip,real: real authoritative: OK
+H mixed skip,real: skipped SUCCESS: OK
+H mixed skip,real: skipped not authoritative: OK
+I mixed eof: results in input order: OK
+I mixed eof: one RTM_DELLINK for the real link: OK
+I mixed eof: real FAILURE: OK
+I mixed eof: real not authoritative: OK
+I mixed eof: skipped SUCCESS: OK
+I mixed eof: skipped not authoritative: OK
+I2 mixed enodev: results in input order: OK
+I2 mixed enodev: one RTM_DELLINK for the real link: OK
+I2 mixed enodev: real FAILURE: OK
+I2 mixed enodev: real authoritative: OK
+I2 mixed enodev: skipped SUCCESS: OK
+I2 mixed enodev: skipped not authoritative: OK
+J encode-recheck: returned: OK
+J encode-recheck: link removed during the flush: OK
+J encode-recheck: one RTM_DELLINK for the first link: OK
+J encode-recheck: first SUCCESS: OK
+J encode-recheck: first authoritative: OK
