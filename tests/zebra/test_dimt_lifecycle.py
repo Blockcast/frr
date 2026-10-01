@@ -128,9 +128,16 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         # comment names netlink_put_dimt_tunnel_msg() first, and a slice from
         # there took in the encoder's recheck, so it passed with the put-time
         # skip neutered.  Stop at the batch add so only the skip is in view.
-        delete_put = encoder.split(
-            "\nnetlink_put_dimt_tunnel_msg(struct nl_batch *bth,", 1
-        )[1].split("netlink_batch_add_msg(", 1)[0]
+        # The argument list makes this unique: the comment mentions the
+        # function without one.  No leading newline, so a reformat that
+        # joins the return type onto this line does not break the anchor.
+        parts = encoder.split(
+            "netlink_put_dimt_tunnel_msg(struct nl_batch *bth,", 1
+        )
+        self.assertEqual(
+            len(parts), 2, "netlink_put_dimt_tunnel_msg() definition not found"
+        )
+        delete_put = parts[1].split("netlink_batch_add_msg(", 1)[0]
         # Collapse whitespace so the whole condition is matched as one
         # string: an extra "&& 0" (or any other term) anywhere in it fails.
         delete_put = " ".join(delete_put.split())
