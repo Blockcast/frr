@@ -449,10 +449,11 @@ jobs:
     #
     # Its steps are a COPY of Build's first five: keep them in lockstep.
     # They differ only in `outputs: type=cacheonly` (no image to push:
-    # nothing pulls one) and in having no seed, upload or cleanup steps
-    # (no Test shard reads an LTTng result).  test_buildcache_freshness.py
-    # fails on any other drift, and checks this matrix together with
-    # Build's against buildcache-seed.yml's.
+    # nothing pulls one), in reading Build's 24.04 cache after its own (see
+    # the step), and in having no seed, upload or cleanup steps (no Test
+    # shard reads an LTTng result).  test_buildcache_freshness.py fails on
+    # any other drift, and checks this matrix together with Build's against
+    # buildcache-seed.yml's.
     runs-on: default
     needs: doc-path-filter
     if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
@@ -503,7 +504,15 @@ jobs:
           # Build and discard: the build is the signal, and no job pulls an
           # LTTng image.  Read-only cache, as in Build (see its comment).
           outputs: type=cacheonly
-          cache-from: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.platform }}-buildcache
+          # Its own cache first, then Build's 24.04 one.  Every layer above
+          # the LTTng one in the Dockerfile has the same cache key in both
+          # legs (ENABLE_LTTNG is declared only at that layer), but each leg
+          # runs on a fresh builder and reads only the ref it names, so
+          # without the second ref nothing is shared: an evicted or stale
+          # LTTng cache rebuilt the whole base chain.
+          cache-from: |
+            type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.platform }}-buildcache
+            type=registry,ref=registry.blockcast.net/cache/frr-ci:amd64_u24-buildcache
 
   Unit-Test:
     runs-on: default
