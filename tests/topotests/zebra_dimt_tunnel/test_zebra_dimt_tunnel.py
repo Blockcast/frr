@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import re
+import select
 import subprocess
 import sys
 import time
@@ -354,6 +355,79 @@ def request(action, tunnel_id, encap="gre", outer_remote=None, outer_local=None)
     return json.loads(output)
 
 
+# Never requested by this module, so zebra holds no entry for it and answers
+# its DEL REMOVED at once from the no-entry branch -- which is what makes it
+# usable as dimt_zapi_client.py's --barrier: zebra serves one session's
+# messages in order, so an answer to the request that arrives after the
+# barrier's REMOVED was not zebra's direct reply to it.
+BARRIER_TUNNEL_ID = 0xFFFFFFF0
+
+
+def client_argv(*args):
+    """argv for a dimt_zapi_client.py run under router.popen()."""
+    client = os.path.join(CWD, "dimt_zapi_client.py")
+    return ["python3", client] + [str(arg) for arg in args]
+
+
+class NotifyReader:
+    """The JSON lines a --follow/--barrier client prints, one at a time.
+
+    communicate() waits for the client to exit, and the tests using this act
+    between its lines. select() on the raw fd rather than readline(): a
+    buffered reader can pull a second line into its buffer where select()
+    cannot see it, and the wait for it would then time out with the line in
+    hand.
+    """
+
+    def __init__(self, proc):
+        self.fd = proc.stdout.fileno()
+        self.buf = b""
+        # Everything read so far, for assertion messages.
+        self.lines = []
+
+    def next(self, timeout):
+        """The next line, parsed; None on timeout or once the client exits."""
+        deadline = time.monotonic() + timeout
+        while b"\n" not in self.buf:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            ready, _, _ = select.select([self.fd], [], [], left)
+            if not ready:
+                return None
+            chunk = os.read(self.fd, 4096)
+            if not chunk:
+                return None
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        text = line.decode("utf-8", "replace")
+        self.lines.append(text)
+        return json.loads(text)
+
+
+def finish_client(proc, timeout=5):
+    """Reap a popen'd client, killing it if it outlives `timeout`.
+
+    Returns its stderr. A --follow client that is still waiting when its test
+    is done -- because the notify it waits for never came -- must not be left
+    holding an owner session into the next test.
+    """
+    try:
+        _stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _stdout, stderr = proc.communicate(timeout=timeout)
+    return _text(stderr)
+
+
+def kernel_ifindex(router, name):
+    """The kernel's ifindex for `name`, or None if there is no such link."""
+    out = router.run(
+        "cat /sys/class/net/{}/ifindex 2>/dev/null".format(name)
+    ).strip()
+    return int(out) if out.isdigit() else None
+
+
 def _route_netlink_fds(router, thread_id):
     """Return zebra's route-netlink FDs as an strace -e trace-fds= set.
 
@@ -496,12 +570,14 @@ SYNC_POLL_WAIT = 0.2
 def hold_dplane_sendmsg(router, delay_usecs):
     """Hold the dplane worker at route-netlink sendmsg ENTRY.
 
-    This is the only dplane hold the module has, deliberately. zebra is built
-    with USE_EPOLL, so its event loops block in epoll_pwait; a hold on the
-    worker's wakeup (the since-removed hold_dplane_worker() delayed ppoll/poll,
-    which this build never calls) engages nothing, and would not help if it
-    did: link notifications arrive on netlink_dplane_in, which this same
-    pthread reads, so freezing it freezes main's view of the kernel too.
+    One of the module's two dplane holds, deliberately; the other is
+    hold_dplane_in_recvmsg(), and both hold a syscall the worker is known to
+    make. zebra is built with USE_EPOLL, so its event loops block in
+    epoll_pwait; a hold on the worker's wakeup (the since-removed
+    hold_dplane_worker() delayed ppoll/poll, which this build never calls)
+    engages nothing, and would not help if it did: link notifications arrive
+    on netlink_dplane_in, which this same pthread reads, so freezing it
+    freezes main's view of the kernel too.
 
     At sendmsg entry the netlink message is fully encoded (all identity checks
     have run) but not yet delivered, so the kernel has not acted on it and no
@@ -560,6 +636,83 @@ def dellink_state(router, trace_file, ifname, ifindex):
 
 def _trace_text(router, trace_file):
     return router.run("cat {} 2>/dev/null".format(trace_file)).strip()
+
+
+def _dplane_in_fd(router, thread_id):
+    """Return the FD of zebra's netlink_dplane_in socket, as a trace-fds= set.
+
+    Of zebra's NETLINK_ROUTE sockets only netlink_dplane_in joins RTMGRP_LINK:
+    kernel_init() (zebra/kernel_netlink.c) gives netlink-listen the route,
+    rule and nexthop groups and netlink_cmd and netlink_dplane_out none. So it
+    is the one whose /proc/net/netlink row -- protocol 0 (field 2), matching
+    inode (field 10) -- has bit 0x1 set in the Groups column (field 4, the
+    first 32 groups in hex). The same FD-table caveat as _route_netlink_fds()
+    applies: confinement to the dplane pthread comes from strace -p, not from
+    this scan.
+
+    Exactly one must match. None means zebra's socket layout changed; more
+    than one means a second NETLINK_ROUTE socket now joins the link group,
+    and holding either alone would no longer freeze main's view of links.
+    Both are harness errors, so pytest.fail rather than WindowNeverOpened.
+    """
+    command = (
+        "for fd in /proc/{}/fd/*; do "
+        "target=$(readlink \"$fd\" 2>/dev/null) || continue; "
+        "case \"$target\" in socket:\\[*\\]) ;; *) continue ;; esac; "
+        "inode=${{target#socket:[}}; inode=${{inode%]}}; "
+        "groups=$(awk -v inode=\"$inode\" 'NR > 1 && $2 == 0 && "
+        "$10 == inode {{ print $4 }}' /proc/{}/net/netlink 2>/dev/null); "
+        "[ -n \"$groups\" ] && [ $(( 0x$groups & 1 )) -ne 0 ] && "
+        "basename \"$fd\"; "
+        "done"
+    ).format(thread_id, thread_id)
+    fds = router.run(command).split()
+    if len(fds) != 1:
+        pytest.fail(
+            "expected exactly one zebra NETLINK_ROUTE socket in RTMGRP_LINK "
+            "(netlink_dplane_in), found {}: {} -- the dplane_in hold cannot "
+            "be aimed".format(len(fds), fds or "none")
+        )
+    return fds[0]
+
+
+def hold_dplane_in_recvmsg(router, delay_usecs):
+    """Hold the dplane worker at netlink_dplane_in recvmsg ENTRY.
+
+    Link notifications reach main only through this socket, so while the hold
+    is engaged main keeps listing a deleted link at its old ifindex -- the
+    REMOVED-before-RTM_DELLINK gap (BLO-38034) held open. Everything else the
+    worker does is untouched, and must be: a DIMT delete's own ACK is read on
+    netlink_dplane_out, and the worker hands that result to main at the end
+    of the same dplane_thread_loop() pass that read the ACK, before its event
+    loop next services the dplane_in read. Holding any other route-netlink
+    FD would hold that ACK too, and the gap would never open.
+
+    strace -o writes recvmsg's line at entry and completes it with ") = "
+    only on return; the buffer is an output argument, so the open line cannot
+    say WHICH notification it is about to read. held_recvmsg_lines() counts
+    them; callers prove the rest from zebra's and the kernel's own state.
+    Returns (tracer, trace_file).
+    """
+    worker = dplane_tid(router)
+    trace_file = "/tmp/dimt-recvmsg-trace-{}.log".format(os.getpid())
+    router.run("rm -f {}".format(trace_file))
+    tracer = _hold_dplane_syscalls(
+        router, "recvmsg", "delay_enter", delay_usecs, trace_file,
+        trace_fds=_dplane_in_fd(router, worker) if worker else None,
+    )
+    return tracer, trace_file
+
+
+def held_recvmsg_lines(router, trace_file):
+    """(open, returned) counts of the recvmsg lines in a dplane_in trace."""
+    lines = [
+        line
+        for line in _trace_text(router, trace_file).splitlines()
+        if line.startswith("recvmsg(")
+    ]
+    returned = sum(1 for line in lines if ") = " in line)
+    return len(lines) - returned, returned
 
 
 def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
@@ -786,6 +939,22 @@ def test_external_delete_does_not_reuse_stale_ifindex():
     assert installed["result"] == 0, installed
     router.run("ip link del dimt-00000003")
     router.run("ip link add dimt-00000003 type dummy")
+    # Act only once zebra has processed both. Until it has, it still lists the
+    # deleted link at its old ifindex, so the identical retry below would be
+    # answered INSTALLED from the entry, for the ordinary reason. Once it has,
+    # the entry is gone: processing an out-of-band delete forgets an INSTALLED
+    # entry outright (BLO-38034, test_out_of_band_delete_tells_the_owner), so
+    # the retry is a fresh create and its FAIL_INSTALL is the kernel refusing
+    # the exclusive create on the dummy's name. It used to come from
+    # zebra_dimt_tunnel_resolve_ifindex() missing on the vanished index.
+    _, seen = topotest.run_and_expect(
+        lambda: zebra_ifindex(router, "dimt-00000003")
+        not in (None, 0, installed["ifindex"]),
+        True,
+        count=SYNC_POLL_COUNT,
+        wait=SYNC_POLL_WAIT,
+    )
+    assert seen, "zebra did not process the replacement link"
 
     stale_retry = request("add", 3)
     assert stale_retry["result"] == 1, stale_retry
@@ -798,6 +967,162 @@ def test_external_delete_does_not_reuse_stale_ifindex():
     reinstalled = request("add", 3)
     assert reinstalled["result"] == 0, reinstalled
     assert request("del", 3)["result"] == 2
+
+
+# The owner sessions below stay open across an out-of-band event and wait for
+# zebra to report it. The client's per-wait socket timeout sits above the
+# SYNC_POLL_* budget (at most 16s) that runs before each wait, so a client
+# cannot give up while the test is still synchronizing.
+OWNER_FOLLOW_TIMEOUT = 30
+
+
+@pytest.mark.parametrize("configured", [False, True], ids=["learned", "configured"])
+def test_out_of_band_delete_tells_the_owner(configured):
+    """An out-of-band delete of an INSTALLED DIMT link answers the owner REMOVED.
+
+    BLO-38034: zebra's old if_del hook never matched. if_delete_update() resets
+    the ifindex to IFINDEX_INTERNAL and clears the l2info before if_delete()
+    fires the hook, and a CONFIGURED interface never reaches if_delete() at
+    all -- hence the second case, which configures the name in zebra first so
+    the ifp outlives the link. Either way the entry stayed INSTALLED on the
+    vanished index and pimd was never told: an operator `ip link del` or a
+    netns teardown left it believing the tunnel was up.
+
+    zebra_dropped_interface() is the positive control: zebra has processed the
+    RTM_DELLINK, so a REMOVED that has not arrived by then never will. The
+    deciding assertion is the add after it: with the entry forgotten it is a
+    fresh create, INSTALLED on the new link's index. Before the fix it was
+    answered FAIL_INSTALL, when zebra_dimt_tunnel_resolve_ifindex() missed on
+    the stale index.
+    """
+    router = get_topogen().gears["r1"]
+    tunnel_id = 19 if configured else 18
+    name = "dimt-{:08x}".format(tunnel_id)
+    if configured:
+        router.vtysh_cmd(
+            "configure terminal\ninterface {}\nend".format(name), daemon="zebra"
+        )
+    try:
+        owner = router.popen(
+            client_argv("add", tunnel_id, "--follow", 1,
+                        "--timeout", OWNER_FOLLOW_TIMEOUT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        reader = NotifyReader(owner)
+        try:
+            installed = reader.next(timeout=15)
+            assert installed is not None and installed.get("result") == 0, (
+                installed, reader.lines)
+            ifindex = installed["ifindex"]
+            assert ifindex > 0, installed
+
+            router.run("ip link del {}".format(name))
+            _, dropped = topotest.run_and_expect(
+                lambda: zebra_dropped_interface(router, name),
+                True,
+                count=SYNC_POLL_COUNT,
+                wait=SYNC_POLL_WAIT,
+            )
+            assert dropped, "zebra still lists {} after the delete".format(name)
+            # zebra notifies in the same pass that drops the interface, so the
+            # notify is on its way by now; the wait only covers delivery.
+            vanished = reader.next(timeout=10)
+            assert vanished == {
+                "tunnel_id": tunnel_id, "ifindex": 0, "result": 2
+            }, (vanished, reader.lines)
+        finally:
+            stderr = finish_client(owner)
+        assert owner.returncode == 0, stderr
+
+        readd = request("add", tunnel_id)
+        assert readd["result"] == 0, readd
+        assert readd["ifindex"] != ifindex, (installed, readd)
+        assert readd["ifindex"] == kernel_ifindex(router, name), readd
+        assert request("del", tunnel_id)["result"] == 2
+    finally:
+        if configured:
+            # `no interface` refuses an interface that is still active, so the
+            # link has to be gone from zebra's table first.
+            router.run("ip link del {} 2>/dev/null".format(name))
+            topotest.run_and_expect(
+                lambda: zebra_dropped_interface(router, name),
+                True,
+                count=SYNC_POLL_COUNT,
+                wait=SYNC_POLL_WAIT,
+            )
+            router.vtysh_cmd(
+                "configure terminal\nno interface {}\nend".format(name),
+                daemon="zebra",
+            )
+
+
+# Within IFNAMSIZ and carrying the dimt- prefix, so the reaper collects it.
+RENAMED_DIMT_LINK = "dimt-renamed"
+# How long the owner session listens for a REMOVED that must not come. Above
+# the SYNC_POLL_* budget (at most 16s) so the session cannot stop listening
+# before zebra has processed the rename, which would make silence vacuous.
+RENAME_OWNER_TIMEOUT = 20
+
+
+def test_rename_is_not_reported_removed():
+    """A rename keeps the netdev, so it must not tell the owner REMOVED.
+
+    zebra sees a rename as RTM_NEWLINK for a known index under a new name, and
+    set_ifindex() retires the old-name interface through the same
+    if_delete_update() an out-of-band delete takes. Only a deletion proves the
+    netdev gone, so only it may report REMOVED (BLO-38034); reporting it here
+    would have pimd rebuild a tunnel whose link is still in the kernel, and
+    collide with it on the GRE tuple.
+
+    The owner session is the evidence: zebra would notify it in the same pass
+    that renames the interface, which the zebra_ifindex() sync below waits
+    for, and the session's timeout outlasts that sync's whole budget, so it
+    is still listening when a REMOVED would arrive. The later DEL is answered REMOVED
+    because zebra_dimt_tunnel_resolve_ifindex() misses on the name, with no
+    dataplane operation -- the renamed link is not ours by name any more and
+    is left alone.
+    """
+    router = get_topogen().gears["r1"]
+    name = "dimt-00000015"
+    owner = router.popen(
+        client_argv("add", 21, "--follow", 1,
+                    "--timeout", RENAME_OWNER_TIMEOUT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    reader = NotifyReader(owner)
+    try:
+        installed = reader.next(timeout=15)
+        assert installed is not None and installed.get("result") == 0, (
+            installed, reader.lines)
+        ifindex = installed["ifindex"]
+
+        renamed = router.run(
+            "ip link set {0} down && ip link set {0} name {1} && "
+            "echo RENAMED".format(name, RENAMED_DIMT_LINK)
+        )
+        assert "RENAMED" in renamed, renamed
+        _, seen = topotest.run_and_expect(
+            lambda: zebra_ifindex(router, RENAMED_DIMT_LINK) == ifindex,
+            True,
+            count=SYNC_POLL_COUNT,
+            wait=SYNC_POLL_WAIT,
+        )
+        assert seen, "zebra did not process the rename"
+
+        removed = request("del", 21)
+        assert removed == {"tunnel_id": 21, "ifindex": 0, "result": 2}, removed
+        # The DEL moved ownership to its own session, so nothing more is owed
+        # to this one: the only line it may print is its own timeout.
+        quiet = reader.next(timeout=RENAME_OWNER_TIMEOUT + 10)
+        assert quiet == {"timeout": True}, (quiet, reader.lines)
+    finally:
+        finish_client(owner)
+    assert "gre remote 192.0.2.2 local 192.0.2.1" in router.run(
+        "ip -d link show {}".format(RENAMED_DIMT_LINK)
+    )
+    router.run("ip link del {}".format(RENAMED_DIMT_LINK))
 
 
 def test_address_failure_cleans_up_and_allows_tunnel_id_reuse():
@@ -887,15 +1212,15 @@ def test_queued_delete_does_not_remove_reused_ifindex():
     """A delete must not remove a same-name link that replaced ours.
 
     The link is replaced out-of-band first, and the DEL is sent only once
-    zebra has processed the replacement. The entry is still INSTALLED at that
-    point, holding the vanished ifindex. zebra_dimt_if_del() does run for a
-    kernel delete, but only after if_delete_update() has reset the ifindex to
-    IFINDEX_INTERNAL, so its ifindex match can never succeed (BLO-38034). The
-    DEL therefore takes the INSTALLED branch,
-    zebra_dimt_tunnel_resolve_ifindex() misses on the vanished index, and zebra
-    must answer REMOVED and forget the entry with no dataplane operation --
-    leaving the same-name dummy alone. Everything here runs on zebra's main
-    thread, so it is deterministic.
+    zebra has processed the replacement. Processing the delete half already
+    forgot the entry: it was INSTALLED, so zebra_dimt_tunnel_if_delete() told
+    its owner REMOVED (that session is long closed) and dropped it
+    (BLO-38034, test_out_of_band_delete_tells_the_owner). The DEL therefore
+    finds no entry and is answered REMOVED from the no-entry branch with no
+    dataplane operation -- leaving the same-name dummy alone. Before that fix
+    the entry stayed INSTALLED on the vanished index and the same answer came
+    from zebra_dimt_tunnel_resolve_ifindex() missing on it. Everything here
+    runs on zebra's main thread, so it is deterministic.
 
     What this does NOT cover, despite the name it has kept: a delete already
     QUEUED in the dataplane when the replacement lands, reaching the pre-encode
@@ -1013,21 +1338,11 @@ def test_add_during_inflight_delete_is_rejected():
         wait=0.2,
     )
     assert link == "", link
-    # REMOVED is sent when the DEL's result reaches main, but main learns the
-    # link is gone only when the zebra_dplane pthread reads the RTM_DELLINK
-    # notification. An ADD landing between the two adopts the dead netdev by
-    # name and answers INSTALLED with its ifindex -- a real zebra defect,
-    # BLO-38034, and not what this test is about. Wait for zebra's own table
-    # to drop the link so the reinstall below is a clean create, and assert
-    # that it is one.
-    _, dropped = topotest.run_and_expect(
-        lambda: zebra_dropped_interface(router, "dimt-00000009"),
-        True,
-        count=SYNC_POLL_COUNT,
-        wait=SYNC_POLL_WAIT,
-    )
-    assert dropped, "zebra still lists dimt-00000009 after the delete"
-
+    # No wait for zebra to drop the link first: a reinstall landing after
+    # REMOVED but before main has processed the RTM_DELLINK is parked until it
+    # has, then served as a fresh create (BLO-38034,
+    # test_add_after_removed_before_dellink_is_parked). Either way it must be a
+    # new link.
     reinstalled = request("add", 9)
     assert reinstalled["result"] == 0, reinstalled
     assert reinstalled["ifindex"] != installed["ifindex"], reinstalled
@@ -1035,6 +1350,140 @@ def test_add_during_inflight_delete_is_rejected():
         "ip -d link show dimt-00000009"
     )
     assert request("del", 9)["result"] == 2
+
+
+def _prove_dellink_unread(router, name, ifindex, trace_file, when):
+    """Raise WindowNeverOpened unless the REMOVED-before-RTM_DELLINK gap is open.
+
+    Open means: the kernel has deleted the link, zebra still lists it at its
+    old index (main has not processed the RTM_DELLINK), and the dplane_in
+    trace holds exactly one recvmsg, entered and not returned -- the worker is
+    parked in front of the notification. A returned recvmsg means a hold
+    already expired and main may have read the notification since.
+    """
+    in_kernel = router.run("ip link show {} 2>/dev/null".format(name)).strip()
+    listed = zebra_ifindex(router, name)
+    held, returned = held_recvmsg_lines(router, trace_file)
+    if in_kernel or listed != ifindex or held != 1 or returned:
+        raise WindowNeverOpened(
+            "{}: the gap between REMOVED and zebra processing {}'s "
+            "RTM_DELLINK is not open (kernel={!r}, zebra ifindex={} want {}, "
+            "dplane_in recvmsg held={} returned={}).\ntrace:\n{}".format(
+                when, name, in_kernel, listed, ifindex, held, returned,
+                _trace_text(router, trace_file)))
+
+
+def test_add_after_removed_before_dellink_is_parked():
+    """An ADD between REMOVED and the RTM_DELLINK is parked, not answered.
+
+    zebra answers a DEL REMOVED when the dataplane result reaches main, but
+    main learns the link is gone only when the zebra_dplane pthread reads the
+    RTM_DELLINK from netlink_dplane_in. pimd re-adds on REMOVED at once, so an
+    ADD landing in that gap is an ordinary production sequence, and before
+    BLO-38034 it took the fresh-create path, found the dead link still listed
+    by name with its address still queued, and was answered INSTALLED on the
+    vanished ifindex.
+
+    hold_dplane_in_recvmsg() holds the gap open: armed before the DEL, it
+    lets the delete and its ACK through and parks the worker in front of the
+    notification. _prove_dellink_unread() shows it open before the re-add and
+    again once the re-add's barrier is in hand. The re-add runs with
+    --barrier: zebra serves one session in order, so nothing may arrive for
+    the tunnel before the barrier's REMOVED -- before the fix, INSTALLED with
+    the dead index did. Released, the parked ADD must be served as a fresh
+    create, on the new link's index.
+    """
+    router = get_topogen().gears["r1"]
+    tunnel_id = 20
+    name = "dimt-00000014"
+    installed = request("add", tunnel_id)
+    assert installed["result"] == 0, installed
+    ifindex = installed["ifindex"]
+
+    tracer, trace_file = hold_dplane_in_recvmsg(
+        router, delay_usecs=HELD_DELETE_USECS
+    )
+    readd = None
+    try:
+        try:
+            delete = router.popen(
+                client_argv("del", tunnel_id),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = delete.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                delete.kill()
+                stdout, stderr = delete.communicate(timeout=5)
+            try:
+                removed = json.loads(_text(stdout))
+            except ValueError:
+                removed = None
+            # Only a dataplane result carries a non-zero ifindex in REMOVED,
+            # so this one is the DEL's own result, handed to main with the
+            # dplane_in notification still unread.
+            if removed != {
+                "tunnel_id": tunnel_id, "ifindex": ifindex, "result": 2
+            }:
+                raise WindowNeverOpened(
+                    "the DEL was not answered REMOVED on ifindex {} while "
+                    "dplane_in was held (got {!r}, rc={}, stderr={!r}).\n"
+                    "trace:\n{}".format(
+                        ifindex, removed, delete.returncode,
+                        _text(stderr).strip(),
+                        _trace_text(router, trace_file)))
+            _prove_dellink_unread(
+                router, name, ifindex, trace_file, "after the DEL's REMOVED"
+            )
+
+            readd = router.popen(
+                client_argv("add", tunnel_id,
+                            "--barrier", BARRIER_TUNNEL_ID, "--follow", 1,
+                            "--timeout", HELD_DELETE_CLIENT_TIMEOUT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            reader = NotifyReader(readd)
+            early = []
+            while True:
+                line = reader.next(timeout=10)
+                if line is None or "tunnel_id" not in line:
+                    break
+                early.append(line)
+            _prove_dellink_unread(
+                router, name, ifindex, trace_file,
+                "after the re-add's barrier",
+            )
+            assert line == {"barrier": True}, (line, reader.lines)
+            assert not early, (
+                "zebra answered an ADD landing before it processed the "
+                "RTM_DELLINK instead of parking it: {}".format(early)
+            )
+        finally:
+            stop_tracer(tracer)
+            router.run("rm -f {}".format(trace_file))
+        replayed = reader.next(timeout=20)
+        assert replayed is not None and replayed.get("result") == 0, (
+            replayed, reader.lines)
+        assert replayed["ifindex"] != ifindex, (installed, replayed)
+        assert replayed["ifindex"] == kernel_ifindex(router, name), replayed
+    finally:
+        if readd is not None:
+            readd_stderr = finish_client(readd)
+    assert readd.returncode == 0, readd_stderr
+    _, converged = topotest.run_and_expect(
+        lambda: zebra_ifindex(router, name) == replayed["ifindex"],
+        True,
+        count=SYNC_POLL_COUNT,
+        wait=SYNC_POLL_WAIT,
+    )
+    assert converged, "zebra lists {} at {}, not {}".format(
+        name, zebra_ifindex(router, name), replayed["ifindex"])
+    assert "gre remote 192.0.2.2 local 192.0.2.1" in router.run(
+        "ip -d link show {}".format(name)
+    )
+    assert request("del", tunnel_id)["result"] == 2
 
 
 def test_uncertain_create_result_reconciles_surviving_link():
@@ -1098,8 +1547,11 @@ def test_delete_encoded_before_replacement_binds_to_ifindex():
     )
     client = os.path.join(CWD, "dimt_zapi_client.py")
     try:
+        # --follow 1: this session owns the tunnel once its DEL is read, and is
+        # the only live one when the original link vanishes; see below.
         pending = router.popen(
             ["python3", client, "del", "10", "--encap", "gre",
+             "--follow", "1",
              "--timeout", str(HELD_DELETE_CLIENT_TIMEOUT)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1147,13 +1599,31 @@ def test_delete_encoded_before_replacement_binds_to_ifindex():
     finally:
         stop_tracer(tracer)
         router.run("rm -f {}".format(trace_file))
-    stdout, stderr = pending.communicate(timeout=15)
-    assert pending.returncode == 0, _text(stderr)
+    # Long enough for a client still waiting on its second notify to time out
+    # and say so, rather than for communicate() to raise past it.
+    stdout, stderr = pending.communicate(
+        timeout=HELD_DELETE_CLIENT_TIMEOUT + 15
+    )
+    lines = [json.loads(line) for line in _text(stdout).splitlines()]
+    assert pending.returncode == 0, (lines, _text(stderr))
     # The encode happened before the replacement (proven by the held
     # RTM_DELLINK), so the pre-encode skip path is unreachable: the delete must
     # fail on the stale index and the replacement must survive.
-    assert json.loads(_text(stdout))["result"] == 3, stdout
+    assert lines[0]["result"] == 3, lines
+    # The worker hands the failed delete's result to main in the same pass
+    # that read its ACK, before it next reads netlink_dplane_in, so main sees
+    # the ENODEV while it still lists the original link: the entry is restored
+    # INSTALLED on that index and REMOVE_FAIL is sent. The RTM_DELLINK of the
+    # out-of-band delete is processed next, and finding an INSTALLED entry on
+    # the vanished index, zebra tells its owner -- this session -- REMOVED and
+    # forgets it (BLO-38034). Before that fix this session heard nothing more
+    # and the entry stayed INSTALLED on an index no link has.
+    assert lines[1:] == [
+        {"tunnel_id": 10, "ifindex": 0, "result": 2}
+    ], lines
     assert "dummy" in router.run("ip -d link show dimt-0000000a")
+    # ...so this DEL finds no entry and is answered from the no-entry branch,
+    # with no dataplane operation to touch the dummy.
     assert request("del", 10)["result"] == 2
     router.run("ip link del dimt-0000000a")
 
@@ -1187,6 +1657,19 @@ def test_lost_delete_ack_reconciles_instead_of_resurrecting():
         wait=0.2,
     )
     assert link == "", link
+    # The kernel has deleted the link, but zebra may not have processed its
+    # RTM_DELLINK yet. A REMOVE_FAIL (3) above restored the entry INSTALLED on
+    # the still-listed index, and a retry served before that notification
+    # would resolve it and send a second, doomed delete. Once zebra has
+    # dropped the link, the INSTALLED entry is forgotten (BLO-38034), so the
+    # retry and the readd below both see a tunnel zebra no longer tracks.
+    _, dropped = topotest.run_and_expect(
+        lambda: zebra_dropped_interface(router, "dimt-0000000b"),
+        True,
+        count=SYNC_POLL_COUNT,
+        wait=SYNC_POLL_WAIT,
+    )
+    assert dropped, "zebra still lists dimt-0000000b after the delete"
     if removed["result"] == 3:
         assert request("del", 11)["result"] == 2
 
@@ -1205,11 +1688,11 @@ def test_skipped_delete_result_survives_mixed_batch():
     """A delete with no link left and a real delete, together, both REMOVED.
 
     Tunnel 12's link is replaced out-of-band and zebra is left to process that
-    first, so 12's entry holds a vanished ifindex (see
+    first, which forgets 12's entry (see
     test_queued_delete_does_not_remove_reused_ifindex) while 13's link is
     live. The two DELs are then issued together: 13's is a real dataplane
-    delete, and 12's is answered at once because resolve_ifindex() misses.
-    Both must report REMOVED, and 12's must leave the same-name dummy alone.
+    delete, and 12's is answered at once from the no-entry branch. Both must
+    report REMOVED, and 12's must leave the same-name dummy alone.
 
     What this does NOT cover, despite the name it has kept: a SKIPPED delete
     sharing one dataplane batch with a real one, the case where the

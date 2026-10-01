@@ -40,9 +40,9 @@ The stages below keep the UMH on a loopback r2 has no route to, and leave the
 underlay out of pim-light, so that the tunnel is the *only* candidate and each
 stage tests the state machine rather than pin resolution.  The shadowing case
 -- where a second, covering pim-light interface competes with the tunnel -- is
-covered deliberately and last, by
+covered deliberately, by
 test_covering_light_interface_does_not_shadow_the_tunnel, which constructs the
-ambiguity on purpose.
+ambiguity on purpose and puts it away again before the next stage.
 
 Historically that resolver returned the FIRST pim-light interface whose
 connected address or point-to-point destination prefix-matched the UMH, with no
@@ -73,7 +73,12 @@ D6 BOUNDARY COVERAGE
   6 anti-recursion ............... NOT covered end-to-end here.
 
 Pin determinism against a competing covering interface is not a D6 boundary; it
-is the BLO-27869 regression guard, covered by the final stage.
+is the BLO-27869 regression guard, covered by
+test_covering_light_interface_does_not_shadow_the_tunnel.
+
+Nor is an out-of-band delete of a demanded netdev: that is the BLO-38034
+regression guard, covered by the final stage,
+test_out_of_band_link_delete_rebuilds_the_tunnel.
 
 Boundary 6 is deliberately left to `zebra_dimt_tunnel/
 test_outer_remote_via_dimt_is_rejected`, which proves the refusal where it
@@ -949,14 +954,133 @@ def test_covering_light_interface_does_not_shadow_the_tunnel():
         == ifname
     )
 
-    # 7. Put the ambiguity away.  This is the last stage today, but leaving a
-    #    covering pim-light interface behind would silently change the premise
-    #    of anything appended after it -- and the name was chosen to win the
-    #    resolver, so it would win in stages that do not expect a competitor.
+    # 7. Put the ambiguity away.  Leaving a covering pim-light interface behind
+    #    would silently change the premise of every stage after this one -- and
+    #    the name was chosen to win the resolver, so it would win in stages
+    #    that do not expect a competitor.
     r2.vtysh_cmd("conf t\nno interface {}".format(COVERING_IFACE))
     r2.run("ip link del {}".format(COVERING_IFACE))
     expect(lambda: check_pin(r2, ifname, "tunnel"))
     expect(lambda: check_forwarding(r2, "ready"))
+
+
+# --- BLO-38034: an out-of-band delete of a demanded netdev is rebuilt -----
+
+
+def test_out_of_band_link_delete_rebuilds_the_tunnel():
+    """Deleting a demanded DIMT netdev behind FRR's back must rebuild it.
+
+    An operator `ip link del`, or a netns teardown, removes the netdev without
+    pimd ever sending a DEL.  zebra used to miss that entirely: its delete hook
+    fired only after if_delete_update() had already reset the ifindex, so it
+    never matched the entry, which stayed INSTALLED on a dead ifindex and pimd
+    was never told.  pimd in turn kept reporting `installed` -- with demand
+    present and nothing in the kernel to carry it.
+
+    The fix has zebra answer the vanished link with an unsolicited REMOVED,
+    and pimd treats a REMOVED it did not ask for as "the netdev is gone":
+    back to IDLE, then reconcile, which finds the demand unchanged and re-ADDs
+    with the same tunnel_id and request bytes.  REMOVED is the only result
+    that proves absence to pimd, which is why it has to come from zebra.
+
+    `installed` on its own is therefore exactly the vacuous reading G10 warns
+    about: it is what the unfixed code reports forever.  The deciding evidence
+    is the kernel -- a netdev under the same name with a DIFFERENT ifindex, an
+    ifindex pimd's row agrees with -- and then the same three readiness
+    conjuncts the earlier stages assert, against the rebuilt device.  The
+    rebuild is not timed: it can complete before a poll could observe the
+    gap, so the ifindex change, not a transient absence, is what proves the
+    delete happened and was answered.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    r2 = tgen.gears["r2"]
+
+    # 1. Precondition: demand present, tunnel installed and admitted by the
+    #    kernel on the DIMT vif, so there is a working data plane to destroy.
+    expect(lambda: check_tunnel_state(r2, "installed"))
+    expect(lambda: check_forwarding(r2, "ready"))
+    ifname = tunnel_ifname(r2)
+    tunnel_id = tunnel_entry(r2)["tunnelId"]
+    before = link_ifindex(r2, ifname)
+    assert before is not None, "no kernel link {} before the delete".format(ifname)
+
+    def kernel_admitted():
+        vif, error = resolve_mr_vif(r2, ifname)
+        if error:
+            return error
+        return check_ip_mr_cache_iif(r2, SOURCE, GROUP, vif)
+
+    expect(kernel_admitted)
+
+    # 2. Delete the netdev behind FRR's back.  `ip link del` is silent on
+    #    success, so any output is the command failing and the rest of the
+    #    stage would be measuring nothing.
+    output = r2.run("ip link del {} 2>&1".format(ifname))
+    assert not output.strip(), "ip link del {} failed: {}".format(ifname, output)
+
+    # 3. The kernel carries a NEW netdev under the same name.  On the unfixed
+    #    code no ADD is ever sent, so this never holds: the link stays absent
+    #    while pimd still reports `installed`.
+    def rebuilt():
+        after = link_ifindex(r2, ifname)
+        if after is None:
+            return "kernel link {} was not rebuilt; pimd row: {}".format(
+                ifname, tunnel_entry(r2)
+            )
+        if after == before:
+            return "kernel link {} still has the original ifindex {}".format(
+                ifname, before
+            )
+        return None
+
+    expect(rebuilt)
+    after = link_ifindex(r2, ifname)
+
+    # 4. pimd re-requested the SAME tunnel -- same id, so the reconcile re-ADD
+    #    rather than a fresh allocation -- and its row is bound to the rebuilt
+    #    netdev, not the dead ifindex the unfixed code keeps.
+    def bound_to_rebuilt():
+        error = check_tunnel_state(r2, "installed")
+        if error:
+            return error
+        entry = tunnel_entry(r2)
+        if entry.get("tunnelId") != tunnel_id:
+            return "tunnel id changed across the rebuild: {} -> {}".format(
+                tunnel_id, entry
+            )
+        if entry.get("ifindex") != after:
+            return "pimd row carries ifindex {}, kernel link {} is {}: {}".format(
+                entry.get("ifindex"), ifname, after, entry
+            )
+        return None
+
+    expect(bound_to_rebuilt)
+
+    # 5. The rebuilt netdev is the documented tunnel, not merely a link with
+    #    the right name: GRE to the same outer, ttl=64, and addressed
+    #    point-to-point with the UMH as peer.
+    expect(
+        lambda: check_gre_link(
+            r2, ifname, local=OUTER_LOCAL, remote=OUTER_REMOTE, ttl=64
+        )
+    )
+    address = r2.run("ip -o address show dev {}".format(ifname))
+    assert "{} peer {}/32".format(INNER_LOCAL, UMH) in address, address
+
+    # 6. The kernel admits the (S,G) on the rebuilt device's vif.  The old vif
+    #    died with its netdev, so a name resolving in the vif table can only be
+    #    the new device -- and readiness returns on top of that admission.
+    expect(kernel_admitted)
+    expect(lambda: check_forwarding(r2, "ready"))
+    forwarding = json.loads(r2.vtysh_cmd("show ip pim dimt forwarding json"))
+    assert forwarding[SG]["interface"] == ifname, forwarding
+
+    # 7. Exactly one DIMT netdev: the rebuild replaced the device rather than
+    #    building a second one beside a survivor.
+    links = r2.run("ip -o link show | grep -c 'dimt-' || true").strip()
+    assert links == "1", "expected exactly one DIMT netdev, found {}".format(links)
 
 
 if __name__ == "__main__":

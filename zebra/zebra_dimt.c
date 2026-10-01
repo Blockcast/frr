@@ -6,8 +6,8 @@
 #define _LINUX_IP_H
 #include <linux/if_tunnel.h>
 
+#include "lib/frrevent.h"
 #include "lib/if.h"
-#include "lib/hook.h"
 #include "lib/linklist.h"
 #include "lib/log.h"
 #include "lib/memory.h"
@@ -15,6 +15,7 @@
 #include "lib/stream.h"
 #include "lib/zclient.h"
 #include "zebra/rib.h"
+#include "zebra/debug.h"
 #include "zebra/interface.h"
 #include "zebra/zebra_dimt.h"
 #include "zebra/zebra_router.h"
@@ -42,12 +43,25 @@ struct zebra_dimt_tunnel {
 		 * fixed one (see zebra_dimt_if_outer_hdr_matches); the
 		 * create follows the delete. */
 		ZEBRA_DIMT_REPLACING,
+		/* Our delete succeeded and REMOVED was sent, but zebra still
+		 * lists the deleted link until its RTM_DELLINK is processed.
+		 * See zebra_dimt_tunnel_deleted(). */
+		ZEBRA_DIMT_DELETED,
 	} state;
+	/* DELETED only: the latest ADD that arrived for the tunnel while the
+	 * deleted link was still listed, replayed by
+	 * zebra_dimt_tunnel_replay() once it is gone. */
+	bool parked_add;
+	struct zebra_dimt_tunnel_ctx parked;
 };
+
+/* Replays the ADDs parked on DELETED entries whose link is gone. */
+static struct event *zebra_dimt_replay_ev;
 
 static void zebra_dimt_notify(const struct zebra_dimt_tunnel_ctx *ctx,
 			      vrf_id_t vrf_id, ifindex_t ifindex,
 			      enum zapi_dimt_tunnel_notify_owner result);
+static void zebra_dimt_tunnel_replay(struct event *event);
 
 static void zebra_dimt_tunnel_free(void *arg)
 {
@@ -288,7 +302,8 @@ static void zebra_dimt_tunnel_fail_install(struct zebra_dimt_tunnel *entry)
  * zebra_dimt_if_matches()): delete it here, and the create follows in
  * zebra_dimt_tunnel_dplane_result().  The delete is bound to the stale
  * link's ifindex like any other; entry->ifindex stays 0 so neither its
- * if_del nor a late notification for it is mistaken for the new link. */
+ * deletion (zebra_dimt_tunnel_if_delete()) nor a late notification for it
+ * is mistaken for the new link. */
 static enum zebra_dplane_result
 zebra_dimt_tunnel_replace(struct zebra_dimt_tunnel *entry,
 			  const struct interface *stale)
@@ -385,23 +400,100 @@ void zebra_dimt_tunnel_if_update(struct interface *ifp)
 	}
 }
 
-static int zebra_dimt_if_del(struct interface *ifp)
+static struct zebra_dimt_tunnel *
+zebra_dimt_tunnel_lookup_ifindex(vrf_id_t vrf_id, ifindex_t ifindex)
 {
 	struct listnode *node;
 	struct zebra_dimt_tunnel *entry;
 
-	if (!zrouter.dimt_tunnels)
-		return 0;
-	for (ALL_LIST_ELEMENTS_RO(zrouter.dimt_tunnels, node, entry)) {
-		if (entry->vrf_id == ifp->vrf->vrf_id &&
-		    entry->ifindex == ifp->ifindex) {
+	for (ALL_LIST_ELEMENTS_RO(zrouter.dimt_tunnels, node, entry))
+		if (entry->vrf_id == vrf_id && entry->ifindex == ifindex)
+			return entry;
+	return NULL;
+}
+
+/*
+ * The netdev behind `ifp` is gone: its RTM_DELLINK was processed, or its
+ * netns went away.  Called from if_delete_update() after the interface
+ * delete has been distributed and while `ifp` still carries the ifindex and
+ * l2info it had -- never for a rename, whose netdev survives under its new
+ * name.
+ *
+ * This replaces an if_del hook that could never match (BLO-38034):
+ * if_delete_update() resets the ifindex to IFINDEX_INTERNAL and wipes
+ * zif->l2info before if_delete() fires the hook, and a configured ifp never
+ * reaches if_delete() at all.  An out-of-band delete (`ip link del`, a netns
+ * teardown) therefore left the entry INSTALLED on a dead ifindex and the
+ * owner was never told -- the tunnel stayed "up" in pimd with no netdev.
+ *
+ * Entries legitimately at ifindex 0 (REPLACING, ADDING before the
+ * RTM_NEWLINK, a CLEANUP tombstone for a link never seen) cannot match: the
+ * caller's ifindex is a real one.
+ *
+ * An entry is forgotten here only when no dplane op for it is in flight.
+ * Results are matched to entries by tunnel_id alone, so a result orphaned by
+ * forgetting its entry would land on the next entry created for the same
+ * tunnel.  Every state with an op in flight only drops the ifindex and lets
+ * that op's result decide.
+ */
+void zebra_dimt_tunnel_if_delete(struct interface *ifp)
+{
+	struct zebra_dimt_tunnel *entry;
+
+	if (!zrouter.dimt_tunnels || ifp->ifindex == IFINDEX_INTERNAL)
+		return;
+	entry = zebra_dimt_tunnel_lookup_ifindex(ifp->vrf->vrf_id,
+						 ifp->ifindex);
+	if (!entry)
+		return;
+
+	if (IS_ZEBRA_DEBUG_KERNEL)
+		zlog_debug("DIMT tunnel %s: link %s(%d) deleted (state %d)",
+			   entry->ctx.ifname, ifp->name, ifp->ifindex,
+			   entry->state);
+
+	switch (entry->state) {
+	case ZEBRA_DIMT_CLEANUP:
+		if (entry->cleanup_pending) {
 			entry->ifindex = 0;
-			if (entry->state == ZEBRA_DIMT_INSTALLED)
-				entry->state = ZEBRA_DIMT_CLEANUP;
 			break;
 		}
+		/* A tombstone bound to this link with nothing in flight.  The
+		 * owner was told FAIL_INSTALL or REMOVE_FAIL when it was made,
+		 * and REMOVED is the only result that proves absence to pimd,
+		 * so say it now that the link is provably gone. */
+		fallthrough;
+	case ZEBRA_DIMT_INSTALLED:
+		/* No dplane op is ever in flight for an INSTALLED entry. */
+		zebra_dimt_notify(&entry->ctx, entry->vrf_id, 0,
+				  ZAPI_DIMT_TUNNEL_REMOVED);
+		zebra_dimt_tunnel_forget(entry);
+		break;
+	case ZEBRA_DIMT_ADDRESSING:
+		/* The in-flight address result now fails the ifindex check and
+		 * goes through zebra_dimt_tunnel_fail_install(). */
+	case ZEBRA_DIMT_DELETING:
+		/* The in-flight delete answers the owner; see the failed-delete
+		 * block in zebra_dimt_tunnel_dplane_result(). */
+		entry->ifindex = 0;
+		break;
+	case ZEBRA_DIMT_DELETED:
+		/* Replay any parked ADD -- but not from here: `ifp` is still
+		 * listed by name with its l2info intact, and a fresh create
+		 * run now would adopt the very link being deleted. */
+		entry->ifindex = 0;
+		event_add_event(zrouter.master, zebra_dimt_tunnel_replay, NULL,
+				0, &zebra_dimt_replay_ev);
+		break;
+	case ZEBRA_DIMT_ADDING:
+		/* zebra_dimt_tunnel_if_update() bound the link while the
+		 * create is still in flight.  Keep the dead index: the create
+		 * ack then runs the address phase against it, which fails, and
+		 * the owner gets FAIL_INSTALL.  Clearing it would leave the ack
+		 * waiting for an RTM_NEWLINK that never comes. */
+	case ZEBRA_DIMT_REPLACING:
+		break;
 	}
-	return 0;
 }
 
 static bool zebra_dimt_if_lifecycle_owned(ifindex_t ifindex, vrf_id_t vrf_id)
@@ -484,12 +576,233 @@ static void zebra_dimt_notify(const struct zebra_dimt_tunnel_ctx *ctx,
 	zserv_send_message(client, s);
 }
 
+/*
+ * Our delete of the link at ctx->delete_ifindex succeeded and REMOVED has
+ * been sent.  Forget the entry -- unless zebra still lists that link.
+ *
+ * The kernel ACKs the RTM_DELLINK on the dplane's command socket, but zebra
+ * learns the link is gone only when the dplane pthread later reads the
+ * RTM_DELLINK broadcast from netlink_dplane_in.  An ADD landing in that gap
+ * would take the fresh-create path and adopt the dying link (see
+ * zebra_dimt_tunnel_park()).  So while the link is still listed keep the
+ * entry as a DELETED tombstone bound to it; zebra_dimt_tunnel_if_delete()
+ * releases it when the link goes.
+ *
+ * Only a real kernel ACK proves an RTM_DELLINK is on its way.  The skip path
+ * in netlink_put_dimt_tunnel_msg() answers success without touching the
+ * kernel -- the link no longer matched what zebra lists -- and leaves
+ * result_authoritative unset; a tombstone there could wait forever.
+ */
+static void zebra_dimt_tunnel_deleted(struct zebra_dimt_tunnel *entry,
+				      const struct zebra_dimt_tunnel_ctx *ctx)
+{
+	struct interface *ifp = NULL;
+
+	if (ctx->result_authoritative && ctx->delete_ifindex)
+		ifp = if_lookup_by_index(ctx->delete_ifindex, entry->vrf_id);
+	if (!ifp || !CHECK_FLAG(ifp->status, ZEBRA_INTERFACE_ACTIVE) ||
+	    strcmp(ifp->name, ctx->ifname) != 0 ||
+	    !zebra_dimt_if_identity_matches(entry, ifp)) {
+		zebra_dimt_tunnel_forget(entry);
+		return;
+	}
+	entry->state = ZEBRA_DIMT_DELETED;
+	entry->ifindex = ctx->delete_ifindex;
+	entry->cleanup_pending = false;
+	entry->cleanup_notify_owner = false;
+	entry->replace_cancelled = false;
+	entry->create_acked = false;
+	entry->parked_add = false;
+}
+
+static void zebra_dimt_tunnel_add(const struct zebra_dimt_tunnel_ctx *ctx,
+				  vrf_id_t vrf_id);
+
+static struct zebra_dimt_tunnel *zebra_dimt_tunnel_lookup_released(void)
+{
+	struct listnode *node;
+	struct zebra_dimt_tunnel *entry;
+
+	for (ALL_LIST_ELEMENTS_RO(zrouter.dimt_tunnels, node, entry))
+		if (entry->state == ZEBRA_DIMT_DELETED && !entry->ifindex)
+			return entry;
+	return NULL;
+}
+
+/* Forget every DELETED tombstone whose link is now gone and run the ADD
+ * parked on it as if it had just arrived.  One entry per pass, with the
+ * lookup restarted each time: the add path appends to the list (never in
+ * DELETED state, so this terminates). */
+static void zebra_dimt_tunnel_replay(struct event *event)
+{
+	struct zebra_dimt_tunnel *entry;
+	struct zebra_dimt_tunnel_ctx parked;
+	vrf_id_t vrf_id;
+	bool replay;
+
+	if (!zrouter.dimt_tunnels)
+		return;
+	while ((entry = zebra_dimt_tunnel_lookup_released())) {
+		replay = entry->parked_add;
+		parked = entry->parked;
+		vrf_id = entry->vrf_id;
+		zebra_dimt_tunnel_forget(entry);
+		if (!replay)
+			continue;
+		if (IS_ZEBRA_DEBUG_KERNEL)
+			zlog_debug("DIMT tunnel %s: replaying parked ADD",
+				   parked.ifname);
+		zebra_dimt_tunnel_add(&parked, vrf_id);
+	}
+}
+
+/* An ADD, after decoding and validation: from a client, or replayed by
+ * zebra_dimt_tunnel_replay() once the link a DELETED entry was waiting on is
+ * gone. */
+static void zebra_dimt_tunnel_add(const struct zebra_dimt_tunnel_ctx *ctx,
+				  vrf_id_t vrf_id)
+{
+	struct zebra_dimt_tunnel *entry;
+	struct interface *ifp;
+	enum zebra_dplane_result result;
+
+	entry = zebra_dimt_tunnel_lookup(vrf_id, ctx->tunnel.tunnel_id);
+	if (entry) {
+		if (zebra_dimt_owner_matches(entry, ctx) &&
+		    memcmp(&entry->ctx.tunnel, &ctx->tunnel,
+			   sizeof(ctx->tunnel)) == 0) {
+			if (entry->state == ZEBRA_DIMT_CLEANUP) {
+				zebra_dimt_notify(
+					ctx, entry->vrf_id, entry->ifindex,
+					ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+				result = zebra_dimt_tunnel_cleanup_link(entry);
+				if (result == ZEBRA_DPLANE_REQUEST_SUCCESS)
+					zebra_dimt_tunnel_forget(entry);
+				return;
+			}
+			if (entry->state == ZEBRA_DIMT_DELETING) {
+				/* A delete is in flight and its completion
+				 * belongs to the delete requester. Reject the
+				 * add instead of rebinding ownership; the owner
+				 * retries once REMOVED arrives. */
+				zebra_dimt_notify(
+					ctx, entry->vrf_id, entry->ifindex,
+					ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+				return;
+			}
+			entry->ctx.owner_session = ctx->owner_session;
+			if (entry->state == ZEBRA_DIMT_INSTALLED) {
+				if (!zebra_dimt_tunnel_resolve_ifindex(entry)) {
+					zebra_dimt_notify(
+						ctx, entry->vrf_id, 0,
+						ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+					zebra_dimt_tunnel_forget(entry);
+					return;
+				}
+				zebra_dimt_notify(&entry->ctx, entry->vrf_id,
+						  entry->ifindex,
+						  ZAPI_DIMT_TUNNEL_INSTALLED);
+			}
+			return;
+		}
+		zebra_dimt_notify(ctx, vrf_id, entry->ifindex,
+				  ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+		return;
+	}
+	if (!zebra_dimt_outer_remote_valid(vrf_id, &ctx->tunnel)) {
+		zebra_dimt_notify(ctx, vrf_id, 0,
+				  ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+		return;
+	}
+	if (!zrouter.dimt_tunnels) {
+		zrouter.dimt_tunnels = list_new();
+		zrouter.dimt_tunnels->del = zebra_dimt_tunnel_free;
+	}
+	if (!(ctx->tunnel.options & ZAPI_DIMT_TUNNEL_MTU_PRESENT))
+		zlog_warn("DIMT tunnel %s: no MTU in the request; the netdev inherits the kernel default, which does not account for the %s outer header and fragments or drops full-size payloads",
+			  ctx->ifname,
+			  IS_IPADDR_V6(&ctx->tunnel.outer_local)
+				  ? "IPv6 + GRE"
+				  : "IPv4 + GRE");
+	entry = XCALLOC(MTYPE_DIMT_TUNNEL, sizeof(*entry));
+	entry->ctx = *ctx;
+	entry->ctx.phase = ZEBRA_DIMT_TUNNEL_CREATE;
+	entry->vrf_id = vrf_id;
+	entry->state = ZEBRA_DIMT_ADDING;
+	listnode_add(zrouter.dimt_tunnels, entry);
+	ifp = if_lookup_by_name(ctx->ifname, entry->vrf_id);
+	if (ifp && zebra_dimt_if_stale_outer_hdr(entry, ifp)) {
+		/* Ours, but built with the wrong outer header. */
+		if (zebra_dimt_tunnel_replace(entry, ifp) !=
+		    ZEBRA_DPLANE_REQUEST_QUEUED)
+			zebra_dimt_tunnel_replace_failed(
+				entry, ifp->ifindex,
+				ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+		return;
+	}
+	if (ifp && zebra_dimt_if_matches(entry, ifp)) {
+		entry->ifindex = ifp->ifindex;
+		if (zebra_dimt_if_address_matches(entry, ifp)) {
+			entry->state = ZEBRA_DIMT_INSTALLED;
+			zebra_dimt_notify(&entry->ctx, entry->vrf_id,
+					  entry->ifindex,
+					  ZAPI_DIMT_TUNNEL_INSTALLED);
+			return;
+		}
+		if (zebra_dimt_tunnel_address(entry) ==
+		    ZEBRA_DPLANE_REQUEST_QUEUED)
+			return;
+		zebra_dimt_tunnel_fail_install(entry);
+		return;
+	}
+	result = dplane_dimt_tunnel_add(entry->vrf_id, &entry->ctx);
+	if (result != ZEBRA_DPLANE_REQUEST_QUEUED) {
+		zebra_dimt_notify(ctx, entry->vrf_id, 0,
+				  ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
+		listnode_delete(zrouter.dimt_tunnels, entry);
+		zebra_dimt_tunnel_free(entry);
+	}
+}
+
+/*
+ * A request for a tunnel whose link we just deleted, while zebra still lists
+ * that link (see zebra_dimt_tunnel_deleted()).
+ *
+ * An ADD cannot be served yet: the fresh-create path would find the dying
+ * link by name, zebra_dimt_if_matches() would pass on its intact l2info, its
+ * address would still be flagged ZEBRA_IFC_QUEUED, and the ADD would be
+ * answered INSTALLED on a dead ifindex (BLO-38034).  pimd re-ADDs the moment
+ * REMOVED lands, so this is an ordinary sequence, not a corner case.  Park
+ * it, whatever its owner or bytes -- pimd's endpoint-change re-ADD differs
+ * from the request just deleted -- and answer it when the link is gone.
+ * Only the latest ADD is kept: it is the one its owner is waiting on.
+ *
+ * A DEL finds nothing left to remove, and cancels a parked ADD of its own.
+ */
+static void zebra_dimt_tunnel_park(struct zebra_dimt_tunnel *entry,
+				   const struct zebra_dimt_tunnel_ctx *ctx,
+				   bool add)
+{
+	if (add) {
+		if (IS_ZEBRA_DEBUG_KERNEL)
+			zlog_debug("DIMT tunnel %s: ADD parked until deleted link %d is gone",
+				   ctx->ifname, entry->ifindex);
+		entry->parked = *ctx;
+		entry->parked_add = true;
+		return;
+	}
+	zebra_dimt_notify(ctx, entry->vrf_id, 0, ZAPI_DIMT_TUNNEL_REMOVED);
+	if (entry->parked_add &&
+	    entry->parked.owner_proto == ctx->owner_proto &&
+	    entry->parked.owner_instance == ctx->owner_instance)
+		entry->parked_add = false;
+}
+
 void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 			       struct stream *msg, struct zebra_vrf *zvrf)
 {
 	struct zebra_dimt_tunnel_ctx ctx = {};
 	struct zebra_dimt_tunnel *entry;
-	struct interface *ifp;
 	enum zebra_dplane_result result;
 	bool add = hdr->command == ZEBRA_DIMT_TUNNEL_ADD;
 
@@ -508,106 +821,12 @@ void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,
 	entry = zebra_dimt_tunnel_lookup(zvrf_id(zvrf),
 					 ctx.tunnel.tunnel_id);
 
+	if (entry && entry->state == ZEBRA_DIMT_DELETED) {
+		zebra_dimt_tunnel_park(entry, &ctx, add);
+		return;
+	}
 	if (add) {
-		if (entry) {
-			if (zebra_dimt_owner_matches(entry, &ctx) &&
-			    memcmp(&entry->ctx.tunnel, &ctx.tunnel,
-				   sizeof(ctx.tunnel)) == 0) {
-				if (entry->state == ZEBRA_DIMT_CLEANUP) {
-					zebra_dimt_notify(
-						&ctx, entry->vrf_id,
-						entry->ifindex,
-						ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
-					result = zebra_dimt_tunnel_cleanup_link(entry);
-					if (result == ZEBRA_DPLANE_REQUEST_SUCCESS)
-						zebra_dimt_tunnel_forget(entry);
-					return;
-				}
-				if (entry->state == ZEBRA_DIMT_DELETING) {
-					/* A delete is in flight and its
-					 * completion belongs to the delete
-					 * requester. Reject the add instead
-					 * of rebinding ownership; the owner
-					 * retries once REMOVED arrives. */
-					zebra_dimt_notify(
-						&ctx, entry->vrf_id,
-						entry->ifindex,
-						ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
-					return;
-				}
-				entry->ctx.owner_session = ctx.owner_session;
-				if (entry->state == ZEBRA_DIMT_INSTALLED) {
-					if (!zebra_dimt_tunnel_resolve_ifindex(entry)) {
-						zebra_dimt_notify(
-							&ctx, entry->vrf_id, 0,
-							ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
-						zebra_dimt_tunnel_forget(entry);
-						return;
-					}
-					zebra_dimt_notify(
-						&entry->ctx, entry->vrf_id,
-						entry->ifindex,
-						ZAPI_DIMT_TUNNEL_INSTALLED);
-				}
-				return;
-			}
-			zebra_dimt_notify(&ctx, zvrf_id(zvrf), entry->ifindex,
-					  ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
-			return;
-		}
-		if (!zebra_dimt_outer_remote_valid(zvrf_id(zvrf), &ctx.tunnel)) {
-			zebra_dimt_notify(&ctx, zvrf_id(zvrf), 0,
-					  ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
-			return;
-		}
-		if (!zrouter.dimt_tunnels) {
-			zrouter.dimt_tunnels = list_new();
-			zrouter.dimt_tunnels->del = zebra_dimt_tunnel_free;
-		}
-		if (!(ctx.tunnel.options & ZAPI_DIMT_TUNNEL_MTU_PRESENT))
-			zlog_warn("DIMT tunnel %s: no MTU in the request; the netdev inherits the kernel default, which does not account for the %s outer header and fragments or drops full-size payloads",
-				  ctx.ifname,
-				  IS_IPADDR_V6(&ctx.tunnel.outer_local)
-					  ? "IPv6 + GRE"
-					  : "IPv4 + GRE");
-		entry = XCALLOC(MTYPE_DIMT_TUNNEL, sizeof(*entry));
-		entry->ctx = ctx;
-		entry->ctx.phase = ZEBRA_DIMT_TUNNEL_CREATE;
-		entry->vrf_id = zvrf_id(zvrf);
-		entry->state = ZEBRA_DIMT_ADDING;
-		listnode_add(zrouter.dimt_tunnels, entry);
-		ifp = if_lookup_by_name(ctx.ifname, entry->vrf_id);
-		if (ifp && zebra_dimt_if_stale_outer_hdr(entry, ifp)) {
-			/* Ours, but built with the wrong outer header. */
-			if (zebra_dimt_tunnel_replace(entry, ifp) !=
-			    ZEBRA_DPLANE_REQUEST_QUEUED)
-				zebra_dimt_tunnel_replace_failed(
-					entry, ifp->ifindex,
-					ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
-			return;
-		}
-		if (ifp && zebra_dimt_if_matches(entry, ifp)) {
-			entry->ifindex = ifp->ifindex;
-			if (zebra_dimt_if_address_matches(entry, ifp)) {
-				entry->state = ZEBRA_DIMT_INSTALLED;
-				zebra_dimt_notify(&entry->ctx, entry->vrf_id,
-						  entry->ifindex,
-						  ZAPI_DIMT_TUNNEL_INSTALLED);
-				return;
-			}
-			if (zebra_dimt_tunnel_address(entry) ==
-			    ZEBRA_DPLANE_REQUEST_QUEUED)
-				return;
-			zebra_dimt_tunnel_fail_install(entry);
-			return;
-		}
-		result = dplane_dimt_tunnel_add(entry->vrf_id, &entry->ctx);
-		if (result != ZEBRA_DPLANE_REQUEST_QUEUED) {
-			zebra_dimt_notify(&ctx, entry->vrf_id, 0,
-					  ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
-			listnode_delete(zrouter.dimt_tunnels, entry);
-			zebra_dimt_tunnel_free(entry);
-		}
+		zebra_dimt_tunnel_add(&ctx, zvrf_id(zvrf));
 		return;
 	}
 
@@ -709,7 +928,7 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 		if (entry->replace_cancelled) {
 			zebra_dimt_notify(&entry->ctx, vrf_id, 0,
 					  ZAPI_DIMT_TUNNEL_REMOVED);
-			zebra_dimt_tunnel_forget(entry);
+			zebra_dimt_tunnel_deleted(entry, ctx);
 			return;
 		}
 		entry->ifindex = 0;
@@ -737,11 +956,20 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 
 		entry->create_acked = true;
 		ifp = if_lookup_by_name(ctx->ifname, vrf_id);
-		/* After a replacement the name may still resolve to the
-		 * deleted stale-TTL link until its RTM_DELLINK is processed;
-		 * the new link's RTM_NEWLINK follows it in kernel order and
-		 * zebra_dimt_tunnel_if_update() adopts it then. */
-		if (ifp && !zebra_dimt_if_stale_outer_hdr(entry, ifp))
+		/* Adopt only a live link.  After a replacement the name may
+		 * still resolve to the deleted stale-TTL link until its
+		 * RTM_DELLINK is processed, and a configured interface
+		 * outlives its deleted link at IFINDEX_INTERNAL -- adopting
+		 * that would set ifindex 0 and wedge the entry in ADDING.  In
+		 * both cases the new link's RTM_NEWLINK follows in kernel
+		 * order and zebra_dimt_tunnel_if_update() adopts it then.
+		 * Identity is left to the address phase (resolve_ifindex()),
+		 * which fails the install on a mismatch: an already-listed
+		 * link gets no second RTM_NEWLINK, so refusing it here would
+		 * wedge the entry instead. */
+		if (ifp && ifp->ifindex != IFINDEX_INTERNAL &&
+		    CHECK_FLAG(ifp->status, ZEBRA_INTERFACE_ACTIVE) &&
+		    !zebra_dimt_if_stale_outer_hdr(entry, ifp))
 			entry->ifindex = ifp->ifindex;
 		if (!entry->ifindex ||
 		    zebra_dimt_tunnel_address(entry) ==
@@ -764,7 +992,8 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 				  ZAPI_DIMT_TUNNEL_FAIL_INSTALL);
 		entry->state = ZEBRA_DIMT_CLEANUP;
 		ifp = if_lookup_by_name(ctx->ifname, vrf_id);
-		if (ifp && zebra_dimt_if_identity_matches(entry, ifp))
+		if (ifp && ifp->ifindex != IFINDEX_INTERNAL &&
+		    zebra_dimt_if_identity_matches(entry, ifp))
 			entry->ifindex = ifp->ifindex;
 		/* Keep the entry even when nothing can be cleaned yet;
 		 * zebra_dimt_tunnel_if_update() reconciles a link that only
@@ -787,13 +1016,17 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 		zebra_dimt_tunnel_fail_install(entry);
 		return;
 	}
-	if (!add && !success && entry && !cleanup &&
-	    !ctx->result_authoritative) {
-		/* The delete's verdict was lost: the kernel may have removed
-		 * the link, and zebra_dimt_if_del() may already have cleared
-		 * the ifindex. Trust the reconciled interface state instead
-		 * of resurrecting INSTALLED blindly -- an identical ADD must
-		 * never report INSTALLED for a link that no longer exists. */
+	if (!add && !success && entry && !cleanup) {
+		/* The delete failed, or its verdict was lost.  Either way the
+		 * reconciled interface state decides, never the failure
+		 * alone: a lost verdict may hide a delete the kernel applied,
+		 * and an explicit one is ENODEV when an out-of-band delete
+		 * already removed the link (netlink_parse_error() forgives
+		 * ENODEV only for DELROUTE) -- in which case
+		 * zebra_dimt_tunnel_if_delete() may have cleared the ifindex
+		 * too.  Restoring INSTALLED there would keep an entry nothing
+		 * can match again and answer an identical ADD INSTALLED for a
+		 * link that no longer exists. */
 		if (zebra_dimt_tunnel_resolve_ifindex(entry)) {
 			entry->state = ZEBRA_DIMT_INSTALLED;
 			zebra_dimt_notify(&entry->ctx, vrf_id, entry->ifindex,
@@ -815,23 +1048,22 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 	if (cleanup && entry)
 		entry->cleanup_notify_owner = false;
 
-	if (!add && entry && !success && !cleanup)
-		entry->state = ZEBRA_DIMT_INSTALLED;
-
-	if (entry && ((add && !success &&
-		      ctx->phase == ZEBRA_DIMT_TUNNEL_CREATE) ||
-		     (!add && success))) {
+	if (entry && !add && success)
+		zebra_dimt_tunnel_deleted(entry, ctx);
+	else if (entry && add && !success &&
+		 ctx->phase == ZEBRA_DIMT_TUNNEL_CREATE)
 		zebra_dimt_tunnel_forget(entry);
-	}
 }
 
 void zebra_dimt_tunnel_init(void)
 {
-	hook_register_prio(if_del, 0, zebra_dimt_if_del);
+	/* Link deletion reaches DIMT through zebra_dimt_tunnel_if_delete(),
+	 * called from if_delete_update(), not through a hook. */
 }
 
 void zebra_dimt_tunnel_cleanup(void)
 {
+	event_cancel(&zebra_dimt_replay_ev);
 	if (zrouter.dimt_tunnels)
 		list_delete(&zrouter.dimt_tunnels);
 }

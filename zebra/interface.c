@@ -743,8 +743,12 @@ static void if_delete_connected(struct interface *ifp)
 	}
 }
 
-/* Handle an interface delete event */
-void if_delete_update(struct interface **pifp)
+/*
+ * Handle an interface delete event.  `link_gone` is false only for a rename
+ * (set_ifindex()): the ifp loses its ifindex to the renamed link, but the
+ * netdev itself survives under its new name.
+ */
+static void zebra_if_delete_update(struct interface **pifp, bool link_gone)
 {
 	struct zebra_if *zif;
 	struct interface *ifp = *pifp;
@@ -786,6 +790,12 @@ void if_delete_update(struct interface **pifp)
 	/* Send out notification on interface delete. */
 	zebra_interface_delete_update(ifp);
 
+	/* After the delete is distributed, so a DIMT owner sees DOWN, DELETE
+	 * and then any REMOVED; before the ifindex and l2info are reset below,
+	 * because that is how DIMT recognises its link (BLO-38034). */
+	if (link_gone)
+		zebra_dimt_tunnel_if_delete(ifp);
+
 	zebra_ns_unlink_ifp(ifp);
 
 	/* Update ifindex after distributing the delete message.  This is in
@@ -815,6 +825,11 @@ void if_delete_update(struct interface **pifp)
 				   ifp->name);
 		if_delete(pifp);
 	}
+}
+
+void if_delete_update(struct interface **pifp)
+{
+	zebra_if_delete_update(pifp, true);
 }
 
 /* VRF change for an interface */
@@ -1629,7 +1644,8 @@ static void set_ifindex(struct interface *ifp, ifindex_t ifi_index,
 					EC_LIB_INTERFACE,
 					"interface rename detected on up interface: index %d was renamed from %s to %s, results are uncertain!",
 					ifi_index, oifp->name, ifp->name);
-			if_delete_update(&oifp);
+			/* The netdev survives under its new name. */
+			zebra_if_delete_update(&oifp, false);
 		}
 	}
 	if_set_index(ifp, ifi_index);

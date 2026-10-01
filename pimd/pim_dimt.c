@@ -1827,18 +1827,63 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
 		tun->ifindex = 0;
 		break;
 	case ZAPI_DIMT_TUNNEL_REMOVED:
+		/* REMOVED is the only result that proves no netdev with this
+		 * id exists, whatever it answers -- so what it means depends
+		 * on what we were waiting for. */
 		tun->ifindex = 0;
 		tun->kernel_present = false;
-		if (tun->readd_pending) {
+		switch (tun->state) {
+		case PIM_DIMT_TUNNEL_REMOVING:
+			/* The answer to our DEL. */
+			if (tun->readd_pending) {
+				tun->readd_pending = false;
+				tun->state =
+					pim_dimt_tunnel_send(pim, tun, true)
+						? PIM_DIMT_TUNNEL_REQUESTED
+						: PIM_DIMT_TUNNEL_IDLE;
+				break;
+			}
+			listnode_delete(pim->dimt_tunnel_list, tun);
+			pim_dimt_tunnel_free(tun);
+			tun = NULL;
+			break;
+		case PIM_DIMT_TUNNEL_REQUESTED:
+			/* zebra answers an ADD only INSTALLED or FAIL_INSTALL,
+			 * so this is not the answer to the ADD we are waiting
+			 * on: it is the late answer to an earlier DEL, or zebra
+			 * reporting that an earlier netdev vanished.  Keep
+			 * waiting, and repeat the ADD in case zebra no longer
+			 * holds it -- a byte-identical ADD is idempotent
+			 * there. */
+			if (!pim_dimt_tunnel_send(pim, tun, true))
+				tun->state = PIM_DIMT_TUNNEL_IDLE;
+			break;
+		case PIM_DIMT_TUNNEL_INSTALLED:
+		case PIM_DIMT_TUNNEL_IDLE:
+		case PIM_DIMT_TUNNEL_FAILED:
+			/* Unsolicited: the netdev vanished out-of-band (an
+			 * operator `ip link del`, a netns teardown) and zebra
+			 * says so (BLO-38034).  Its riders were already
+			 * unpinned by the interface delete, which zebra sends
+			 * first.
+			 * Forget the acknowledgement and let reconcile decide:
+			 * with demand it re-ADDs the same tunnel_id and request
+			 * bytes, without demand it frees the record.
+			 *
+			 * This cannot loop.  An ADD is never answered REMOVED,
+			 * and a create that fails lands in FAILED, which
+			 * re-requests only on a real demand edge; only an
+			 * external deleter can drive a rebuild, so an operator
+			 * deleting a demanded tunnel sees it rebuilt -- which
+			 * is the point.
+			 *
+			 * reconcile may free tun: do not touch it after. */
 			tun->readd_pending = false;
-			tun->state = pim_dimt_tunnel_send(pim, tun, true)
-					     ? PIM_DIMT_TUNNEL_REQUESTED
-					     : PIM_DIMT_TUNNEL_IDLE;
+			tun->state = PIM_DIMT_TUNNEL_IDLE;
+			tun = NULL;
+			pim_dimt_reconcile(pim);
 			break;
 		}
-		listnode_delete(pim->dimt_tunnel_list, tun);
-		pim_dimt_tunnel_free(tun);
-		tun = NULL;
 		break;
 	case ZAPI_DIMT_TUNNEL_REMOVE_FAIL:
 		/* The netdev survives.  Return to INSTALLED so the next
