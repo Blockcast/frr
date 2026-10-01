@@ -46,9 +46,45 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
 
         self.assertIn("zebra_dimt_tunnel_resolve_ifindex(entry)", dimt)
-        self.assertIn("hook_register_prio(if_del, 0, zebra_dimt_if_del)", dimt)
         cleanup_branch = dimt.split("if (entry->state == ZEBRA_DIMT_CLEANUP)", 1)[1]
         self.assertIn("zebra_dimt_tunnel_cleanup_link(entry)", cleanup_branch)
+
+    def test_link_deletion_reaches_dimt_before_the_ifindex_reset(self):
+        """BLO-38034: an if_del hook fires after if_delete_update() has reset
+        the ifindex and wiped l2info, and never for a configured ifp, so it
+        could not match.  The call must sit after the delete is distributed
+        and before the reset, and a rename (whose netdev survives) opts out.
+        """
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+        iface = (ROOT / "zebra" / "interface.c").read_text()
+
+        self.assertNotIn("hook_register_prio(if_del", dimt)
+        update = iface.split("static void zebra_if_delete_update(", 1)[1]
+        update = update.split("\n}\n", 1)[0]
+        call = update.index("zebra_dimt_tunnel_if_delete(ifp)")
+        self.assertLess(update.index("zebra_interface_delete_update(ifp)"), call)
+        self.assertLess(call, update.index("if_set_index(ifp, IFINDEX_INTERNAL)"))
+        self.assertLess(call, update.index("memset(&zif->l2info"))
+        self.assertIn("if (link_gone)", update[:call])
+        rename = iface.split("static void set_ifindex(", 1)[1]
+        rename = rename.split("\n}\n", 1)[0]
+        self.assertIn("zebra_if_delete_update(&oifp, false)", rename)
+
+    def test_deleted_tombstone_needs_a_kernel_ack_and_replays_deferred(self):
+        """A tombstone waits for an RTM_DELLINK only a real kernel ACK
+        promises, and its parked ADD is replayed from an event, never from
+        the deletion itself, while the dying ifp is still listed by name."""
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+
+        deleted = dimt.split("static void zebra_dimt_tunnel_deleted(", 1)[1]
+        deleted = deleted.split("\n}\n", 1)[0]
+        self.assertIn("ctx->result_authoritative", deleted)
+        self.assertIn("ZEBRA_DIMT_DELETED", deleted)
+        if_delete = dimt.split("void zebra_dimt_tunnel_if_delete(", 1)[1]
+        if_delete = if_delete.split("\n}\n", 1)[0]
+        self.assertIn("event_add_event(", if_delete)
+        self.assertNotIn("zebra_dimt_tunnel_add(", if_delete)
+        self.assertIn("event_cancel(&zebra_dimt_replay_ev)", dimt)
 
     def test_new_dataplane_api_version_and_vrf_scope_are_explicit(self):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
@@ -152,8 +188,8 @@ class TestDimtLifecycleWiring(unittest.TestCase):
 
     def test_wrong_ttl_link_is_replaced_not_adopted(self):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
-        request = dimt.split("void zebra_dimt_tunnel_request", 1)[1]
-        request = request.split("void zebra_dimt_tunnel_dplane_result", 1)[0]
+        request = dimt.split("static void zebra_dimt_tunnel_add(", 2)[2]
+        request = request.split("\n}\n", 1)[0]
         result = dimt.split("void zebra_dimt_tunnel_dplane_result", 1)[1]
 
         # Adoption is the strict (outer-header-checking) match; a
@@ -247,13 +283,13 @@ class TestDimtLifecycleWiring(unittest.TestCase):
 
     def test_add_during_delete_rejects_instead_of_rebinding_owner(self):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
-        identical_add = dimt.split("if (add) {", 1)[1]
+        identical_add = dimt.split("static void zebra_dimt_tunnel_add(", 2)[2]
 
         deleting_reject = identical_add.index(
             "entry->state == ZEBRA_DIMT_DELETING"
         )
         rebind = identical_add.index(
-            "entry->ctx.owner_session = ctx.owner_session"
+            "entry->ctx.owner_session = ctx->owner_session"
         )
         self.assertLess(deleting_reject, rebind)
 
@@ -280,16 +316,24 @@ class TestDimtLifecycleWiring(unittest.TestCase):
     def test_uncertain_delete_reconciles_before_restoring_installed(self):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
 
-        # Both CREATE and DELETE distinguish lost verdicts from explicit
-        # kernel verdicts.
-        self.assertEqual(dimt.count("!ctx->result_authoritative"), 2)
-        # The uncertain-DELETE branch re-resolves the interface before
+        # A CREATE distinguishes a lost verdict from an explicit one.  A
+        # failed DELETE no longer needs to: lost or explicit (ENODEV after an
+        # out-of-band delete, BLO-38034), it re-resolves the interface before
         # deciding between REMOVE_FAIL and REMOVED, instead of restoring
         # INSTALLED blindly.
-        uncertain_del = dimt.rsplit("!ctx->result_authoritative", 1)[1]
-        head = uncertain_del.split("ZAPI_DIMT_TUNNEL_REMOVED", 1)[0]
+        self.assertEqual(dimt.count("!ctx->result_authoritative"), 1)
+        result = dimt.split("void zebra_dimt_tunnel_dplane_result", 1)[1]
+        failed_del = result.split(
+            "if (!add && !success && entry && !cleanup) {", 1
+        )[1]
+        head = failed_del.split("ZAPI_DIMT_TUNNEL_REMOVED", 1)[0]
         self.assertIn("zebra_dimt_tunnel_resolve_ifindex(entry)", head)
         self.assertIn("ZAPI_DIMT_TUNNEL_REMOVE_FAIL", head)
+        self.assertNotIn(
+            "if (!add && entry && !success && !cleanup)\n\t\tentry->state = "
+            "ZEBRA_DIMT_INSTALLED;",
+            result,
+        )
 
     def test_no_message_results_skip_ack_correlation(self):
         batch = (ROOT / "zebra" / "kernel_netlink.c").read_text()
@@ -373,7 +417,7 @@ class TestDimtLifecycleWiring(unittest.TestCase):
 
     def test_restart_adopts_exact_kernel_tunnel(self):
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
-        request = dimt.split("void zebra_dimt_tunnel_request", 1)[1]
+        request = dimt.split("static void zebra_dimt_tunnel_add(", 2)[2]
 
         self.assertIn("zebra_dimt_if_matches(entry, ifp)", request)
         self.assertIn("zebra_dimt_if_address_matches(entry, ifp)", request)
@@ -485,7 +529,7 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         rather than on every idempotent re-ADD from a reconnecting pimd.
         """
         dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
-        request = dimt.split("void zebra_dimt_tunnel_request", 1)[1]
+        request = dimt.split("static void zebra_dimt_tunnel_add(", 2)[2]
         warn = request.split("ZAPI_DIMT_TUNNEL_MTU_PRESENT", 1)[1]
 
         self.assertIn("zlog_warn", warn)
