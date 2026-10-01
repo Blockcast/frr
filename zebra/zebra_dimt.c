@@ -800,6 +800,12 @@ static void zebra_dimt_tunnel_add(const struct zebra_dimt_tunnel_ctx *ctx,
 	entry->state = ZEBRA_DIMT_ADDING;
 	listnode_add(zrouter.dimt_tunnels, entry);
 	ifp = if_lookup_by_name(ctx->ifname, entry->vrf_id);
+	/* Only a live link can be adopted or replaced, as in the create ack
+	 * and the lost-create bind: a configured interface outlives its deleted
+	 * link at IFINDEX_INTERNAL with ACTIVE cleared. */
+	if (ifp && (ifp->ifindex == IFINDEX_INTERNAL ||
+		    !CHECK_FLAG(ifp->status, ZEBRA_INTERFACE_ACTIVE)))
+		ifp = NULL;
 	if (ifp && zebra_dimt_if_stale_outer_hdr(entry, ifp)) {
 		/* Ours, but built with the wrong outer header. */
 		if (zebra_dimt_tunnel_replace(entry, ifp) !=
@@ -842,21 +848,29 @@ static void zebra_dimt_tunnel_add(const struct zebra_dimt_tunnel_ctx *ctx,
  * address would still be flagged ZEBRA_IFC_QUEUED, and the ADD would be
  * answered INSTALLED on a dead ifindex (BLO-38034).  pimd re-ADDs the moment
  * REMOVED lands, so this is an ordinary sequence, not a corner case.  Park
- * it, whatever its owner or bytes -- pimd's endpoint-change re-ADD differs
- * from the request just deleted -- and answer it when the link is gone.
- * Only the latest ADD is kept: it is the one its owner is waiting on.  Its
- * owner is checked when it is replayed, through zebra_dimt_tunnel_add().
+ * it, whatever its bytes -- pimd's endpoint-change re-ADD differs from the
+ * request just deleted -- and answer it when the link is gone.  Only the
+ * latest ADD is kept: it is the one the owner is waiting on, and an earlier
+ * one of the owner's is superseded.  zebra_dimt_tunnel_replay() forgets the
+ * tombstone before it serves the parked ADD, so the replay is a fresh create
+ * and its requester becomes the owner; the owner is therefore checked here.
  *
- * A DEL is answered now, so it is judged as for a live entry: the tombstone
- * stands for the link until zebra stops listing it, and a DEL from another
- * owner is refused REMOVE_FAIL rather than told the tunnel is gone.  The
- * owner's DEL finds nothing left to remove and cancels a parked ADD of its
- * own.
+ * The tombstone stands for the entry until zebra stops listing the link, so
+ * a request from another owner is refused as a live entry refuses it: an ADD
+ * FAIL_INSTALL, a DEL REMOVE_FAIL.  That also keeps a competing ADD from
+ * displacing the owner's parked one unanswered.  The owner's DEL finds
+ * nothing left to remove and cancels its parked ADD.
  */
 static void zebra_dimt_tunnel_park(struct zebra_dimt_tunnel *entry,
 				   const struct zebra_dimt_tunnel_ctx *ctx,
 				   bool add)
 {
+	if (!zebra_dimt_owner_matches(entry, ctx)) {
+		zebra_dimt_notify(ctx, entry->vrf_id, entry->ifindex,
+				  add ? ZAPI_DIMT_TUNNEL_FAIL_INSTALL
+				      : ZAPI_DIMT_TUNNEL_REMOVE_FAIL);
+		return;
+	}
 	if (add) {
 		if (IS_ZEBRA_DEBUG_KERNEL)
 			zlog_debug("DIMT tunnel %s: ADD parked until deleted link %d is gone",
@@ -865,16 +879,8 @@ static void zebra_dimt_tunnel_park(struct zebra_dimt_tunnel *entry,
 		entry->parked_add = true;
 		return;
 	}
-	if (!zebra_dimt_owner_matches(entry, ctx)) {
-		zebra_dimt_notify(ctx, entry->vrf_id, entry->ifindex,
-				  ZAPI_DIMT_TUNNEL_REMOVE_FAIL);
-		return;
-	}
 	zebra_dimt_notify(ctx, entry->vrf_id, 0, ZAPI_DIMT_TUNNEL_REMOVED);
-	if (entry->parked_add &&
-	    entry->parked.owner_proto == ctx->owner_proto &&
-	    entry->parked.owner_instance == ctx->owner_instance)
-		entry->parked_add = false;
+	entry->parked_add = false;
 }
 
 void zebra_dimt_tunnel_request(struct zserv *client, struct zmsghdr *hdr,

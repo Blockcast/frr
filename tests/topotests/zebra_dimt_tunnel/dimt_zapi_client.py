@@ -112,11 +112,6 @@ def main():
     # as long as the hold; the default only has to cover an ordinary round
     # trip.  Under --follow/--barrier it bounds each wait for the next notify.
     parser.add_argument("--timeout", type=float, default=10)
-    # HELLO with synchronous=0.  zebra withholds capabilities, VRF and
-    # interface updates from a synchronous client but sends DIMT owner
-    # notifies -- unsolicited ones included -- to either kind, so no test
-    # here needs it; it exists to mirror pimd's own session when one does.
-    parser.add_argument("--async", dest="async_session", action="store_true")
     # Keep the owner session open after the first notify and print this many
     # more for the tunnel, one JSON line each.  On timeout {"timeout": true}
     # is printed and the client exits 3.
@@ -130,8 +125,7 @@ def main():
     args = parser.parse_args()
 
     session_id = 0xD1000000 | (os.getpid() & 0xFFFF)
-    synchronous = 0 if args.async_session else 1
-    hello = struct.pack("!BHIB", ZEBRA_ROUTE_PIM, 0, session_id, synchronous)
+    hello = struct.pack("!BHIB", ZEBRA_ROUTE_PIM, 0, session_id, 1)
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(args.timeout)
