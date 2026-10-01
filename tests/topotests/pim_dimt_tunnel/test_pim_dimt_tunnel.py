@@ -1038,9 +1038,12 @@ def test_out_of_band_link_delete_rebuilds_the_tunnel():
     expect(rebuilt)
     after = link_ifindex(r2, ifname)
 
-    # 4. pimd re-requested the SAME tunnel -- same id, so the reconcile re-ADD
-    #    rather than a fresh allocation -- and its row is bound to the rebuilt
-    #    netdev, not the dead ifindex the unfixed code keeps.
+    # 4. pimd's row is bound to the rebuilt netdev, not the dead ifindex the
+    #    unfixed code keeps. The id check is a sanity check only: ids are
+    #    jhash(UMH), so a record freed and reallocated for the same UMH gets
+    #    the same id, and this cannot tell a kept-and-re-ADDed record from a
+    #    fresh allocation. Stage 3 is what catches the old free-on-REMOVED
+    #    behaviour: it sent no ADD, so nothing was rebuilt.
     def bound_to_rebuilt():
         error = check_tunnel_state(r2, "installed")
         if error:

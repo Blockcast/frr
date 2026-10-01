@@ -33,6 +33,12 @@ struct zebra_dimt_tunnel {
 	bool cleanup_notify_owner;
 	/* A DEL arrived while REPLACING: finish the delete, skip the create. */
 	bool replace_cancelled;
+	/* ADDING/ADDRESSING only: zebra processed the RTM_DELLINK of the link
+	 * this entry was building while the create or address op was still in
+	 * flight.  Nothing of zebra's deletes a link in those states, so the
+	 * delete was out of band and the link provably existed; see
+	 * zebra_dimt_tunnel_fail_install(). */
+	bool link_deleted;
 	enum {
 		ZEBRA_DIMT_ADDING,
 		ZEBRA_DIMT_ADDRESSING,
@@ -43,9 +49,12 @@ struct zebra_dimt_tunnel {
 		 * fixed one (see zebra_dimt_if_outer_hdr_matches); the
 		 * create follows the delete. */
 		ZEBRA_DIMT_REPLACING,
-		/* Our delete succeeded and REMOVED was sent, but zebra still
-		 * lists the deleted link until its RTM_DELLINK is processed.
-		 * See zebra_dimt_tunnel_deleted(). */
+		/* Our delete (an owner DEL, a cancelled replace, or zebra's
+		 * own cleanup) succeeded, but zebra still lists the deleted
+		 * link until its RTM_DELLINK is processed.  The owner has been
+		 * answered REMOVED -- or, for a silent cleanup, only the
+		 * FAIL_INSTALL that preceded it.  See
+		 * zebra_dimt_tunnel_deleted(). */
 		ZEBRA_DIMT_DELETED,
 	} state;
 	/* DELETED only: the latest ADD that arrived for the tunnel while the
@@ -285,6 +294,24 @@ zebra_dimt_tunnel_cleanup_link(struct zebra_dimt_tunnel *entry)
 	return result;
 }
 
+/* The owner learns a link it was building vanished: REMOVED after the
+ * FAIL_INSTALL already sent, then the entry is forgotten.  FAIL_INSTALL alone
+ * parks pimd's tunnel in FAILED, which re-requests only on a demand edge, so a
+ * demanded tunnel would stay dark; REMOVED is the only result that proves
+ * absence, and pimd re-ADDs on it.
+ *
+ * Only for entry->link_deleted, i.e. once an out-of-band RTM_DELLINK for the
+ * link was processed.  Never for a create that failed without producing a
+ * link, nor for one whose link merely fails resolve_ifindex() on a name or
+ * identity mismatch: pimd would re-ADD into the same failure forever. */
+static void zebra_dimt_tunnel_forget_vanished(struct zebra_dimt_tunnel *entry)
+{
+	if (entry->link_deleted)
+		zebra_dimt_notify(&entry->ctx, entry->vrf_id, 0,
+				  ZAPI_DIMT_TUNNEL_REMOVED);
+	zebra_dimt_tunnel_forget(entry);
+}
+
 static void zebra_dimt_tunnel_fail_install(struct zebra_dimt_tunnel *entry)
 {
 	enum zebra_dplane_result result;
@@ -295,7 +322,7 @@ static void zebra_dimt_tunnel_fail_install(struct zebra_dimt_tunnel *entry)
 	 * identical request retries cleanup instead of colliding with the link. */
 	result = zebra_dimt_tunnel_cleanup_link(entry);
 	if (result == ZEBRA_DPLANE_REQUEST_SUCCESS)
-		zebra_dimt_tunnel_forget(entry);
+		zebra_dimt_tunnel_forget_vanished(entry);
 }
 
 /* Replace a link of ours built with the wrong outer header (see
@@ -310,6 +337,7 @@ zebra_dimt_tunnel_replace(struct zebra_dimt_tunnel *entry,
 {
 	entry->ifindex = 0;
 	entry->create_acked = false;
+	entry->link_deleted = false;
 	entry->ctx.phase = ZEBRA_DIMT_TUNNEL_DELETE;
 	entry->ctx.delete_ifindex = stale->ifindex;
 	entry->state = ZEBRA_DIMT_REPLACING;
@@ -392,6 +420,9 @@ void zebra_dimt_tunnel_if_update(struct interface *ifp)
 		if (zebra_dimt_if_stale_outer_hdr(entry, ifp))
 			break;
 		entry->ifindex = ifp->ifindex;
+		/* A link bound earlier and deleted out of band is replaced by
+		 * this one. */
+		entry->link_deleted = false;
 		if (entry->create_acked &&
 		    zebra_dimt_tunnel_address(entry) !=
 			    ZEBRA_DPLANE_REQUEST_QUEUED)
@@ -433,8 +464,13 @@ zebra_dimt_tunnel_lookup_ifindex(vrf_id_t vrf_id, ifindex_t ifindex)
  * An entry is forgotten here only when no dplane op for it is in flight.
  * Results are matched to entries by tunnel_id alone, so a result orphaned by
  * forgetting its entry would land on the next entry created for the same
- * tunnel.  Every state with an op in flight only drops the ifindex and lets
- * that op's result decide.
+ * tunnel.  A state with an op in flight is left for that op's result to
+ * decide: ADDRESSING, DELETING and a CLEANUP tombstone with cleanup_pending
+ * set drop the ifindex; ADDING keeps the dead ifindex so the create ack's
+ * address phase fails against it; REPLACING is already at ifindex 0.
+ * ADDRESSING and ADDING also set link_deleted, so their failed install is
+ * followed by REMOVED (zebra_dimt_tunnel_fail_install()).  DELETED drops the
+ * ifindex and defers the parked-ADD replay.
  */
 void zebra_dimt_tunnel_if_delete(struct interface *ifp)
 {
@@ -471,7 +507,11 @@ void zebra_dimt_tunnel_if_delete(struct interface *ifp)
 		break;
 	case ZEBRA_DIMT_ADDRESSING:
 		/* The in-flight address result now fails the ifindex check and
-		 * goes through zebra_dimt_tunnel_fail_install(). */
+		 * goes through zebra_dimt_tunnel_fail_install(), which follows
+		 * its FAIL_INSTALL with REMOVED for the vanished link. */
+		entry->link_deleted = true;
+		entry->ifindex = 0;
+		break;
 	case ZEBRA_DIMT_DELETING:
 		/* The in-flight delete answers the owner; see the failed-delete
 		 * block in zebra_dimt_tunnel_dplane_result(). */
@@ -489,8 +529,11 @@ void zebra_dimt_tunnel_if_delete(struct interface *ifp)
 		/* zebra_dimt_tunnel_if_update() bound the link while the
 		 * create is still in flight.  Keep the dead index: the create
 		 * ack then runs the address phase against it, which fails, and
-		 * the owner gets FAIL_INSTALL.  Clearing it would leave the ack
-		 * waiting for an RTM_NEWLINK that never comes. */
+		 * the owner gets FAIL_INSTALL and then REMOVED.  Clearing it
+		 * would leave the ack waiting for an RTM_NEWLINK that never
+		 * comes. */
+		entry->link_deleted = true;
+		break;
 	case ZEBRA_DIMT_REPLACING:
 		break;
 	}
@@ -577,8 +620,11 @@ static void zebra_dimt_notify(const struct zebra_dimt_tunnel_ctx *ctx,
 }
 
 /*
- * Our delete of the link at ctx->delete_ifindex succeeded and REMOVED has
- * been sent.  Forget the entry -- unless zebra still lists that link.
+ * Our delete of the link at ctx->delete_ifindex succeeded and the owner has
+ * been answered: REMOVED, or nothing further after the FAIL_INSTALL that
+ * preceded a silent cleanup.  Forget the entry -- unless zebra still lists
+ * that link.  A silent cleanup keeps the tombstone too: forgetting it would
+ * let an ADD landing before the RTM_DELLINK adopt the dying link.
  *
  * The kernel ACKs the RTM_DELLINK on the dplane's command socket, but zebra
  * learns the link is gone only when the dplane pthread later reads the
@@ -612,6 +658,7 @@ static void zebra_dimt_tunnel_deleted(struct zebra_dimt_tunnel *entry,
 	entry->cleanup_notify_owner = false;
 	entry->replace_cancelled = false;
 	entry->create_acked = false;
+	entry->link_deleted = false;
 	entry->parked_add = false;
 }
 
@@ -956,21 +1003,34 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 
 		entry->create_acked = true;
 		ifp = if_lookup_by_name(ctx->ifname, vrf_id);
-		/* Adopt only a live link.  After a replacement the name may
-		 * still resolve to the deleted stale-TTL link until its
-		 * RTM_DELLINK is processed, and a configured interface
-		 * outlives its deleted link at IFINDEX_INTERNAL -- adopting
-		 * that would set ifindex 0 and wedge the entry in ADDING.  In
-		 * both cases the new link's RTM_NEWLINK follows in kernel
-		 * order and zebra_dimt_tunnel_if_update() adopts it then.
+		/* Adopt only a live link.  The name may resolve to a dead
+		 * one in two ways:
+		 *
+		 *  - After a replacement, to the deleted stale-TTL link until
+		 *    its RTM_DELLINK is processed.  entry->ifindex is still 0,
+		 *    the new link's RTM_NEWLINK follows in kernel order, and
+		 *    zebra_dimt_tunnel_if_update() adopts it then.
+		 *  - To a configured interface, which outlives its deleted
+		 *    link at IFINDEX_INTERNAL with ACTIVE cleared.  For a fresh
+		 *    entry (ifindex still 0) the new link's RTM_NEWLINK
+		 *    follows, as above.  But if if_update() already bound the
+		 *    new link and an out-of-band delete then removed it,
+		 *    entry->ifindex holds the dead index (see the ADDING case
+		 *    of zebra_dimt_tunnel_if_delete()) and no RTM_NEWLINK will
+		 *    come: overwriting it with 0 would wedge the entry in
+		 *    ADDING.  Keeping it lets the address phase fail, which
+		 *    answers FAIL_INSTALL and then REMOVED.
+		 *
 		 * Identity is left to the address phase (resolve_ifindex()),
 		 * which fails the install on a mismatch: an already-listed
 		 * link gets no second RTM_NEWLINK, so refusing it here would
 		 * wedge the entry instead. */
 		if (ifp && ifp->ifindex != IFINDEX_INTERNAL &&
 		    CHECK_FLAG(ifp->status, ZEBRA_INTERFACE_ACTIVE) &&
-		    !zebra_dimt_if_stale_outer_hdr(entry, ifp))
+		    !zebra_dimt_if_stale_outer_hdr(entry, ifp)) {
 			entry->ifindex = ifp->ifindex;
+			entry->link_deleted = false;
+		}
 		if (!entry->ifindex ||
 		    zebra_dimt_tunnel_address(entry) ==
 			    ZEBRA_DPLANE_REQUEST_QUEUED)
@@ -993,12 +1053,18 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 		entry->state = ZEBRA_DIMT_CLEANUP;
 		ifp = if_lookup_by_name(ctx->ifname, vrf_id);
 		if (ifp && ifp->ifindex != IFINDEX_INTERNAL &&
-		    zebra_dimt_if_identity_matches(entry, ifp))
+		    zebra_dimt_if_identity_matches(entry, ifp)) {
 			entry->ifindex = ifp->ifindex;
+			entry->link_deleted = false;
+		}
 		/* Keep the entry even when nothing can be cleaned yet;
 		 * zebra_dimt_tunnel_if_update() reconciles a link that only
-		 * becomes visible later. */
-		zebra_dimt_tunnel_cleanup_link(entry);
+		 * becomes visible later -- unless the create's link was
+		 * already seen and deleted out of band, so none can come. */
+		if (zebra_dimt_tunnel_cleanup_link(entry) ==
+			    ZEBRA_DPLANE_REQUEST_SUCCESS &&
+		    entry->link_deleted)
+			zebra_dimt_tunnel_forget_vanished(entry);
 		return;
 	}
 	if (add && success && entry &&
@@ -1014,6 +1080,22 @@ void zebra_dimt_tunnel_dplane_result(struct zebra_dplane_ctx *dplane_ctx)
 	if (add && !success && entry &&
 	    ctx->phase == ZEBRA_DIMT_TUNNEL_ADDRESS) {
 		zebra_dimt_tunnel_fail_install(entry);
+		return;
+	}
+	if (!add && !success && cleanup &&
+	    !zebra_dimt_tunnel_resolve_ifindex(entry)) {
+		/* A cleanup delete failed and the link is gone: the explicit
+		 * failure is ENODEV after an out-of-band delete (see below),
+		 * and zebra_dimt_tunnel_if_delete() cleared the ifindex when
+		 * that delete's RTM_DELLINK came first.  Answer REMOVED and
+		 * forget, exactly as if_delete() does for a tombstone whose
+		 * link goes while nothing is in flight, so both orders of the
+		 * RTM_DELLINK and this result converge.  entry->ctx is the
+		 * DEL requester when cleanup_notify_owner is set and the owner
+		 * otherwise.  A tombstone whose link is still listed stays. */
+		zebra_dimt_notify(&entry->ctx, vrf_id, 0,
+				  ZAPI_DIMT_TUNNEL_REMOVED);
+		zebra_dimt_tunnel_forget(entry);
 		return;
 	}
 	if (!add && !success && entry && !cleanup) {

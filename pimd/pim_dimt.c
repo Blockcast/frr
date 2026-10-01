@@ -1870,12 +1870,14 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
 			 * with demand it re-ADDs the same tunnel_id and request
 			 * bytes, without demand it frees the record.
 			 *
-			 * This cannot loop.  An ADD is never answered REMOVED,
-			 * and a create that fails lands in FAILED, which
-			 * re-requests only on a real demand edge; only an
-			 * external deleter can drive a rebuild, so an operator
-			 * deleting a demanded tunnel sees it rebuilt -- which
-			 * is the point.
+			 * This cannot loop.  zebra sends REMOVED only to answer
+			 * a DEL or to report a netdev it saw deleted -- for a
+			 * link deleted while zebra was still building it, right
+			 * after that ADD's FAIL_INSTALL.  A create that fails on
+			 * its own lands in FAILED, which re-requests only on a
+			 * real demand edge; only an external deleter can drive
+			 * a rebuild, so an operator deleting a demanded tunnel
+			 * sees it rebuilt -- which is the point.
 			 *
 			 * reconcile may free tun: do not touch it after. */
 			tun->readd_pending = false;
