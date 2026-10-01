@@ -320,8 +320,20 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         # failed DELETE no longer needs to: lost or explicit (ENODEV after an
         # out-of-band delete, BLO-38034), it re-resolves the interface before
         # deciding between REMOVE_FAIL and REMOVED, instead of restoring
-        # INSTALLED blindly.
-        self.assertEqual(dimt.count("!ctx->result_authoritative"), 1)
+        # INSTALLED blindly.  The only other reader is the cleanup branch,
+        # where a non-authoritative success is a delete the dplane skipped
+        # after the link's RTM_DELLINK was processed, and only once that
+        # RTM_DELLINK was seen (link_deleted).
+        self.assertEqual(dimt.count("!ctx->result_authoritative"), 2)
+        self.assertEqual(
+            dimt.count("(entry->link_deleted && !ctx->result_authoritative)"),
+            1,
+        )
+        if_delete = dimt.split("void zebra_dimt_tunnel_if_delete(", 1)[1]
+        pending = if_delete.split("if (entry->cleanup_pending) {", 1)[1]
+        self.assertIn(
+            "entry->link_deleted = true;", pending.split("break;", 1)[0]
+        )
         result = dimt.split("void zebra_dimt_tunnel_dplane_result", 1)[1]
         failed_del = result.split(
             "if (!add && !success && entry && !cleanup) {", 1
