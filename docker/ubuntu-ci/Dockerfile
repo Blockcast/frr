@@ -11,9 +11,6 @@ ARG APT_RETRIES=3
 # Optional mirror for MIB downloads (expects mirrored https path layout).
 ARG MIB_MIRROR_BASE_URL=
 
-# LTTng tracing support (optional)
-ARG ENABLE_LTTNG=false
-
 # Configure apt to retry on transient network failures
 RUN echo "Acquire::Retries \"${APT_RETRIES}\";" > /etc/apt/apt.conf.d/80-retries && \
     echo 'Acquire::http::Timeout "30";' >> /etc/apt/apt.conf.d/80-retries && \
@@ -241,6 +238,16 @@ RUN set -eux; \
 # keyring setup and the pip installs -- and made those expensive layers
 # unshareable between them. Keep any new conditional-on-ENABLE_LTTNG work below
 # this line, not above it.
+#
+# The ARG is declared here, not at the top of the stage, for the same reason: a
+# stage ARG is an implicit input to every RUN after its declaration, so declared
+# right after FROM it forked the LTTng leg at the very first RUN and none of the
+# layers above could be shared. This placement is the precondition, not the
+# sharing itself: it shows up within one BuildKit cache, but each CI leg runs a
+# fresh builder that reads only its own per-platform -buildcache ref. Sharing in
+# CI also needs a cache both legs read, e.g. the amd64_u24 ref as a second
+# cache-from on the LTTng legs.
+ARG ENABLE_LTTNG=false
 RUN if [ "$ENABLE_LTTNG" = "true" ]; then \
         apt-get install -y liblttng-ust-dev; \
     fi
