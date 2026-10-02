@@ -144,17 +144,18 @@ class WindowNeverOpened(Exception):
     Deliberately a bespoke type rather than pytest.fail()'s Failed. EVERY
     pytest.fail() in this module raises Failed -- the tracing_unavailable()
     funnel, both reap_stray_dimt_links() precondition failures, dplane_tid()
-    ("zebra_dplane worker not found" / "not uniquely resolved", reached from
-    both inject_netlink_syscall_failure() and _hold_dplane_syscalls()), their
-    strace attach failures and assert_injection_fired() -- so a marker
-    written raises=pytest.fail.Exception
-    absorbs all of them as a green xfail, a *setup-time* fixture failure
-    included. No marker absorbs this class today either: a window that cannot
-    be proven open fails the job, because a test that never opened its window
-    has not run. It stays a bespoke type so that any future marker can be
-    narrowed to exactly these guards, and a missing strace, a dirty kernel, a
-    missing dplane worker or a failed attach still fails loudly instead of
-    reading as "expected failure, blocker still open".
+    ("zebra_dplane worker not found" / "not uniquely resolved" / "not
+    parsed"), the two FD scans that aim an injection or a hold
+    (_route_netlink_fds(), _dplane_in_fd()), both _await_strace_attached()
+    failures ("strace attach failed", "strace never attached") and
+    assert_injection_fired() -- so a marker written
+    raises=pytest.fail.Exception absorbs all of them as a green xfail, a
+    *setup-time* fixture failure included. No marker absorbs this class today
+    either: a window that cannot be proven open fails the job, because a test
+    that never opened its window has not run. It stays a bespoke type so that
+    any future marker can be narrowed to exactly these guards, and a missing
+    strace, a dirty kernel, a missing dplane worker or a failed attach still
+    fails loudly instead of reading as "expected failure, blocker still open".
 
     It keeps the property that made pytest.fail() right in the first place: it
     is NOT an AssertionError, so a raises=AssertionError marker cannot swallow
@@ -888,11 +889,16 @@ def dplane_tid(router, purpose):
             "zebra_dplane worker not found: zebra {} has no zebra_dplane "
             "thread -- {}".format(zebra_pid, purpose)
         )
-    if len(tids) != 1 or not tids[0].isdigit():
+    if len(tids) != 1:
         pytest.fail(
             "zebra_dplane worker not uniquely resolved: expected one "
             "zebra_dplane TID in zebra {}, found {}: {} -- {}".format(
                 zebra_pid, len(tids), tids, purpose)
+        )
+    if not tids[0].isdigit():
+        pytest.fail(
+            "zebra_dplane worker not parsed: the task scan of zebra {} "
+            "returned {!r}, not a TID -- {}".format(zebra_pid, tids[0], purpose)
         )
     return tids[0]
 
