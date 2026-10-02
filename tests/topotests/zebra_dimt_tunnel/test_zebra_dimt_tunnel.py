@@ -1544,10 +1544,12 @@ def _run_client(router, argv):
 
     A client still waiting after 15s is killed, so a reply that never comes
     cannot hold the test past the hold that is waiting on it. If even the
-    killed client has not exited 5s later, its output is given up as empty
-    and its returncode is None: the caller's assertion on the reply then
-    fails on what the client did, instead of a second TimeoutExpired
-    replacing that failure with a traceback.
+    killed client has not exited 5s later, its stdout is given up as empty,
+    its stderr says so and its returncode is None: the caller's assertion on
+    the reply then fails on what the client did, instead of a second
+    TimeoutExpired replacing that failure with a traceback. The stderr marker
+    matters because a held dplane worker also leaves the DEL unanswered, and
+    the messages that blame it print stderr.
     """
     proc = router.popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
@@ -1557,7 +1559,7 @@ def _run_client(router, argv):
         try:
             stdout, stderr = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            stdout, stderr = None, None
+            stdout, stderr = None, "<client did not exit 5s after SIGKILL>"
     return _text(stdout), proc.returncode, _text(stderr).strip()
 
 
