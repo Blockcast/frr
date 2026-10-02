@@ -615,12 +615,11 @@ def hold_dplane_sendmsg(router, delay_usecs):
     decoded sendmsg, so callers synchronize positively with dellink_state()
     instead of guessing with sleeps.
     """
-    worker = dplane_tid(router)
     trace_file = "/tmp/dimt-sendmsg-trace-{}.log".format(os.getpid())
     router.run("rm -f {}".format(trace_file))
     tracer = _hold_dplane_syscalls(
         router, "sendmsg", "delay_enter", delay_usecs, trace_file,
-        trace_fds=_route_netlink_fds(router, worker) if worker else None,
+        trace_fds_for=_route_netlink_fds,
     )
     return tracer, trace_file
 
@@ -730,12 +729,11 @@ def hold_dplane_in_recvmsg(router, delay_usecs):
     them; callers prove the rest from zebra's and the kernel's own state.
     Returns (tracer, trace_file).
     """
-    worker = dplane_tid(router)
     trace_file = "/tmp/dimt-recvmsg-trace-{}.log".format(os.getpid())
     router.run("rm -f {}".format(trace_file))
     tracer = _hold_dplane_syscalls(
         router, "recvmsg", "delay_enter", delay_usecs, trace_file,
-        trace_fds=_dplane_in_fd(router, worker) if worker else None,
+        trace_fds_for=_dplane_in_fd,
     )
     return tracer, trace_file
 
@@ -752,13 +750,18 @@ def held_recvmsg_lines(router, trace_file):
 
 
 def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
-                          trace_file=None, trace_fds=None):
+                          trace_file=None, trace_fds_for=None):
+    # trace_fds_for(router, worker) aims the hold at the worker's FDs. It is
+    # applied to the one TID resolved here, so the narrowing and the -p target
+    # cannot come from two different resolves: a caller-side lookup that missed
+    # while this one succeeded used to arm the hold unnarrowed (BLO-28405).
     require_strace(router)
     worker = dplane_tid(router)
     if not worker:
         pytest.fail(
             "zebra_dplane worker not found -- cannot hold the dplane worker"
         )
+    trace_fds = trace_fds_for(router, worker) if trace_fds_for else None
     cmd = [
         "strace",
         "-qq",
