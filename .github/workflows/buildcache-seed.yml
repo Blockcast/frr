@@ -81,10 +81,10 @@ jobs:
     # tags actually advanced, and warns if the cache had already gone stale --
     # i.e. tells us this guard was load-bearing on this cycle.
     if: github.repository == 'Blockcast/frr'
-    # arc-dind, like github-ci.yml's Build (see the comment on its runs-on):
-    # on `default` these seed runs waited out the day and the caches went
-    # stale.
-    runs-on: arc-dind
+    # arc-light: this job, verify and freshness-gate are a checkout plus
+    # buildcache_freshness.py, which reads Harbor over urllib (no docker, no
+    # sudo), so none of them needs a dind pod. Only `seed` builds.
+    runs-on: arc-light
     name: Probe buildcache age (before)
     timeout-minutes: 10
     outputs:
@@ -149,6 +149,9 @@ jobs:
     # success() condition used to inherit that boundary for free; always()
     # discards it, so each always() job below restates it.
     if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
+    # arc-dind, like github-ci.yml's Build (see the comment on its runs-on):
+    # on `default` these seed runs waited out the day and the caches went
+    # stale.
     runs-on: arc-dind
     name: Seed ${{ matrix.cfg.name }}
     timeout-minutes: 90
@@ -203,7 +206,8 @@ jobs:
     # seed leg failed instead of silently skipping verification and its gate.
     # Repository check restated because always() ignores skipped dependencies.
     if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
-    runs-on: arc-dind
+    # arc-light, like probe-before: see the comment on its runs-on.
+    runs-on: arc-light
     name: Verify buildcache advanced
     timeout-minutes: 10
     steps:
@@ -257,7 +261,8 @@ jobs:
     # into a skipped freshness signal rather than a visible failure state.
     # Repository check restated because always() ignores skipped dependencies.
     if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
-    runs-on: arc-dind
+    # arc-light, like probe-before: see the comment on its runs-on.
+    runs-on: arc-light
     name: Buildcache freshness gate (${{ github.event_name }})
     timeout-minutes: 10
     steps:

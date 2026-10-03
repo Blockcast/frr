@@ -295,8 +295,14 @@ jobs:
     # Same runner image. BuildKit compiles frr in the dind sidecar, whose
     # limits there are twice default's: 4 CPU, 16Gi memory and 40Gi
     # ephemeral storage (gtm-image-build already runs buildx there).
-    # HTML documentation stays on `default`: it runs only on doc changes,
-    # and needs sudo apt plus more memory than an arc-light runner has.
+    # What shrinks is the runner's work dir: a node-local emptyDir under
+    # the runner's 24Gi limit, not default's 40Gi Ceph volume. That fits
+    # because Build checks out at fetch-depth 1 and only pushes its image
+    # (no type=docker tarball); a full-history checkout or a tarball
+    # exporter here needs that limit re-checked first.
+    # HTML documentation stays on `default`, not here (it builds no image)
+    # and not on arc-light: it runs only on doc changes, and needs sudo apt
+    # plus more memory than an arc-light runner has.
     runs-on: arc-dind
     needs: doc-path-filter
     # `build`, never the raw non_doc: see the comment on doc-path-filter.
