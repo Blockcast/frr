@@ -288,7 +288,16 @@ jobs:
           if-no-files-found: error
 
   Build:
-    runs-on: default
+    # frr's image jobs run on arc-dind, not `default` (2026-10-03). GitHub
+    # hands queued `default` jobs to runners org-wide and not oldest-first:
+    # frr Builds waited 12-37h there while ~1,300 newer jobs from other repos
+    # started, and arc-dind's queue averaged 2.5 jobs over the same 24h.
+    # Same runner image. BuildKit compiles frr in the dind sidecar, whose
+    # limits there are twice default's: 4 CPU, 16Gi memory and 40Gi
+    # ephemeral storage (gtm-image-build already runs buildx there).
+    # HTML documentation stays on `default`: it runs only on doc changes,
+    # and needs sudo apt plus more memory than an arc-light runner has.
+    runs-on: arc-dind
     needs: doc-path-filter
     # `build`, never the raw non_doc: see the comment on doc-path-filter.
     if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
@@ -454,7 +463,8 @@ jobs:
     # shard reads an LTTng result).  test_buildcache_freshness.py fails on
     # any other drift, and checks this matrix together with Build's against
     # buildcache-seed.yml's.
-    runs-on: default
+    # arc-dind, like Build: see the comment on its runs-on.
+    runs-on: arc-dind
     needs: doc-path-filter
     if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
     name: ${{ matrix.cfg.name }}
@@ -515,7 +525,8 @@ jobs:
             type=registry,ref=registry.blockcast.net/cache/frr-ci:amd64_u24-buildcache
 
   Unit-Test:
-    runs-on: default
+    # arc-dind, like Build: see the comment on its runs-on.
+    runs-on: arc-dind
     needs: Build
     # BLO-35428: one lost Build leg must not skip the other platform.  With
     # the default `success()` a failed Build leg skipped every Unit-Test and
