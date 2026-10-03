@@ -2383,33 +2383,47 @@ def test_acknowledged_gre_in_fou_lifecycle():
     assert removed["result"] == 2, removed
 
 
-
 def test_pytest_fail_owners_are_documented():
     """WindowNeverOpened's docstring lists every function here that calls
     pytest.fail(), because its argument (that a raises=pytest.fail.Exception
     marker would absorb them all) depends on the list being complete. The
-    list went stale once already; a new pytest.fail() owner missing from it
-    fails here instead of falsifying the docstring silently.
+    list went stale once already; in a topotest run (setup_module() and the
+    autouse reaper still run first), a new pytest.fail() owner missing from
+    it fails here instead of falsifying the docstring silently.
     """
     with open(__file__) as source:
         tree = ast.parse(source.read())
+
+    def calls_pytest_fail(fn):
+        # Only fn's own calls: a nested def owns the calls inside it.
+        todo = list(fn.body)
+        while todo:
+            node = todo.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "fail"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "pytest"):
+                return True
+            todo.extend(ast.iter_child_nodes(node))
+        return False
+
     owners = {
         fn.name
         for fn in ast.walk(tree)
         if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
-        for call in ast.walk(fn)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "fail"
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "pytest"
+        and calls_pytest_fail(fn)
     }
+    assert owners, (
+        "found no pytest.fail() call in this module: the check itself stopped "
+        "matching (is pytest.fail now imported under another name?)")
     documented = " ".join(WindowNeverOpened.__doc__.split())
     missing = sorted(name for name in owners if name + "()" not in documented)
-    assert owners and not missing, (
+    assert not missing, (
         "pytest.fail() owners missing from WindowNeverOpened's docstring: "
         "{}".format(missing))
-
 
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
