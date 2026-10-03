@@ -1,8 +1,14 @@
 # LC-UMH to DIMT UMH mapping
 
-Status: spec, no code yet. Implements step 1 of BLO-36558; the shared decoder
-(step 2) and the neighbor-trust gate (step 3) follow and are blocked on
-BLO-36553.
+Status: spec of record for step 1 of BLO-36558. The DIMT lane (steps 2-3:
+the shared decoder `bgp_umh_lc_decode()` in `bgpd/bgp_dimt.c`, the
+`bgp dimt umh-large-community` knob, the neighbor-trust gate on the LC, and
+`show bgp umh-large-community`) is implemented on branch
+`blo-36558-lc-umh-dimt-decoder`. Passages below that describe what the
+decoder does "today" describe `bgp_mvpn_resolve_from_lcommunity()` before
+that change, and their `bgp_mvpn.c` / `bgp_dimt.c` / `bgpd.h` line numbers
+refer to origin/master `d4467836c8`; the decode logic now lives in
+`bgp_umh_lc_decode()`.
 
 ## Why this exists
 
@@ -12,7 +18,9 @@ The DIMT Upstream Multicast Hop has two on-the-wire encodings:
   (`ECOMMUNITY_UMH`), decoded by `bgp_dimt_umh_from_path()` in
   `bgpd/bgp_dimt.c`;
 - the **UMH large community** (RFC 8092, RFC 8195 layout), decoded by
-  `bgp_mvpn_resolve_from_lcommunity()` in `bgpd/bgp_mvpn.c:1232` and gated by
+  the shared `bgp_umh_lc_decode()` in `bgpd/bgp_dimt.c` (the MVPN lane calls
+  it through `bgp_mvpn_resolve_from_lcommunity()` in `bgpd/bgp_mvpn.c`) and,
+  for that lane, gated by
   `bgp mvpn umh-large-community <function>`.
 
 Today only the MVPN Type-7 lane reads the large community. The DIMT pin path
@@ -60,7 +68,9 @@ parameter. Both facts drive the mapping below.
 ### The DIMT lane has its own knob
 
 `bgp mvpn umh-large-community <function>` sets `bgp->mvpn_umh_lc_function`,
-which the MVPN decoder reads directly (`bgp_mvpn.c:1244`, `:1334`). The DIMT
+which the MVPN decoder reads directly (`bgp_mvpn.c:1213`, `:1248`; now the
+`fn` argument `bgp_mvpn_resolve_from_lcommunity()` passes to
+`bgp_umh_lc_decode()`). The DIMT
 lane does **not** reuse it. It gets its own knob,
 `bgp dimt umh-large-community <function>`, stored in a separate `bgp` field
 with `0`/unset disabling DIMT LC decode, and "the knob" below means that one:
@@ -173,7 +183,9 @@ Two separate restrictions, and they are not the same one:
    community of the wrong address family; ignored (the UMH family must match
    the route family)". Copying the warn's "extended community" text verbatim
    would send the operator to `attr->ecommunity` for a `0x80` that is not
-   there. It does not reuse the warn's call site either. That warn (`bgp_dimt.c:204`) is an unthrottled `zlog_warn` that fires
+   there. It does not reuse the warn's call site either. That warn
+   (`bgp_dimt.c:706`; now in `bgp_dimt_route_update()`) is an unthrottled
+   `zlog_warn` that fires
    on every route update, which suits the cross-family EC because it is rare.
    A v6 route carrying an LC-UMH is the common shape on an IX-connected box
    (see "Why this exists"), so it goes to the throttled call-site log, at most
@@ -222,13 +234,13 @@ once per route for the two the DIMT call site raises itself, readable from
 per-lane throttle state (see below). The MVPN
 lane has no counter today either, so step 2 adds both: the DIMT one and the
 MVPN one, the latter owned by the MVPN call site
-(`bgp_mvpn_resolve_from_source_route()`, `bgp_mvpn.c:1578`).
+(`bgp_mvpn_resolve_from_source_route()` in `bgp_mvpn.c`).
 
 The shared decoder owns no counter, but it is the one that increments: each
 call site passes a pointer to its own lane's counter, and the decoder bumps it
 once per rejected tuple, except for the route-scoped reason below. That
 includes tuples after a winner. Today the decoder skips every tuple past the
-first one that resolves before any reject check runs (`bgp_mvpn.c:1337-1342`).
+first one that resolves before any reject check runs (`bgp_mvpn.c:1251-1256`).
 Tuples sort ascending by Global Administrator, the
 field the GA checks test, so a crafted tuple with a `GA` above the origin AS
 sorts behind a legitimate one and would never be counted. The decoder must
@@ -238,7 +250,7 @@ route is the one exception, and its decode ends at its first such tuple
 (below). A tuple past the winner that passes the checks is still ignored, not
 counted, and cannot change which tuple resolves. A return value cannot carry
 this. The decoder walks the whole LC list, `continue`s past each rejected
-tuple (`bgp_mvpn.c:1344`, `:1401`) and returns one `bool` per route (`:1424`),
+tuple (`bgp_mvpn.c:1258`, `:1315`) and returns one `bool` per route (`:1338`),
 so a call site counting from the return moves at most once for a route
 carrying three GA-mismatched tuples, under-counting exactly the flood the
 counter exists to show. Were the counter the decoder's own instead, the four
@@ -269,10 +281,10 @@ lane's `Function` it carries and whatever their `GA` or `Parameter`.
 
 Today's `bgp_mvpn_resolve_from_lcommunity()` already never reaches the
 per-tuple checks on such a route. `origin_ambiguous` leads the combined
-condition at `bgp_mvpn.c:1344` (`origin_ambiguous || ga == 0 ||
+condition at `bgp_mvpn.c:1258` (`origin_ambiguous || ga == 0 ||
 ga != origin_as`), so it short-circuits the `GA` tests, the notice it emits
-names only the ambiguous reason (`:1368-1372`), and the `continue` there skips
-the usable-address check at `:1401`. What it does not do is stop: it computes
+names only the ambiguous reason (`:1282-1286`), and the `continue` there skips
+the usable-address check at `:1315`. What it does not do is stop: it computes
 `origin_ambiguous` before its loop but tests it inside, and `continue`s to
 reject the next tuple with the lane's `Function` for the same reason, so
 carried over as-is that test would count once per tuple. Step 2 returns at the
@@ -294,8 +306,8 @@ gate is DIMT-only, and the MVPN lane must inherit neither. Either counts only
 when the route carries at least one tuple with the DIMT function. That takes a
 `Function` match over the LC list at the call site, the one place a call site
 looks inside a tuple, and it decides only *whether* to count, never how many
-times. It must reuse the decoder's match (`bgp_mvpn.c:1327-1335`) through a
-shared helper rather than copy it. A route whose LCs carry only another
+times. It must reuse the decoder's match (`bgp_mvpn.c:1248-1249`) through a
+shared helper rather than copy it (implemented as `bgp_umh_lc_has_function()`). A route whose LCs carry only another
 function is not a reject on either count.
 
 A wrong `Function` is **not** a
@@ -307,8 +319,8 @@ counter's ownership rule, because the counter says how many and only the log
 says which tuple (`ga`, `fn`, `param`) and why. Only three of the decoder's
 four reasons reach that log: origin-ambiguous, `GA == 0` and
 `GA != origin_as`, the trust-boundary rejects the notice is guarded on
-(`bgp_mvpn.c:1344`, `:1364-1365`). The fourth, unusable UMH address, is an
-unthrottled `zlog_debug` behind `debug bgp zebra` (`bgp_mvpn.c:1404-1406`) and
+(`bgp_mvpn.c:1258`, `:1278-1279`). The fourth, unusable UMH address, is an
+unthrottled `zlog_debug` behind `debug bgp zebra` (`bgp_mvpn.c:1318-1320`) and
 touches no throttle state. Step 2 keeps it there. Its tuple has already passed
 origin-AS, so it is the originating AS naming a bad address for its own route.
 That is a misconfiguration to diagnose, not a probe across the trust boundary,
@@ -316,10 +328,10 @@ and in production the counter is its only trace, deliberately. Its throttle
 state today is one
 pair per instance, `bgp->mvpn_umh_untrusted_log_last` and
 `bgp->mvpn_umh_untrusted_log_seen` (`bgpd.h:997`, `:1004`, read and written at
-`bgp_mvpn.c:1355-1367`). Carried over as-is onto a decoder shared by two lanes,
+`bgp_mvpn.c:1268-1292`). Carried over as-is onto a decoder shared by two lanes,
 the first lane to reject in a given minute claims the instance's one slot, and
 the other lane's rejects are counted and never described. That is the masking
-`bgp_mvpn.c:1349-1352` scopes the throttle per instance to prevent ("a probe on
+`bgp_mvpn.c:1263-1266` scopes the throttle per instance to prevent ("a probe on
 one VRF cannot mask a distinct probe on another"), reintroduced one lane inside
 the instance. So step 2 splits it: each lane owns its throttle pair, and each
 call site passes a pointer to its own lane's pair alongside the counter
@@ -347,7 +359,7 @@ one lane inside the instance.
   mismatch, so the DIMT counter's `0` is a measured decline rather than an
   absent read. The single-knob case above cannot see this direction: with the
   MVPN knob unset the MVPN decoder returns before examining any tuple
-  (`bgp_mvpn.c:1244`), so it never rejects.
+  (in `bgp_umh_lc_decode()`, on `fn == 0`), so it never rejects.
 - With both knobs set to different function code points, a route whose only LC
   is a valid tuple carrying one lane's function, read on the DIMT pin path and
   while resolving a Type-7 join, resolves on that lane and declines on
@@ -410,7 +422,10 @@ one lane inside the instance.
 
 ## References
 
-- `bgpd/bgp_mvpn.c:1232` — `bgp_mvpn_resolve_from_lcommunity()`, call site `:1578`
+- `bgpd/bgp_dimt.c` — `bgp_umh_lc_decode()`, the shared LC decoder, and
+  `bgp_dimt_umh_lc_resolve()`, the DIMT lane's call-site gates
+- `bgpd/bgp_mvpn.c` — `bgp_mvpn_resolve_from_lcommunity()`, the MVPN lane's
+  wrapper, called from `bgp_mvpn_resolve_from_source_route()`
 - `bgpd/bgp_dimt.c` — `bgp_dimt_umh_from_path()`, the `0x80` decoder
 - `bgpd/bgp_ecommunity.h:83-87` — `ECOMMUNITY_UMH` and the LA nibble macros
 - `lib/zclient.h:790` — `ZAPI_UMH_TYPE_PIM`, `ZAPI_UMH_TYPE_AMT_RELAY`

@@ -4631,6 +4631,101 @@ driven by these routes is not yet implemented.
    would silently fail to apply -- which for a revocation is the dangerous
    direction. Configure it at turn-up.
 
+.. clicmd:: bgp mvpn umh-large-community (1-4294967295)
+
+   Resolve the Upstream Multicast Hop of a locally originated Type-7 join
+   from a UMH *large* community ``<sourceAS>:<function>:<UMH-IPv4>`` on the
+   unicast route toward C-S, where ``<function>`` is the configured code
+   point (IANA has not assigned one; the operator picks it) and the third
+   field is the upstream PE's IPv4 address as a 32-bit integer. A tuple is
+   honoured only when its Global Administrator equals the route's origin AS.
+   A valid large community wins over the :rfc:`6514` extended communities on
+   the same route; those remain the fallback. **Default: disabled**; the
+   ``no`` form disables it. Changing it re-resolves the existing local
+   Type-7 joins.
+
+.. clicmd:: bgp dimt umh-large-community (1-4294967295)
+
+   Pin the DIMT Upstream Multicast Hop from the same UMH large community
+   encoding, ``<sourceAS>:<function>:<UMH-IPv4>``, carried on a unicast
+   route. This is a separate knob from ``bgp mvpn umh-large-community``,
+   deliberately: enabling LC-UMH for MVPN does not open the DIMT pin path.
+   The two may use the same or different function code points. **Default:
+   disabled**; the ``no`` form disables it (function 0). Accepted under
+   ``router bgp`` of the default BGP instance only -- the pin path is
+   default-instance only -- and refused in a VRF instance.
+
+   A large community is decoded for DIMT only when all of these hold, in
+   this order:
+
+   - the route carries a tuple with the configured function; a large
+     community with any other function is unrelated and is never counted;
+   - the neighbor is marked :clicmd:`neighbor PEER dimt-trusted`, under the
+     same trust rules as the UMH extended community (routes this speaker
+     originated are trusted);
+   - the route is IPv4 unicast: the 32-bit parameter cannot carry an IPv6
+     UMH, and the pin path is same-family, so a large-community UMH on an
+     IPv6 route is ignored and logged as "the wrong address family";
+   - the tuple's Global Administrator is non-zero and equals the route's
+     origin AS, the origin AS is knowable (no AS_SET, AS 0 or confederation
+     member origin), and the UMH address is usable (not 0/8, 127/8,
+     169.254/16, 224/4 or 240/4). Among several valid tuples the lowest
+     wins.
+
+   A large community carries neither a UMH type nor a preference, so a
+   decoded one maps as type ``pim``, preference 0. On a route that also
+   carries the UMH extended community (``set extcommunity umh``) the large
+   community wins, **unless** the extended community's selected tuple is
+   ``amt-relay``: that is an explicit instruction not to pin, and it is
+   kept. Preference plays no part in this choice. With ``debug bgp zebra``
+   a disagreement between the two encodings is logged.
+
+   Changing the function code point, or removing it, re-evaluates every
+   IPv4 and IPv6 unicast route's DIMT mapping at once, without a session
+   reset: mappings that no longer resolve are withdrawn from pimd and new
+   ones are sent. Each re-evaluated route is treated as newly adjudicated,
+   so its rejects are counted again.
+
+   Rejects are counted in ``show bgp umh-large-community``. An untrusted
+   neighbor's large community also moves that neighbor's ``DIMT UMH
+   rejected`` (``dimtUmhRejected``) in ``show bgp neighbors`` -- once per
+   route, so a route refused under both encodings moves it by two.
+
+.. clicmd:: show bgp [vrf VRF] umh-large-community [json]
+
+   Display, for one BGP instance (the default instance unless ``vrf VRF``
+   is given), the function code point and reject counter of each lane of
+   the UMH large community decoder: ``DIMT`` (``bgp dimt
+   umh-large-community``) and ``MVPN`` (``bgp mvpn umh-large-community``).
+   A lane whose knob is unset shows ``disabled``. The JSON form has the keys
+   ``vrfName``, ``dimtFunction``, ``dimtUmhLcRejected``, ``mvpnFunction``
+   and ``mvpnUmhLcRejected``; a function of 0 means disabled.
+
+   Both counters count, per rejected tuple carrying the lane's function,
+   a Global Administrator of 0, a Global Administrator different from the
+   route's origin AS, and an unusable UMH address -- including tuples
+   sorted after the winning one -- and, once per route, an origin-ambiguous
+   AS_PATH (AS_SET, AS 0, confederation member origin), which ends that
+   route's decode. A tuple with another function is never counted. They
+   differ in when they count:
+
+   - ``dimtUmhLcRejected`` counts when a route's attribute set is first
+     evaluated; re-processing a route whose attributes did not change does
+     not count it again, while a re-announcement with changed attributes or
+     a change of the DIMT knob does. It also counts, once per route, the two
+     reasons the DIMT lane checks itself: an untrusted neighbor and an IPv6
+     route. A route that trips both counts once. It stays 0 outside the
+     default instance.
+   - ``mvpnUmhLcRejected`` counts on every resolution of a local Type-7
+     join, so a re-resolve counts the same tuples again. It is not
+     comparable with the per-neighbor ``dimtUmhRejected``.
+
+   The trust-boundary rejects (origin-ambiguous and the two Global
+   Administrator reasons) are also logged at notice, at most once a minute
+   per lane; the DIMT lane's untrusted-neighbor and wrong-family rejects each
+   log on their own once-a-minute throttle. An unusable address is logged
+   only under ``debug bgp zebra``.
+
 .. clicmd:: show bgp <ipv4|ipv6> mvpn [json]
 
    Display the MCAST-VPN table of the default BGP instance for the IPv4 or
