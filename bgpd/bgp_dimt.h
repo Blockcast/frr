@@ -71,4 +71,56 @@ extern bool bgp_dimt_umh_from_path(const struct bgp_path_info *pi, afi_t afi,
 extern bool bgp_dimt_peer_is_trusted(const struct bgp_path_info *pi,
 				     const char **why);
 
+/*
+ * The UMH LARGE community (BLO-36558; contract in doc/dimt-lc-umh-mapping.md).
+ * One decoder for both lanes that read it -- the MVPN Type-7 lane and the
+ * DIMT pin path -- so the encoding, the origin-AS trust rule and the reject
+ * accounting cannot drift between them.
+ */
+enum bgp_umh_lc_lane_id {
+	BGP_UMH_LC_LANE_MVPN,
+	BGP_UMH_LC_LANE_DIMT,
+};
+
+struct bgp;
+struct lcommunity;
+struct bgp_umh_lc_lane;
+
+/* Does the list carry a tuple with this function at all? THE function match:
+ * the decoder uses it too, so "is this route on my lane" and "which tuples
+ * does the decoder read" cannot disagree. False for fn == 0. */
+extern bool bgp_umh_lc_has_function(const struct lcommunity *lcom, uint32_t fn);
+
+/* Decode one lane's UMH large community off a path: lowest valid tuple with
+ * function @fn wins, its Global Administrator into *source_as and its
+ * Parameter (htonl'd) into *umh; both untouched on false. Applies the
+ * origin-AS trust rule and the usable-address rule, and nothing lane-specific.
+ *
+ * Counts every reject into @lane (per tuple, or once per route for an
+ * origin-ambiguous AS_PATH) and logs the trust-boundary ones on @lane's
+ * throttle; @lane == NULL is a pure query that counts and notices nothing.
+ * See the comment on the definition for the exact rules. */
+extern bool bgp_umh_lc_decode(struct bgp *bgp, const struct bgp_path_info *pi,
+			      uint32_t fn, enum bgp_umh_lc_lane_id lane_id,
+			      struct bgp_umh_lc_lane *lane, uint32_t *source_as,
+			      struct in_addr *umh);
+
+/* The DIMT lane: bgp->dimt_umh_lc_function, then the neighbour-trust gate,
+ * then the AFI_IP-only rule, then the decoder. count == false is a pure
+ * query. *on_lane (may be NULL) reports whether the path carries a DIMT tuple
+ * at all. Exported for tests/bgpd/test_dimt_umh_lc.c. */
+extern bool bgp_dimt_umh_lc_resolve(struct bgp *bgp,
+				    const struct bgp_path_info *pi, afi_t afi,
+				    bool count, struct in_addr *umh,
+				    bool *on_lane);
+
+/* bgp_dimt_umh_lc_resolve() at most once per attribute set with counting on,
+ * as the loc-RIB hook calls it. Exported for tests/bgpd/test_dimt_umh_lc.c. */
+extern bool bgp_dimt_umh_lc_from_path(struct bgp *bgp, struct bgp_path_info *pi,
+				      afi_t afi, struct in_addr *umh);
+
+/* `bgp dimt umh-large-community`: set the function code point (0 = off) and
+ * re-evaluate every unicast route's DIMT mapping under it, no session reset. */
+extern void bgp_dimt_umh_lc_set_function(struct bgp *bgp, uint32_t fn);
+
 #endif /* _FRR_BGP_DIMT_H */
