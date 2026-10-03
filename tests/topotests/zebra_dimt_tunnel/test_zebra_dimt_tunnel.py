@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: ISC
 
+import ast
 import json
 import os
 import pathlib
@@ -889,16 +890,16 @@ def dplane_tid(router, purpose):
             "zebra_dplane worker not found: zebra {} has no zebra_dplane "
             "thread -- {}".format(zebra_pid, purpose)
         )
+    if not all(tid.isdigit() for tid in tids):
+        pytest.fail(
+            "zebra_dplane worker not parsed: the task scan of zebra {} "
+            "returned {}, not TIDs -- {}".format(zebra_pid, tids, purpose)
+        )
     if len(tids) != 1:
         pytest.fail(
             "zebra_dplane worker not uniquely resolved: expected one "
             "zebra_dplane TID in zebra {}, found {}: {} -- {}".format(
                 zebra_pid, len(tids), tids, purpose)
-        )
-    if not tids[0].isdigit():
-        pytest.fail(
-            "zebra_dplane worker not parsed: the task scan of zebra {} "
-            "returned {!r}, not a TID -- {}".format(zebra_pid, tids[0], purpose)
         )
     return tids[0]
 
@@ -2380,6 +2381,34 @@ def test_acknowledged_gre_in_fou_lifecycle():
     assert "encap fou" in link and "encap-dport 5555" in link, link
     removed = request("del", 2)
     assert removed["result"] == 2, removed
+
+
+
+def test_pytest_fail_owners_are_documented():
+    """WindowNeverOpened's docstring lists every function here that calls
+    pytest.fail(), because its argument (that a raises=pytest.fail.Exception
+    marker would absorb them all) depends on the list being complete. The
+    list went stale once already; a new pytest.fail() owner missing from it
+    fails here instead of falsifying the docstring silently.
+    """
+    with open(__file__) as source:
+        tree = ast.parse(source.read())
+    owners = {
+        fn.name
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for call in ast.walk(fn)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "fail"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "pytest"
+    }
+    documented = " ".join(WindowNeverOpened.__doc__.split())
+    missing = sorted(name for name in owners if name + "()" not in documented)
+    assert owners and not missing, (
+        "pytest.fail() owners missing from WindowNeverOpened's docstring: "
+        "{}".format(missing))
 
 
 if __name__ == "__main__":
