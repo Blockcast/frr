@@ -143,10 +143,11 @@ class WindowNeverOpened(Exception):
 
     Deliberately a bespoke type rather than pytest.fail()'s Failed. EVERY
     pytest.fail() in this module raises Failed -- the tracing_unavailable()
-    funnel, both reap_stray_dimt_links() precondition failures, both
-    inject_netlink_syscall_failure() setup paths, both _hold_dplane_syscalls()
-    paths ("zebra_dplane worker not found", "strace attach failed") and
-    assert_injection_fired() -- so a marker written raises=pytest.fail.Exception
+    funnel, both reap_stray_dimt_links() precondition failures, dplane_tid()
+    ("zebra_dplane worker not found" / "not uniquely resolved", reached from
+    both inject_netlink_syscall_failure() and _hold_dplane_syscalls()), their
+    strace attach failures and assert_injection_fired() -- so a marker
+    written raises=pytest.fail.Exception
     absorbs all of them as a green xfail, a *setup-time* fixture failure
     included. No marker absorbs this class today either: a window that cannot
     be proven open fails the job, because a test that never opened its window
@@ -496,11 +497,7 @@ def inject_netlink_syscall_failure(
     router, syscall, when, errno_name="EIO", route_netlink_fds=False
 ):
     require_strace(router)
-    worker = dplane_tid(router)
-    if not worker:
-        pytest.fail(
-            "zebra_dplane worker not found -- netlink failure injection cannot run"
-        )
+    worker = dplane_tid(router, "netlink failure injection cannot run")
     command = [
         "strace",
         "-qq",
@@ -756,11 +753,7 @@ def _hold_dplane_syscalls(router, syscalls, inject_kind, delay_usecs,
     # cannot come from two different resolves: a caller-side lookup that missed
     # while this one succeeded used to arm the hold unnarrowed (BLO-28405).
     require_strace(router)
-    worker = dplane_tid(router)
-    if not worker:
-        pytest.fail(
-            "zebra_dplane worker not found -- cannot hold the dplane worker"
-        )
+    worker = dplane_tid(router, "cannot hold the dplane worker")
     trace_fds = trace_fds_for(router, worker) if trace_fds_for else None
     cmd = [
         "strace",
@@ -865,25 +858,43 @@ def assert_injection_fired(trace_output, what, tag="(INJECTED)"):
         )
 
 
-def dplane_tid(router):
-    """The zebra_dplane pthread's TID, or "" when it cannot be found.
+def dplane_tid(router, purpose):
+    """The zebra_dplane pthread's TID. Anything but exactly one numeric TID
+    is a harness error: pytest.fail() names which, then `purpose`.
 
     router.run() returns stderr with stdout, so each read here discards its
     own. A zebra thread that exits between the task glob and its comm read
     used to make `cat` print its error into the result, and _dplane_in_fd()
     then spliced "<tid>\\ncat: ..." into its shell loop, which died as a bash
-    syntax error near `cat:' instead of naming the problem. Anything but one
-    numeric TID is "not found", which every caller reports.
+    syntax error near `cat:' instead of naming the problem.
+
+    None and several are told apart the way _dplane_in_fd() tells apart its
+    own none-vs-several, so a second dplane thread would not read as a
+    missing one.
     """
     zebra_pid = router.run("cat /var/run/frr/zebra.pid 2>/dev/null").strip()
     if not zebra_pid.isdigit():
-        return ""
+        pytest.fail(
+            "zebra_dplane worker not found: no zebra pid (read {!r}) -- "
+            "{}".format(zebra_pid, purpose)
+        )
     tids = router.run(
         f"for task in /proc/{zebra_pid}/task/*; do "
         '[ "$(cat $task/comm 2>/dev/null)" = zebra_dplane ] && basename "$task"; '
         "done"
     ).split()
-    return tids[0] if len(tids) == 1 and tids[0].isdigit() else ""
+    if not tids:
+        pytest.fail(
+            "zebra_dplane worker not found: zebra {} has no zebra_dplane "
+            "thread -- {}".format(zebra_pid, purpose)
+        )
+    if len(tids) != 1 or not tids[0].isdigit():
+        pytest.fail(
+            "zebra_dplane worker not uniquely resolved: expected one "
+            "zebra_dplane TID in zebra {}, found {}: {} -- {}".format(
+                zebra_pid, len(tids), tids, purpose)
+        )
+    return tids[0]
 
 
 def gre_in_fou_supported(router):
@@ -1528,23 +1539,33 @@ def _prove_dellink_unread(router, name, ifindex, trace_file, when):
 
 
 def _run_client(router, argv):
-    """Run one dimt_zapi_client.py; (stdout text, stderr text, returncode).
+    """Run one dimt_zapi_client.py; (stdout text, returncode, stderr text),
+    the order its callers return.
 
     A client still waiting after 15s is killed, so a reply that never comes
-    cannot hold the test past the hold that is waiting on it.
+    cannot hold the test past the hold that is waiting on it. If even the
+    killed client has not exited 5s later, its stdout is given up as empty,
+    its stderr says so and its returncode is None: the caller's assertion on
+    the reply then fails on what the client did, instead of a second
+    TimeoutExpired replacing that failure with a traceback. The stderr marker
+    matters because a held dplane worker also leaves the DEL unanswered, and
+    the messages that blame it print stderr.
     """
     proc = router.popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         stdout, stderr = proc.communicate(timeout=15)
     except subprocess.TimeoutExpired:
         proc.kill()
-        stdout, stderr = proc.communicate(timeout=5)
-    return _text(stdout), _text(stderr).strip(), proc.returncode
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = None, "<client did not exit 5s after SIGKILL>"
+    return _text(stdout), proc.returncode, _text(stderr).strip()
 
 
 def _held_delete(router, tunnel_id):
     """DEL `tunnel_id`; (parsed reply or None, returncode, stderr text)."""
-    stdout, stderr, rc = _run_client(router, client_argv("del", tunnel_id))
+    stdout, rc, stderr = _run_client(router, client_argv("del", tunnel_id))
     try:
         removed = json.loads(stdout)
     except ValueError:
@@ -1560,7 +1581,7 @@ def _direct_answer(router, action, tunnel_id, *extra):
     --barrier) -- and `rest` is everything printed from the barrier on, so a
     caller can tell a refused request from one that went unanswered.
     """
-    stdout, stderr, rc = _run_client(
+    stdout, rc, stderr = _run_client(
         router,
         client_argv(action, tunnel_id, "--barrier", BARRIER_TUNNEL_ID, *extra),
     )
