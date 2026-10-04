@@ -455,8 +455,8 @@ def test_parse_jp_reads_tsharks_layout():
 
     It once accepted only an inline ``Join:`` entry, which no Wireshark in CI
     prints.  Every Join then parsed to nothing: F9's positive check could not
-    pass, and F10's "no Join was sent" check could not fail.  Pure parsing,
-    so it runs without the topology.
+    pass, and F10's "no Join was sent" check could not fail.  The body is
+    pure parsing; setup_module still builds the topology before it runs.
     """
     joins, prunes = JPCapture._parse_jp(JP_TSHARK_TEXT)
     assert joins == [("10.99.0.1", "232.1.1.10", "10.10.10.10")], joins
