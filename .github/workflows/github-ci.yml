@@ -34,14 +34,14 @@ on:
 # lands while a master run is executing and no newer head is already pending.
 # That run used to be cancelled at once. A merge that only replaces a pending
 # run costs nothing extra. At the current merge rate (about 2 a day) this
-# keeps roughly one master run in flight on `default` and arc-e2e almost all
-# the time, which adds to PR queue waits. Each such run puts 5 jobs on
-# `default` (the 2 Build legs and Build-LTTng, the 2 Unit-Test legs, plus
-# Documentation-HTML when docs change; the path filter runs on arc-light, see
-# doc-path-filter) and 4 Test legs on arc-e2e, next to a `default` backlog of
-# about 800 queued jobs org-wide on 2026-09-29. A master verdict can also
-# trail the tip by about one run plus the queue wait; it belongs to the SHA
-# it ran on, not to the current tip.
+# keeps roughly one master run in flight on arc-dind and arc-e2e almost all
+# the time, which adds to PR queue waits on both. Each such run puts 5 jobs
+# on arc-dind (the 2 Build legs, Build-LTTng and the 2 Unit-Test legs, see
+# Build's runs-on), 4 Test legs on arc-e2e, and 1 on `default`
+# (Documentation-HTML, only when docs change); the path filter runs on
+# arc-light, see doc-path-filter. A master verdict can also trail the tip by
+# about one run plus the queue wait; it belongs to the SHA it ran on, not to
+# the current tip.
 #
 # A run holds the lane from the moment it is created, including while its
 # jobs wait for a runner, and `timeout-minutes` does not count that wait. So a
@@ -122,13 +122,13 @@ jobs:
     # min at the median and 5 min 41 s in run 36588232306.  Their checkout
     # is shallow now (see the Checkout step).
     #
-    # Both pools are pinned to one runner image digest (onprem-k8s
-    # arc/runner-image-pins.rb holds every ARC pool's pin to
+    # arc-light and arc-dind are pinned to one runner image digest
+    # (onprem-k8s arc/runner-image-pins.rb holds every ARC pool's pin to
     # arc/arc-runner-image.txt).  actions/cache folds the compression it
     # picks (zstd if the image has it, else gzip) into an entry's version.
     # Were the two images ever to differ on zstd, Build, Build-LTTng and
-    # buildcache-seed.yml, all on `default`, could restore no entry this
-    # job saves, and no other job saves one.  The image's own fetch_mib
+    # buildcache-seed.yml's seed, all on arc-dind, could restore no entry
+    # this job saves, and no other job saves one.  The image's own fetch_mib
     # (docker/ubuntu-ci/Dockerfile) then downloads the MIBs, as on any
     # miss: slower, not broken.
     runs-on: arc-light
@@ -288,7 +288,22 @@ jobs:
           if-no-files-found: error
 
   Build:
-    runs-on: default
+    # frr's image jobs run on arc-dind, not `default` (2026-10-03). GitHub
+    # hands queued `default` jobs to runners org-wide and not oldest-first:
+    # frr Builds waited 12-37h there while ~1,300 newer jobs from other repos
+    # started, and arc-dind's queue averaged 2.5 jobs over the same 24h.
+    # Same runner image. BuildKit compiles frr in the dind sidecar, whose
+    # limits there are twice default's: 4 CPU, 16Gi memory and 40Gi
+    # ephemeral storage (gtm-image-build already runs buildx there).
+    # What shrinks is the runner's work dir: a node-local emptyDir under
+    # the runner's 24Gi limit, not default's 40Gi Ceph volume. That fits
+    # because Build checks out at fetch-depth 1 and only pushes its image
+    # (no type=docker tarball); a full-history checkout or a tarball
+    # exporter here needs that limit re-checked first.
+    # HTML documentation stays on `default`, not here (it builds no image)
+    # and not on arc-light: it runs only on doc changes, and needs sudo apt
+    # plus more memory than an arc-light runner has.
+    runs-on: arc-dind
     needs: doc-path-filter
     # `build`, never the raw non_doc: see the comment on doc-path-filter.
     if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
@@ -454,7 +469,8 @@ jobs:
     # shard reads an LTTng result).  test_buildcache_freshness.py fails on
     # any other drift, and checks this matrix together with Build's against
     # buildcache-seed.yml's.
-    runs-on: default
+    # arc-dind, like Build: see the comment on its runs-on.
+    runs-on: arc-dind
     needs: doc-path-filter
     if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
     name: ${{ matrix.cfg.name }}
@@ -515,7 +531,8 @@ jobs:
             type=registry,ref=registry.blockcast.net/cache/frr-ci:amd64_u24-buildcache
 
   Unit-Test:
-    runs-on: default
+    # arc-dind, like Build: see the comment on its runs-on.
+    runs-on: arc-dind
     needs: Build
     # BLO-35428: one lost Build leg must not skip the other platform.  With
     # the default `success()` a failed Build leg skipped every Unit-Test and
