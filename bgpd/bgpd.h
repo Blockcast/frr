@@ -571,6 +571,33 @@ struct bgp_clearing_info {
 #define BGP_IPV6_SAFI_SUPPORTS_NEXTHOP_PREFER_GLOBAL(safi)                                        \
 	((safi) == SAFI_UNICAST || (safi) == SAFI_MULTICAST || (safi) == SAFI_LABELED_UNICAST)
 
+/* Once-a-minute log throttle. "Ever logged" is its own flag rather than a
+ * zero timestamp: monotime() counts from host boot, so 0 is a legitimate
+ * value during the first second of uptime and cannot double as "never
+ * logged" -- using it as a sentinel leaves every reject in that tick
+ * unthrottled.
+ */
+struct bgp_umh_lc_throttle {
+	time_t last;
+	bool seen;
+};
+
+/* One lane of the shared UMH large community decoder (bgp_umh_lc_decode()):
+ * the MVPN Type-7 lane or the DIMT pin path. Each lane owns its counter and
+ * its throttle so that, on an instance running both, a reject on one lane is
+ * attributed to it and a flood on one lane cannot mask the other's detail.
+ *
+ * rejected counts once per rejected tuple carrying the lane's function
+ * (Global Administrator 0, Global Administrator != origin AS, unusable UMH
+ * address), including tuples after the winner, and once per ROUTE for an
+ * origin-ambiguous AS_PATH (AS_SET, AS 0, confederation-member origin). A
+ * tuple with another function is not a reject and is never counted.
+ */
+struct bgp_umh_lc_lane {
+	uint64_t rejected;
+	struct bgp_umh_lc_throttle log;
+};
+
 /* BGP instance structure.  */
 struct bgp {
 	/* AS number of this BGP instance.  */
@@ -989,19 +1016,43 @@ struct bgp {
 	char *mvpn_event_socket_path;
 	struct bgp_mvpn_event_sink *mvpn_event_sink;
 
-	/* GTM MCAST-VPN: monotime of the last UMH large-community
-	 * trust-boundary reject notice, for the per-instance once-a-minute
-	 * throttle (see bgp_mvpn_resolve_from_lcommunity). Validity is carried
-	 * by mvpn_umh_untrusted_log_seen below, not by a zero sentinel.
+	/* GTM MCAST-VPN: the MVPN Type-7 lane of the shared UMH large
+	 * community decoder (bgp_umh_lc_decode() in bgp_dimt.c): its reject
+	 * counter and the throttle state of its once-a-minute trust-boundary
+	 * notice. See struct bgp_umh_lc_lane for what the counter counts --
+	 * on this lane, one per rejected tuple PER EVALUATION, i.e. on every
+	 * Type-7 resolve or re-resolve, not per arrival, so it is not the same
+	 * kind of number as the per-peer dimtUmhRejected.
 	 */
-	time_t mvpn_umh_untrusted_log_last;
+	struct bgp_umh_lc_lane mvpn_umh_lc;
 
-	/* Whether mvpn_umh_untrusted_log_last holds a real timestamp yet.
-	 * monotime() counts from host boot, so 0 is a legitimate value during
-	 * the first second of uptime and cannot double as "never logged":
-	 * using it as a sentinel leaves every reject in that tick unthrottled.
+	/* DIMT: function code point of the UMH large community the DIMT pin
+	 * path decodes (`bgp dimt umh-large-community <fn>`, BLO-36558). Its
+	 * own knob, deliberately not mvpn_umh_lc_function: enabling LC-UMH
+	 * for MVPN must not silently open the DIMT pin path, which is what the
+	 * neighbour-trust gate exists to guard. 0 = DIMT LC decode disabled;
+	 * the UMH extended community stays the only encoding. Default instance
+	 * only, like the pin path itself.
 	 */
-	bool mvpn_umh_untrusted_log_seen;
+	uint32_t dimt_umh_lc_function;
+
+	/* DIMT: the DIMT lane of the shared UMH large community decoder. Counts
+	 * once per rejected tuple when the path's attribute set is first
+	 * evaluated (re-processes do not re-charge it; see
+	 * bgp_path_info.dimt_umh_lc_counted), plus once per route for the two
+	 * reasons the DIMT call site raises itself: untrusted neighbour and
+	 * wrong address family.
+	 */
+	struct bgp_umh_lc_lane dimt_umh_lc;
+
+	/* DIMT: throttle state of the DIMT call site's two own reject notices
+	 * (untrusted neighbour, wrong address family). One pair per reason,
+	 * shared with neither the decoder lane above nor each other, so a v6
+	 * LC-UMH flood -- the common shape on an IX-connected box -- cannot
+	 * silence the security-load-bearing untrusted-neighbour line.
+	 */
+	struct bgp_umh_lc_throttle dimt_umh_lc_untrusted_log;
+	struct bgp_umh_lc_throttle dimt_umh_lc_xfam_log;
 
 	/* EVPN - use RFC 8365 to auto-derive RT */
 	int advertise_autort_rfc8365;
@@ -2113,7 +2164,16 @@ struct peer {
 	 * so counting it here would write the detection signal to a sink. Those
 	 * are logged against the prefix and the instance instead, by
 	 * bgp_dimt_umh_refuse_local(). Giving them a counter means giving them
-	 * a per-instance home, not borrowing this field. */
+	 * a per-instance home, not borrowing this field.
+	 *
+	 * Also charged, once per route, when the DIMT pin path refuses this
+	 * neighbour's UMH LARGE community for want of trust (BLO-36558): the
+	 * same refusal under the other encoding, on the same route, so the
+	 * operator reading `show bgp neighbors` sees it in the same place. It
+	 * follows that lane's contract, not this one's: default instance only,
+	 * and only while `bgp dimt umh-large-community` is set. The per-lane
+	 * total, every reason included, is in `show bgp umh-large-community`.
+	 * A route refused under both encodings therefore moves this by two. */
 	uint64_t stat_dimt_umh_rejected;
 	/* Throttle state for the refusal log above (once a minute per peer).
 	 * "Ever logged" is its own flag because monotime() 0 is a real time. */

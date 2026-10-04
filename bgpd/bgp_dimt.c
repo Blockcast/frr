@@ -36,6 +36,8 @@
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_aspath.h"
 #include "bgpd/bgp_ecommunity.h"
+#include "bgpd/bgp_lcommunity.h"
+#include "bgpd/bgp_table.h"
 #include "bgpd/bgp_zebra.h"
 #include "bgpd/bgp_debug.h"
 #include "bgpd/bgp_dimt.h"
@@ -560,6 +562,428 @@ static void bgp_dimt_umh_audit_path(struct bgp_path_info *pi)
 	pi->dimt_umh_refused = refused ? bgp_attr_intern(pi->attr) : NULL;
 }
 
+/*
+ * UMH LARGE community (RFC 8092 carrier, RFC 8195 layout) -- the one decoder,
+ * shared by the MVPN Type-7 lane (bgp_mvpn.c) and the DIMT pin path below.
+ * BLO-36558; the field-by-field contract is doc/dimt-lc-umh-mapping.md.
+ *
+ *   bytes 0-3  Global Administrator  the Source AS; must equal the origin AS
+ *   bytes 4-7  Function              the lane's configured code point
+ *   bytes 8-11 Parameter             the UMH IPv4 address, host-order u32
+ *
+ * The decoder owns the encoding and the origin-AS trust rule. It owns no
+ * policy beyond that: each call site passes its own lane's function code
+ * point and its own lane's counter + throttle, and the gates that belong to
+ * one lane only (DIMT neighbour trust, the DIMT same-family rule) live at
+ * that lane's call site, so the MVPN lane inherits neither -- vector p6 in
+ * bgp_mvpn_gtm_umh_lc, a v4 UMH on a v6 C-S route, keeps resolving there.
+ */
+
+/* Per lane, so the MVPN log lines stay byte-identical to the ones the decoder
+ * emitted before it was shared ("MVPN UMH resolved via large community" is the
+ * live-proof signal the onprem README greps for). */
+static const char *const umh_lc_lane_name[] = {
+	[BGP_UMH_LC_LANE_MVPN] = "MVPN",
+	[BGP_UMH_LC_LANE_DIMT] = "DIMT",
+};
+
+/* What the Parameter names on that lane: MVPN turns it into the upstream PE's
+ * Route Target, DIMT into a PIM Light tunnel endpoint. */
+static const char *const umh_lc_lane_noun[] = {
+	[BGP_UMH_LC_LANE_MVPN] = "upstream PE",
+	[BGP_UMH_LC_LANE_DIMT] = "UMH",
+};
+
+/* Whether a throttled line may be emitted now, charging @t when it may. The
+ * state is written only on emit, so a suppressed call cannot push the window
+ * out. */
+static bool bgp_umh_lc_throttle_ok(struct bgp_umh_lc_throttle *t, time_t now)
+{
+	if (t->seen && now - t->last < 60)
+		return false;
+	t->seen = true;
+	t->last = now;
+	return true;
+}
+
+/* THE Function match. The decoder's walk and the call site's "is this route
+ * on my lane at all" question both go through here, so they cannot disagree
+ * on what a lane's tuple is. A full 32-bit compare. */
+static bool bgp_umh_lc_tuple_is_fn(const uint8_t *lval, uint32_t fn)
+{
+	uint32_t tuple_fn;
+
+	ptr_get_be32(lval + 4, &tuple_fn);
+	return fn && tuple_fn == fn;
+}
+
+bool bgp_umh_lc_has_function(const struct lcommunity *lcom, uint32_t fn)
+{
+	int i;
+
+	if (!lcom || !lcom->val || !fn)
+		return false;
+
+	for (i = 0; i < lcom->size; i++)
+		if (bgp_umh_lc_tuple_is_fn(lcom->val + i * LCOMMUNITY_SIZE, fn))
+			return true;
+	return false;
+}
+
+/*
+ * Decode the UMH large community for one lane.
+ *
+ * Trust: a tuple counts only when its Global Administrator equals the source
+ * route's origin AS (rightmost AS_PATH entry; the local AS for a local route
+ * or one whose AS_PATH is structurally empty), and only when that origin is
+ * knowable at all -- an AS_SET/AS_CONFED_SET aggregates several origins, and
+ * a path carrying AS 0 names no real one, so no tuple on either is trusted.
+ * A transitive community survives more AS hops than any one operator can
+ * vouch for -- this check is the border-scoping primitive that bounds who may
+ * claim a UMH for a route.
+ *
+ * Ties: large communities are sorted and de-duplicated at attribute parse
+ * (lcommunity_uniq_sort), so candidates iterate in ascending tuple order and
+ * the first valid one -- the lowest tuple -- wins deterministically.
+ *
+ * Counting (lane != NULL), per doc/dimt-lc-umh-mapping.md "Reject counter":
+ *   - once per ROUTE for an origin-ambiguous AS_PATH, at the first tuple with
+ *     the lane's function, and the decode ends there: no tuple on such a
+ *     route can resolve, and the per-tuple checks have no origin to test;
+ *   - once per TUPLE for Global Administrator 0, Global Administrator !=
+ *     origin AS, and an unusable UMH address -- on every tuple with the
+ *     lane's function, INCLUDING tuples after the winner. Tuples sort by
+ *     Global Administrator, the very field the GA checks test, so a crafted
+ *     tuple with a GA above the origin AS sorts behind a legitimate one; an
+ *     early "a lower tuple already won" skip would never count it. A tuple
+ *     past the winner that passes the checks is ignored, not counted, and
+ *     cannot change which tuple resolves.
+ * A tuple with another function is an unrelated large community, not a
+ * reject, and is never counted. The counter is the lane's and only moves
+ * through this pointer; a return value cannot carry it (one bool per route
+ * would under-count a route carrying three GA-mismatched tuples by two).
+ *
+ * Logging: the trust-boundary rejects (origin-ambiguous and the two GA
+ * reasons) emit a notice throttled to once a minute on the LANE's own state,
+ * so a probe on one lane cannot mask a distinct probe on the other inside
+ * the same instance, any more than one VRF can mask another. An unusable
+ * address is a debug line only and touches no throttle state: its tuple has
+ * already passed origin-AS, so it is the originating AS naming a bad address
+ * for its own route -- a misconfiguration to diagnose, not a probe.
+ *
+ * lane == NULL is a pure query: same result, no count, no notice. Debug
+ * lines are unaffected.
+ *
+ * Selection is atomic: the winning tuple supplies BOTH outputs; when no tuple
+ * wins the outputs are untouched.
+ */
+bool bgp_umh_lc_decode(struct bgp *bgp, const struct bgp_path_info *pi,
+		       uint32_t fn, enum bgp_umh_lc_lane_id lane_id,
+		       struct bgp_umh_lc_lane *lane, uint32_t *source_as,
+		       struct in_addr *umh)
+{
+	const char *name = umh_lc_lane_name[lane_id];
+	const char *noun = umh_lc_lane_noun[lane_id];
+	const char *ambiguous_reason = NULL;
+	struct lcommunity *lcom;
+	uint32_t origin_as;
+	bool path_is_empty;
+	bool found = false;
+	int i;
+
+	if (!fn || !pi || !pi->attr)
+		return false;
+
+	lcom = bgp_attr_get_lcommunity(pi->attr);
+	if (!lcom || !lcom->val)
+		return false;
+
+	/*
+	 * Resolve the origin AS -- and first decide whether it is knowable at
+	 * all. aspath_origin_as() owns that judgement (AS_SET / AS 0 /
+	 * confederation-member origins are all unusable); it is shared with the
+	 * DIMT UMH extended-community trust gate above so the two
+	 * border-scoping checks cannot drift apart.
+	 *
+	 * The local-AS substitution stays here because it is caller policy, not
+	 * AS_PATH parsing: an empty AS_PATH means the route never crossed an AS
+	 * boundary, so the local AS genuinely is its origin and a tuple stamped
+	 * GA == our AS is legitimate. It keys on the path being STRUCTURALLY
+	 * empty, never on the lookup returning 0 -- see aspath_origin_as().
+	 * peer->sort is only a belt-and-braces second gate here (it describes
+	 * who advertised the route, not where it came from), and an empty
+	 * AS_PATH is malformed over eBGP anyway (RFC 7606 treat-as-withdraw at
+	 * parse).
+	 */
+	origin_as = aspath_origin_as(pi->attr->aspath, &ambiguous_reason,
+				     &path_is_empty);
+	if (!ambiguous_reason && path_is_empty && pi->peer &&
+	    (pi->peer == bgp->peer_self || pi->peer->sort == BGP_PEER_IBGP))
+		origin_as = bgp->as;
+
+	for (i = 0; i < lcom->size; i++) {
+		const uint8_t *lval = lcom->val + i * LCOMMUNITY_SIZE;
+		uint32_t ga, tuple_fn, param;
+		struct in_addr addr;
+
+		if (!bgp_umh_lc_tuple_is_fn(lval, fn))
+			continue;
+
+		ptr_get_be32(lval, &ga);
+		ptr_get_be32(lval + 4, &tuple_fn);
+		ptr_get_be32(lval + 8, &param);
+
+		if (ambiguous_reason) {
+			/* A property of the route, not of this tuple: counted
+			 * once and the decode ends, see above. */
+			if (lane) {
+				lane->rejected++;
+				if (bgp_umh_lc_throttle_ok(&lane->log,
+							   monotime(NULL)))
+					zlog_notice("%s UMH large community %u:%u:%u rejected on %s: %s, origin AS is indeterminate",
+						    name, ga, tuple_fn, param,
+						    bgp->name_pretty,
+						    ambiguous_reason);
+			}
+			return false;
+		}
+
+		if (ga == 0 || ga != origin_as) {
+			/*
+			 * Trust-boundary reject: someone is claiming a UMH for
+			 * this route across an AS they do not originate. Surface
+			 * it at notice (not debug) so a probe is visible in
+			 * production, throttled to once a minute per lane per
+			 * BGP instance so a flood of crafted tuples cannot spam
+			 * the log, a probe on one VRF cannot mask a distinct
+			 * probe on another, and a probe on one lane cannot mask
+			 * one on the other.
+			 */
+			if (lane) {
+				lane->rejected++;
+				if (bgp_umh_lc_throttle_ok(&lane->log,
+							   monotime(NULL)))
+					zlog_notice("%s UMH large community %u:%u:%u rejected on %s: Global Administrator %u != origin AS %u",
+						    name, ga, tuple_fn, param,
+						    bgp->name_pretty, ga,
+						    origin_as);
+			}
+			continue;
+		}
+
+		addr.s_addr = htonl(param);
+		/*
+		 * Usable-UMH gate on the parameter. This is a per-route trust
+		 * decision, so the reject set is spelled out here rather than
+		 * deferred to ipv4_unicast_valid(): that helper treats Class E
+		 * (240/4) as usable unicast per draft-schoen-intarea-unicast-240,
+		 * and gates 0/8 + 127/8 on the global "allow-reserved-ranges"
+		 * toggle -- neither is acceptable for a UMH target an adversary
+		 * can put on the wire. Reject, all unconditionally:
+		 *   0.0.0.0/8      unspecified / "this network"
+		 *   127.0.0.0/8    loopback
+		 *   169.254.0.0/16 link-local: interface-scoped and NOT
+		 *                  globally unique, so it either names nothing
+		 *                  reachable or collides with a different box
+		 *                  on some other link
+		 *   224.0.0.0/4    multicast (Class D)
+		 *   240.0.0.0/4    reserved (Class E), incl. 255.255.255.255
+		 */
+		if (IPV4_NET0(param) || IPV4_NET127(param) ||
+		    IPV4_LINKLOCAL(param) || IPV4_CLASS_D(param) ||
+		    IPV4_CLASS_E(param)) {
+			if (lane)
+				lane->rejected++;
+			if (BGP_DEBUG(zebra, ZEBRA))
+				zlog_debug("%s UMH large community %u:%u:%u rejected: %pI4 is not a usable %s address",
+					   name, ga, tuple_fn, param, &addr,
+					   noun);
+			continue;
+		}
+
+		if (found) {
+			if (BGP_DEBUG(zebra, ZEBRA))
+				zlog_debug("%s UMH large community %u:%u:%u ignored: lower tuple already won",
+					   name, ga, tuple_fn, param);
+			continue;
+		}
+
+		*source_as = ga;
+		*umh = addr;
+		found = true;
+		/* The value-checked "resolved via" line: the MVPN live proof
+		 * greps for it under `debug bgp zebra` (an LC-resolved upstream
+		 * RT is byte-identical to an EC-resolved one by design, so the
+		 * log IS the signal). Debug-gated: re-resolution runs on every
+		 * covering unicast best-path change, so an unconditional line
+		 * would flood under route churn. */
+		if (BGP_DEBUG(zebra, ZEBRA))
+			zlog_debug("%s UMH resolved via large community %u:%u:%u: %s %pI4, Source AS %u",
+				   name, ga, tuple_fn, param, noun, &addr, ga);
+	}
+
+	return found;
+}
+
+/* The prefix for the DIMT call site's two notices, printed like its EC twins
+ * (%pFX, no node pointer). NULL prints "(null)": a synthetic path in the unit
+ * test has no node. */
+static const struct prefix *bgp_dimt_umh_lc_prefix(const struct bgp_path_info *pi)
+{
+	return pi->net ? bgp_dest_get_prefix(pi->net) : NULL;
+}
+
+/* The DIMT call site's own name for who sent the path, for its two notices.
+ * peer->host for peer_self is a pseudo-peer string ("Static announcement"),
+ * which would name as a local announcement the very thing a refusal on an
+ * imported or aggregate path is denying is one -- see
+ * bgp_dimt_umh_refuse_local(). */
+static const char *bgp_dimt_umh_lc_sender(const struct bgp_path_info *pi)
+{
+	if (!pi->peer)
+		return "(unknown peer)";
+	if (pi->peer->bgp && pi->peer == pi->peer->bgp->peer_self)
+		return "this speaker (locally-held route)";
+	return pi->peer->host ? pi->peer->host : "(unknown peer)";
+}
+
+/*
+ * The DIMT lane of the UMH large community: may this path's LC-UMH steer the
+ * pin path, and to where?
+ *
+ * Acts only when `bgp dimt umh-large-community` is set and the path carries a
+ * tuple with that function (bgp_umh_lc_has_function(), the decoder's own
+ * match). A route whose large communities carry only another function is not
+ * on this lane at all and is never counted.
+ *
+ * Two gates the decoder must not own, in this order, each of which ends the
+ * route's DIMT handling and counts ONCE PER ROUTE however many tuples it
+ * carries (a route tripping both counts once, on the first):
+ *
+ *   1. Neighbour trust, bgp_dimt_peer_is_trusted() -- BEFORE decoding. The
+ *      LC is the same claim as the 0x80 EC under another encoding; without
+ *      this gate an untrusted route-server peer's refused EC would be
+ *      accepted as an LC on the same route, with the same effect. Also
+ *      charged to the neighbour's dimtUmhRejected, so `show bgp neighbors`
+ *      moves for it the way it does for the EC.
+ *   2. Family: AFI_IP only. A u32 parameter cannot carry an IPv6 UMH, and
+ *      the pin path is same-family by design (a v4 UMH on a v6 route names
+ *      no endpoint pim6d can build an adjacency to). This is where DIMT
+ *      diverges from MVPN, which accepts p6; it lives here and not in the
+ *      decoder for exactly that reason.
+ *
+ * Each gate logs on its own throttle pair, shared with neither the decoder's
+ * lane nor the other gate, so a v6 LC-UMH flood (the common shape on an
+ * IX-connected box) cannot silence the untrusted-neighbour line or the
+ * decoder's detail.
+ *
+ * count == false is a pure query (no counter, no notice), for a re-read of an
+ * attribute set already adjudicated. *on_lane, when non-NULL, is set to
+ * whether the path carries a tuple with the DIMT function at all.
+ *
+ * The result is always an IPv4 UMH; the caller maps it as type PIM,
+ * preference 0 -- the LC encodes neither (doc/dimt-lc-umh-mapping.md).
+ */
+bool bgp_dimt_umh_lc_resolve(struct bgp *bgp, const struct bgp_path_info *pi,
+			     afi_t afi, bool count, struct in_addr *umh,
+			     bool *on_lane)
+{
+	uint32_t fn = bgp ? bgp->dimt_umh_lc_function : 0;
+	const char *why = NULL;
+	uint32_t source_as = 0;
+
+	if (on_lane)
+		*on_lane = false;
+
+	if (!fn || !pi || !pi->attr ||
+	    !bgp_umh_lc_has_function(bgp_attr_get_lcommunity(pi->attr), fn))
+		return false;
+
+	if (on_lane)
+		*on_lane = true;
+
+	if (!bgp_dimt_peer_is_trusted(pi, &why)) {
+		if (count) {
+			bgp->dimt_umh_lc.rejected++;
+			/* Never charged to peer_self: `show bgp neighbors`
+			 * does not walk it, see stat_dimt_umh_rejected. */
+			if (pi->peer && pi->peer->bgp &&
+			    pi->peer != pi->peer->bgp->peer_self)
+				pi->peer->stat_dimt_umh_rejected++;
+			if (bgp_umh_lc_throttle_ok(&bgp->dimt_umh_lc_untrusted_log,
+						   monotime(NULL)))
+				zlog_notice("DIMT: UMH large community on %pFX from %s refused: %s",
+					    bgp_dimt_umh_lc_prefix(pi),
+					    bgp_dimt_umh_lc_sender(pi),
+					    why ? why : "no usable peer on the path");
+		}
+		return false;
+	}
+
+	if (afi != AFI_IP) {
+		/* Not the per-update cross-family EC warn's call site or its
+		 * throttle: that one suits a rare wrong-family EC, while a v6
+		 * route carrying an LC-UMH is routine on an IX-connected box.
+		 * And the text names the attribute actually rejected, so the
+		 * operator is not sent looking for a 0x80 that is not there. */
+		if (count) {
+			bgp->dimt_umh_lc.rejected++;
+			if (bgp_umh_lc_throttle_ok(&bgp->dimt_umh_lc_xfam_log,
+						   monotime(NULL)))
+				zlog_warn("DIMT: %pFX from %s carries a UMH large community of the wrong address family; ignored (the UMH family must match the route family); further wrong-family UMH large communities on this instance suppressed for 60s",
+					  bgp_dimt_umh_lc_prefix(pi),
+					  bgp_dimt_umh_lc_sender(pi));
+		}
+		return false;
+	}
+
+	return bgp_umh_lc_decode(bgp, pi, fn, BGP_UMH_LC_LANE_DIMT,
+				 count ? &bgp->dimt_umh_lc : NULL, &source_as,
+				 umh);
+}
+
+/*
+ * The DIMT lane at most once per attribute set: same contract as
+ * bgp_dimt_umh_audit_path() for the extended community, on its own record.
+ *
+ * The route-update hook re-runs on re-processes that carry no new
+ * announcement (add-path transmit, RPKI revalidation, `clear ip bgp PREFIX`,
+ * a sibling path's event). pi->dimt_umh_lc_counted holds an interned
+ * reference to the attribute set last evaluated with counting on, so an
+ * unchanged pass is a pure query and charges nothing; a re-announcement that
+ * changes the attributes interns to a different attr and is evaluated
+ * afresh. The record is kept only for a path on the DIMT lane, so a route
+ * carrying no DIMT tuple costs no reference. A knob change clears every
+ * record (bgp_dimt_umh_lc_set_function()), because the verdict depends on the
+ * function code point as much as on the attributes.
+ *
+ * Exported for tests/bgpd/test_dimt_umh_lc.c.
+ */
+bool bgp_dimt_umh_lc_from_path(struct bgp *bgp, struct bgp_path_info *pi,
+			       afi_t afi, struct in_addr *umh)
+{
+	bool fresh;
+	bool on_lane;
+	bool has;
+
+	if (!pi || !pi->attr)
+		return false;
+
+	fresh = pi->dimt_umh_lc_counted != pi->attr;
+	has = bgp_dimt_umh_lc_resolve(bgp, pi, afi, fresh, umh, &on_lane);
+
+	if (fresh) {
+		/* Reassigned rather than left to bgp_attr_unintern(), which
+		 * only NULLs the pointer when it frees the attr. */
+		if (pi->dimt_umh_lc_counted)
+			bgp_attr_unintern(&pi->dimt_umh_lc_counted);
+		pi->dimt_umh_lc_counted = on_lane ? bgp_attr_intern(pi->attr)
+						  : NULL;
+	}
+
+	return has;
+}
+
 static void bgp_dimt_umh_send(const struct prefix *p,
 			      const struct ipaddr *umh, uint8_t umh_type,
 			      uint8_t preference, bool add)
@@ -603,7 +1027,9 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 	struct ipaddr new_umh = {};
 	uint8_t new_type = 0;
 	uint8_t new_pref = 0;
+	struct in_addr lc_umh = {};
 	bool new_has;
+	bool lc_has;
 
 	/* IPv4/IPv6 unicast only. Extraction is same-family by choice: a v4 UMH
 	 * EC is read from v4 routes and a v6 UMH EC from v6 routes; a
@@ -641,6 +1067,46 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 
 	new_has = bgp_dimt_umh_from_path(new_route, afi, &new_umh, &new_type,
 					 &new_pref);
+
+	/* The UMH large community (BLO-36558). Evaluated on every pass so its
+	 * own call-site gates count and log, but de-duplicated per attribute
+	 * set inside bgp_dimt_umh_lc_from_path(). Returns false, having
+	 * counted any reject, for a v6 route. */
+	lc_has = bgp_dimt_umh_lc_from_path(bgp, new_route, afi, &lc_umh);
+
+	/* LC vs EC precedence (doc/dimt-lc-umh-mapping.md, "Preference"): a
+	 * valid LC-UMH wins over the UMH extended community on the same route,
+	 * EXCEPT when the EC's selected tuple is typed amt-relay. The LC's PIM
+	 * type is a default, not an assertion, while an amt-relay EC is an
+	 * explicit one that pimd honours by NOT pinning; letting the LC win
+	 * would turn that no-pin into a PIM Light join toward an AMT relay the
+	 * moment the knob is set. Preference plays no part in this rule. */
+	if (lc_has) {
+		bool ec_amt = new_has && new_type == ZAPI_UMH_TYPE_AMT_RELAY;
+
+		/* Unlike the MVPN lane's disagreement log, compare what 0x80
+		 * actually carries: the address AND the type. An LC overridden
+		 * by an amt-relay EC is logged even when both name the same
+		 * address -- the case only the type comparison can catch. */
+		if (new_has && BGP_DEBUG(zebra, ZEBRA) &&
+		    (ec_amt || new_type != ZAPI_UMH_TYPE_PIM ||
+		     !IS_IPADDR_V4(&new_umh) ||
+		     new_umh.ipaddr_v4.s_addr != lc_umh.s_addr))
+			zlog_debug("DIMT UMH large community disagrees with the UMH extended community on %pFX (LC: %pI4 type pim; EC: %pIA type %s): %s wins",
+				   p, &lc_umh, &new_umh,
+				   new_type == ZAPI_UMH_TYPE_AMT_RELAY ? "amt-relay" : "pim",
+				   ec_amt ? "the amt-relay extended community"
+					  : "the large community");
+
+		if (!ec_amt) {
+			new_umh = (struct ipaddr){};
+			SET_IPADDR_V4(&new_umh);
+			new_umh.ipaddr_v4 = lc_umh;
+			new_type = ZAPI_UMH_TYPE_PIM;
+			new_pref = 0;
+			new_has = true;
+		}
+	}
 
 	if (new_has) {
 		struct route_node *rn = route_node_get(dimt_sent[afi], p);
@@ -729,6 +1195,65 @@ static int bgp_dimt_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 	}
 
 	return 0;
+}
+
+/*
+ * `bgp dimt umh-large-community`: set the DIMT lane's function code point and
+ * re-evaluate every unicast route's DIMT mapping under it, the way the MVPN
+ * knob re-resolves its joins. No session reset: the attributes have not
+ * changed, only how we read them, so nothing needs re-sending -- re-running
+ * the route-update hook on each selected path is the whole job. A mapping the
+ * new setting no longer yields is DELeted (an LC-only route when the knob is
+ * cleared), one it newly yields is ADDed, and an unchanged one is re-ADDed,
+ * which pimd treats as an upsert.
+ *
+ * Every LC record is cleared first, on every path and not only the selected
+ * one, because the verdict a record stands for was reached under the old
+ * function code point: a re-announcement-free path must be adjudicated, and
+ * counted, afresh under the new one. The EC lane's record is untouched -- its
+ * verdict does not depend on this knob.
+ *
+ * Both families are walked: the v4 table for the mappings, the v6 table so
+ * its wrong-family records are re-adjudicated under the new code point too.
+ * Synchronous and O(unicast table); a no-op set (same value) walks nothing.
+ */
+void bgp_dimt_umh_lc_set_function(struct bgp *bgp, uint32_t fn)
+{
+	afi_t afi;
+
+	if (bgp->dimt_umh_lc_function == fn)
+		return;
+
+	bgp->dimt_umh_lc_function = fn;
+
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++) {
+		struct bgp_table *table = bgp->rib[afi][SAFI_UNICAST];
+		struct bgp_dest *dest;
+
+		if (!table)
+			continue;
+
+		for (dest = bgp_table_top(table); dest;
+		     dest = bgp_route_next(dest)) {
+			struct bgp_path_info *pi;
+			struct bgp_path_info *sel = NULL;
+
+			for (pi = bgp_dest_get_bgp_path_info(dest); pi;
+			     pi = pi->next) {
+				if (pi->dimt_umh_lc_counted) {
+					bgp_attr_unintern(&pi->dimt_umh_lc_counted);
+					pi->dimt_umh_lc_counted = NULL;
+				}
+				if (CHECK_FLAG(pi->flags, BGP_PATH_SELECTED) &&
+				    !CHECK_FLAG(pi->flags, BGP_PATH_REMOVED))
+					sel = pi;
+			}
+
+			if (sel)
+				bgp_dimt_route_update(bgp, afi, SAFI_UNICAST,
+						      dest, sel, sel);
+		}
+	}
 }
 
 /* pimd (re-)subscribed through zebra: re-dump the shadow table. The shadow

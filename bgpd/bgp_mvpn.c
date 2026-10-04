@@ -1180,162 +1180,27 @@ static void bgp_mvpn_resolve_from_ecommunity(struct bgp_path_info *pi, uint32_t 
  * TRANSITIVE where the RFC 6514 route-import EC is not -- it survives an IX
  * route server hop, which is the point of this encoding.
  *
+ * The decode itself -- origin-AS trust, usable-address rule, lowest tuple
+ * wins, reject counting and the throttled notice -- is bgp_umh_lc_decode() in
+ * bgp_dimt.c, shared with the DIMT pin path (BLO-36558) so the two lanes
+ * cannot drift. This lane passes its own knob and its own counter + throttle
+ * (bgp->mvpn_umh_lc), and applies neither of the DIMT lane's call-site gates:
+ * no neighbour-trust gate, and no family gate -- a v4 UMH on a v6 C-S route is
+ * legitimate here (RFC 6515; vector p6 in bgp_mvpn_gtm_umh_lc).
+ *
+ * The counter therefore moves once per rejected tuple PER EVALUATION: on each
+ * Type-7 resolve or re-resolve, not once per arrival.
+ *
  * Selection is atomic: the winning tuple supplies BOTH outputs; when no
  * tuple wins the outputs are untouched and the caller falls back to the
  * RFC 6514 extended communities.
- *
- * Trust: a tuple counts only when its Global Administrator equals the source
- * route's origin AS (rightmost AS_PATH entry; the local AS for a local route
- * or one whose AS_PATH is structurally empty), and only when that origin is
- * knowable at all -- an AS_SET/AS_CONFED_SET aggregates several origins, and
- * a path carrying AS 0 names no real one, so no tuple on either is trusted.
- * A transitive community survives more AS hops than any one operator can
- * vouch for -- this check is the border-scoping primitive that bounds who may
- * claim a UMH for a route.
- *
- * Ties: large communities are sorted and de-duplicated at attribute parse
- * (lcommunity_uniq_sort), so candidates iterate in ascending tuple order and
- * the first valid one -- the lowest tuple -- wins deterministically; any
- * further matching tuples are logged and ignored.
  */
 static bool bgp_mvpn_resolve_from_lcommunity(struct bgp *bgp, struct bgp_path_info *pi,
 					     uint32_t *source_as, struct in_addr *upstream)
 {
-	struct lcommunity *lcom = bgp_attr_get_lcommunity(pi->attr);
-	struct aspath *aspath = pi->attr->aspath;
-	const char *ambiguous_reason = NULL;
-	uint32_t origin_as;
-	bool origin_ambiguous;
-	bool path_is_empty;
-	bool found = false;
-	int i;
-
-	if (!bgp->mvpn_umh_lc_function || !lcom)
-		return false;
-
-	/*
-	 * Resolve the origin AS -- and first decide whether it is knowable at
-	 * all. aspath_origin_as() owns that judgement (AS_SET / AS 0 /
-	 * confederation-member origins are all unusable); it is shared with the
-	 * DIMT UMH extended-community trust gate in bgp_dimt.c so the two
-	 * border-scoping checks cannot drift apart.
-	 *
-	 * The local-AS substitution stays here because it is caller policy, not
-	 * AS_PATH parsing: an empty AS_PATH means the route never crossed an AS
-	 * boundary, so the local AS genuinely is its origin and a tuple stamped
-	 * GA == our AS is legitimate. It keys on the path being STRUCTURALLY
-	 * empty, never on the lookup returning 0 -- see aspath_origin_as().
-	 * peer->sort is only a belt-and-braces second gate here (it describes
-	 * who advertised the route, not where it came from), and an empty
-	 * AS_PATH is malformed over eBGP anyway (RFC 7606 treat-as-withdraw at
-	 * parse).
-	 */
-	origin_as = aspath_origin_as(aspath, &ambiguous_reason, &path_is_empty);
-	origin_ambiguous = (ambiguous_reason != NULL);
-	if (!origin_ambiguous && path_is_empty &&
-	    (pi->peer == bgp->peer_self || pi->peer->sort == BGP_PEER_IBGP))
-		origin_as = bgp->as;
-
-	for (i = 0; i < lcom->size; i++) {
-		const uint8_t *lval = lcom->val + i * LCOMMUNITY_SIZE;
-		uint32_t ga, fn, param;
-		struct in_addr umh;
-
-		ptr_get_be32(lval, &ga);
-		ptr_get_be32(lval + 4, &fn);
-		ptr_get_be32(lval + 8, &param);
-
-		if (fn != bgp->mvpn_umh_lc_function)
-			continue;
-
-		if (found) {
-			if (BGP_DEBUG(zebra, ZEBRA))
-				zlog_debug("MVPN UMH large community %u:%u:%u ignored: lower tuple already won",
-					   ga, fn, param);
-			continue;
-		}
-
-		if (origin_ambiguous || ga == 0 || ga != origin_as) {
-			/*
-			 * Trust-boundary reject: someone is claiming a UMH for
-			 * this route across an AS they do not originate. Surface
-			 * it at notice (not debug) so a probe is visible in
-			 * production, throttled to once a minute per BGP
-			 * instance so a flood of crafted tuples cannot spam the
-			 * log and a probe on one VRF cannot mask a distinct
-			 * probe on another.
-			 */
-			time_t now = monotime(NULL);
-			time_t last = bgp->mvpn_umh_untrusted_log_last;
-
-			/* Track "have we ever logged" in its own flag rather
-			 * than treating a zero timestamp as the sentinel:
-			 * monotime() counts from host boot, so 0 is a real
-			 * time during the first second of uptime. Overloading
-			 * it swallowed the very first reject on a freshly
-			 * booted PE in one direction, and left every reject in
-			 * that opening tick unthrottled in the other. */
-			if (!bgp->mvpn_umh_untrusted_log_seen ||
-			    now - last >= 60) {
-				bgp->mvpn_umh_untrusted_log_seen = true;
-				bgp->mvpn_umh_untrusted_log_last = now;
-				if (origin_ambiguous)
-					zlog_notice("MVPN UMH large community %u:%u:%u rejected on %s: %s, origin AS is indeterminate",
-						    ga, fn, param,
-						    bgp->name_pretty,
-						    ambiguous_reason);
-				else
-					zlog_notice("MVPN UMH large community %u:%u:%u rejected on %s: Global Administrator %u != origin AS %u",
-						    ga, fn, param,
-						    bgp->name_pretty, ga,
-						    origin_as);
-			}
-			continue;
-		}
-
-		umh.s_addr = htonl(param);
-		/*
-		 * Usable-upstream-PE gate on the parameter. This is a per-route
-		 * trust decision, so the reject set is spelled out here rather
-		 * than deferred to ipv4_unicast_valid(): that helper treats
-		 * Class E (240/4) as usable unicast per draft-schoen-intarea-
-		 * unicast-240, and gates 0/8 + 127/8 on the global
-		 * "allow-reserved-ranges" toggle -- neither is acceptable for a
-		 * UMH target an adversary can put on the wire. Reject, all
-		 * unconditionally:
-		 *   0.0.0.0/8      unspecified / "this network"
-		 *   127.0.0.0/8    loopback
-		 *   169.254.0.0/16 link-local: interface-scoped and NOT
-		 *                  globally unique, so it either names nothing
-		 *                  reachable or collides with a different box
-		 *                  on some other link
-		 *   224.0.0.0/4    multicast (Class D)
-		 *   240.0.0.0/4    reserved (Class E), incl. 255.255.255.255
-		 */
-		if (IPV4_NET0(param) || IPV4_NET127(param) ||
-		    IPV4_LINKLOCAL(param) || IPV4_CLASS_D(param) ||
-		    IPV4_CLASS_E(param)) {
-			if (BGP_DEBUG(zebra, ZEBRA))
-				zlog_debug("MVPN UMH large community %u:%u:%u rejected: %pI4 is not a usable upstream PE address",
-					   ga, fn, param, &umh);
-			continue;
-		}
-
-		*source_as = ga;
-		*upstream = umh;
-		found = true;
-		/* The value-checked "resolved via" line: the live proof greps
-		 * for this under `debug bgp zebra` (an LC-resolved upstream RT
-		 * is byte-identical to an EC-resolved one by design, so the
-		 * log IS the signal). Debug-gated: re-resolution runs on every
-		 * covering unicast best-path change, so an unconditional line
-		 * would flood under route churn. */
-		if (BGP_DEBUG(zebra, ZEBRA))
-			zlog_debug("MVPN UMH resolved via large community %u:%u:%u: upstream PE %pI4, Source AS %u",
-				   ga, fn, param, &umh, ga);
-	}
-
-	return found;
+	return bgp_umh_lc_decode(bgp, pi, bgp->mvpn_umh_lc_function,
+				 BGP_UMH_LC_LANE_MVPN, &bgp->mvpn_umh_lc,
+				 source_as, upstream);
 }
 
 /*

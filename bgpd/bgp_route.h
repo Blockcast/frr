@@ -333,6 +333,15 @@ struct bgp_path_info {
 	 */
 	struct attr *dimt_umh_refused;
 
+	/* DIMT: the attribute set the DIMT lane of the UMH large community
+	 * decoder last evaluated with counting on, with one interned reference
+	 * held; NULL if none, or if that set carried no tuple with the DIMT
+	 * function. Same contract as dimt_umh_refused, kept separate so the
+	 * EC and LC lanes de-duplicate independently. See
+	 * bgp_dimt_umh_lc_from_path().
+	 */
+	struct attr *dimt_umh_lc_counted;
+
 	/* Extra information */
 	struct bgp_path_info_extra *extra;
 

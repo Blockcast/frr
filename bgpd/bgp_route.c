@@ -485,6 +485,8 @@ void bgp_path_info_free_with_caller(const char *name,
 	bgp_attr_unintern(&path->attr);
 	if (path->dimt_umh_refused)
 		bgp_attr_unintern(&path->dimt_umh_refused);
+	if (path->dimt_umh_lc_counted)
+		bgp_attr_unintern(&path->dimt_umh_lc_counted);
 
 	bgp_unlink_nexthop(path);
 	bgp_path_info_extra_free(&path->extra);
@@ -6819,6 +6821,8 @@ filtered:
 		 * earlier in bgp_update() cannot silently leak. */
 		if (new->dimt_umh_refused)
 			bgp_attr_unintern(&new->dimt_umh_refused);
+		if (new->dimt_umh_lc_counted)
+			bgp_attr_unintern(&new->dimt_umh_lc_counted);
 		XFREE(MTYPE_BGP_ROUTE, new);
 	}
 

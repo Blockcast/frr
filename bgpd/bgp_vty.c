@@ -74,6 +74,7 @@
 #include "bgpd/rfapi/bgp_rfapi_cfg.h"
 #endif
 #include "bgpd/bgp_ls.h"
+#include "bgpd/bgp_dimt.h"
 
 extern struct host host;
 
@@ -22422,6 +22423,11 @@ int bgp_config_write(struct vty *vty)
 			vty_out(vty, " bgp mvpn umh-large-community %u\n",
 				bgp->mvpn_umh_lc_function);
 
+		/* DIMT pin path UMH large community function code point */
+		if (bgp->dimt_umh_lc_function)
+			vty_out(vty, " bgp dimt umh-large-community %u\n",
+				bgp->dimt_umh_lc_function);
+
 		/* Suppress duplicate updates if the route actually not changed
 		 */
 		if (!!CHECK_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_DUPLICATES)
@@ -23393,6 +23399,37 @@ DEFPY (bgp_mvpn_umh_large_community,
 	return CMD_SUCCESS;
 }
 
+DEFPY (bgp_dimt_umh_large_community,
+       bgp_dimt_umh_large_community_cmd,
+       "[no] bgp dimt umh-large-community [(1-4294967295)$fn]",
+       NO_STR
+       BGP_STR
+       "DIMT (dynamic Internet multicast tunnel) commands\n"
+       "Pin the DIMT UMH from a <sourceAS>:<function>:<UMH-IPv4> large community on the unicast source route (default: disabled)\n"
+       "Function code point identifying the UMH large community\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+
+	/* The pin path is default-instance only (bgp_dimt_route_update()), so
+	 * a VRF knob would be configuration that never does anything. */
+	if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT) {
+		vty_out(vty,
+			"%% bgp dimt umh-large-community is only supported in the default BGP instance\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	if (!no && !fn_str) {
+		vty_out(vty, "%% Must specify a function code point\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	/* Re-evaluates every unicast route's DIMT mapping under the new
+	 * setting; no session reset. */
+	bgp_dimt_umh_lc_set_function(bgp, no ? 0 : fn);
+
+	return CMD_SUCCESS;
+}
+
 DEFPY (bgp_mvpn_event_socket,
        bgp_mvpn_event_socket_cmd,
        "[no] bgp mvpn event-socket [FILENAME]",
@@ -23459,6 +23496,64 @@ DEFPY (show_bgp_mvpn,
 	}
 
 	bgp_mvpn_show_routes(vty, bgp, afi, !!uj);
+	return CMD_SUCCESS;
+}
+
+DEFPY (show_bgp_umh_large_community,
+       show_bgp_umh_large_community_cmd,
+       "show bgp [vrf VRFNAME$vrf_name] umh-large-community [json$uj]",
+       SHOW_STR
+       BGP_STR
+       VRF_CMD_HELP_STR
+       "UMH large community decode lanes: function code points and reject counters\n"
+       JSON_STR)
+{
+	struct bgp *bgp;
+
+	if (vrf_name && !strmatch(vrf_name, VRF_DEFAULT_NAME))
+		bgp = bgp_lookup_by_name(vrf_name);
+	else
+		bgp = bgp_get_default();
+
+	if (!bgp) {
+		if (uj)
+			vty_out(vty, "{}\n");
+		else
+			vty_out(vty, "%% No BGP process configured\n");
+		return CMD_SUCCESS;
+	}
+
+	if (uj) {
+		json_object *json = json_object_new_object();
+
+		json_object_string_add(json, "vrfName", bgp->name_pretty);
+		json_object_int_add(json, "dimtFunction",
+				    bgp->dimt_umh_lc_function);
+		json_object_int_add(json, "dimtUmhLcRejected",
+				    bgp->dimt_umh_lc.rejected);
+		json_object_int_add(json, "mvpnFunction",
+				    bgp->mvpn_umh_lc_function);
+		json_object_int_add(json, "mvpnUmhLcRejected",
+				    bgp->mvpn_umh_lc.rejected);
+		vty_json(vty, json);
+		return CMD_SUCCESS;
+	}
+
+	vty_out(vty, "UMH large community lanes, BGP instance %s:\n",
+		bgp->name_pretty);
+	vty_out(vty, "%-6s %-12s %s\n", "Lane", "Function", "Rejected");
+	if (bgp->dimt_umh_lc_function)
+		vty_out(vty, "%-6s %-12u %" PRIu64 "\n", "DIMT",
+			bgp->dimt_umh_lc_function, bgp->dimt_umh_lc.rejected);
+	else
+		vty_out(vty, "%-6s %-12s %" PRIu64 "\n", "DIMT", "disabled",
+			bgp->dimt_umh_lc.rejected);
+	if (bgp->mvpn_umh_lc_function)
+		vty_out(vty, "%-6s %-12u %" PRIu64 "\n", "MVPN",
+			bgp->mvpn_umh_lc_function, bgp->mvpn_umh_lc.rejected);
+	else
+		vty_out(vty, "%-6s %-12s %" PRIu64 "\n", "MVPN", "disabled",
+			bgp->mvpn_umh_lc.rejected);
 	return CMD_SUCCESS;
 }
 
@@ -23953,6 +24048,8 @@ void bgp_vty_init(void)
 	/* Instance-wide (BGP_NODE): one setting serves both mvpn AFs -- the
 	 * UMH large community carries a v4 PE address either way. */
 	install_element(BGP_NODE, &bgp_mvpn_umh_large_community_cmd);
+	install_element(BGP_NODE, &bgp_dimt_umh_large_community_cmd);
+	install_element(VIEW_NODE, &show_bgp_umh_large_community_cmd);
 	install_element(BGP_NODE, &bgp_mvpn_event_socket_cmd);
 	install_element(VIEW_NODE, &show_bgp_mvpn_cmd);
 	install_element(VIEW_NODE, &show_bgp_mvpn_events_cmd);
