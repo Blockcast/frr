@@ -345,15 +345,24 @@ class JPCapture:
         Tracking the most recent upstream-neighbor and group is enough to
         attribute each source address, and does not depend on indentation.
 
-        Two entry shapes are accepted because Wireshark has used both:
-        inline (``Join: 10.10.10.10/32`` / ``Join 0: 10.10.10.10/32``) and a
-        heading followed by ``IP address:``.  "Num Joins: 1" does not match
-        either -- it starts with "Num".
+        Wireshark 3.6.2 (Ubuntu 22.04) and 4.2.2 (24.04) print each group's
+        entries under a count heading, one ``IP address:`` line per source
+        (JP_TSHARK_TEXT below is their output, identical on both):
+
+            Num Joins: 1
+                IP address: 10.10.10.10/32 (S)
+            Num Prunes: 0
+
+        so a ``Num Joins`` / ``Num Prunes`` heading sets the kind for the
+        ``IP address:`` lines under it.  An inline entry (``Join:
+        10.10.10.10/32`` / ``Join 0: 10.10.10.10/32``) is accepted as well,
+        in case a release prints that instead.
         """
         addr = re.compile(r"(\d+\.\d+\.\d+\.\d+)")
         upstream_re = re.compile(r"^Upstream[- ]neighbor\b", re.I)
         group_re = re.compile(r"^Group\s+\d+\b", re.I)
         entry_re = re.compile(r"^(Join|Prune)\s*\d*\s*:", re.I)
+        heading_re = re.compile(r"^Num\s+(Join|Prune)s\b", re.I)
         ipaddr_re = re.compile(r"^IP address\b", re.I)
 
         upstream = None
@@ -374,6 +383,8 @@ class JPCapture:
                 found = addr.search(line)
                 group = found.group(1) if found else None
                 kind = None
+            elif heading_re.match(line):
+                kind = heading_re.match(line).group(1).lower()
             elif entry_re.match(line):
                 kind = entry_re.match(line).group(1).lower()
                 found = addr.search(line)
@@ -389,6 +400,67 @@ class JPCapture:
         """Entries for our (S,G), as (upstream_neighbor, group, source)."""
         rows = self.joins if kind == "join" else self.prunes
         return [r for r in rows if r[1] == GROUP and r[2] == SOURCE]
+
+    def pim_text(self, limit=4000):
+        """The dissection from the first PIM header on.  The Ethernet, IP
+        and GRE layers in front of it fill a 4000-character excerpt by
+        themselves and cut it off before the first Join entry."""
+        start = max(self.jp_text.find("Protocol Independent Multicast"), 0)
+        return self.jp_text[start:][:limit]
+
+
+# tshark -V of one Join/Prune (upstream 10.99.0.1; 232.1.1.10 joins
+# 10.10.10.10, 232.1.1.11 prunes it), as Wireshark 3.6.2 and 4.2.2 both print
+# it, from "PIM Options" on.  Only the per-address flag lines are cut.
+JP_TSHARK_TEXT = """\
+    PIM Options
+        Upstream-neighbor: 10.99.0.1
+            Address Family: IPv4 (1)
+            Encoding Type: Native (0)
+            Unicast: 10.99.0.1
+        Reserved byte(s): 00
+        Num Groups: 2
+        Holdtime: 210
+        Group 0
+            Group 0: 232.1.1.10/32
+                Address Family: IPv4 (1)
+                Encoding Type: Native (0)
+                Masklen: 32
+                Group: 232.1.1.10
+            Num Joins: 1
+                IP address: 10.10.10.10/32 (S)
+                    Address Family: IPv4 (1)
+                    Encoding Type: Native (0)
+                    Masklen: 32
+                    Source: 10.10.10.10
+            Num Prunes: 0
+        Group 1
+            Group 1: 232.1.1.11/32
+                Address Family: IPv4 (1)
+                Encoding Type: Native (0)
+                Masklen: 32
+                Group: 232.1.1.11
+            Num Joins: 0
+            Num Prunes: 1
+                IP address: 10.10.10.10/32 (S)
+                    Address Family: IPv4 (1)
+                    Encoding Type: Native (0)
+                    Masklen: 32
+                    Source: 10.10.10.10
+"""
+
+
+def test_parse_jp_reads_tsharks_layout():
+    """_parse_jp reads the layout CI's tshark actually prints.
+
+    It once accepted only an inline ``Join:`` entry, which no Wireshark in CI
+    prints.  Every Join then parsed to nothing: F9's positive check could not
+    pass, and F10's "no Join was sent" check could not fail.  Pure parsing,
+    so it runs without the topology.
+    """
+    joins, prunes = JPCapture._parse_jp(JP_TSHARK_TEXT)
+    assert joins == [("10.99.0.1", "232.1.1.10", "10.10.10.10")], joins
+    assert prunes == [("10.99.0.1", "232.1.1.11", "10.10.10.10")], prunes
 
 
 # --- F8 ------------------------------------------------------------------
@@ -459,7 +531,7 @@ def test_jp_upstream_is_hello_neighbor():
     assert rows, (
         "no Join({},{}) decoded from the capture. If the dissection text has "
         "changed shape this parse is what broke, so here it is:\n{}".format(
-            SOURCE, GROUP, capture.jp_text[:4000]
+            SOURCE, GROUP, capture.pim_text()
         )
     )
 
@@ -566,7 +638,7 @@ def test_neighbor_expiry_with_pin_held():
     assert rows, (
         "no triggered Join({},{}) after hellos resumed; a pin that only "
         "recovers on the 60 s periodic timer is a blackhole, not a "
-        "recovery. Dissection:\n{}".format(SOURCE, GROUP, capture.jp_text[:4000])
+        "recovery. Dissection:\n{}".format(SOURCE, GROUP, capture.pim_text())
     )
     assert sorted({row[0] for row in rows}) == [R1_LINK], (
         "the re-armed Join named {}, expected {}".format(
