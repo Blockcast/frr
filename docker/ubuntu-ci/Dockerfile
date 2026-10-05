@@ -1,4 +1,24 @@
 ARG UBUNTU_VERSION=22.04
+
+# ccache seed for the compile steps below. Empty by default, so a plain
+# `docker build` is the cold path and needs nothing injected. CI overrides it
+# with `--build-context ccache-seed=<dir>` pointing at the ccache directory
+# actions/cache restored (see "Restore ccache" in github-ci.yml).
+FROM scratch AS ccache-seed
+
+# `--target ccache-out --output type=local,dest=<dir>` exports the compile
+# steps' ccache after a build on the same builder, for actions/cache to save.
+# A cache mount is never part of an image or of the registry buildcache, so a
+# second build that reads the mount by its id is the only way out of the
+# builder. FRR_SOURCE_REV only keeps this RUN from being cached on a builder
+# that already exported once.
+FROM ubuntu:$UBUNTU_VERSION AS ccache-export
+ARG FRR_SOURCE_REV=unknown
+RUN --mount=type=cache,id=frr-ccache,target=/ccache,uid=1010,gid=92,sharing=locked \
+    echo "Exporting ccache for ${FRR_SOURCE_REV}" && cp -a /ccache /ccache-out
+FROM scratch AS ccache-out
+COPY --from=ccache-export /ccache-out/ /
+
 FROM ubuntu:$UBUNTU_VERSION
 
 # If passed, update the value
@@ -230,6 +250,43 @@ RUN set -eux; \
     # tracer cannot do the one thing it was upgraded for.
     strace -e trace-fds=1 -o /dev/null true
 
+# ccache for the two FRR compile steps at the end, pinned and verified like
+# strace above. Not the distro package: --enable-gcov compiles everything with
+# -fprofile-update=atomic, which ccache only accepts from 4.10 on. jammy's
+# 4.5.1 and noble's 4.9.1 log "Unknown profiling option" and run the compiler
+# uncached, which on a 22.04 build was 1360 of ~1490 compiles. The
+# musl-static build runs unchanged on both releases. Its own layer below
+# every expensive one, so adding it did not invalidate the libyang and strace
+# builds above.
+#
+# /usr/local/lib/ccache holds gcc/g++/cc/c++ links to it. Only `make` and
+# `make check` below run with that directory first in PATH, so the image's
+# Makefiles record plain `gcc` and never depend on ccache (Unit-Test re-runs
+# `make check` from the image without it). configure runs without it: its
+# few hundred one-off test compiles are uncacheable or never repeat, and
+# through ccache they made configure 55 s slower on a 4-CPU builder (62 s ->
+# 117 s), most of what the cache saved in `make`.
+ARG CCACHE_VERSION=4.14.1
+ARG CCACHE_SHA256_X86_64=fa1443c9fbea879c9bff6619d1284eda3102992e91831b9f6e546879972195cc
+ARG CCACHE_SHA256_AARCH64=265d687c6d84a96cef851b57f804b21fc8268e53bfbc468441d029a5f7000a10
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64) sum="$CCACHE_SHA256_X86_64" ;; \
+      aarch64) sum="$CCACHE_SHA256_AARCH64" ;; \
+      *) echo "no pinned ccache for $arch" >&2; exit 1 ;; \
+    esac; \
+    pkg="ccache-${CCACHE_VERSION}-linux-${arch}-musl-static"; \
+    curl -fsSL --retry 5 --retry-connrefused -o /tmp/ccache.tar.xz \
+      "https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/${pkg}.tar.xz"; \
+    echo "${sum}  /tmp/ccache.tar.xz" | sha256sum -c -; \
+    tar -C /tmp -xf /tmp/ccache.tar.xz; \
+    install -m 0755 "/tmp/${pkg}/ccache" /usr/local/bin/ccache; \
+    rm -rf /tmp/ccache.tar.xz "/tmp/${pkg}"; \
+    mkdir -p /usr/local/lib/ccache; \
+    for c in gcc g++ cc c++; do ln -s ../../bin/ccache "/usr/local/lib/ccache/$c"; done; \
+    ccache --version | head -1
+
 # LTTng tracing dependencies (conditional).
 #
 # Deliberately the LAST root layer. ENABLE_LTTNG is a cache-key input for every
@@ -260,10 +317,62 @@ USER frr:frr
 # CI build arg used to invalidate the compile layer when source revision changes.
 ARG FRR_SOURCE_REV=unknown
 
+# ccache for the compile (`make`) and `make check` steps. FRR_SOURCE_REV
+# rebuilds both on every commit by design, but most translation units do not
+# change between two commits, so ccache turns their recompile into a cache read.
+#
+# The cache lives in a BuildKit cache mount, which is NOT exported with the
+# image or the registry buildcache, and CI builders are fresh per job. CI
+# carries it between runs with actions/cache: restored into the ccache-seed
+# context (copied into the empty mount below), and exported via the
+# ccache-out target after the build.
+#
+# Measured on a 4-CPU builder (22.04, master plus a one-line .c change, warm
+# run and no-ccache run side by side): compile step 278 s vs 368 s, `make
+# check` 234 s vs 281 s, 1148 of 1149 cacheable compiles hit. A miss costs
+# more than no ccache at all (ccache preprocesses before it compiles): with no
+# seed the compile step took 469 s. Master and buildcache-seed.yml runs save
+# the cache, so a pull request starts from the newest master entry and pays
+# that only for the files it changes; touching a header half the tree
+# includes gets close to the cold number.
+#
+# These are ARGs, not ENVs, so they reach the RUNs below without landing in
+# the image, which runs no compile through ccache (see the PATH note above).
+#
+# CCACHE_IGNOREOPTIONS: configure puts -DCONFDATE=<today> on every compile
+# line of a -dev version (Makefile.am DEFS), which would make yesterday's
+# cache miss on every file. Ignoring it is only safe in preprocessor mode
+# (CCACHE_NODIRECT): the two files that test `#if CONFDATE > ...` then still
+# hash differently once the date crosses their threshold, because the
+# preprocessed output differs. Direct mode would serve the stale object.
+#
+# The cache that leaves the builder holds only what this build used: a hit
+# refreshes an entry's mtime, so after `make check` everything older than the
+# frr-build-start marker is a seed entry this commit no longer compiles, and
+# is evicted. Without that, every master build would save the previous cache
+# plus its own, growing each actions/cache entry toward CCACHE_MAXSIZE. The
+# seed copy keeps its timestamps for the same reason: a plain cp -R would
+# stamp every restored entry as new.
+#
+# Source and build dir are always /home/frr/frr, so the cache is path-stable
+# without CCACHE_BASEDIR, and --coverage's .gcno files (which embed the cwd)
+# stay correct.
+ARG CCACHE_DIR=/home/frr/.ccache
+ARG CCACHE_MAXSIZE=2G
+ARG CCACHE_NODIRECT=1
+ARG CCACHE_IGNOREOPTIONS=-DCONFDATE=*
+
 COPY --chown=frr:frr . /home/frr/frr/
 
-RUN cd ~/frr && \
+RUN --mount=type=cache,id=frr-ccache,target=/home/frr/.ccache,uid=1010,gid=92,sharing=locked \
+    --mount=type=bind,from=ccache-seed,target=/tmp/ccache-seed \
+    cd ~/frr && \
     echo "Building FRR source revision: ${FRR_SOURCE_REV}" && \
+    if [ -z "$(ls -A "$CCACHE_DIR")" ] && [ -n "$(ls -A /tmp/ccache-seed)" ]; then \
+        cp -R --preserve=timestamps /tmp/ccache-seed/. "$CCACHE_DIR"/; \
+    fi && \
+    touch "$CCACHE_DIR/frr-build-start" && \
+    ccache -z && \
     ./bootstrap.sh && \
     LTTNG_OPT="" && \
     : "${ENABLE_LTTNG:?is not in scope: declare ARG ENABLE_LTTNG in this stage}" && \
@@ -289,10 +398,16 @@ RUN cd ~/frr && \
        --enable-scripting \
        $LTTNG_OPT \
        --with-pkg-extra-version=-my-manual-build && \
+    export PATH="/usr/local/lib/ccache:$PATH" && \
     make -j $(nproc) && \
+    ccache -s && \
     sudo make install
 
-RUN cd ~/frr && make check
+RUN --mount=type=cache,id=frr-ccache,target=/home/frr/.ccache,uid=1010,gid=92,sharing=locked \
+    cd ~/frr && export PATH="/usr/local/lib/ccache:$PATH" && \
+    ccache -z && make check && ccache -s && \
+    ccache --evict-older-than \
+        "$(( $(date +%s) - $(stat -c %Y "$CCACHE_DIR/frr-build-start") + 1 ))s"
 
 COPY docker/ubuntu-ci/docker-start /usr/sbin/docker-start
 CMD ["/usr/sbin/docker-start"]

@@ -354,6 +354,21 @@ jobs:
         with:
           path: docker/ubuntu-ci/mib-cache
           key: mib-cache-v1-ubuntu24
+      - name: Ensure ccache seed directory exists
+        # The build step names it as the ccache-seed build context, which must
+        # exist even when the restore below misses (first run, or evicted).
+        run: mkdir -p "${{ runner.temp }}/frr-ccache"
+      - name: Restore ccache
+        # Seeds the Dockerfile's ccache mount for the FRR compile and `make
+        # check` (see the ccache comment above its compile step). Every ref
+        # restores; only master writes (see "Save ccache"), so a PR reads the
+        # newest master entry through the prefix in restore-keys. A miss is a
+        # cold compile, as before this cache existed, never a failure.
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/frr-ccache
+          key: frr-ccache-v1-${{ matrix.cfg.platform }}-${{ github.sha }}
+          restore-keys: frr-ccache-v1-${{ matrix.cfg.platform }}-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Log in to Harbor
@@ -374,6 +389,7 @@ jobs:
             UBUNTU_VERSION=${{ matrix.cfg.rel }}
             ENABLE_LTTNG=${{ matrix.cfg.lttng || 'false' }}
             FRR_SOURCE_REV=${{ github.sha }}
+          build-contexts: ccache-seed=${{ runner.temp }}/frr-ccache
           # One exporter: a registry image, which `Unit-Test` and `Test` both
           # pull.  Moving them off Actions artifact storage deleted a 5-43 min
           # variance term for the same bytes (BLO-29817).
@@ -416,6 +432,33 @@ jobs:
           # the matrix comment above records: two runs exporting to one
           # registry cache ref overwrite each other's manifest.
           cache-from: type=registry,ref=registry.blockcast.net/cache/frr-ci:${{ matrix.cfg.platform }}-buildcache
+      - name: Export ccache
+        # The ccache lives in a BuildKit cache mount, which no image or
+        # registry buildcache carries; this second build on the same builder
+        # reads it by id and writes it out (the Dockerfile's ccache-out
+        # target). Into the restore path itself: actions/cache versions an
+        # entry by its path, so save and restore must name the same one.
+        #
+        # Master only, like the save. A pull_request entry would be scoped to
+        # that PR, useless to every other ref, and would count against the
+        # repository's 10 GB actions/cache budget that the MIB cache shares.
+        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
+        run: |
+          rm -rf "${{ runner.temp }}/frr-ccache"
+          docker buildx build \
+            --file docker/ubuntu-ci/Dockerfile \
+            --build-arg UBUNTU_VERSION=${{ matrix.cfg.rel }} \
+            --build-arg FRR_SOURCE_REV=${{ github.sha }} \
+            --target ccache-out \
+            --output type=local,dest="${{ runner.temp }}/frr-ccache" \
+            .
+          du -sh "${{ runner.temp }}/frr-ccache"
+      - name: Save ccache
+        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/frr-ccache
+          key: frr-ccache-v1-${{ matrix.cfg.platform }}-${{ github.sha }}
       - name: Clear any previous results
         # So if all jobs are re-run then all tests will be re-run.
         #
@@ -462,11 +505,14 @@ jobs:
     # runs alongside Test instead, and CI-Verdict needs it and requires it
     # to be 'success', so an LTTng failure still turns the run red.
     #
-    # Its steps are a COPY of Build's first five: keep them in lockstep.
+    # Its steps are a COPY of Build's first seven: keep them in lockstep.
     # They differ only in `outputs: type=cacheonly` (no image to push:
     # nothing pulls one), in reading Build's 24.04 cache after its own (see
     # the step), and in having no seed, upload or cleanup steps (no Test
-    # shard reads an LTTng result).  test_buildcache_freshness.py fails on
+    # shard reads an LTTng result).  It restores its ccache like Build but
+    # never exports or saves one: buildcache-seed.yml's LTTng leg saves the
+    # amd64_u24_lttng entry twice a day, which is fresh enough for a leg that
+    # gates nothing.  test_buildcache_freshness.py fails on
     # any other drift, and checks this matrix together with Build's against
     # buildcache-seed.yml's.
     # arc-dind, like Build: see the comment on its runs-on.
@@ -497,6 +543,21 @@ jobs:
         with:
           path: docker/ubuntu-ci/mib-cache
           key: mib-cache-v1-ubuntu24
+      - name: Ensure ccache seed directory exists
+        # The build step names it as the ccache-seed build context, which must
+        # exist even when the restore below misses (first run, or evicted).
+        run: mkdir -p "${{ runner.temp }}/frr-ccache"
+      - name: Restore ccache
+        # Seeds the Dockerfile's ccache mount for the FRR compile and `make
+        # check` (see the ccache comment above its compile step). Every ref
+        # restores; only master writes (see "Save ccache"), so a PR reads the
+        # newest master entry through the prefix in restore-keys. A miss is a
+        # cold compile, as before this cache existed, never a failure.
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/frr-ccache
+          key: frr-ccache-v1-${{ matrix.cfg.platform }}-${{ github.sha }}
+          restore-keys: frr-ccache-v1-${{ matrix.cfg.platform }}-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Log in to Harbor
@@ -517,6 +578,7 @@ jobs:
             UBUNTU_VERSION=${{ matrix.cfg.rel }}
             ENABLE_LTTNG=${{ matrix.cfg.lttng || 'false' }}
             FRR_SOURCE_REV=${{ github.sha }}
+          build-contexts: ccache-seed=${{ runner.temp }}/frr-ccache
           # Build and discard: the build is the signal, and no job pulls an
           # LTTng image.  Read-only cache, as in Build (see its comment).
           outputs: type=cacheonly
