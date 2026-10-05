@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: ISC
 
+import ast
 import json
 import os
 import pathlib
@@ -144,17 +145,18 @@ class WindowNeverOpened(Exception):
     Deliberately a bespoke type rather than pytest.fail()'s Failed. EVERY
     pytest.fail() in this module raises Failed -- the tracing_unavailable()
     funnel, both reap_stray_dimt_links() precondition failures, dplane_tid()
-    ("zebra_dplane worker not found" / "not uniquely resolved", reached from
-    both inject_netlink_syscall_failure() and _hold_dplane_syscalls()), their
-    strace attach failures and assert_injection_fired() -- so a marker
-    written raises=pytest.fail.Exception
-    absorbs all of them as a green xfail, a *setup-time* fixture failure
-    included. No marker absorbs this class today either: a window that cannot
-    be proven open fails the job, because a test that never opened its window
-    has not run. It stays a bespoke type so that any future marker can be
-    narrowed to exactly these guards, and a missing strace, a dirty kernel, a
-    missing dplane worker or a failed attach still fails loudly instead of
-    reading as "expected failure, blocker still open".
+    ("zebra_dplane worker not found" / "not uniquely resolved" / "not
+    parsed"), the two FD scans that aim an injection or a hold
+    (_route_netlink_fds(), _dplane_in_fd()), both _await_strace_attached()
+    failures ("strace attach failed", "strace never attached") and
+    assert_injection_fired() -- so a marker written
+    raises=pytest.fail.Exception absorbs all of them as a green xfail, a
+    *setup-time* fixture failure included. No marker absorbs this class today
+    either: a window that cannot be proven open fails the job, because a test
+    that never opened its window has not run. It stays a bespoke type so that
+    any future marker can be narrowed to exactly these guards, and a missing
+    strace, a dirty kernel, a missing dplane worker or a failed attach still
+    fails loudly instead of reading as "expected failure, blocker still open".
 
     It keeps the property that made pytest.fail() right in the first place: it
     is NOT an AssertionError, so a raises=AssertionError marker cannot swallow
@@ -888,7 +890,12 @@ def dplane_tid(router, purpose):
             "zebra_dplane worker not found: zebra {} has no zebra_dplane "
             "thread -- {}".format(zebra_pid, purpose)
         )
-    if len(tids) != 1 or not tids[0].isdigit():
+    if not all(tid.isdigit() for tid in tids):
+        pytest.fail(
+            "zebra_dplane worker not parsed: the task scan of zebra {} "
+            "returned {}, not TIDs -- {}".format(zebra_pid, tids, purpose)
+        )
+    if len(tids) != 1:
         pytest.fail(
             "zebra_dplane worker not uniquely resolved: expected one "
             "zebra_dplane TID in zebra {}, found {}: {} -- {}".format(
@@ -2375,6 +2382,48 @@ def test_acknowledged_gre_in_fou_lifecycle():
     removed = request("del", 2)
     assert removed["result"] == 2, removed
 
+
+def test_pytest_fail_owners_are_documented():
+    """WindowNeverOpened's docstring lists every function here that calls
+    pytest.fail(), because its argument (that a raises=pytest.fail.Exception
+    marker would absorb them all) depends on the list being complete. The
+    list went stale once already; in a topotest run (setup_module() and the
+    autouse reaper still run first), a new pytest.fail() owner missing from
+    it fails here instead of falsifying the docstring silently.
+    """
+    with open(__file__) as source:
+        tree = ast.parse(source.read())
+
+    def calls_pytest_fail(fn):
+        # Only fn's own calls: a nested def owns the calls inside it.
+        todo = list(fn.body)
+        while todo:
+            node = todo.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "fail"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "pytest"):
+                return True
+            todo.extend(ast.iter_child_nodes(node))
+        return False
+
+    owners = {
+        fn.name
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and calls_pytest_fail(fn)
+    }
+    assert owners, (
+        "found no pytest.fail() call in this module: the check itself stopped "
+        "matching (is pytest.fail now imported under another name?)")
+    documented = " ".join(WindowNeverOpened.__doc__.split())
+    missing = sorted(name for name in owners if name + "()" not in documented)
+    assert not missing, (
+        "pytest.fail() owners missing from WindowNeverOpened's docstring: "
+        "{}".format(missing))
 
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
