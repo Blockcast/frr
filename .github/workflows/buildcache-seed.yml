@@ -225,7 +225,16 @@ jobs:
         # Master only, like the save. A pull_request entry would be scoped to
         # that PR, useless to every other ref, and would count against the
         # repository's 10 GB actions/cache budget that the MIB cache shares.
+        #
+        # The cache is an optimization on the write side too: a failed export
+        # (builder hiccup, no space for the local output) must not turn the job
+        # red after the image is already built. `nonempty` is written only after
+        # a complete export that produced files, and "Save ccache" requires it,
+        # so an empty or half-written directory never becomes the newest entry
+        # that every restore-keys prefix match returns.
+        id: ccache-export
         if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
+        continue-on-error: true
         run: |
           rm -rf "${{ runner.temp }}/frr-ccache"
           docker buildx build \
@@ -236,8 +245,13 @@ jobs:
             --output type=local,dest="${{ runner.temp }}/frr-ccache" \
             .
           du -sh "${{ runner.temp }}/frr-ccache"
+          if [ -n "$(ls -A "${{ runner.temp }}/frr-ccache")" ]; then
+            echo "nonempty=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::ccache export is empty; not saving it"
+          fi
       - name: Save ccache
-        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
+        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && steps.ccache-export.outputs.nonempty == 'true' }}
         uses: actions/cache/save@v5
         with:
           path: ${{ runner.temp }}/frr-ccache

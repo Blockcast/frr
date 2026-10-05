@@ -345,6 +345,9 @@ ARG FRR_SOURCE_REV=unknown
 # (CCACHE_NODIRECT): the two files that test `#if CONFDATE > ...` then still
 # hash differently once the date crosses their threshold, because the
 # preprocessed output differs. Direct mode would serve the stale object.
+# The compile RUN asserts direct_mode is false, so the two cannot drift apart.
+# (CCACHE_NODIRECT is not an on/off switch: ccache 4.5 and 4.9 reject =0 as an
+# invalid boolean, which the assert also catches.)
 #
 # The cache that leaves the builder holds only what this build used: a hit
 # refreshes an entry's mtime, so after `make check` everything older than the
@@ -373,6 +376,8 @@ RUN --mount=type=cache,id=frr-ccache,target=/home/frr/.ccache,uid=1010,gid=92,sh
     fi && \
     touch "$CCACHE_DIR/frr-build-start" && \
     ccache -z && \
+    { ccache --get-config direct_mode | grep -qx false || \
+      { echo "ccache direct mode is on: CCACHE_IGNOREOPTIONS=-DCONFDATE=* would serve stale objects across CONFDATE thresholds" >&2; exit 1; }; } && \
     ./bootstrap.sh && \
     LTTNG_OPT="" && \
     : "${ENABLE_LTTNG:?is not in scope: declare ARG ENABLE_LTTNG in this stage}" && \
