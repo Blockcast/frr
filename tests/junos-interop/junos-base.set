@@ -1,8 +1,8 @@
 ## Junos GTM-SSM MVPN interop base config (BLO-15579).
 ##
 ## Loaded with `load set /var/tmp/...` inside `configure exclusive`, committed with
-## `commit confirmed`, and rolled back by the harness on exit.  Nothing here is
-## meant to survive the run.
+## `commit confirmed`, and undone on exit by `load override` of the config the
+## harness saved in G2.  Nothing here is meant to survive the run.
 ##
 ## @@PLACEHOLDER@@ tokens are substituted by mvpn-gtm-interop.sh:
 ##   @@AS@@          local AS (iBGP both sides)
@@ -18,14 +18,18 @@
 ## Junos error so one edit here fixes it -- no round-trip through the script.
 ## Reviewers: this is the file to read; you do not need to read the bash.
 
-set system host-name @@JUNOS_RID_HOST@@
+## No `system` statements: the box is shared, and a host-name would be the one
+## change still visible to the next user if a restore ever failed.
 
 ## --- BGP: iBGP to FRR, MCAST-VPN AF in the master instance (this is what makes
 ## --- it Global Table Multicast rather than VRF MVPN: no routing-instance).
 set routing-options autonomous-system @@AS@@
 set routing-options router-id @@JUNOS_RID@@
 set routing-options multicast ssm-groups @@V4_GRP@@/32
-set routing-options multicast ssm-groups @@V6_GRP@@/128
+## No IPv6 entry, dropped rather than moved: `ssm-groups` above is the IPv4 list,
+## and the v6 group under test (ff3e::1 by default) lies inside both FF3x::/96
+## and FF3x::/32 (RFC 4607), so the default IPv6 SSM range already covers it,
+## whichever of the two Junos applies.
 
 set protocols bgp group blo15579 type internal
 set protocols bgp group blo15579 local-address @@JUNOS_RID@@
@@ -45,13 +49,10 @@ set protocols mvpn receiver-site
 set protocols pim interface @@LAN_IFL@@ mode sparse
 set protocols pim interface lo0.0 mode sparse
 
-## --- Junos-side receiver joins.  These are the Junos->FRR Type-7 legs; the
-## --- harness deactivates/activates these stanzas to drive join and leave
-## --- without reloading the whole config.
-set protocols igmp interface @@LAN_IFL@@ version 3
-set protocols igmp interface @@LAN_IFL@@ static group @@V4_GRP@@ source @@V4_SRC@@
-set protocols mld interface @@LAN_IFL@@ version 2
-set protocols mld interface @@LAN_IFL@@ static group @@V6_GRP@@ source @@V6_SRC@@
+## --- No Junos-side receiver joins here, on purpose.  The type7-*-junos-to-frr
+## --- cells add the IGMP/MLD static (S,G) joins and the withdraw-type7-* cells
+## --- delete them.  A join in this file would be live from the G4 commit, so
+## --- the join cell would change nothing and the leave cell could never pass.
 
 ## --- Junos-side source, so Junos originates a Type-5 Source Active that FRR
 ## --- must learn (the Junos->FRR Type-5 leg).

@@ -1,0 +1,17 @@
+
+bgp.mvpn.0: 3 destinations, 3 routes (0 active, 0 holddown, 3 hidden)
+1:10.255.0.1:0:10.255.0.1/240 (1 entry, 0 announced)
+         BGP                 /-101
+                Next hop type: Indirect
+                State: <Hidden Int Ext>
+                Communities: target:10.255.0.1:0
+5:10.255.0.1:0:32:10.199.99.1:32:232.1.1.10/240 (1 entry, 0 announced)
+         BGP                 /-101
+                State: <Hidden Int Ext>
+                Communities: target:10.255.0.1:0
+7:10.255.0.1:65001:32:10.199.99.1:32:232.1.1.10/240 (1 entry, 0 announced)
+         BGP                 /-101
+                State: <Hidden Int Ext>
+                Communities: target:10.255.0.1:0
+
+bgp.mvpn6.0: 0 destinations, 0 routes (0 active, 0 holddown, 0 hidden)

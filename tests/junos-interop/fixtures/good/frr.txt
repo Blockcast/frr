@@ -18,13 +18,13 @@ BGP neighbor is 198.51.100.120, remote AS 65001, local AS 65001, internal link
 MCAST-VPN routes for IPv4:
  [1] originator 10.255.0.1 RT:10.255.0.1:0 PMSI:IR label 1000 endpoint 10.255.0.1
  [1] originator 198.51.100.120 RT:198.51.100.120:0 PMSI:IR label 16 endpoint 198.51.100.120
- [5] source 10.199.99.1 group 232.1.1.10 originator 10.255.0.1 RT:10.255.0.1:0
- [7] source 10.199.99.1 group 232.1.1.10 originator 198.51.100.120 sourceAs 65001 RT:198.51.100.120:0
+ [5] source 10.199.99.1 group 232.1.1.10 (local) RT:10.255.0.1:0
+ [7] source 10.199.99.1 group 232.1.1.10 (local) RT:198.51.100.120:0
 
 MCAST-VPN routes for IPv6:
  [1] originator 10.255.0.1 RT:10.255.0.1:0 PMSI:IR label 1000
- [5] source 2001:db8:1557::1 group ff3e::1 originator 10.255.0.1 RT:10.255.0.1:0
- [7] source 2001:db8:1557::1 group ff3e::1 originator 198.51.100.120 sourceAs 65001 RT:198.51.100.120:0
+ [5] source 2001:db8:1557::1 group ff3e::1 (local) RT:10.255.0.1:0
+ [7] source 2001:db8:1557::1 group ff3e::1 (local) RT:198.51.100.120:0
 
 IP Multicast Routing Table
 Source          Group           Flags Proto  Input      Output     TTL  Uptime
