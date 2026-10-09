@@ -1,0 +1,59 @@
+## Junos GTM-SSM MVPN interop base config (BLO-15579).
+##
+## Loaded with `load set /var/tmp/...` inside `configure exclusive`, committed with
+## `commit confirmed`, and rolled back by the harness on exit.  Nothing here is
+## meant to survive the run.
+##
+## @@PLACEHOLDER@@ tokens are substituted by mvpn-gtm-interop.sh:
+##   @@AS@@          local AS (iBGP both sides)
+##   @@JUNOS_RID@@   Junos router-id / local-address
+##   @@FRR_PEER@@    address Junos sees the FRR speaker as (the lab host, post-NAT)
+##   @@V4_SRC@@ @@V4_GRP@@   IPv4 SSM (S,G) under test
+##   @@V6_SRC@@ @@V6_GRP@@   IPv6 SSM (S,G) under test
+##   @@LAN_IFL@@     Junos interface used as the receiver stub for Junos-side joins
+##
+## UNVERIFIED AGAINST A LIVE BOX.  This file is the harness's single Junos-syntax
+## risk, which is why step 0 gate G3 runs `commit check` on it before anything
+## else is built or committed.  A rejected stanza is reported verbatim with its
+## Junos error so one edit here fixes it -- no round-trip through the script.
+## Reviewers: this is the file to read; you do not need to read the bash.
+
+set system host-name @@JUNOS_RID_HOST@@
+
+## --- BGP: iBGP to FRR, MCAST-VPN AF in the master instance (this is what makes
+## --- it Global Table Multicast rather than VRF MVPN: no routing-instance).
+set routing-options autonomous-system @@AS@@
+set routing-options router-id @@JUNOS_RID@@
+set routing-options multicast ssm-groups @@V4_GRP@@/32
+set routing-options multicast ssm-groups @@V6_GRP@@/128
+
+set protocols bgp group blo15579 type internal
+set protocols bgp group blo15579 local-address @@JUNOS_RID@@
+set protocols bgp group blo15579 family inet unicast
+set protocols bgp group blo15579 family inet6 unicast
+set protocols bgp group blo15579 family inet-mvpn signaling
+set protocols bgp group blo15579 family inet6-mvpn signaling
+set protocols bgp group blo15579 neighbor @@FRR_PEER@@
+
+## --- MVPN in the master instance.  `mvpn-mode spt-only` is the GTM/SSM shape:
+## --- no shared tree, no RP, C-multicast joins are Type-7 Source Tree Joins.
+set protocols mvpn mvpn-mode spt-only
+set protocols mvpn receiver-site
+
+## --- PIM is required for Junos to build the local (S,G) that drives a
+## --- Junos-originated Type-7.  SSM only; no RP.
+set protocols pim interface @@LAN_IFL@@ mode sparse
+set protocols pim interface lo0.0 mode sparse
+
+## --- Junos-side receiver joins.  These are the Junos->FRR Type-7 legs; the
+## --- harness deactivates/activates these stanzas to drive join and leave
+## --- without reloading the whole config.
+set protocols igmp interface @@LAN_IFL@@ version 3
+set protocols igmp interface @@LAN_IFL@@ static group @@V4_GRP@@ source @@V4_SRC@@
+set protocols mld interface @@LAN_IFL@@ version 2
+set protocols mld interface @@LAN_IFL@@ static group @@V6_GRP@@ source @@V6_SRC@@
+
+## --- Junos-side source, so Junos originates a Type-5 Source Active that FRR
+## --- must learn (the Junos->FRR Type-5 leg).
+set routing-options static route @@V4_SRC@@/32 discard
+set routing-options rib inet6.0 static route @@V6_SRC@@/128 discard

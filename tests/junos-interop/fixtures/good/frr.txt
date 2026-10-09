@@ -1,0 +1,31 @@
+BGP router identifier 10.255.0.1, local AS number 65001 vrf-id 0
+Neighbor        V   AS   MsgRcvd   MsgSent   Up/Down  State/PfxRcd
+198.51.100.120    4 65001      118       121  00:21:44            6
+
+BGP neighbor is 198.51.100.120, remote AS 65001, local AS 65001, internal link
+  BGP version 4, remote router ID 198.51.100.120, local router ID 10.255.0.1
+  BGP state = Established, up for 00:21:44
+  Local host: 203.0.113.9, Local port: 44312
+  Foreign host: 198.51.100.120, Foreign port: 179
+  Neighbor capabilities:
+    Address Family IPv4 Unicast: advertised and received
+    Address Family IPv6 Unicast: advertised and received
+    Address Family IPv4 MCAST-VPN: advertised and received
+    Address Family IPv6 MCAST-VPN: advertised and received
+  "connectionsEstablished": 1,
+  "connectionsDropped": 0,
+
+MCAST-VPN routes for IPv4:
+ [1] originator 10.255.0.1 RT:10.255.0.1:0 PMSI:IR label 1000 endpoint 10.255.0.1
+ [1] originator 198.51.100.120 RT:198.51.100.120:0 PMSI:IR label 16 endpoint 198.51.100.120
+ [5] source 10.199.99.1 group 232.1.1.10 originator 10.255.0.1 RT:10.255.0.1:0
+ [7] source 10.199.99.1 group 232.1.1.10 originator 198.51.100.120 sourceAs 65001 RT:198.51.100.120:0
+
+MCAST-VPN routes for IPv6:
+ [1] originator 10.255.0.1 RT:10.255.0.1:0 PMSI:IR label 1000
+ [5] source 2001:db8:1557::1 group ff3e::1 originator 10.255.0.1 RT:10.255.0.1:0
+ [7] source 2001:db8:1557::1 group ff3e::1 originator 198.51.100.120 sourceAs 65001 RT:198.51.100.120:0
+
+IP Multicast Routing Table
+Source          Group           Flags Proto  Input      Output     TTL  Uptime
+10.199.99.1     232.1.1.10      SG    BGP    eth0       rx0          1  00:03:11
