@@ -50,6 +50,13 @@ lock at that moment, but another session can still commit between two of ours. T
 why the restore below is an absolute snapshot rather than a count of commits. It is safe
 to re-run.
 
+Two *harness* runs against one box is the case `configure exclusive` does not cover, so
+G2 refuses to start while another run's `/var/tmp/blo15579-baseline-*.conf` is present.
+Without that the second run would capture the first run's harness config as its own
+"baseline", restore the box to that, and report `junos-left-unchanged` **PASS** over a
+box that is still mutated. If a crashed run left a stale file, check the box is actually
+back on its real config, then delete the file.
+
 ## What it does to the Junos, and how you can check
 
 - Every commit is `commit confirmed $CONFIRM_MIN`, derived from `HOLD_SECONDS` and
@@ -58,10 +65,18 @@ to re-run.
   dropped SSH session, `kill -9`), the box **reverts itself within that window** with
   no further action from anyone.
 - Before its first commit (gate G2) it saves the running config on the box as
-  `/var/tmp/blo15579-baseline.conf`; on exit it restores that with `load override` and
-  `commit`, transcript in `junos-cleanup.txt`. A `rollback <n>` would name the wrong
-  revision if anything else committed in between. The flip side: a commit another
-  session makes during the run is undone too.
+  `/var/tmp/blo15579-baseline-<run timestamp>.conf`; on exit it restores that with
+  `load override` and `commit`, transcript in `junos-cleanup.txt`. A `rollback <n>` would
+  name the wrong revision if anything else committed in between. The flip side: a commit
+  another session makes during the run is undone too.
+- **If the restore point is not on the box, cleanup refuses to commit at all.** The Junos
+  CLI does not abort a stdin script when a line errors, so a `commit` following a failed
+  `load override` would commit an *unchanged* candidate — which is exactly how a pending
+  `commit confirmed` gets **confirmed**, turning the auto-revert safety net into the thing
+  that makes the harness config permanent. Letting the timer fire is strictly better. The
+  summary then says `NOT RESTORED` and names the file to `load override` by hand; it never
+  claims a restore it did not verify.
+
 - It then re-downloads the running config and **diffs it against the baseline it captured
   before touching anything**. That diff is in the artifact as `junos-config.diff`, and
   `junos-left-unchanged` is a cell in the verdict table like any other.

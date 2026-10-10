@@ -77,8 +77,10 @@ JUNOS_COMMITS=0
 # Absolute, not `rollback $JUNOS_COMMITS`: `configure exclusive` lasts one ssh
 # call, so another session's commit (or a confirmed-commit expiry) can land
 # between ours, and a count would then name the wrong revision.
-JUNOS_RESTORE=/var/tmp/blo15579-baseline.conf
+JUNOS_RESTORE="/var/tmp/blo15579-baseline-$TS.conf"
+JUNOS_RESTORE_GLOB='/var/tmp/blo15579-baseline-*.conf'
 RESULTS=()   # "VERDICT<TAB>cell<TAB>note"
+JUNOS_RESTORED=0   # set by main() once the restore is VERIFIED, never assumed
 
 # ------------------------------------------------------------------ sanitize
 # Applied to every captured byte before it reaches the artifact.  Built from the
@@ -93,6 +95,8 @@ sanitize() {
       -e "s#${JUNOS_KEY:-__nokey__}#<JUNOS-KEY>#g" \
       -e "s#$JUNOS_USER@#<JUNOS-USER>@#g" \
       -e "s#${LOCAL_ADDR:-__nolocal__}#<LAB-HOST-ADDR>#g" \
+      -e "s#${JUNOS_LAN_IFL:-__noifl__}#<JUNOS-IFL>#g" \
+      -e "s#${JUNOS_RID:-__norid__}#<JUNOS-RID>#g" \
       -e 's#\b\([0-9a-fA-F]\{2\}:\)\{5\}[0-9a-fA-F]\{2\}\b#<MAC>#g' \
       -e 's#\(ssh-rsa\|ssh-ed25519\) [A-Za-z0-9+/=]\{20,\}#\1 <PUBKEY>#g'
 }
@@ -171,6 +175,20 @@ if (( DRY_RUN )); then
       *"| save $JUNOS_RESTORE")
         cp "$PRIV/.junos-live.set" "$PRIV/.junos-saved.set"
         echo "Wrote $(wc -l <"$PRIV/.junos-live.set") lines of configuration to '$JUNOS_RESTORE'" ;;
+      # Checked before the generic arm below: at G2 this asks "is ANOTHER run's
+      # restore point here?", which must answer no on a clean box even though this
+      # run's own file is about to exist.  DRY_STALE_RESTORE models a collision.
+      *"file list $JUNOS_RESTORE_GLOB")
+        if [[ -n "${DRY_STALE_RESTORE:-}" ]]
+        then echo "/var/tmp/blo15579-baseline-20260101T000000Z.conf"
+        else echo "$JUNOS_RESTORE_GLOB: No such file or directory"; fi ;;
+      # Junos prints the path either way; the error text is the only discriminator,
+      # which is why cleanup_junos tests for both.  DRY_NO_RESTORE models the
+      # restore point having been reaped out from under us.
+      *"file list "*)
+        if [[ -e "$PRIV/.junos-saved.set" && -z "${DRY_NO_RESTORE:-}" ]]
+        then echo "$JUNOS_RESTORE"
+        else echo "$JUNOS_RESTORE: No such file or directory"; fi ;;
       *" hidden "*)       fx junos-hidden ;;
       *) fx junos
          if [[ "$*" =~ table\ (bgp\.mvpn6?\.0)\ detail ]]; then live7 "${BASH_REMATCH[1]}"; fi ;;
@@ -179,6 +197,10 @@ if (( DRY_RUN )); then
   # stdin = the configure-mode script cleanup_junos sends.  Only `load override`
   # is modelled: a rollback count is right only if no other session committed in
   # between, which nothing here can promise, so the model does not offer one.
+  # `commit` reports success unconditionally ON PURPOSE -- on a real box a commit
+  # of an unchanged candidate also succeeds, and *confirms* the pending
+  # `commit confirmed`.  So the transcript check alone cannot save us; the
+  # refusal in cleanup_junos, before anything is sent, is what does.
   jcli() {
     local l
     while read -r l; do
@@ -202,13 +224,32 @@ if (( DRY_RUN )); then
     done <"$PRIV/.junos-load.set"
     echo "commit complete"
   }
+  # The session counter has to MOVE when something restarts, or the restart cells'
+  # "did anything actually restart?" check has nothing to read and a static fixture
+  # would let "nothing restarted" pass.  DRY_NO_RESTART freezes it: that is the
+  # mutation test for the check.
+  DRY_ESTAB=1
   frrcmd() {
     stub_ok "$1" || return
+    case "$1" in
+      *"neighbor $JUNOS_RID json") echo "  \"connectionsEstablished\": $DRY_ESTAB,"; return 0 ;;
+      "clear bgp "*) [[ -n "${DRY_NO_RESTART:-}" ]] || DRY_ESTAB=$((DRY_ESTAB + 1)); return 0 ;;
+      # Only the rx0 stanza matters to G6, and running-config is FRR's own view of
+      # gm_enable (pim_vty.c only emits these two when it is set), not an echo of
+      # frr-base.conf.  DRY_NO_GM drops them: the mutation test for that gate.
+      "show running-config")
+        echo "interface rx0"; echo " ip pim"; echo " ipv6 pim"
+        [[ -n "${DRY_NO_GM:-}" ]] || { echo " ip igmp"; echo " ipv6 mld"; }
+        echo "!"; return 0 ;;
+    esac
     fx frr
     case "$1" in "show bgp ipv4 mvpn") rx igmp ;; "show bgp ipv6 mvpn") rx mld ;; esac
   }
   frr_up() { echo "dry-run: FRR container not started"; }
-  frr_restart_bgpd() { echo "dry-run: bgpd restart"; }
+  frr_restart_bgpd() {
+    echo "dry-run: bgpd restart"
+    [[ -n "${DRY_NO_RESTART:-}" ]] || DRY_ESTAB=$((DRY_ESTAB + 1))
+  }
   sleep() { :; }
 else
   jcmd() { ssh "${ssh_opts[@]}" "$JUNOS_USER@$JUNOS_HOST" "$@" 2>&1; }
@@ -246,15 +287,41 @@ else
 fi
 
 # Shared by the real run and the dry-run, so the self-check exercises it.
+# Returns 0 only when the box is VERIFIABLY back on the G2 restore point.
+#
+# The bare `commit` is the hazard.  jcommit() arms `commit confirmed`, and the
+# Junos CLI does not abort a stdin script when a line errors -- so if
+# `load override` fails (restore point reaped, /var/tmp cleared, the G2 save
+# having landed elsewhere) the candidate is still the harness config and the
+# next line's `commit` CONFIRMS the pending auto-revert, turning the safety net
+# into the thing that makes the mutation permanent.  A commit of an unchanged
+# candidate succeeds, so no transcript check can catch that after the fact:
+# the only defence is to not send `commit` at all unless the restore point is
+# known to be there.  Letting the timer fire is strictly better than confirming.
 cleanup_junos() {
   (( JUNOS_COMMITS == 0 )) && return 0
-  printf 'configure exclusive\nload override %s\ncommit\nexit\n' "$JUNOS_RESTORE" | jcmd
+  local o
+  o="$(jcmd "file list $JUNOS_RESTORE" 2>&1 || true)"
+  if ! grep -qF "$JUNOS_RESTORE" <<<"$o" || grep -qi 'no such file' <<<"$o"; then
+    echo "!!!!! restore point $JUNOS_RESTORE is not on the box -- NOT committing."
+    echo "!!!!! Sending a bare commit now would confirm the pending 'commit confirmed'"
+    echo "!!!!! and make the harness config permanent.  Leaving the ${CONFIRM_MIN}-minute"
+    echo "!!!!! timer to auto-revert instead.  file list said: $o"
+    return 1
+  fi
+  o="$(printf 'configure exclusive\nload override %s\ncommit\nexit\n' "$JUNOS_RESTORE" | jcmd 2>&1 || true)"
+  echo "$o"
+  grep -q 'commit complete' <<<"$o"
 }
 
 cleanup() {
   local rc=$?
   log "cleanup: restoring Junos from $JUNOS_RESTORE ($JUNOS_COMMITS commit(s) made), removing container"
-  cleanup_junos 2>&1 | sanitize >>"$OUT/junos-cleanup.txt" || true
+  if cleanup_junos 2>&1 | sanitize >>"$OUT/junos-cleanup.txt"; then
+    (( JUNOS_COMMITS == 0 )) || log "cleanup: Junos restore verified"
+  else
+    log "cleanup: JUNOS NOT RESTORED -- 'load override $JUNOS_RESTORE' by hand; see junos-cleanup.txt"
+  fi
   (( DRY_RUN )) || docker rm -f "$CNAME" >/dev/null 2>&1 || true
   rm -rf "$PRIV"
   return $rc
@@ -346,6 +413,10 @@ record() { RESULTS+=("$1	$2	$3"); log "$1 $2 ${3:+-- $3}"; }
 # cells are expressed, and it is the only way a withdraw can actually be proven.
 cell() {
   local name="$1" frr_do="$2" junos_do="$3" exp_frr="$4" exp_junos="$5"
+  # DRY_MISSCOPE (dry-run L): point one Junos expectation at a heading only the FRR
+  # section emits.  Per-box scoping must FAIL it; without scoping it is satisfied
+  # off the wrong box and PASSes.  That is the mutation test for sect().
+  [[ -n "${DRY_MISSCOPE:-}" && "$name" == type1-ipmsi-bidir ]] && exp_junos='MCAST-VPN routes for IPv4'
   if [[ -n "$frr_do" ]] && ! frrcmd "configure terminal
 $frr_do" >/dev/null; then record FAIL "$name" "frr config rejected"; return; fi
   if [[ -n "$junos_do" ]]; then
@@ -357,30 +428,36 @@ $frr_do" >/dev/null; then record FAIL "$name" "frr config rejected"; return; fi
   local body; body="$(cat "$OUT/cells/$name.txt")"
   # A hidden route must not satisfy a presence check, but is named when it would
   # have, since its fix differs.  Absence reads both views: withdrawn means gone.
-  local active hidden
-  active="$(awk '/^=====/{h = / hidden /} !h' <<<"$body")"
-  hidden="$(awk '/^=====/{h = / hidden /} h' <<<"$body")"
+  # Sections are also scoped to the box that produced them, so `frr:` / `junos:`
+  # is a scope rather than a naming convention: both views are greppable from one
+  # string, so an expectation that is not format-distinctive (a bare group
+  # address, say) would otherwise be satisfiable from the wrong box.
+  sect() {  # sect <frr#|junos>> <0 active | 1 hidden | 2 either>
+    awk -v p="===== $1" -v want="$2" \
+      '/^=====/{ s = (substr($0, 1, length(p)) == p); h = (/ hidden / ? 1 : 0) }
+       s && (want == 2 || h == want)' <<<"$body"
+  }
   local why=""
   # Every arm ends `return 0` on purpose.  A bare `grep ... && why=...` whose grep
   # misses leaves the function's status at 1, and under `set -e` that aborts the
   # whole run -- silently, and *only* on the withdraw cells, whose entire job is
   # for that grep to miss.  A harness that dies on its own success path reports
   # fewer cells rather than a failure, which is the worst direction.
-  check() {  # check <expect> <label>
-    local e="$1" label="$2"
+  check() {  # check <expect> <label> <section-prefix>
+    local e="$1" label="$2" p="$3"
     if [[ -n "$e" ]]; then
       if [[ "${e:0:1}" == "!" ]]; then
-        if grep -qE -- "${e:1}" <<<"$body"; then why="$why $label:unexpectedly-present(${e:1})"; fi
+        if grep -qE -- "${e:1}" <<<"$(sect "$p" 2)"; then why="$why $label:unexpectedly-present(${e:1})"; fi
       else
-        if grep -qE -- "$e" <<<"$active"; then :
-        elif grep -qE -- "$e" <<<"$hidden"; then why="$why $label:hidden($e)"
+        if grep -qE -- "$e" <<<"$(sect "$p" 0)"; then :
+        elif grep -qE -- "$e" <<<"$(sect "$p" 1)"; then why="$why $label:hidden($e)"
         else why="$why $label:missing($e)"; fi
       fi
     fi
     return 0
   }
-  check "$exp_frr" frr
-  check "$exp_junos" junos
+  check "$exp_frr" frr 'frr#'
+  check "$exp_junos" junos 'junos>'
   # A failed show leaves a hole that a '!' (absence) expectation reads as proof.
   if grep -q '^!!!!! show failed' <<<"$body"; then why="$why show-failed"; fi
   # Session-reset accounting, on every cell except the two that restart on purpose.
@@ -388,7 +465,13 @@ $frr_do" >/dev/null; then record FAIL "$name" "frr config rejected"; return; fi
   if [[ -z "$n" ]]; then
     why="$why session-counter-unreadable"
   elif [[ "$name" == restart-* ]]; then
-    BASE_ESTAB="$n"
+    # Both restart triggers are deliberately non-fatal (pkill matching no bgpd,
+    # a rejected `clear bgp`), so a run in which nothing actually restarted would
+    # leave the counter unmoved and re-baseline onto it -- and these two cells are
+    # the only evidence the session recovers.  connectionsEstablished only ever
+    # increases, so requiring it to move is what stops "never disturbed" passing.
+    if (( n > BASE_ESTAB )); then BASE_ESTAB="$n"
+    else why="$why no-restart-observed($BASE_ESTAB->$n)"; fi
   elif [[ "$n" != "$BASE_ESTAB" ]]; then
     why="$why session-reset($BASE_ESTAB->$n)"
   fi
@@ -418,6 +501,19 @@ step0() {
     || { record FAIL step0-G2-baseline "could not read the Junos config; see junos-baseline.set"; return 1; }
   # junos-baseline.set is sanitized, so it cannot be loaded back; save a raw copy on
   # the box itself.  No restore point, no commits.
+  #
+  # The path carries $TS because a fixed one lets two runs against the same box
+  # collide: the second run's G2 would capture the FIRST run's harness config as
+  # its baseline, restore the box to that, and report junos-left-unchanged PASS
+  # over a box that is still mutated.  Timestamping stops the clobber; refusing to
+  # start while another run's restore point is present stops the false baseline,
+  # which timestamping alone does not.
+  o="$(jcmd "file list $JUNOS_RESTORE_GLOB" 2>&1 || true)"
+  if grep -qF '/var/tmp/blo15579-baseline-' <<<"$o" && ! grep -qi 'no such file' <<<"$o"; then
+    log "$o"
+    record FAIL step0-G2-baseline "another blo15579 run's restore point is on the box; its baseline would be this run's mutations. Finish or clean up that run first (see run.log)"
+    return 1
+  fi
   o="$(jcmd "show configuration | save $JUNOS_RESTORE" 2>&1 | sanitize)"
   grep -qi '^wrote' <<<"$o" \
     || { log "$o"; record FAIL step0-G2-baseline "could not save the restore point $JUNOS_RESTORE; see run.log"; return 1; }
@@ -457,6 +553,26 @@ step0() {
   else
     record PASS step0-G4-session ""
   fi
+
+  gate G4b "the rx0 receiver stub is GM-enabled, so join-group becomes local membership rather than a silent no-op"
+  # `ip pim` alone leaves gm_enable false.  join-group only needs pim_ifp, so it is
+  # ACCEPTED and even issues a socket join, but pim_if_membership_refresh() returns
+  # early on !gm_enable: FRR never reaches JOINED, originates no Type-7, and six of
+  # the fourteen cells fail for a reason that is not interop.  The dry-run cannot
+  # see this (no FRR, no container), which is exactly what a step-0 gate is for --
+  # an operator round-trip is the scarcest input here.
+  # running-config emits these two only when gm_enable is set (pim_vty.c
+  # gm_config_write), so this reads FRR's state, not an echo of frr-base.conf.
+  local rx0; rx0="$(frrcmd "show running-config" 2>/dev/null \
+    | awk '/^interface rx0$/{f=1;next} /^interface |^router /{f=0} f')"
+  why=""
+  grep -qx ' ip igmp'  <<<"$rx0" || why="$why rx0-igmp-not-enabled"
+  grep -qx ' ipv6 mld' <<<"$rx0" || why="$why rx0-mld-not-enabled"
+  if [[ -n "$why" ]]; then
+    record FAIL step0-G4b-receiver-stub "$why -- join-group would be accepted but never become membership; see frr-base.conf"
+    return 1
+  fi
+  record PASS step0-G4b-receiver-stub ""
 
   gate G5 "hold the session ${HOLD_SECONDS}s -- commit check is not a sustained session, and the box reports no installed licenses"
   sleep "$HOLD_SECONDS"
@@ -582,7 +698,16 @@ summarize() {
     echo "| FRR commit | \`$FRR_SHA\` |"
     echo "| FRR image | \`$FRR_IMAGE\` |"
     echo "| Junos | see \`junos-baseline-state.txt\` |"
-    echo "| Junos commits made, then restored | ${JUNOS_MADE:-0} |"
+    echo "| Junos commits made | ${JUNOS_MADE:-0} |"
+    # Reported from the verified restore, never assumed: an operator holding only
+    # the tarball has to be able to tell a restored box from a mutated one, and
+    # which file to load override by hand if it is the latter.
+    if (( ${JUNOS_MADE:-0} == 0 )) || (( JUNOS_RESTORED )); then
+      echo "| Junos restore | restored |"
+    else
+      echo "| Junos restore | **NOT RESTORED** -- \`load override $JUNOS_RESTORE\` by hand; see \`junos-cleanup.txt\` |"
+    fi
+    echo "| Junos restore point | \`$JUNOS_RESTORE\` |"
     echo
     echo "| verdict | cell | note |"
     echo "|---|---|---|"
@@ -613,8 +738,17 @@ main() {
   fi
 
   # The proof, not the claim: pull the config back down after cleanup and diff.
-  cleanup_junos 2>&1 | sanitize >"$OUT/junos-cleanup.txt" || true
-  JUNOS_MADE=$JUNOS_COMMITS; JUNOS_COMMITS=0   # the exit trap must not restore twice
+  # Only a VERIFIED restore disarms the EXIT trap.  Zeroing unconditionally spent
+  # the one automatic retry on a path that could not report failure, and the
+  # summary then asserted "restored" over a box left fully mutated.
+  JUNOS_MADE=$JUNOS_COMMITS
+  if cleanup_junos 2>&1 | sanitize >"$OUT/junos-cleanup.txt"; then
+    JUNOS_RESTORED=1
+    JUNOS_COMMITS=0            # verified: the exit trap must not restore twice
+  else
+    JUNOS_RESTORED=0           # unverified: leave the trap armed for one more go
+    log "Junos NOT restored -- EXIT trap stays armed; 'load override $JUNOS_RESTORE' by hand if it also fails"
+  fi
   if ! jcmd "show configuration | display set" 2>&1 | sanitize >"$OUT/junos-final.set"; then
     record FAIL junos-left-unchanged "could not read the Junos config back; see junos-final.set"
   elif diff -u "$OUT/junos-baseline.set" "$OUT/junos-final.set" >"$OUT/junos-config.diff"; then
@@ -639,7 +773,16 @@ if (( DRY_WRAPPER )); then
   assert() { if eval "$2"; then echo "  ok   $1"; else echo "  FAIL $1"; fails=$((fails+1)); fi; }
   # grep -c exits 1 on zero matches, which under `set -e` turns a legitimate
   # "no failures" into a skipped assertion.  awk always exits 0.
-  countfail() { awk '/^\| FAIL \|/{n++} END{print n+0}' "$1" 2>/dev/null || echo 99; }
+  #
+  # The -f guard makes the missing-file answer independent of the awk in $PATH.
+  # Whether awk runs END after failing to open a file is implementation-defined:
+  # if it does, the old form emitted `0` from END *and* `99` from the `||` arm, and
+  # the two-line result made `[ '$good_fail' -eq 0 ]` die with "integer expression
+  # expected" instead of reporting the missing summary.  Not reproduced on the awks
+  # here -- mawk 1.3.4 and busybox both treat it as fatal and skip END, so both
+  # forms print a bare 99 -- so the assertion below does not discriminate on this
+  # host.  One line to stop depending on which awk is installed.
+  countfail() { [ -f "$1" ] || { echo 99; return 0; }; awk '/^\| FAIL \|/{n++} END{print n+0}' "$1"; }
 
   echo "== dry-run A: good fixtures, expect the matrix to pass"
   FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-good" \
@@ -674,6 +817,26 @@ if (( DRY_WRAPPER )); then
     bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-nocount.log" 2>&1 || true
   FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-nocount-g5" DRY_FAIL_CMD='^step0-G5-soak .*json' \
     bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-nocount-g5.log" 2>&1 || true
+
+  echo "== dry-run I: the restore point is gone, expect a REFUSAL to commit, not a confirm"
+  FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-norestore" DRY_NO_RESTORE=1 \
+    bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-norestore.log" 2>&1 || true
+
+  echo "== dry-run J: nothing actually restarts, expect the restart cells to FAIL"
+  FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-norestart" DRY_NO_RESTART=1 \
+    bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-norestart.log" 2>&1 || true
+
+  echo "== dry-run K: rx0 is not GM-enabled, expect step 0 to FAIL before the matrix"
+  FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-nogm" DRY_NO_GM=1 \
+    bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-nogm.log" 2>&1 || true
+
+  echo "== dry-run L: a Junos expectation that only FRR satisfies, expect that cell to FAIL"
+  FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-misscope" DRY_MISSCOPE=1 \
+    bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-misscope.log" 2>&1 || true
+
+  echo "== dry-run M: another run's restore point is on the box, expect G2 to refuse"
+  FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-stale" DRY_STALE_RESTORE=1 \
+    bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-stale.log" 2>&1 || true
 
   echo "== assertions"
   assert "good fixtures produce zero FAIL cells (got $good_fail)"  "[ '$good_fail' -eq 0 ]"
@@ -727,6 +890,39 @@ if (( DRY_WRAPPER )); then
   # Read as 0, a failed counter matches a 0 baseline and passes every reset check.
   assert "unreadable session counter fails G4, G5 and the cell, not 0 == 0" \
     "grep -q '^| FAIL | .step0-G4-session. |.*session-counter-unreadable' '$OUT/dryrun-nocount/summary.md' && grep -q '^| FAIL | .step0-G5-soak. | session counter unreadable' '$OUT/dryrun-nocount-g5/summary.md' && grep -q '^| FAIL | .type1-ipmsi-bidir. |.*session-counter-unreadable' '$OUT/dryrun-showfail/summary.md'"
+  # C2: a bare `commit` after a failed `load override` CONFIRMS the pending
+  # `commit confirmed` and makes the mutation permanent.  The refusal has to
+  # happen before anything is sent, so the box must be left mutated and SAID to be.
+  assert "a missing restore point refuses to commit rather than confirming" \
+    "grep -q 'NOT committing' '$OUT/dryrun-norestore/junos-cleanup.txt' && ! grep -q 'commit complete' '$OUT/dryrun-norestore/junos-cleanup.txt'"
+  assert "an unrestored box is reported as NOT RESTORED, not as restored" \
+    "grep -q 'NOT RESTORED' '$OUT/dryrun-norestore/summary.md' && grep -q '^| FAIL | .junos-left-unchanged.' '$OUT/dryrun-norestore/summary.md' && grep -qF '| Junos restore point |' '$OUT/dryrun-norestore/summary.md'"
+  assert "a restored box still reports restored (positive control)" \
+    "grep -q '^| Junos restore | restored |' '$OUT/dryrun-good/summary.md'"
+  # I1: both restart triggers are non-fatal, so "nothing restarted" must not pass.
+  assert "restart cells FAIL when nothing actually restarted" \
+    "grep -q '^| FAIL | .restart-bgpd. |.*no-restart-observed' '$OUT/dryrun-norestart/summary.md' && grep -q '^| FAIL | .restart-session. |.*no-restart-observed' '$OUT/dryrun-norestart/summary.md'"
+  # C1: join-group without `ip igmp` is accepted and never becomes membership.
+  assert "a receiver stub that is not GM-enabled fails step 0, before the matrix" \
+    "grep -q '^| FAIL | .step0-G4b-receiver-stub. |.*rx0-igmp-not-enabled' '$OUT/dryrun-nogm/summary.md' && [ \$(ls '$OUT/dryrun-nogm/cells' | wc -l) -lt 10 ]"
+  assert "frr-base.conf enables igmp and mld on the receiver stub" \
+    "grep -qx ' ip igmp' '$HERE/frr-base.conf' && grep -qx ' ipv6 mld' '$HERE/frr-base.conf'"
+  # S3: the ifl and an overridden router-id are parameters like any other.
+  assert "sanitizer removed the Junos receiver ifl" \
+    "[ -d '$OUT/dryrun-good/cells' ] && ! grep -rqF '$JUNOS_LAN_IFL' '$OUT/dryrun-good'"
+  # Contract check, not a mutation test: it fires only on an awk that runs END
+  # after a failed open.  mawk and busybox do not, so this passes either way here.
+  assert "countfail reports a missing summary as a single 99" \
+    "[ \$(countfail /nonexistent/summary.md) -eq 99 ]"
+  # S2: `frr:` / `junos:` must be a scope, not a naming convention.
+  assert "a Junos expectation is not satisfiable from the FRR section" \
+    "grep -q '^| FAIL | .type1-ipmsi-bidir. |.*junos:missing(' '$OUT/dryrun-misscope/summary.md'"
+  # S4: a fixed restore path let a second run adopt the first run's mutations as
+  # its baseline and then report junos-left-unchanged PASS over a mutated box.
+  assert "a second run refuses to start while another run's restore point is present" \
+    "grep -q '^| FAIL | .step0-G2-baseline. |.*another blo15579 run' '$OUT/dryrun-stale/summary.md'"
+  assert "the restore point is per-run, not a fixed path two runs would share" \
+    "grep -qE 'blo15579-baseline-[0-9]{8}T[0-9]{6}Z\.conf' '$OUT/dryrun-good/summary.md'"
   echo
   if (( fails )); then echo "DRY-RUN FAILED ($fails assertion(s))"; exit 1; fi
   echo "DRY-RUN OK -- harness logic, verdicts (both directions), sanitizer and packaging all exercised."
