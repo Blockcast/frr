@@ -20,7 +20,7 @@ jobs:
       - name: Set custom variables
         id: vars
         run: |
-          echo "behind_by=$(git log --oneline origin/${{ github.base_ref }} ^${{ github.event.pull_request.head.sha }} | wc -l)" >> $GITHUB_OUTPUT
+          echo "behind_by=$(git log --oneline origin/${{ github.base_ref }} ^${{ github.event.pull_request.head.sha }} | wc -l)" >> "$GITHUB_OUTPUT"
       - name: Add rebase label if needed
         if: ${{ steps.vars.outputs.behind_by > 50 }}
         uses: actions-ecosystem/action-add-labels@v1
