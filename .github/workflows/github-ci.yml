@@ -1358,7 +1358,7 @@ jobs:
           # reported success over three real failures.
           rerun_rc=0
           docker run --init -i --privileged --name "frr-${RESULT_ID}-cont" ${ADD_DOCKER_ENV[@]+"${ADD_DOCKER_ENV[@]}"} -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
-            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest "$@"' pytest-rerun "${rerun_files[@]}" || rerun_rc=$?
+            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest '$rerun_files || rerun_rc=$?
 
           # pytest's exit code only claims "everything I collected passed",
           # which is strictly weaker than "every test we named passed".  A
