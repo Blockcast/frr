@@ -1,0 +1,4 @@
+
+bgp.mvpn.0: 4 destinations, 4 routes (4 active, 0 holddown, 0 hidden)
+
+bgp.mvpn6.0: 3 destinations, 3 routes (3 active, 0 holddown, 0 hidden)
