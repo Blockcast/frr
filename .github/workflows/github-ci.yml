@@ -704,6 +704,11 @@ jobs:
         id: unit_tests
         run: |
           set -euo pipefail
+          # The `bash -lc` body is single-quoted on purpose: `$?` and the rest
+          # must be expanded by the shell INSIDE the container, against that
+          # container's state.  Letting the runner's shell expand them first
+          # is the bug, not the fix.
+          # shellcheck disable=SC2016
           timeout --signal=TERM --kill-after=1m 15m \
           docker run --init --name "${UNIT_TEST_CONTAINER}" \
             frr-${{ matrix.cfg.platform }} \
@@ -1020,11 +1025,26 @@ jobs:
           MODPKGVER=$(uname -r)
           # Retry loop for apt-get update in case of transient mirror failures
           APT_RETRIES=3
-          for i in $(seq 1 ${APT_RETRIES}); do sudo apt-get update -y && break || sleep 10; done
+          # `if cmd; then break; fi` rather than `cmd && break || sleep 10`:
+          # the old form needed the trailing `|| sleep 10` to keep `set -e`
+          # from killing the step on the first failed attempt, so the retry
+          # and the set -e suppression were the same token.  A condition
+          # context does the suppression explicitly and leaves the retry
+          # readable.
+          for _ in $(seq 1 "${APT_RETRIES}"); do
+            if sudo apt-get update -y; then break; fi
+            sleep 10
+          done
           # Retry install as well; mirrors can fail between update and install.
           install_ok=0
-          for i in $(seq 1 ${APT_RETRIES}); do
-            sudo apt-get install -y kmod linux-modules-extra-azure linux-modules-${MODPKGVER} linux-modules-extra-${MODPKGVER} python3-xmltodict && install_ok=1 && break || sleep 10
+          for _ in $(seq 1 "${APT_RETRIES}"); do
+            if sudo apt-get install -y kmod linux-modules-extra-azure \
+                "linux-modules-${MODPKGVER}" "linux-modules-extra-${MODPKGVER}" \
+                python3-xmltodict; then
+              install_ok=1
+              break
+            fi
+            sleep 10
           done
           [ "${install_ok}" -eq 1 ] || { echo "ERROR: apt-get install failed after ${APT_RETRIES} attempts" >&2; exit 1; }
           # Github is running old kernels but installing newer packages :(
@@ -1032,11 +1052,18 @@ jobs:
           sudo modprobe mpls-iptunnel
           sudo modprobe mpls-router
 
-          ADD_DOCKER_ENV=""
+          # An array, not a string: the three `docker run`s below relied on
+          # leaving the scalar unquoted so the shell would split "-e X=1"
+          # into two arguments, which is the same construct BLO-29523 turned
+          # into a silent false green one layer down.  One array element is
+          # one docker argument, so nothing re-splits or globs, and an empty
+          # array expands to no arguments at all -- which a quoted scalar
+          # could not do, as `""` would hand docker a stray empty argument.
+          ADD_DOCKER_ENV=()
           if ! grep CONFIG_IP_MROUTE_MULTIPLE_TABLES=y /boot/config*; then
-            ADD_DOCKER_ENV+="-e MROUTE_VRF_MISSING=1"
+            ADD_DOCKER_ENV+=(-e MROUTE_VRF_MISSING=1)
           fi
-          echo "ADD_DOCKER_ENV: ${ADD_DOCKER_ENV}"
+          echo "ADD_DOCKER_ENV: ${ADD_DOCKER_ENV[*]-}"
 
           # BLO-35428: collect the whole tree first, in the same privileged
           # image the run uses, so what the run produced can be checked
@@ -1068,7 +1095,7 @@ jobs:
           # the collecting process, not just this one.
           collect_start=$(date +%s)
           collect_rc=0
-          timeout 15m docker run --rm --init --privileged ${ADD_DOCKER_ENV} -e PYTEST_XDIST_MODE=no -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
+          timeout 15m docker run --rm --init --privileged ${ADD_DOCKER_ENV[@]+"${ADD_DOCKER_ENV[@]}"} -e PYTEST_XDIST_MODE=no -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
             bash -c 'cd ~/frr/tests/topotests && sudo -E pytest --collect-only -q -p no:cacheprovider -p no:warnings "$@"' pytest-collect \
             > "${RUNNER_TEMP}/collect.out" || collect_rc=$?
           echo "collect-only rc=${collect_rc} after $(( $(date +%s) - collect_start ))s"
@@ -1216,7 +1243,7 @@ jobs:
           # failed-only rerun below could only re-verify the failures that
           # partial junit happened to record.
           par_rc=0
-          docker run --init -i --privileged --name "frr-${RESULT_ID}-cont" ${ADD_DOCKER_ENV} \
+          docker run --init -i --privileged --name "frr-${RESULT_ID}-cont" ${ADD_DOCKER_ENV[@]+"${ADD_DOCKER_ENV[@]}"} \
             -e TOPOTEST_WORKERS="${TOPOTEST_WORKERS}" -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
             bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest -n"${TOPOTEST_WORKERS}" --dist=loadfile --no-loadscope-reorder "$@"' pytest-run "${run_tests[@]}" || par_rc=$?
           echo "parallel pytest rc=${par_rc}"
@@ -1330,8 +1357,8 @@ jobs:
           # so pytest collected 5 tests, passed them, exited 0, and the step
           # reported success over three real failures.
           rerun_rc=0
-          docker run --init -i --privileged --name "frr-${RESULT_ID}-cont" ${ADD_DOCKER_ENV} -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
-            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest "$@"' pytest-rerun "${rerun_files[@]}" || rerun_rc=$?
+          docker run --init -i --privileged --name "frr-${RESULT_ID}-cont" ${ADD_DOCKER_ENV[@]+"${ADD_DOCKER_ENV[@]}"} -v /lib/modules:/lib/modules frr-${{ matrix.cfg.platform }} \
+            bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest '$rerun_files || rerun_rc=$?
 
           # pytest's exit code only claims "everything I collected passed",
           # which is strictly weaker than "every test we named passed".  A
