@@ -146,7 +146,7 @@ if (( DRY_RUN )); then
   # never deleted (or sits in junos-base.set) shows up in the withdraw cells.
   joins() {  # joins igmp|mld: "<S> <G>" per static join committed on the box
     sed -n "s#^set protocols $1 interface [^ ]* static group \([^ ]*\) source \([^ ]*\)\$#\2 \1#p" \
-      "$PRIV/.junos-live.set" 2>/dev/null || true
+      "$BOX/.junos-live.set" 2>/dev/null || true
   }
   live7() {  # live7 <table>
     local af=igmp s g; [[ "$1" == bgp.mvpn6.0 ]] && af=mld
@@ -160,39 +160,50 @@ if (( DRY_RUN )); then
   rx() {  # rx igmp|mld
     local s g; [[ "${FIXTURE_MODE:-good}" == empty ]] && return 0
     joins "$1" | while read -r s g; do echo " [7] source $s group $g  RT:dry-run-model"; done
-    if [[ "$1" == igmp ]] && grep -qx 'set protocols mvpn source-active-advertisement' "$PRIV/.junos-live.set"; then
+    if [[ "$1" == igmp ]] && grep -qx 'set protocols mvpn source-active-advertisement' "$BOX/.junos-live.set"; then
       echo " [5] source $V4_SRC group $V4_GRP  RT:dry-run-model"
     fi
   }
+  # DRY_NO_TYPE1 (dry-run P): no Type-1 crosses in either direction, so each box
+  # holds only its own.  Each side keeps the Type-1 routes whose originator is
+  # its own address, not by any token the type1 cell matches, so it cannot agree
+  # with the expectation by construction.
+  not1() { if [[ -n "${DRY_NO_TYPE1:-}" ]]; then sed "$1"; else cat; fi; }
   # The config commands read and write that model, so G2's baseline, the restore
   # point and the final read-back are all real; the box starts with a config of
   # its own (seeded below), so a restore has to bring it back, not just empty it.
+  # The box is a directory, $BOX: /var/tmp/<f> is $BOX/<f>.  DRY_BOX keeps it
+  # across runs, which is what lets two runs meet on one box (dry-run M and O).
   jcmd()  {
     stub_ok "$*" || return
     case "$*" in
       "")                 jcli ;;
-      *"| display set")   sort -u "$PRIV/.junos-live.set" ;;
+      *"| display set")   sort -u "$BOX/.junos-live.set" ;;
+      "show configuration") sort -u "$BOX/.junos-live.set" ;;
       *"| save $JUNOS_RESTORE")
-        cp "$PRIV/.junos-live.set" "$PRIV/.junos-saved.set"
-        echo "Wrote $(wc -l <"$PRIV/.junos-live.set") lines of configuration to '$JUNOS_RESTORE'" ;;
-      # Checked before the generic arm below: at G2 this asks "is ANOTHER run's
-      # restore point here?", which must answer no on a clean box even though this
-      # run's own file is about to exist.  DRY_STALE_RESTORE models a collision.
+        sort -u "$BOX/.junos-live.set" >"$DRY_RP"
+        [[ "${DRY_BAD_RESTORE:-}" != save ]] || dry_damage
+        echo "Wrote $(wc -l <"$BOX/.junos-live.set") lines of configuration to '$JUNOS_RESTORE'" ;;
       *"file list $JUNOS_RESTORE_GLOB")
-        if [[ -n "${DRY_STALE_RESTORE:-}" ]]
-        then echo "/var/tmp/blo15579-baseline-20260101T000000Z.conf"
+        if compgen -G "$BOX/blo15579-baseline-*.conf" >/dev/null; then
+          local f; for f in "$BOX"/blo15579-baseline-*.conf; do echo "/var/tmp/${f##*/}"; done
         else echo "$JUNOS_RESTORE_GLOB: No such file or directory"; fi ;;
-      # Junos prints the path either way; the error text is the only discriminator,
-      # which is why cleanup_junos tests for both.  DRY_NO_RESTORE models the
-      # restore point having been reaped out from under us.
-      *"file list "*)
-        if [[ -e "$PRIV/.junos-saved.set" && -z "${DRY_NO_RESTORE:-}" ]]
-        then echo "$JUNOS_RESTORE"
-        else echo "$JUNOS_RESTORE: No such file or directory"; fi ;;
+      "file show "*)
+        if [[ -e "$BOX/${*##*/}" ]]; then cat "$BOX/${*##*/}"
+        else echo "error: could not resolve file: ${*##* }"; fi ;;
+      "file delete "*)
+        rm "$BOX/${*##*/}" 2>/dev/null || echo "error: ${*##* }: No such file or directory" ;;
       *" hidden "*)       fx junos-hidden ;;
-      *) fx junos
+      *) fx junos | not1 "/^1:/{/:$JUNOS_RID\//!d;}"
          if [[ "$*" =~ table\ (bgp\.mvpn6?\.0)\ detail ]]; then live7 "${BASH_REMATCH[1]}"; fi ;;
     esac
+  }
+  # The restore point going bad: DRY_NO_RESTORE reaps it at the first commit (dry-run
+  # I); DRY_BAD_RESTORE truncates it mid-line, as a full /var/tmp or a partial write
+  # would, at the G2 save (=save) or at the first commit (=commit) (dry-run N).
+  dry_damage() {
+    if [[ -n "${DRY_NO_RESTORE:-}" ]]; then rm -f "$DRY_RP"; return 0; fi
+    head -c 10 "$DRY_RP" >"$DRY_RP.t"; mv "$DRY_RP.t" "$DRY_RP"
   }
   # stdin = the configure-mode script cleanup_junos sends.  Only `load override`
   # is modelled: a rollback count is right only if no other session committed in
@@ -205,7 +216,7 @@ if (( DRY_RUN )); then
     local l
     while read -r l; do
       case "$l" in
-        "load override $JUNOS_RESTORE") cp "$PRIV/.junos-saved.set" "$PRIV/.junos-live.set" ;;
+        "load override $JUNOS_RESTORE") cp "$DRY_RP" "$BOX/.junos-live.set" ;;
         commit) echo "commit complete" ;;
       esac
     done
@@ -214,8 +225,9 @@ if (( DRY_RUN )); then
   # DRY_DROP_JUNOS (dry-run F): `set` lines matching it never reach the box, as
   # if the cell had not set them.
   jcommit() {
-    local l live="$PRIV/.junos-live.set"
+    local l live="$BOX/.junos-live.set"
     JUNOS_COMMITS=$((JUNOS_COMMITS + 1))
+    if [[ -n "${DRY_NO_RESTORE:-}" || "${DRY_BAD_RESTORE:-}" == commit ]]; then dry_damage; fi
     while IFS= read -r l; do
       case "$l" in
         "set "*)    [[ -n "${DRY_DROP_JUNOS:-}" && "$l" =~ $DRY_DROP_JUNOS ]] || echo "$l" >>"$live" ;;
@@ -242,7 +254,7 @@ if (( DRY_RUN )); then
         [[ -n "${DRY_NO_GM:-}" ]] || { echo " ip igmp"; echo " ipv6 mld"; }
         echo "!"; return 0 ;;
     esac
-    fx frr
+    fx frr | not1 "/^ \[1\] originator /{/originator $FRR_RID /!d;}"
     case "$1" in "show bgp ipv4 mvpn") rx igmp ;; "show bgp ipv6 mvpn") rx mld ;; esac
   }
   frr_up() { echo "dry-run: FRR container not started"; }
@@ -286,27 +298,42 @@ else
   frr_restart_bgpd() { docker exec "$CNAME" sh -c 'pkill -x bgpd' || log "bgpd restart: pkill exited $?"; sleep 15; }
 fi
 
+# The restore point is intact iff `file show` returns exactly the `show
+# configuration` G2 saved it from (kept raw in $PRIV, which never reaches the
+# artifact).  Both are exec-mode reads, the channel the baseline and the read-back
+# use, so this parses no interactive CLI transcript.  Silent when intact;
+# otherwise prints one line saying what came back instead.
+restore_point_intact() {
+  local got; got="$(jcmd "file show $JUNOS_RESTORE" 2>&1 || true)"
+  [[ -s "$PRIV/.junos-restore.ref" && "$got" == "$(cat "$PRIV/.junos-restore.ref")" ]] && return 0
+  echo "file show returned $(wc -l <<<"$got") line(s) against the $(wc -l <"$PRIV/.junos-restore.ref") saved; first: $(head -1 <<<"$got")"
+  return 1
+}
+
 # Shared by the real run and the dry-run, so the self-check exercises it.
-# Returns 0 only when the box is VERIFIABLY back on the G2 restore point.
+# Returns 0 once the restore is committed; main() calls it restored only when the
+# read-back matches the baseline.
 #
 # The bare `commit` is the hazard.  jcommit() arms `commit confirmed`, and the
 # Junos CLI does not abort a stdin script when a line errors -- so if
-# `load override` fails (restore point reaped, /var/tmp cleared, the G2 save
-# having landed elsewhere) the candidate is still the harness config and the
-# next line's `commit` CONFIRMS the pending auto-revert, turning the safety net
-# into the thing that makes the mutation permanent.  A commit of an unchanged
+# `load override` fails the candidate is still the harness config and the next
+# line's `commit` CONFIRMS the pending auto-revert, turning the safety net into
+# the thing that makes the mutation permanent.  A commit of an unchanged
 # candidate succeeds, so no transcript check can catch that after the fact:
-# the only defence is to not send `commit` at all unless the restore point is
-# known to be there.  Letting the timer fire is strictly better than confirming.
+# the only defence is to not send `commit` at all unless the load is known to
+# succeed.  "The file is there" does not know that -- a truncated or zero-length
+# save (a full /var/tmp, a partial write) is there and still fails to load -- so
+# the gate is that the file is byte-for-byte what G2 saved.  Letting the timer
+# fire is strictly better than confirming.
 cleanup_junos() {
   (( JUNOS_COMMITS == 0 )) && return 0
   local o
-  o="$(jcmd "file list $JUNOS_RESTORE" 2>&1 || true)"
-  if ! grep -qF "$JUNOS_RESTORE" <<<"$o" || grep -qi 'no such file' <<<"$o"; then
-    echo "!!!!! restore point $JUNOS_RESTORE is not on the box -- NOT committing."
-    echo "!!!!! Sending a bare commit now would confirm the pending 'commit confirmed'"
-    echo "!!!!! and make the harness config permanent.  Leaving the ${CONFIRM_MIN}-minute"
-    echo "!!!!! timer to auto-revert instead.  file list said: $o"
+  if ! o="$(restore_point_intact)"; then
+    echo "!!!!! restore point $JUNOS_RESTORE is gone, or is not the config G2 saved"
+    echo "!!!!! (truncated, emptied, replaced) -- NOT committing.  A failed load"
+    echo "!!!!! override followed by a bare commit would confirm the pending"
+    echo "!!!!! 'commit confirmed' and make the harness config permanent.  Leaving the"
+    echo "!!!!! ${CONFIRM_MIN}-minute timer to auto-revert instead.  $o"
     return 1
   fi
   o="$(printf 'configure exclusive\nload override %s\ncommit\nexit\n' "$JUNOS_RESTORE" | jcmd 2>&1 || true)"
@@ -318,7 +345,7 @@ cleanup() {
   local rc=$?
   log "cleanup: restoring Junos from $JUNOS_RESTORE ($JUNOS_COMMITS commit(s) made), removing container"
   if cleanup_junos 2>&1 | sanitize >>"$OUT/junos-cleanup.txt"; then
-    (( JUNOS_COMMITS == 0 )) || log "cleanup: Junos restore verified"
+    (( JUNOS_COMMITS == 0 )) || log "cleanup: Junos restore committed, not read back; its restore point stays on the box"
   else
     log "cleanup: JUNOS NOT RESTORED -- 'load override $JUNOS_RESTORE' by hand; see junos-cleanup.txt"
   fi
@@ -330,7 +357,10 @@ cleanup() {
 # loaded; they live here, outside $OUT, so the tarball cannot pick them up.
 PRIV="$(mktemp -d)"
 trap cleanup EXIT
-if (( DRY_RUN )); then echo "set system host-name dry-run-box" >"$PRIV/.junos-live.set"; fi
+if (( DRY_RUN )); then
+  BOX="${DRY_BOX:-$PRIV}"; DRY_RP="$BOX/${JUNOS_RESTORE##*/}"; mkdir -p "$BOX"
+  [[ -e "$BOX/.junos-live.set" ]] || echo "set system host-name dry-run-box" >"$BOX/.junos-live.set"
+fi
 
 # -------------------------------------------------------- rendered configs
 LOCAL_ADDR="${LOCAL_ADDR:-}"
@@ -511,12 +541,19 @@ step0() {
   o="$(jcmd "file list $JUNOS_RESTORE_GLOB" 2>&1 || true)"
   if grep -qF '/var/tmp/blo15579-baseline-' <<<"$o" && ! grep -qi 'no such file' <<<"$o"; then
     log "$o"
-    record FAIL step0-G2-baseline "another blo15579 run's restore point is on the box; its baseline would be this run's mutations. Finish or clean up that run first (see run.log)"
+    record FAIL step0-G2-baseline "another blo15579 run's restore point is on the box; its baseline would be this run's mutations. A run deletes its own only once its read-back verifies the restore, so this is one still running or one that did not verify: check the box is on its real config, then delete the file (see run.log)"
     return 1
   fi
+  # Saved is not loadable: a truncated save (a full /var/tmp, a partial write) still
+  # prints "Wrote", and cleanup will refuse to restore from it.  Prove it is the
+  # config it was saved from now, while refusing costs nothing but this run.
+  jcmd "show configuration" >"$PRIV/.junos-restore.ref" 2>&1 \
+    || { record FAIL step0-G2-baseline "could not read the Junos config to save"; return 1; }
   o="$(jcmd "show configuration | save $JUNOS_RESTORE" 2>&1 | sanitize)"
   grep -qi '^wrote' <<<"$o" \
     || { log "$o"; record FAIL step0-G2-baseline "could not save the restore point $JUNOS_RESTORE; see run.log"; return 1; }
+  o="$(restore_point_intact | sanitize)" \
+    || { log "$o"; record FAIL step0-G2-baseline "the restore point $JUNOS_RESTORE does not read back as the config it was saved from; see run.log"; return 1; }
   { jcmd "show system commit"; jcmd "show system license"; jcmd "show version"; } 2>&1 \
     | sanitize >"$OUT/junos-baseline-state.txt"
   record PASS step0-G2-baseline ""
@@ -597,8 +634,13 @@ matrix() {
   # ` [1] originator <X> ...` (bgp_mvpn_show_routes), so anchor on `[N]` rather
   # than on a bare "5:" -- an unanchored "5:" also matches an uptime timestamp,
   # which is exactly how a harness reports a route it never saw.
+  # Each box holds its OWN Type-1 as soon as the AF is up, so "a Type-1 is here"
+  # proves nothing crossed.  FRR side: one it received.  bgp_mvpn.c prints Type-1
+  # as `originator X ` + `IR `? + `(local)`?, so its own path has `(local)` where a
+  # received one has a space (before the RT) or the end of the line.  Junos side:
+  # the one FRR originated, `1:<RD>:<FRR_RID>/<len>`, not Junos's own.
   cell type1-ipmsi-bidir "" "" \
-    "\\[1\\] originator" "^1:|Intra-AS"
+    "\\[1\\] originator [^ ]+ (IR )?( |\$)" "^1:.*:$FRR_RID/"
 
   cell type1-pmsi-ir-label "router bgp $AS
  bgp mvpn ipmsi-label 1000" "" \
@@ -738,21 +780,27 @@ main() {
   fi
 
   # The proof, not the claim: pull the config back down after cleanup and diff.
-  # Only a VERIFIED restore disarms the EXIT trap.  Zeroing unconditionally spent
-  # the one automatic retry on a path that could not report failure, and the
-  # summary then asserted "restored" over a box left fully mutated.
+  # Only a VERIFIED restore disarms the EXIT trap, and "verified" is that diff:
+  # `commit complete` after a load that failed some other way would still read as
+  # success, and the summary would assert "restored" over a mutated box.
   JUNOS_MADE=$JUNOS_COMMITS
-  if cleanup_junos 2>&1 | sanitize >"$OUT/junos-cleanup.txt"; then
-    JUNOS_RESTORED=1
-    JUNOS_COMMITS=0            # verified: the exit trap must not restore twice
-  else
-    JUNOS_RESTORED=0           # unverified: leave the trap armed for one more go
-    log "Junos NOT restored -- EXIT trap stays armed; 'load override $JUNOS_RESTORE' by hand if it also fails"
-  fi
+  cleanup_junos 2>&1 | sanitize >"$OUT/junos-cleanup.txt" \
+    || log "Junos restore NOT committed -- EXIT trap stays armed; 'load override $JUNOS_RESTORE' by hand if it also fails"
   if ! jcmd "show configuration | display set" 2>&1 | sanitize >"$OUT/junos-final.set"; then
     record FAIL junos-left-unchanged "could not read the Junos config back; see junos-final.set"
   elif diff -u "$OUT/junos-baseline.set" "$OUT/junos-final.set" >"$OUT/junos-config.diff"; then
     record PASS junos-left-unchanged ""
+    JUNOS_RESTORED=1
+    JUNOS_COMMITS=0            # verified: the exit trap must not restore twice
+    # ...and only now is the restore point spent.  Left on the box it makes the
+    # next run's G2 refuse; deleted on any weaker evidence it would take with it
+    # the file the summary tells the operator to `load override` by hand.  The ref
+    # exists iff G2 got past the stale-file check, so this deletes only this run's
+    # own path (a no-op if the save never wrote it).
+    if [[ -e "$PRIV/.junos-restore.ref" ]]; then
+      log "restore verified by the read-back; deleting the restore point $JUNOS_RESTORE"
+      jcmd "file delete $JUNOS_RESTORE" 2>&1 | sanitize >>"$OUT/run.log" || true
+    fi
   else
     record FAIL junos-left-unchanged "config differs from baseline; see junos-config.diff"
   fi
@@ -835,8 +883,34 @@ if (( DRY_WRAPPER )); then
     bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-misscope.log" 2>&1 || true
 
   echo "== dry-run M: another run's restore point is on the box, expect G2 to refuse"
-  FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-stale" DRY_STALE_RESTORE=1 \
+  # The box path goes through $box, not "$OUT/..." beside OUT=: bash expands prefix
+  # assignments left to right, so the box would follow OUT into the inner run's dir.
+  box="$OUT/dryrun-stale-box"; mkdir -p "$box"; : >"$box/blo15579-baseline-20260101T000000Z.conf"
+  DRY_BOX="$box" FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-stale" \
     bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-stale.log" 2>&1 || true
+
+  echo "== dry-run N: the restore point is truncated at the save / after G2, expect G2 / cleanup to refuse it"
+  FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-badsave" DRY_BAD_RESTORE=save \
+    bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-badsave.log" 2>&1 || true
+  box="$OUT/dryrun-badrestore-box"
+  DRY_BOX="$box" FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-badrestore" DRY_BAD_RESTORE=commit \
+    bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-badrestore.log" 2>&1 || true
+
+  echo "== dry-run O: two runs against one box, expect the second to reach the matrix"
+  box="$OUT/dryrun-rerun-box"
+  for r in 1 2; do
+    DRY_BOX="$box" FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-rerun$r" \
+      bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-rerun$r.log" 2>&1 || true
+  done
+  # The restore commits, but the read-back that would verify it fails.
+  box="$OUT/dryrun-noreadback-box"
+  DRY_BOX="$box" FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-noreadback" \
+    DRY_FAIL_CMD='^restart-session show configuration \| display set' \
+    bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-noreadback.log" 2>&1 || true
+
+  echo "== dry-run P: no Type-1 crosses either way, expect type1-ipmsi-bidir to FAIL both directions"
+  FIXTURE_MODE=good HOLD_SECONDS=0 SETTLE=0 OUT="$OUT/dryrun-notype1" DRY_NO_TYPE1=1 \
+    bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-notype1.log" 2>&1 || true
 
   echo "== assertions"
   assert "good fixtures produce zero FAIL cells (got $good_fail)"  "[ '$good_fail' -eq 0 ]"
@@ -923,6 +997,22 @@ if (( DRY_WRAPPER )); then
     "grep -q '^| FAIL | .step0-G2-baseline. |.*another blo15579 run' '$OUT/dryrun-stale/summary.md'"
   assert "the restore point is per-run, not a fixed path two runs would share" \
     "grep -qE 'blo15579-baseline-[0-9]{8}T[0-9]{6}Z\.conf' '$OUT/dryrun-good/summary.md'"
+  # C1: nothing deleted the restore point, so that refusal fired on every run after a
+  # clean first one, and the second run returned no matrix at all.
+  assert "a verified run deletes its restore point, so a second run on the box reaches the matrix" \
+    "grep -q '^| PASS | .step0-G2-baseline.' '$OUT/dryrun-rerun2/summary.md' && [ \$(countfail '$OUT/dryrun-rerun2/summary.md') -eq 0 ] && ! compgen -G '$OUT/dryrun-rerun-box/blo15579-baseline-*.conf' >/dev/null"
+  assert "a restore the read-back cannot verify keeps its restore point and is NOT RESTORED" \
+    "grep -q 'NOT RESTORED' '$OUT/dryrun-noreadback/summary.md' && compgen -G '$OUT/dryrun-noreadback-box/blo15579-baseline-*.conf' >/dev/null"
+  # I1: present is not loadable.  A truncated restore point passed the presence check,
+  # the load failed, and the bare commit after it confirmed the harness config.
+  assert "a truncated save fails G2, before any commit" \
+    "grep -q '^| FAIL | .step0-G2-baseline. |.*does not read back' '$OUT/dryrun-badsave/summary.md' && grep -qF '| Junos commits made | 0 |' '$OUT/dryrun-badsave/summary.md'"
+  assert "a restore point truncated after G2 is refused, not committed over, and kept" \
+    "grep -q 'NOT committing' '$OUT/dryrun-badrestore/junos-cleanup.txt' && ! grep -q 'commit complete' '$OUT/dryrun-badrestore/junos-cleanup.txt' && grep -q 'NOT RESTORED' '$OUT/dryrun-badrestore/summary.md' && compgen -G '$OUT/dryrun-badrestore-box/blo15579-baseline-*.conf' >/dev/null"
+  # I2: each box holds its own Type-1 regardless, so a bare "a Type-1 is here" passed
+  # with nothing crossing in either direction.
+  assert "type1-ipmsi-bidir FAILs both directions when no Type-1 crosses" \
+    "grep -q '^| FAIL | .type1-ipmsi-bidir. |.*frr:missing(.*junos:missing(' '$OUT/dryrun-notype1/summary.md'"
   echo
   if (( fails )); then echo "DRY-RUN FAILED ($fails assertion(s))"; exit 1; fi
   echo "DRY-RUN OK -- harness logic, verdicts (both directions), sanitizer and packaging all exercised."

@@ -54,8 +54,12 @@ Two *harness* runs against one box is the case `configure exclusive` does not co
 G2 refuses to start while another run's `/var/tmp/blo15579-baseline-*.conf` is present.
 Without that the second run would capture the first run's harness config as its own
 "baseline", restore the box to that, and report `junos-left-unchanged` **PASS** over a
-box that is still mutated. If a crashed run left a stale file, check the box is actually
-back on its real config, then delete the file.
+box that is still mutated. A run deletes its own file once the post-run read-back proves
+the box is back on its baseline, so a clean run leaves nothing behind and the next run
+starts. A file that is there belongs to a run still in progress, or to one that crashed or
+could not verify its restore; it is kept on purpose, since it is the file to
+`load override` by hand. Check the box is actually back on its real config, then delete
+the file.
 
 ## What it does to the Junos, and how you can check
 
@@ -68,8 +72,13 @@ back on its real config, then delete the file.
   `/var/tmp/blo15579-baseline-<run timestamp>.conf`; on exit it restores that with
   `load override` and `commit`, transcript in `junos-cleanup.txt`. A `rollback <n>` would
   name the wrong revision if anything else committed in between. The flip side: a commit
-  another session makes during the run is undone too.
-- **If the restore point is not on the box, cleanup refuses to commit at all.** The Junos
+  another session makes during the run is undone too. G2 also reads the file back
+  (`file show`) and requires it to match the `show configuration` it was saved from, so a
+  save that came out truncated (a full `/var/tmp`, a partial write) fails G2 before
+  anything is committed.
+- **If the restore point is not on the box, or no longer matches what G2 saved, cleanup
+  refuses to commit at all.** Present is not enough: a truncated or emptied file is present
+  and still fails to load. The Junos
   CLI does not abort a stdin script when a line errors, so a `commit` following a failed
   `load override` would commit an *unchanged* candidate — which is exactly how a pending
   `commit confirmed` gets **confirmed**, turning the auto-revert safety net into the thing
@@ -79,7 +88,9 @@ back on its real config, then delete the file.
 
 - It then re-downloads the running config and **diffs it against the baseline it captured
   before touching anything**. That diff is in the artifact as `junos-config.diff`, and
-  `junos-left-unchanged` is a cell in the verdict table like any other.
+  `junos-left-unchanged` is a cell in the verdict table like any other. It is also the
+  restore verdict: only a clean diff reports `restored`, disarms the exit-time retry and
+  deletes the restore point.
 
 That last point is deliberate: "nothing was committed" is a claim, a diff is a receipt.
 The BLO-15630 probe could assert it because it only ran `commit check`; a matrix that
@@ -132,7 +143,7 @@ every transcript header and into `summary.md`.
 
 | cell | what it proves |
 |---|---|
-| `type1-ipmsi-bidir` | Intra-AS I-PMSI A-D in both directions |
+| `type1-ipmsi-bidir` | Intra-AS I-PMSI A-D in both directions: FRR must hold a Type-1 it *received*, not its own `(local)` one, and Junos the one FRR originated, since each box holds its own either way |
 | `type1-pmsi-ir-label` | PMSI Tunnel attribute, Ingress Replication, label as Junos reads it |
 | `type5-v4-frr-to-junos` / `-junos-to-frr` | Source Active, both directions; `-junos-to-frr` needs a Type-5 FRR *received*, not its own `(local)` one |
 | `type7-v4-frr-to-junos` / `-junos-to-frr` | Source Tree Join from a real IGMPv3 (S,G), both directions; `-junos-to-frr` needs a Type-7 FRR *received*, not its own `(local)` one (see Known limits) |
@@ -195,11 +206,18 @@ pass sets `DRY_DROP_JUNOS='static group|source-active-advertisement'`, so the Ju
 of the three `*-junos-to-frr` cells never reach the box; those cells must then FAIL.
 They would pass if FRR's own `(local)` paths satisfied them.
 
-The same model backs the config commands: G2's `display set` and `save`, the cleanup's
-`load override`, and the final read-back. It starts with a config of its own and offers
-no `rollback`, so `junos-left-unchanged` passes only if cleanup restores the saved
-snapshot. One more assertion keeps `junos-base.set` free of `system` statements (the box
-is shared) and of IPv6 prefixes in the IPv4 `ssm-groups` list.
+The same model backs the config commands: G2's `display set`, `save` and `file show`, the
+cleanup's `load override`, the final read-back and the `file delete` after it. It starts
+with a config of its own and offers no `rollback`, so `junos-left-unchanged` passes only if
+cleanup restores the saved snapshot. `DRY_BOX` keeps the modelled box across runs, so
+two runs can meet on one box: a second run after a clean one must reach the matrix, and
+one that finds another run's restore point must refuse at G2. Further passes truncate the
+restore point at the save (G2 must refuse, with no commit) and after G2 (cleanup must
+refuse to commit, and keep the file), fail the read-back after a committed restore (the
+summary must say `NOT RESTORED` and the file must stay), and stop Type-1 crossing in
+either direction (`type1-ipmsi-bidir` must fail both halves). One more assertion keeps
+`junos-base.set` free of `system` statements (the box is shared) and of IPv6 prefixes in
+the IPv4 `ssm-groups` list.
 
 Both halves are mutation-tested: deleting the withdraw fixtures turns exactly the three
 withdraw cells red, and neutering `sanitize()` turns exactly the four sanitizer
