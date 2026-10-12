@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import pytest
 from lib.common_config import step
@@ -108,6 +109,29 @@ def wait_op_json(f, op, path, json_match=None, exact=False, timeout=30):
             logging.debug("json match: %s", jo)
             return op, path, jo
         logging.debug("no json match: %s: continue", jo)
+
+
+# A backend client that has just connected holds the *running* datastore lock for
+# as long as mgmtd takes to push it the initial config: txn_cfg_be_client_connect()
+# in mgmtd/mgmt_txn_cfg.c takes mgmt_ds_lock(running, session-id 0) and only drops
+# it once the last init-config apply completes.  The datastore SYNC notification a
+# test waits for is a separate path and does not imply that push has finished, so a
+# config apply issued right after spawning a backend client can be refused with
+# "% could not lock running DS".  That refusal is transient by construction, so
+# retry it instead of taking the first one as a failure.
+def vtysh_config(r1, *config, timeout=30):
+    """Apply vtysh config, retrying while a mgmtd datastore lock is held."""
+    cmd = 'vtysh -c "conf t" ' + " ".join(f'-c "{c}"' for c in config)
+    rc, out, err = -1, "", ""
+    for _ in Timeout(timeout):
+        rc, out, err = r1.cmd_status(cmd, warn=False)
+        if not rc:
+            return out
+        if "could not lock" not in out:
+            break
+        logging.debug("mgmtd datastore locked, retrying: %s", cmd)
+        time.sleep(0.5)
+    raise AssertionError(f"{cmd} failed: rc={rc} stdout={out!r} stderr={err!r}")
 
 
 @retry(retry_timeout=30, initial_wait=0.5)
@@ -217,7 +241,7 @@ def test_backend_datastore_add_delete(tgen):
     )
     check_backend_xpath_registry(r1, r"/frr-vrf:lib/vrf:.*mgmtd-testc.*")
 
-    r1.cmd_raises('vtysh -c "conf t" -c "int foobar"')
+    vtysh_config(r1, "int foobar")
     try:
         #
         # If have a failure here b/c we are now notifying at the list element
@@ -237,7 +261,7 @@ def test_backend_datastore_add_delete(tgen):
             timeout=30,
         )
 
-        r1.cmd_raises('vtysh -c "conf t" -c "no int foobar"')
+        vtysh_config(r1, "no int foobar")
         assert waitline(
             p.stdout,
             re.escape('#OP=DELETE: /frr-interface:lib/interface[name="foobar"]/state'),
@@ -247,12 +271,12 @@ def test_backend_datastore_add_delete(tgen):
         # Now add/delete a VRF and watch for notifications
         # We are more picky here and validate the active state as well.
         r1.cmd_raises("ip link add red type vrf table 10")
-        r1.cmd_raises('vtysh -c "conf t" -c "vrf red" -c "exit"')
+        vtysh_config(r1, "vrf red", "exit")
 
         wait_op_json(p.stdout, "REPLACE", '/frr-vrf:lib/vrf[name="red"]')
 
         r1.cmd_raises("ip link del red")
-        r1.cmd_raises('vtysh -c "conf t" -c "no vrf red"')
+        vtysh_config(r1, "no vrf red")
         wait_op_json(p.stdout, "DELETE", '/frr-vrf:lib/vrf[name="red"]')
     finally:
         p.kill()
@@ -300,14 +324,14 @@ def test_backend_datastore_router_id(tgen):
             "/frr-vrf:lib/vrf/frr-zebra:zebra/router-id",
             js4_init,
         )
-        r1.cmd_raises('vtysh -c "conf t" -c "router-id 1.2.3.4"')
+        vtysh_config(r1, "router-id 1.2.3.4")
         wait_op_json(
             p.stdout,
             "REPLACE",
             '/frr-vrf:lib/vrf[name="default"]/frr-zebra:zebra/router-id',
             js4_chg,
         )
-        r1.cmd_raises('vtysh -c "conf t" -c "no router-id"')
+        vtysh_config(r1, "no router-id")
         wait_op_json(
             p.stdout,
             "REPLACE",
@@ -318,21 +342,21 @@ def test_backend_datastore_router_id(tgen):
         #
         # IPv6 Router ID
         #
-        r1.cmd_raises('vtysh -c "conf t" -c "ipv6 router-id aa::bb"')
+        vtysh_config(r1, "ipv6 router-id aa::bb")
         wait_op_json(
             p.stdout,
             "REPLACE",
             '/frr-vrf:lib/vrf[name="default"]/frr-zebra:zebra/ipv6-router-id',
             js6_new,
         )
-        r1.cmd_raises('vtysh -c "conf t" -c "ipv6 router-id aa::cc"')
+        vtysh_config(r1, "ipv6 router-id aa::cc")
         wait_op_json(
             p.stdout,
             "REPLACE",
             '/frr-vrf:lib/vrf[name="default"]/frr-zebra:zebra/ipv6-router-id',
             js6_chg,
         )
-        # r1.cmd_raises('vtysh -c "conf t" -c "no ipv6 router-id"')
+        # vtysh_config(r1, "no ipv6 router-id")
         # wait_op_json(
         #     p.stdout,
         #     "DELETE",
