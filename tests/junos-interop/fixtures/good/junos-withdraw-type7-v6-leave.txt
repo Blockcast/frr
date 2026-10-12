@@ -1,0 +1,13 @@
+bgp.mvpn.0: 1 destinations, 1 routes (1 active, 0 holddown, 0 hidden)
+1:198.51.100.120:0:198.51.100.120/240
+                   *[MVPN/70] 00:27:14, metric2 1
+
+bgp.mvpn6.0: 1 destinations, 1 routes (1 active, 0 holddown, 0 hidden)
+5:10.255.0.1:0:128:2001:db8:1557::1:128:ff3e::1/352
+                   *[BGP/170] 00:07:02, localpref 100, from 203.0.113.9
+
+Peer: 203.0.113.9 AS 65001  Local: 198.51.100.120 AS 65001
+  State: Established   Last flap event: never
+  NLRI for this session: inet-unicast inet6-unicast inet-mvpn inet6-mvpn
+
+IPv6 Source Tree Join withdrawn after MLD leave -- no 7: route remains in bgp.mvpn6.0.

@@ -1,0 +1,15 @@
+Groups: 1 Peers: 1 Down peers: 0
+Peer                     AS      InPkt     OutPkt    OutQ   Flaps Last Up/Dwn State
+203.0.113.9           65001         12         12       0       0       01:02 Establ
+
+Peer: 203.0.113.9 AS 65001  Local: 198.51.100.120 AS 65001
+  Type: Internal    State: Established
+  NLRI for this session: inet-mvpn inet6-mvpn
+  Last flap event: never
+
+bgp.mvpn.0: 0 destinations, 0 routes (0 active, 0 holddown, 0 hidden)
+
+bgp.mvpn6.0: 0 destinations, 0 routes (0 active, 0 holddown, 0 hidden)
+
+Instance : master
+  MVPN Mode : SPT-ONLY

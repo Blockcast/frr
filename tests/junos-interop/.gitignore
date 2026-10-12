@@ -1,0 +1,4 @@
+# Run artifacts land in $PWD by default, so a `git add -A` from this directory
+# would otherwise sweep a lab run's transcripts and config dumps into a commit.
+blo15579-artifact-*/
+blo15579-artifact-*.tar.gz

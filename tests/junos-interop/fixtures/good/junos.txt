@@ -1,0 +1,37 @@
+Groups: 1 Peers: 1 Down peers: 0
+Peer                     AS      InPkt     OutPkt    OutQ   Flaps Last Up/Dwn State
+203.0.113.9           65001        121        118       0       0       21:44 Establ
+  bgp.mvpn.0: 4/4/4/0
+  bgp.mvpn6.0: 3/3/3/0
+
+Peer: 203.0.113.9 AS 65001  Local: 198.51.100.120 AS 65001
+  Type: Internal    State: Established    Flags: <ImportEval Sync>
+  NLRI for this session: inet-unicast inet6-unicast inet-mvpn inet6-mvpn
+  Last flap event: never
+
+bgp.mvpn.0: 4 destinations, 4 routes (4 active, 0 holddown, 0 hidden)
+1:198.51.100.120:0:198.51.100.120/240
+                   *[MVPN/70] 00:21:44, metric2 1
+                      Indirect
+                      PMSI: Flags 0x0: Label 16: Type INGRESS-REPLICATION Label 16: Tunnel-type Ingress Replication, Endpoint 198.51.100.120
+1:10.255.0.1:0:10.255.0.1/240
+                   *[BGP/170] 00:21:40, localpref 100
+                      PMSI: Flags 0x0: Label 1000: Type INGRESS-REPLICATION
+5:10.255.0.1:0:32:10.199.99.1:32:232.1.1.10/240
+                   *[BGP/170] 00:03:21, localpref 100, from 203.0.113.9
+                      Communities: target:10.255.0.1:0
+7:10.255.0.1:65001:32:10.199.99.1:32:232.1.1.10/240
+                   *[MVPN/70] 00:03:11, metric2 1
+                      Communities: target:10.255.0.1:0
+
+bgp.mvpn6.0: 3 destinations, 3 routes (3 active, 0 holddown, 0 hidden)
+5:10.255.0.1:0:128:2001:db8:1557::1:128:ff3e::1/352
+                   *[BGP/170] 00:02:05, localpref 100, from 203.0.113.9
+                      Communities: target:10.255.0.1:0
+7:10.255.0.1:65001:128:2001:db8:1557::1:128:ff3e::1/352
+                   *[MVPN/70] 00:01:58, metric2 1
+
+Instance : master
+  MVPN Mode : SPT-ONLY
+  C-mcast IPv4 (S:G)    Ptype    St
+  10.199.99.1/32:232.1.1.10/32   ST   RM

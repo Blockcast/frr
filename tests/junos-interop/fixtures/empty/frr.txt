@@ -1,0 +1,18 @@
+BGP router identifier 10.255.0.1, local AS number 65001 vrf-id 0
+Neighbor        V   AS   MsgRcvd   MsgSent   Up/Down  State/PfxRcd
+198.51.100.120    4 65001       12        12  00:01:02            0
+
+BGP neighbor is 198.51.100.120, remote AS 65001, local AS 65001, internal link
+  BGP state = Established, up for 00:01:02
+  Local host: 203.0.113.9, Local port: 41002
+  Neighbor capabilities:
+    Address Family IPv4 MCAST-VPN: advertised and received
+    Address Family IPv6 MCAST-VPN: advertised and received
+  "connectionsEstablished": 1,
+  "connectionsDropped": 0,
+
+MCAST-VPN routes for IPv4:
+% No MCAST-VPN routes
+
+MCAST-VPN routes for IPv6:
+% No MCAST-VPN routes
