@@ -1,0 +1,196 @@
+name: actionlint
+
+# Lints the workflows themselves.  BLO-29523 was a `bash -c 'cmd '$list`
+# that handed pytest only the first failing test file and turned the rest
+# into positional parameters of the -c script, so a serial rerun certified
+# one file and reported green for all of them.  shellcheck sees that shape
+# (SC2128 "expanding an array without an index only gives the first
+# element", plus SC2086), which is the whole reason this job exists: the
+# bug was in CI's own shell, where nothing was looking.
+#
+# Deliberately NOT a step inside github-ci.yml, for the reason
+# rerun-guard-selftest.yml and review-gate-selftest.yml already record: a
+# check wired into the job it protects can abort that job before it reports
+# anything, which recreates the silent hole the check exists to close.  It
+# also keeps a ~30 s linter off the critical path of a ~2.5 h topotest run,
+# and off that run's cancel-in-progress concurrency group.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/actionlint.yaml'
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - '.github/workflows/**'
+      - '.github/actionlint.yaml'
+
+permissions:
+  contents: read
+
+env:
+  # Pinned, not "latest": a lint gate that changes its mind when an upstream
+  # release adds a rule goes red on a PR that touched nothing, and the fix
+  # for that is always to weaken the gate.  Bump deliberately, in a PR that
+  # also clears whatever the new version finds.
+  ACTIONLINT_VERSION: 1.7.7
+  SHELLCHECK_VERSION: 0.10.0
+  # actionlint's digest is the one published in
+  # actionlint_1.7.7_checksums.txt.  shellcheck publishes no checksums file
+  # for this release, so its digest was observed at download and pinned
+  # here: that stops a later substitution, it does not independently attest
+  # the bytes.
+  ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+  SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+
+jobs:
+  actionlint:
+    name: Workflow lint (actionlint + shellcheck)
+    # arc-light, not `default`: checkout, two small downloads and a linter
+    # that finishes in seconds, the same shape hosted-runner-policy and
+    # review-gate-selftest run there.  `default` is the chronically
+    # saturated build pool (BLO-20032, BLO-25481).
+    runs-on: arc-light
+    # A template roll of arc-light takes no new jobs until every pending or
+    # running one finishes (ARC updateStrategy eventual, onprem-k8s
+    # arc/controller-values.yaml), so the 360-minute default would let one
+    # hung job hold the lane for up to 6 h.  This job has no runs yet, so
+    # the lane's sizing rule ceil(6 * T_best / 60) is taken against
+    # hosted-runner-policy's enforce, the closest existing shape (43 s =>
+    # 5).  It adds ~6 MB of downloads that job does not have; if a healthy
+    # run is ever killed here, re-size against the rule with this job's own
+    # T_best rather than bumping the cap.
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install actionlint and shellcheck
+        run: |
+          set -euo pipefail
+          # Whether this runner image gives the job root or a sudo-capable
+          # user is not guaranteed across pools, and a bare `sudo` fails
+          # outright on an image that ships none (dimt-reconcile-selftest).
+          SUDO=''; [ "$(id -u)" -eq 0 ] || SUDO=sudo
+          # GNU tar shells out to the xz binary for .tar.xz, and shellcheck
+          # ships no other format.
+          command -v xz >/dev/null 2>&1 || {
+            $SUDO apt-get update -qq && $SUDO apt-get install -y -qq xz-utils; }
+
+          bin="${RUNNER_TEMP}/lint-bin"
+          mkdir -p "${bin}"
+
+          al="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl -fsSL -o "${al}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${al}" | sha256sum -c -
+          tar -xzf "${al}" -C "${bin}" actionlint
+
+          sc="${RUNNER_TEMP}/shellcheck.tar.xz"
+          curl -fsSL -o "${sc}" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  ${sc}" | sha256sum -c -
+          tar -xJf "${sc}" -C "${bin}" --strip-components=1 \
+            "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+
+          echo "${bin}" >> "$GITHUB_PATH"
+
+      - name: Show tool versions
+        # actionlint finds shellcheck by name on PATH and, if it is absent,
+        # skips every SC* rule and still exits 0.  So "actionlint ran" and
+        # "the shell in these workflows was checked" are different claims;
+        # print both versions so a green run says which one it is.
+        run: |
+          set -euo pipefail
+          actionlint --version
+          shellcheck --version
+
+      - name: Lint workflows
+        # No -shellcheck severity floor is set, because none is needed:
+        # actionlint reports every shellcheck finding as an actionlint error
+        # and exits 1 regardless of shellcheck's own severity.  Measured on
+        # this tree at the parent commit -- 18 findings whose highest
+        # severity was `warning`, zero `error`, exit 1 -- and on the
+        # mutation below, whose SC2128 is `warning` and SC2086 `info`.
+        # Anything shellcheck says here is already gating.
+        run: actionlint -color
+
+      - name: Self-test - the gate can still fail
+        # A lint job that cannot fail is worse than no lint job: it reports
+        # the same green whether the workflows are clean or the checker is
+        # inert.  The realistic way this one goes inert is shellcheck
+        # disappearing from PATH, which silently drops every SC* rule --
+        # the trap that made the first BLO-29596 measurement read as
+        # "actionlint finds nothing".  So prove on every run that the exact
+        # BLO-29523 shape is still rejected.
+        #
+        # The fixture is synthetic rather than a mutated copy of
+        # github-ci.yml: this step's claim is only "the SC* rules are live",
+        # and the step above already lints the real call sites.  A fixture
+        # that does not quote github-ci.yml cannot rot when github-ci.yml is
+        # refactored.
+        run: |
+          set -euo pipefail
+          fixture="${RUNNER_TEMP}/blo-29523-fixture.yml"
+          out="${RUNNER_TEMP}/selftest.out"
+
+          # Arm 1, the bug shape: the run list glued onto the `bash -c`
+          # string, so pytest receives only its first element and the rest
+          # become positional parameters of the -c script.
+          cat > "${fixture}" <<'FIXTURE'
+          name: fixture
+          on: push
+          jobs:
+            rerun:
+              runs-on: arc-light
+              steps:
+                - run: |
+                    mapfile -t rerun_tests < <(printf 'a.py\nb.py\n')
+                    bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest '$rerun_tests
+          FIXTURE
+
+          # -config-file + a path, rather than a scratch tree: actionlint
+          # resolves its project root through git and refuses to lint a file
+          # outside a repository, and this way the self-test also proves the
+          # real .github/actionlint.yaml parses and resolves `arc-light`.
+          rc=0
+          actionlint -oneline -config-file .github/actionlint.yaml "${fixture}" \
+            > "${out}" 2>&1 || rc=$?
+          cat "${out}"
+
+          if [ "${rc}" -eq 0 ]; then
+            echo "::error title=actionlint gate is vacuous::The BLO-29523 bug shape linted CLEAN. The SC* rules are not running (shellcheck missing from PATH, or the integration broke), so a green 'Lint workflows' above means nothing." >&2
+            exit 1
+          fi
+          # Name the rule, not just non-zero: an unrelated failure (bad
+          # fixture, unreadable config, actionlint crash) is also non-zero
+          # and would prove nothing about shellcheck.
+          grep -q 'SC2128' "${out}" || {
+            echo "::error title=actionlint gate is vacuous::The fixture was rejected, but not with SC2128 -- the array-truncation diagnosis for BLO-29523 is not firing. Check that shellcheck is on PATH and that the fixture still carries the bug shape." >&2
+            exit 1; }
+
+          # Arm 2, the positive control.  Without it a checker that rejected
+          # EVERYTHING would pass arm 1 and be reported healthy, which is
+          # the same false green in the other direction.  Written out as its
+          # own fixture rather than sed-ed out of the first one: the
+          # replacement text would be a single-quoted string full of `$`,
+          # which is an SC2016 in this very file.
+          cat > "${fixture}" <<'FIXTURE'
+          name: fixture
+          on: push
+          jobs:
+            rerun:
+              runs-on: arc-light
+              steps:
+                - run: |
+                    mapfile -t rerun_tests < <(printf 'a.py\nb.py\n')
+                    bash -c 'cd ~/frr/tests/topotests ; sudo -E pytest "$@"' pytest-rerun "${rerun_tests[@]}"
+          FIXTURE
+          actionlint -oneline -config-file .github/actionlint.yaml "${fixture}" || {
+            echo "::error title=actionlint self-test is broken::The FIXED form was rejected too, so arm 1 proves nothing -- this checker is failing everything it is given." >&2
+            exit 1; }
+
+          echo "Self-test OK: bug shape rejected with SC2128, fixed shape accepted."

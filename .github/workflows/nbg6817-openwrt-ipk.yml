@@ -373,6 +373,10 @@ jobs:
             # has already quarantined any .ipk set into artifacts/REJECTED/ and
             # written REJECTED.txt, so the verdict is inside the download too --
             # this is the same statement on the surface the operator reads first.
+            # Literal markdown: the backticks below are code spans for the
+            # step summary, not command substitution, so single quotes are
+            # what the text needs.
+            # shellcheck disable=SC2016
             {
               echo '### ⛔ ACCEPTANCE CHECKS FAILED — DO NOT INSTALL'
               echo
@@ -390,6 +394,10 @@ jobs:
             exit 0
           fi
 
+          # Literal markdown again, plus one line that prints a ready-to-paste
+          # ssh command: its `\n` is an argument to the REMOTE `tr`, so it has
+          # to survive this echo unexpanded rather than becoming a newline here.
+          # shellcheck disable=SC2016,SC2028
           {
             echo '### Manifest'
             echo '```'
