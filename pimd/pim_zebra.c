@@ -569,6 +569,36 @@ void pim_gtm_upstream_update(struct pim_instance *pim, struct pim_upstream *up,
 	}
 }
 
+/* Toggle mvpn-gtm and reconcile every existing upstream against it.
+ *
+ * pim_gtm_upstream_update() is driven by join_state edges, so flipping the
+ * bool alone does nothing for an (S,G) that is already Joined: enabling GTM
+ * after a receiver joined originated no Type-7 (BLO-46056 -- the knob has to
+ * be on BEFORE the join), and disabling it left every announced route
+ * advertised with nothing left to withdraw it.  Withdraw while the flag is
+ * still set (the reconcile is a no-op when it is clear), announce once it is
+ * set. */
+void pim_gtm_enable_set(struct pim_instance *pim, bool enable)
+{
+	struct pim_upstream *up;
+
+	if (pim->gtm_enable == enable)
+		return;
+
+	if (!enable)
+		frr_each (rb_pim_upstream, &pim->upstream_head, up)
+			pim_gtm_upstream_update(pim, up, true);
+
+	pim->gtm_enable = enable;
+
+	/* ponytail: RPF is not re-run here.  An upstream whose RPF failed for
+	 * want of a PIM neighbor (pim_rpf.c neigh_needed) only recovers on its
+	 * next NHT event; DIMT-pinned upstreams are unaffected. */
+	if (enable)
+		frr_each (rb_pim_upstream, &pim->upstream_head, up)
+			pim_gtm_upstream_update(pim, up, false);
+}
+
 /* Relay a change in proven-forwarding state for an already-announced (S,G).
  * Edge-triggered: an unchanged state sends nothing, so this is safe to call
  * from every event that could plausibly have moved readiness.

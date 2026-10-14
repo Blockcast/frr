@@ -298,6 +298,45 @@ interface r2-eth1
     _assert_no_parse_errors("after controlled re-establishment")
 
 
+def _set_r2(lines):
+    get_topogen().gears["r2"].vtysh_cmd("configure terminal\n" + lines)
+
+
+def _assert_type7(want_present, stage):
+    _, result = topotest.run_and_expect(
+        functools.partial(_type7_present, want_present), None, count=90, wait=1
+    )
+    assert result is None, "{}: {}".format(stage, result)
+
+
+def test_ipv6_mvpn_gtm_toggle_reconciles_joined_sg():
+    """Toggling mvpn-gtm under an already-Joined (S,G) must withdraw and
+    re-originate its Type-7 (BLO-46056).  pim6d announces on join_state
+    edges only, so before the fix `no mvpn-gtm` stranded the Type-7 and a
+    later `mvpn-gtm` never re-originated it."""
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    _set_reflection_enabled(False)
+    _assert_primary_converged()
+    sg = "{} {}".format(GROUP, SOURCE)
+
+    _set_r2("interface r2-eth1\n ipv6 mld join-group {}\n".format(sg))
+    _assert_type7(True, "joined with mvpn-gtm on")
+
+    _set_r2("router pim6\n no mvpn-gtm\n")
+    _assert_type7(False, "mvpn-gtm disabled under a joined (S,G)")
+
+    _set_r2("router pim6\n mvpn-gtm\n")
+    _assert_type7(True, "mvpn-gtm re-enabled under a joined (S,G)")
+
+    _set_r2("interface r2-eth1\n no ipv6 mld join-group {}\n".format(sg))
+    _assert_type7(False, "after leave")
+    _assert_primary_converged()
+    _assert_no_parse_errors("after mvpn-gtm toggle")
+
+
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
     sys.exit(pytest.main(args))
