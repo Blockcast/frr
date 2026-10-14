@@ -24,6 +24,7 @@
 #include "pim_dimt.h"
 #include "pim_ssmpingd.h"
 #include "pim_vxlan.h"
+#include "pim_zebra.h"
 #include "pim_util.h"
 #include "log.h"
 #include "lib_errors.h"
@@ -743,7 +744,7 @@ int routing_control_plane_protocols_control_plane_protocol_pim_address_family_mv
 	case NB_EV_APPLY:
 		vrf = nb_running_get_entry(args->dnode, NULL, true);
 		pim = vrf->info;
-		pim->gtm_enable = yang_dnode_get_bool(args->dnode, NULL);
+		pim_gtm_enable_set(pim, yang_dnode_get_bool(args->dnode, NULL));
 	}
 
 	return NB_OK;
