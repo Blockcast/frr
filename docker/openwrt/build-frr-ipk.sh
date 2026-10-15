@@ -124,6 +124,34 @@ fi
 echo "OK: $FRR_REF -> $SRC_SHA in the handed-in repo"
 
 echo "=== feeds update ==="
+# Fetch only the two feeds this build compiles from, and the base feed shallow.
+#
+# The SDK image's feeds.conf.default declares five feeds, and declares base as
+# `src-git-full`, for which scripts/feeds runs `git clone --branch <tag>` with
+# no --depth: the WHOLE openwrt.git history, from git.openwrt.org, on every run.
+# Nothing here reads that history. The build needs the tree at the tag, for the
+# base packages frr depends on (libcap, libjson-c, ncurses, readline, zlib,
+# pcre2, util-linux), and git.openwrt.org is slow and variable: that one clone
+# took 62m55s of run 38194870475's 120-minute budget, and 3m46s to 24m34s in the
+# green runs. luci, routing and telephony are never read at all; frr and
+# everything it depends on live in base and packages.
+#
+# So derive feeds.conf from the image's own feeds.conf.default -- same URLs and
+# the same tag/commit pins, which stay a property of the SDK image -- keeping
+# only base and packages, with base as `src-git` (scripts/feeds: `git clone
+# --depth 1 --branch <tag>`). scripts/feeds reads feeds.conf in preference to
+# feeds.conf.default.
+awk '$2 == "base" || $2 == "packages" { if ($1 == "src-git-full") $1 = "src-git"; print }' \
+  feeds.conf.default > feeds.conf
+# Exactly two shallow, pinned feeds must come out. Anything else means the
+# image's feeds.conf.default changed shape and this derivation needs revisiting.
+if [ "$(awk '$1 == "src-git" && ($2 == "base" || $2 == "packages") && $3 ~ /[;^]/' feeds.conf | wc -l)" -ne 2 ] \
+   || [ "$(wc -l < feeds.conf)" -ne 2 ]; then
+  echo "FATAL: could not derive a pinned base+packages feeds.conf from feeds.conf.default:" >&2
+  cat feeds.conf.default >&2
+  exit 1
+fi
+cat feeds.conf
 ./scripts/feeds update -a
 
 MK=feeds/packages/net/frr/Makefile
