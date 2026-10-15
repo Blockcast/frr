@@ -17,11 +17,15 @@ on:
       - review_request_removed
       - labeled
       - unlabeled
-  pull_request_review:
+  # Formal reviews (submitted/edited/dismissed) arrive via
+  # review-gate-relay.yml. A `pull_request_review` trigger here would run the
+  # PR's own copy of this file, which cannot be pinned to the default branch
+  # (BLO-46675). `workflow_run` always runs this file from the default branch.
+  workflow_run:
+    workflows:
+      - review-gate-relay
     types:
-      - submitted
-      - edited
-      - dismissed
+      - completed
   # The policy accepts Ally *issue comments* as head signals, so without this
   # trigger that fallback could never re-evaluate: the head status would stay
   # stale until some unrelated PR event happened to fire. The payload carries
@@ -61,7 +65,9 @@ permissions:
 # intermediates are fine because every run recomputes from full current
 # state.
 concurrency:
-  group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  # workflow_run: pull_requests[0] is empty for fork PRs; those fall back to a
+  # per-head group, the one place the v2 race above can still occur.
+  group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha || github.ref }}
   cancel-in-progress: false
 
 jobs:
