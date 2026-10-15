@@ -1,0 +1,32 @@
+name: review-gate-relay
+
+# Carries formal-review events to review-gate.yml without running anything.
+#
+# A `pull_request_review` run executes the workflow file from the PR's merge
+# ref, i.e. PR-supplied code. frr is public, so that cannot land on a
+# self-hosted runner: runner groups are pinned to default-branch workflow refs
+# (BLO-40782 / BLO-46675), and no hosted fallback exists (BLO-16558). This
+# workflow's only job is `if: false`, so no runner is ever allocated. The run
+# still completes, and its `workflow_run: completed` event wakes
+# review-gate.yml, which runs from the default branch and re-evaluates the PR.
+#
+# Dropping the review trigger instead would let a review with findings, or a
+# dismissal, on an already-green head leave the stale `success` standing.
+# Measured 2026-10-15: `workflow_run` delivers for runs whose every job was
+# skipped (13/13 such review-gate runs in Blockcast/hang-mmt-fec, 10-12..10-15,
+# each followed by its consumer run within 3s; null rate 2-3%).
+on:
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
+
+permissions: {}
+
+jobs:
+  relay:
+    if: false
+    runs-on: arc-light
+    steps:
+      - run: "true"

@@ -1018,6 +1018,157 @@ class TestApprovalAndRecency(unittest.TestCase):
         self.assertEqual(state, "pending")
 
 
+class TestWorkflowRunRelay(unittest.TestCase):
+    """BLO-46675: formal reviews reach the gate through review-gate-relay.yml's
+    `workflow_run` completion, whose payload names only the reviewed head."""
+
+    OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    def _resolve(self, run, open_prs):
+        with mock.patch.object(gate, "fetch_paginated", return_value=open_prs) as listing:
+            number = gate.pull_number_for_workflow_run(run, "https://api", "Blockcast", "frr", "t")
+        return number, listing
+
+    def test_same_repo_pr_resolves_from_the_payload_without_listing(self):
+        run = {"head_sha": HEAD, "pull_requests": [{"number": 7, "head": {"sha": HEAD}}]}
+        number, listing = self._resolve(run, [])
+        self.assertEqual(number, 7)
+        listing.assert_not_called()
+
+    def test_fork_pr_resolves_from_the_open_pr_list(self):
+        # pull_requests is empty for forks; the open-PR list is authoritative.
+        run = {"head_sha": HEAD, "pull_requests": []}
+        number, _ = self._resolve(run, [{"number": 3, "head": {"sha": self.OTHER}},
+                                        {"number": 9, "head": {"sha": HEAD}}])
+        self.assertEqual(number, 9)
+
+    def test_review_of_a_superseded_head_gates_nothing(self):
+        # PR #7 has moved on to HEAD since the review of OTHER.
+        run = {"head_sha": self.OTHER, "pull_requests": [{"number": 7, "head": {"sha": HEAD}}]}
+        number, _ = self._resolve(run, [{"number": 7, "head": {"sha": HEAD}}])
+        self.assertIsNone(number)
+
+    def test_main_gates_the_refetched_head_of_the_resolved_pr(self):
+        event = {"workflow_run": {"head_sha": HEAD, "pull_requests": [{"number": 7, "head": {"sha": HEAD}}]},
+                 "repository": {"full_name": "Blockcast/frr"}}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+        self.addCleanup(os.unlink, handle.name)
+        statuses = []
+        refetched = {"number": 7, "state": "open", "draft": False, "head": {"sha": HEAD},
+                     "user": {"login": HUMAN}, "labels": []}
+        env = {"GITHUB_EVENT_PATH": handle.name, "GITHUB_REPOSITORY": "Blockcast/frr",
+               "GITHUB_TOKEN": "test-token"}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "_request", return_value=refetched) as refetch, \
+                mock.patch.object(gate, "set_commit_status",
+                                  side_effect=lambda *a, **k: statuses.append((a[3], a[5]))), \
+                mock.patch.object(gate, "fetch_paginated", return_value=[]), \
+                mock.patch.object(gate, "enrich_reviews_with_edit_times"):
+            gate.main()
+        self.assertTrue(statuses)
+        self.assertEqual({sha for sha, _ in statuses}, {HEAD})
+        self.assertTrue(any("/pulls/7" in c[0][0] for c in refetch.call_args_list))
+
+    def test_a_failed_pr_lookup_leaves_the_reviewed_head_addressable(self):
+        # The crash handler writes `error` to _STATUS_TARGET["sha"]; without the
+        # head claimed first, a lookup failure would leave a stale success.
+        event = {"workflow_run": {"head_sha": HEAD, "pull_requests": []},
+                 "repository": {"full_name": "Blockcast/frr"}}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+        self.addCleanup(os.unlink, handle.name)
+        env = {"GITHUB_EVENT_PATH": handle.name, "GITHUB_REPOSITORY": "Blockcast/frr",
+               "GITHUB_TOKEN": "test-token"}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "fetch_paginated", side_effect=RuntimeError("down")):
+            with self.assertRaises(RuntimeError):
+                gate.main()
+        self.assertEqual(gate._STATUS_TARGET.get("sha"), HEAD)
+
+    def _run_main(self, event, **patches):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+        self.addCleanup(os.unlink, handle.name)
+        env = {"GITHUB_EVENT_PATH": handle.name, "GITHUB_REPOSITORY": "Blockcast/frr",
+               "GITHUB_TOKEN": "test-token"}
+        statuses = []
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "set_commit_status",
+                                  side_effect=lambda *a, **k: statuses.append((a[3], a[5]))), \
+                mock.patch.multiple(gate, **patches):
+            gate.main()
+        return statuses
+
+    def test_fork_review_hands_off_to_the_pr_group_without_posting(self):
+        # A fork run sits in a per-head group; posting from it would race the
+        # PR's review-gate-<N> group (fail-open). It must only dispatch.
+        event = {"workflow_run": {"head_sha": HEAD, "pull_requests": []},
+                 "repository": {"full_name": "Blockcast/frr", "default_branch": "master"}}
+        request = mock.Mock(return_value=None)
+        statuses = self._run_main(
+            event, _request=request,
+            fetch_paginated=mock.Mock(return_value=[{"number": 9, "head": {"sha": HEAD}}]))
+        self.assertEqual(statuses, [])
+        request.assert_called_once()
+        url = request.call_args[0][0]
+        self.assertTrue(url.endswith("/actions/workflows/review-gate.yml/dispatches"))
+        self.assertEqual(request.call_args[1]["payload"],
+                         {"ref": "master", "inputs": {"pr_number": "9"}})
+
+    def test_a_failed_fork_hand_off_leaves_the_reviewed_head_addressable(self):
+        event = {"workflow_run": {"head_sha": HEAD, "pull_requests": []},
+                 "repository": {"full_name": "Blockcast/frr", "default_branch": "master"}}
+        with self.assertRaises(RuntimeError):
+            self._run_main(
+                event, _request=mock.Mock(side_effect=RuntimeError("422")),
+                fetch_paginated=mock.Mock(return_value=[{"number": 9, "head": {"sha": HEAD}}]))
+        self.assertEqual(gate._STATUS_TARGET.get("sha"), HEAD)
+
+    def test_dispatched_run_gates_the_named_pr(self):
+        refetched = {"number": 9, "state": "open", "draft": False, "head": {"sha": HEAD},
+                     "user": {"login": HUMAN}, "labels": []}
+        request = mock.Mock(return_value=refetched)
+        statuses = self._run_main(
+            {"inputs": {"pr_number": "9"}, "repository": {"full_name": "Blockcast/frr"}},
+            _request=request, fetch_paginated=mock.Mock(return_value=[]),
+            enrich_reviews_with_edit_times=mock.Mock())
+        self.assertTrue(statuses)
+        self.assertEqual({sha for sha, _ in statuses}, {HEAD})
+        self.assertTrue(any("/pulls/9" in c[0][0] for c in request.call_args_list))
+
+    def test_dispatched_runs_join_the_pr_group(self):
+        gate_yml = self._workflow("review-gate.yml")
+        self.assertRegex(gate_yml, r"(?m)^\s{2}workflow_dispatch:\s*$")
+        self.assertRegex(gate_yml, r"(?m)^\s*actions:\s*write\s*$")
+        group = re.search(r"(?m)^\s*group:\s*(.+)$", gate_yml).group(1)
+        # Before the head_sha fallback, or the dispatched run lands per-head too.
+        self.assertLess(group.index("inputs.pr_number"),
+                        group.index("github.event.workflow_run.head_sha"))
+
+    def _workflow(self, name):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", name)
+        with open(path, encoding="utf8") as handle:
+            return handle.read()
+
+    def test_gate_never_runs_a_pr_supplied_copy_on_review_events(self):
+        gate_yml = self._workflow("review-gate.yml")
+        self.assertNotRegex(gate_yml, r"(?m)^\s{2}pull_request_review:\s*$")
+        self.assertRegex(gate_yml, r"(?m)^\s{2}workflow_run:\s*$")
+        self.assertRegex(gate_yml, r"(?m)^\s*-\s*review-gate-relay\s*$")
+        self.assertIn("github.event.workflow_run.pull_requests[0].number", gate_yml)
+
+    def test_relay_allocates_no_runner_and_relays_every_review_action(self):
+        relay = self._workflow("review-gate-relay.yml")
+        self.assertRegex(relay, r"(?m)^name:\s*review-gate-relay\s*$")
+        self.assertRegex(relay, r"(?m)^\s{2}pull_request_review:\s*$")
+        for action in ("submitted", "edited", "dismissed"):
+            self.assertRegex(relay, r"(?m)^\s*-\s*%s\s*$" % action)
+        self.assertEqual(len(re.findall(r"(?m)^\s{2}\w[\w-]*:\s*$", relay.split("jobs:", 1)[1])), 1)
+        self.assertRegex(relay, r"(?m)^\s*if:\s*false\s*$")
+        self.assertRegex(relay, r"(?m)^permissions:\s*\{\}\s*$")
+
+
 class TestStalePayloadOrchestration(unittest.TestCase):
     """Runs serialize on a shared group and must be unconditionally willing to
     evaluate current state, whatever stale snapshot woke them. Round 7: a
