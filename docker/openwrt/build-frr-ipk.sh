@@ -205,6 +205,30 @@ subs = [
     # a human can reach.
     (r"(?m)^(\t\$\(CP\) \$\(PKG_INSTALL_DIR\)/usr/lib/libmgmt_be_nb\.so\* \$\(1\)/usr/lib/)$",
      "\\1\n\t$(CP) $(PKG_INSTALL_DIR)/usr/lib/libmlag_pb.so* $(1)/usr/lib/"),
+    # Drop frr-pythontools from the source package entirely. It is never
+    # shipped (not in FRR_PKGS), and building it costs most of the compile.
+    #
+    # OpenWrt orders builds per SOURCE package: package-metadata.pl emits
+    # `frr/compile += python3/compile` for frr-pythontools' +python3-base
+    # +python3-light +python3-logging whether or not frr-pythontools is
+    # selected, and python3 defines Build/InstallDev, so its `compile` builds
+    # the whole TARGET Python even with no python3 package selected. Its
+    # PKG_BUILD_DEPENDS then pulls in bluez (+kmod-bluetooth, i.e.
+    # package/kernel/linux packaging every =m kmod the SDK defaults on, which
+    # downloads the 386 MB linux-firmware-20241110.tar.xz), glib2, dbus,
+    # libical, sqlite3, gdbm and openssl (+kmod-cryptodev). The frr TARGET
+    # compile cannot start until all of that is done. Measured from the job
+    # logs, from frr's host tool (clippy) being ready to the frr target compile
+    # starting: 11m06s in run 35754114883 and 28m10s in run 37328124607. Run
+    # 38194870475 hit its 120-minute limit packaging kmods, 7m19s after clippy
+    # was ready, and its frr target compile never started.
+    #
+    # Deselecting it in .config would therefore remove nothing; deleting the
+    # BuildPackage call removes the dependency edge itself. No shipped byte
+    # changes: frr-pythontools is not in the feed's PKG_CONFIG_DEPENDS, so
+    # frr's CONFIGURE_ARGS and .configured_<md5> stamp are unchanged, and its
+    # install recipe only copies files out of the shared PKG_INSTALL_DIR.
+    (r"(?m)^\$\(eval \$\(call BuildPackage,frr-pythontools\)\)\n", ""),
 ]
 for entry in subs:
     pat, repl = entry[0], entry[1]
@@ -248,6 +272,17 @@ if ! grep -qx 'CONFIG_PACKAGE_frr-pim6d=y' .config; then
   exit 1
 fi
 echo "OK: CONFIG_PACKAGE_frr-pim6d=y is selected"
+
+# The feed rewrite deletes frr-pythontools so the target Python closure is off
+# frr's critical path (see the comment on that substitution). Check the package
+# metadata this build actually resolved, not just the Makefile text: the symbol
+# must be absent, because a merely deselected package keeps its build edges.
+if grep -q 'CONFIG_PACKAGE_frr-pythontools' .config; then
+  echo "FATAL: frr-pythontools is still a package after the feed rewrite --" >&2
+  echo "       the target Python build is back on frr's critical path" >&2
+  exit 1
+fi
+echo "OK: frr-pythontools is not a package in this build"
 
 echo "=== make package/frr/clean ==="
 make package/frr/clean V=s
@@ -328,15 +363,16 @@ mkdir -p /builder/artifacts
 # Copy ONLY the daemon set this PoP runs -- deliberately not `find -name 'frr*.ipk'`.
 #
 # `make defconfig` marks every other FRR daemon =m (the SDK's default for package
-# symbols), so the build also produces frr-ospfd, frr-isisd, frr-ldpd, frr-nhrpd,
-# frr-pythontools and a dozen more. Shipping those to the operator is actively
-# harmful, not merely untidy: the retrieval instructions say
-# `opkg install ./frr*.ipk` (one transaction, so opkg resolves the inter-package
-# deps together), and frr-pythontools DEPENDS on +python3-base +python3-light
-# +python3-logging. A home router has none of those and no configured network
-# feed to fetch them from, so opkg fails the WHOLE transaction on an unsatisfied
-# dependency -- inside a one-shot operator window, on a device only a human can
-# reach. Filtering here is what keeps the glob in those instructions safe.
+# symbols), so the build also produces frr-ospfd, frr-isisd, frr-ldpd, frr-nhrpd
+# and a dozen more. Shipping those to the operator is actively harmful, not
+# merely untidy: the retrieval instructions say `opkg install ./frr*.ipk` (one
+# transaction, so opkg resolves the inter-package deps together), so a single
+# package with a dependency the router lacks -- frr-pythontools' +python3-base
+# +python3-light +python3-logging was the example before the feed rewrite
+# stopped building it -- fails the WHOLE transaction. A home router has no
+# configured network feed to fetch such deps from, and this happens inside a
+# one-shot operator window, on a device only a human can reach. Filtering here
+# is what keeps the glob in those instructions safe.
 #
 # It also honours frr-openwrt-build.md's standing rule: "do not let the SDK's
 # default package selection silently add daemons this fork doesn't ship config
