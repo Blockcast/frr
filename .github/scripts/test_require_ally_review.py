@@ -1086,6 +1086,66 @@ class TestWorkflowRunRelay(unittest.TestCase):
                 gate.main()
         self.assertEqual(gate._STATUS_TARGET.get("sha"), HEAD)
 
+    def _run_main(self, event, **patches):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(event, handle)
+        self.addCleanup(os.unlink, handle.name)
+        env = {"GITHUB_EVENT_PATH": handle.name, "GITHUB_REPOSITORY": "Blockcast/frr",
+               "GITHUB_TOKEN": "test-token"}
+        statuses = []
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gate, "set_commit_status",
+                                  side_effect=lambda *a, **k: statuses.append((a[3], a[5]))), \
+                mock.patch.multiple(gate, **patches):
+            gate.main()
+        return statuses
+
+    def test_fork_review_hands_off_to_the_pr_group_without_posting(self):
+        # A fork run sits in a per-head group; posting from it would race the
+        # PR's review-gate-<N> group (fail-open). It must only dispatch.
+        event = {"workflow_run": {"head_sha": HEAD, "pull_requests": []},
+                 "repository": {"full_name": "Blockcast/frr", "default_branch": "master"}}
+        request = mock.Mock(return_value=None)
+        statuses = self._run_main(
+            event, _request=request,
+            fetch_paginated=mock.Mock(return_value=[{"number": 9, "head": {"sha": HEAD}}]))
+        self.assertEqual(statuses, [])
+        request.assert_called_once()
+        url = request.call_args[0][0]
+        self.assertTrue(url.endswith("/actions/workflows/review-gate.yml/dispatches"))
+        self.assertEqual(request.call_args[1]["payload"],
+                         {"ref": "master", "inputs": {"pr_number": "9"}})
+
+    def test_a_failed_fork_hand_off_leaves_the_reviewed_head_addressable(self):
+        event = {"workflow_run": {"head_sha": HEAD, "pull_requests": []},
+                 "repository": {"full_name": "Blockcast/frr", "default_branch": "master"}}
+        with self.assertRaises(RuntimeError):
+            self._run_main(
+                event, _request=mock.Mock(side_effect=RuntimeError("422")),
+                fetch_paginated=mock.Mock(return_value=[{"number": 9, "head": {"sha": HEAD}}]))
+        self.assertEqual(gate._STATUS_TARGET.get("sha"), HEAD)
+
+    def test_dispatched_run_gates_the_named_pr(self):
+        refetched = {"number": 9, "state": "open", "draft": False, "head": {"sha": HEAD},
+                     "user": {"login": HUMAN}, "labels": []}
+        request = mock.Mock(return_value=refetched)
+        statuses = self._run_main(
+            {"inputs": {"pr_number": "9"}, "repository": {"full_name": "Blockcast/frr"}},
+            _request=request, fetch_paginated=mock.Mock(return_value=[]),
+            enrich_reviews_with_edit_times=mock.Mock())
+        self.assertTrue(statuses)
+        self.assertEqual({sha for sha, _ in statuses}, {HEAD})
+        self.assertTrue(any("/pulls/9" in c[0][0] for c in request.call_args_list))
+
+    def test_dispatched_runs_join_the_pr_group(self):
+        gate_yml = self._workflow("review-gate.yml")
+        self.assertRegex(gate_yml, r"(?m)^\s{2}workflow_dispatch:\s*$")
+        self.assertRegex(gate_yml, r"(?m)^\s*actions:\s*write\s*$")
+        group = re.search(r"(?m)^\s*group:\s*(.+)$", gate_yml).group(1)
+        # Before the head_sha fallback, or the dispatched run lands per-head too.
+        self.assertLess(group.index("inputs.pr_number"),
+                        group.index("github.event.workflow_run.head_sha"))
+
     def _workflow(self, name):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", name)
         with open(path, encoding="utf8") as handle:

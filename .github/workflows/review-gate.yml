@@ -26,6 +26,15 @@ on:
       - review-gate-relay
     types:
       - completed
+  # Fork-PR reviews only: the workflow_run run cannot key its concurrency on
+  # the PR number (pull_requests is empty for forks), so it re-dispatches this
+  # workflow with the number it resolved, and that run joins review-gate-<N>.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR to re-evaluate
+        required: true
+        type: string
   # The policy accepts Ally *issue comments* as head signals, so without this
   # trigger that fallback could never re-evaluate: the head status would stay
   # stale until some unrelated PR event happened to fire. The payload carries
@@ -45,6 +54,9 @@ permissions:
   issues: read
   pull-requests: read
   statuses: write
+  # Only for the fork-review hand-off dispatch above. Every run of this file
+  # executes default-branch code, never the PR's.
+  actions: write
 
 # One shared group per PR; nothing cancels, everything queues. Fourth design
 # for this block; each prior failure is this one's spec:
@@ -65,9 +77,10 @@ permissions:
 # intermediates are fine because every run recomputes from full current
 # state.
 concurrency:
-  # workflow_run: pull_requests[0] is empty for fork PRs; those fall back to a
-  # per-head group, the one place the v2 race above can still occur.
-  group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha || github.ref }}
+  # workflow_run: pull_requests[0] is empty for fork PRs; those runs land in a
+  # per-head group, evaluate nothing, and dispatch a run carrying inputs.pr_number
+  # into review-gate-<N>. So no run that posts a verdict sits outside its PR's group.
+  group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha || github.ref }}
   cancel-in-progress: false
 
 jobs:

@@ -2843,6 +2843,20 @@ def pull_number_for_workflow_run(run, api_base_url, owner, repo, token):
     return None
 
 
+def dispatch_gate_for_pull(api_base_url, owner, repo, token, pull_number, default_branch):
+    """Re-run this gate for PR `pull_number` in its own `review-gate-<N>` group."""
+    if not default_branch:
+        raise RuntimeError("workflow_run payload carries no repository.default_branch")
+    _request(
+        "%s/repos/%s/%s/actions/workflows/review-gate.yml/dispatches"
+        % (api_base_url.rstrip("/"), owner, repo),
+        token,
+        method="POST",
+        payload={"ref": default_branch, "inputs": {"pr_number": str(pull_number)}},
+    )
+    print("Fork PR #%d: dispatched review-gate into its PR group." % pull_number)
+
+
 def fetch_collaborator_permission(api_base_url, owner, repo, username, token):
     """Requester-view-independent trust lookup: the actual repo-level
     permission grant for a login. Returns None when not a collaborator (404).
@@ -3084,6 +3098,9 @@ def main():
         issue = event.get("issue") or {}
         if issue.get("pull_request"):
             pull_number = issue.get("number")
+    if not pull_number and (event.get("inputs") or {}).get("pr_number"):
+        # Dispatched by a fork-PR review hand-off (see below).
+        pull_number = int(event["inputs"]["pr_number"])
     if not pull_number and event.get("workflow_run"):
         # Formal-review events arrive through review-gate-relay.yml. A
         # pull_request_review run executes the PR-supplied workflow file, so
@@ -3096,6 +3113,19 @@ def main():
         pull_number = pull_number_for_workflow_run(
             event["workflow_run"], api_base_url, owner, repo, token
         )
+        if pull_number and not (event["workflow_run"] or {}).get("pull_requests"):
+            # Fork PR: `workflow_run.pull_requests` is empty, so this run sits in
+            # a per-head concurrency group and would run CONCURRENTLY with the
+            # PR's own review-gate-<N> group -- an older run there could post
+            # `success` after this one posted `failure` for a new
+            # CHANGES_REQUESTED. Hand off to a dispatched run keyed on <N>
+            # instead, which queues behind them. A failed dispatch raises, and
+            # the head claimed above records it as `error` (fail-closed).
+            dispatch_gate_for_pull(
+                api_base_url, owner, repo, token, pull_number,
+                (event.get("repository") or {}).get("default_branch"),
+            )
+            return
     if not pull_number:
         print("No pull_request payload found; nothing to gate.")
         return
