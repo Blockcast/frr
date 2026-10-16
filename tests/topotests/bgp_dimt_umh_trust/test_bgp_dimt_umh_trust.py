@@ -43,6 +43,11 @@ next one builds on:
         `no neighbor ... dimt-trusted` on an otherwise-valid route takes the
         mapping away again, proving the knob is live in both directions and
         not just an at-boot filter.
+  5. test_addpath_reprocess_does_not_recharge
+        With r1 untrusted again and add-path transmit enabled on r2's
+        ipv4 unicast, `clear ip bgp prefix` re-runs the loc-RIB hook over the
+        unchanged refused path.  No new announcement arrived, so the counter
+        must not move.  BLO-36822.
 """
 
 import json
@@ -381,6 +386,66 @@ def test_untrusting_the_peer_withdraws_the_mapping():
         sleep(1)
         absent = _mapping_absent()
         assert absent is None, absent
+
+
+def test_addpath_reprocess_does_not_recharge():
+    """A RE-PROCESS IS NOT AN ARRIVAL.  With add-path transmit configured,
+    bgp_process_main_one() skips its unchanged-bestpath early return, so the
+    bgp_route_update hook fires on re-processes that carry no new
+    announcement; `clear ip bgp prefix` is the same shape via
+    BGP_NODE_USER_CLEAR.  Each one used to re-charge the refusal counter
+    against a neighbour that had sent nothing.  BLO-36822.
+
+    Stage 3 is the other half of this contract: an attribute change on the
+    same bgp_path_info MUST still count, and it runs unmodified above."""
+    _skip_on_failure()
+    _precondition(_mapping_absent, "no mapping, as stage 4 left it")
+
+    # The addpath config change resets the session, so the route is
+    # re-learned -- a genuine arrival that may charge.  Settle on that first.
+    get_topogen().gears["r2"].vtysh_cmd(
+        """
+        configure terminal
+         router bgp 65002
+          address-family ipv4 unicast
+           neighbor 10.0.0.1 addpath-tx-all-paths
+        """
+    )
+    _, result = topotest.run_and_expect(_route_learned, None, count=60, wait=1)
+    assert result is None, result
+
+    def _stable():
+        a = _umh_rejected()
+        sleep(3)
+        b = _umh_rejected()
+        if a is None or b is None:
+            return "r2: counter unreadable (bgpd dead?)"
+        if a != b or a < 1:
+            return "r2 counter not settled: {} -> {}".format(a, b)
+        return None
+
+    _, result = topotest.run_and_expect(_stable, None, count=20, wait=1)
+    assert result is None, result
+
+    settled = _umh_rejected()
+    for _ in range(3):
+        get_topogen().gears["r2"].vtysh_cmd(
+            "clear ip bgp prefix {}".format(SRC_PREFIX)
+        )
+        sleep(1)
+    sleep(3)
+
+    # Bound once, for the same reason as the stages above.
+    after = _umh_rejected()
+    assert after == settled, (
+        "r2 re-charged the refusal counter on a re-process that carried no "
+        "new announcement: {} -> {}".format(settled, after)
+    )
+
+    learned = _route_learned()
+    assert learned is None, learned
+    absent = _mapping_absent()
+    assert absent is None, absent
 
 
 def test_memory_leak():
