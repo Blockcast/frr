@@ -305,7 +305,6 @@ def test_pin_skips_an_interface_without_a_vif():
     assert never_pinned() is None, never_pinned()
 
 
-
 def test_freed_vif_admits_a_refused_umh():
     """Under the derived cap, a non-DIMT vif being freed re-admits a refused
     UMH by itself -- no demand edge, no `dimt tunnel-limit` change.
@@ -354,6 +353,7 @@ def test_freed_vif_admits_a_refused_umh():
     expect(admitted)
     assert tunnels(r2)[umh]["interface"] in kernel_vifs(r2), kernel_vifs(r2)
     assert cap(r2)["refusals"] == 2, cap(r2)
+
 
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
