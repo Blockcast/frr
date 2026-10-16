@@ -46,8 +46,8 @@ next one builds on:
   5. test_addpath_reprocess_does_not_recharge
         With r1 untrusted again and add-path transmit enabled on r2's
         ipv4 unicast, `clear ip bgp prefix` (BGP_NODE_USER_CLEAR) re-runs the
-        loc-RIB hook over the unchanged refused path.  No new announcement arrived, so the counter
-        must not move.  BLO-36822.
+        loc-RIB hook over the unchanged refused path.  No new announcement
+        arrived, so the counter must not move.  BLO-36822.
 """
 
 import json
