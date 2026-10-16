@@ -1745,9 +1745,6 @@ void pim_dimt_show_tunnel_limit(struct pim_instance *pim, struct vty *vty,
 		vty_out(vty, "Refused UMH:      %pPAs\n", &ref->umh);
 }
 
-/* Recompute tunnel demand across every upstream and drive the resulting
- * ADD/DEL edges.  Idempotent by construction: it is safe (and expected) to
- * call this from any event that can change the answer. */
 /* A vif was just freed.  Under the derived cap that is budget a refused UMH
  * may now fit, and no demand edge will follow to reconcile, so do it here.
  * Only when something is refused: otherwise the answer cannot change. */
@@ -1757,6 +1754,9 @@ void pim_dimt_vif_freed(struct pim_instance *pim)
 		pim_dimt_reconcile(pim);
 }
 
+/* Recompute tunnel demand across every upstream and drive the resulting
+ * ADD/DEL edges.  Idempotent by construction: it is safe (and expected) to
+ * call this from any event that can change the answer. */
 void pim_dimt_reconcile(struct pim_instance *pim)
 {
 	struct listnode *node, *nnode;

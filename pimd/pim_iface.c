@@ -1111,6 +1111,10 @@ int pim_if_add_vif(struct interface *ifp, bool ispimreg, bool is_vxlan_term)
 		zlog_warn(
 			"%s: Attempting to configure more than MAXVIFS=%d on pim enabled interface %s",
 			__func__, MAXVIFS, ifp->name);
+		/* No slot: leave it vif-less, or pim_dimt_iface_pinnable() and
+		 * the "already has a vif" check above both read index MAXVIFS
+		 * as a real vif (BLO-36556). */
+		pim_ifp->mroute_vif_index = -1;
 		return -3;
 	}
 
@@ -1123,6 +1127,7 @@ int pim_if_add_vif(struct interface *ifp, bool ispimreg, bool is_vxlan_term)
 
 	if (pim_mroute_add_vif(ifp, ifaddr, flags)) {
 		/* pim_mroute_add_vif reported error */
+		pim_ifp->mroute_vif_index = -1;
 		return -5;
 	}
 
