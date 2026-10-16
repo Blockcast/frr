@@ -305,6 +305,56 @@ def test_pin_skips_an_interface_without_a_vif():
     assert never_pinned() is None, never_pinned()
 
 
+
+def test_freed_vif_admits_a_refused_umh():
+    """Under the derived cap, a non-DIMT vif being freed re-admits a refused
+    UMH by itself -- no demand edge, no `dimt tunnel-limit` change.
+
+    Runs on the full vif table left by the pin stage.  Pre-fix nothing
+    reconciled on a vif release, so the UMH stayed refused.
+    """
+    r2 = get_topogen().gears["r2"]
+    umh = "10.99.4.1"
+
+    # aaa0 has no vif but could take the freed one: remove it first so the
+    # freed slot can only go to the refused tunnel.
+    r2.vtysh_cmd("conf t\ninterface {}\nno ip pim".format(COVERING_IFACE))
+    r2.run("ip link del {}".format(COVERING_IFACE))
+
+    r2.vtysh_cmd(
+        "conf t\ndimt tunnel-endpoint {} inner-local 10.99.4.2 outer-local "
+        "10.0.0.2 outer 10.0.0.1 encap gre key 4".format(umh)
+    )
+
+    def refused():
+        state = cap(r2)
+        if state.get("refusedUmhs") != [umh]:
+            return "UMH {} not refused on a full table: {}".format(umh, state)
+        return None
+
+    expect(refused)
+    state = cap(r2)
+    assert state["configuredLimit"] == 0, state
+    assert state["refusals"] == 2, state
+    assert umh not in tunnels(r2), tunnels(r2)
+
+    # Free one non-DIMT vif.  Nothing else changes.
+    r2.vtysh_cmd("conf t\ninterface vf0\nno ip pim")
+
+    def admitted():
+        rows = tunnels(r2)
+        if rows.get(umh, {}).get("state") != "installed":
+            return "refused UMH {} not admitted after a vif was freed: {}".format(
+                umh, rows
+            )
+        if cap(r2)["refusedUmhs"]:
+            return "refused set not drained: {}".format(cap(r2))
+        return None
+
+    expect(admitted)
+    assert tunnels(r2)[umh]["interface"] in kernel_vifs(r2), kernel_vifs(r2)
+    assert cap(r2)["refusals"] == 2, cap(r2)
+
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
     sys.exit(pytest.main(args))

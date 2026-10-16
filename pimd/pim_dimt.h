@@ -224,6 +224,9 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
  * Not on interface events: those only move pins (pim_dimt_iface_up/down). */
 void pim_dimt_reconcile(struct pim_instance *pim);
 
+/* A vif was freed: re-admit refused UMHs the budget now fits (BLO-36556). */
+void pim_dimt_vif_freed(struct pim_instance *pim);
+
 /* Drop acknowledgement state for every tunnel without sending anything --
  * the zebra session that owned those requests is gone, so nothing can be
  * acked over it.  Tunnel identity (id + request bytes) is deliberately kept

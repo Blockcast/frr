@@ -1165,6 +1165,8 @@ int pim_if_del_vif(struct interface *ifp)
 	pim_ifp->pim->iface_vif_index[pim_ifp->mroute_vif_index] = 0;
 
 	pim_ifp->mroute_vif_index = -1;
+
+	pim_dimt_vif_freed(pim_ifp->pim);
 	return 0;
 }
 
