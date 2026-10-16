@@ -190,6 +190,11 @@ void pim_dimt_neighbor_change(struct pim_instance *pim, struct interface *ifp);
 
 void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json);
 void pim_dimt_show_tunnel(struct pim_instance *pim, struct vty *vty, bool json);
+void pim_dimt_show_tunnel_limit(struct pim_instance *pim, struct vty *vty,
+				bool json);
+
+/* `dimt tunnel-limit` (BLO-36556); 0 = auto, the VIF budget. */
+void pim_dimt_tunnel_limit_set(struct pim_instance *pim, uint32_t limit);
 
 /* Per-(S,G) readiness aggregation.  The verdict is otherwise unobservable:
  * pim_dimt_forwarding_state() only ever leaves pimd as a zapi re-ADD toward
