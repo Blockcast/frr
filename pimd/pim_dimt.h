@@ -135,6 +135,10 @@ struct pim_dimt_tunnel {
 	 * for an id it does not know with REMOVED, which frees the record.
 	 */
 	bool kernel_present;
+	/* netdev MTU last checked against PIM_DIMT_PAYLOAD_FLOOR, so the
+	 * warning fires once per observed MTU, not on every re-adopt.
+	 */
+	unsigned int mtu_checked;
 };
 
 void pim_dimt_init(struct pim_instance *pim);

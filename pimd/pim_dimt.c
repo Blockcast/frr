@@ -42,6 +42,7 @@
 #include "pim_jp_agg.h"
 #include "pim_neighbor.h"
 #include "pim_dimt.h"
+#include "pim_time.h"
 
 extern struct zclient *pim_zclient;
 
@@ -1704,6 +1705,57 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 	}
 }
 
+/*
+ * Smallest inner IP packet a DIMT tunnel must carry whole: one 7 x 188 B
+ * MPEG-TS datagram (1316 B) plus UDP (8) and IPv4 (20) headers -- the demo
+ * stream's packet.
+ *
+ * ponytail: a constant, not a knob; make it per-row config when a stream
+ * with a different packet size has to ride a DIMT tunnel.
+ */
+#define PIM_DIMT_PAYLOAD_FLOOR 1344
+
+/*
+ * Warn when a DIMT netdev's MTU leaves less than PIM_DIMT_PAYLOAD_FLOOR once
+ * the outer header of its configured encap is paid for.  An oversized packet
+ * is not fragmented on the way into the tunnel -- the outer header carries
+ * DF -- so it is dropped with nothing on the box saying why.
+ *
+ * The netdev MTU is treated as the bound the OUTER packet must fit.  That is
+ * exactly true in the case this exists for -- `mtu` stated on the endpoint
+ * row at the underlay's own value -- and conservative by one header on a
+ * kernel-derived MTU, which already subtracted it.  Every default derivation
+ * on a 1500-byte underlay still clears the floor.
+ *
+ * Once per observed MTU: adoption re-runs on every interface add and up, and
+ * an unchanged link must not log again.
+ */
+static void pim_dimt_mtu_check(struct pim_dimt_tunnel *tun,
+			       const struct interface *ifp)
+{
+	unsigned int overhead, payload;
+
+	if (!ifp->mtu || ifp->mtu == tun->mtu_checked)
+		return;
+	tun->mtu_checked = ifp->mtu;
+
+	/* outer IP + base GRE header */
+	overhead = (IS_IPADDR_V6(&tun->req.outer_local) ? 40 : 20) + 4;
+	if (tun->req.options & ZAPI_DIMT_TUNNEL_KEY_PRESENT)
+		overhead += 4;
+	if (tun->req.encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU)
+		overhead += 8; /* FOU's UDP header */
+
+	payload = ifp->mtu > overhead ? ifp->mtu - overhead : 0;
+	if (payload < PIM_DIMT_PAYLOAD_FLOOR)
+		zlog_warn("DIMT tunnel %s: MTU %u leaves %u bytes of payload after the %u-byte %s outer header, below the %u-byte floor; larger packets are dropped silently",
+			  ifp->name, ifp->mtu, payload, overhead,
+			  tun->req.encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU
+				  ? "gre-in-fou"
+				  : "gre",
+			  PIM_DIMT_PAYLOAD_FLOOR);
+}
+
 /* An interface pimd asked zebra to create just appeared (or was addressed).
  * Adopt it as a PIM Light interface so it can carry the RPF pin and become a
  * multicast vif.  No-op for interfaces we did not request. */
@@ -1724,6 +1776,7 @@ void pim_dimt_ifp_adopt(struct pim_instance *pim, struct interface *ifp)
 			continue;
 
 		tun->ifindex = ifp->ifindex;
+		pim_dimt_mtu_check(tun, ifp);
 
 		pim_ifp = ifp->info;
 		if (!pim_ifp)
@@ -1957,6 +2010,7 @@ pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up,
 	struct pim_interface *pim_ifp;
 	struct channel_oil *c_oil;
 	struct interface *ifp;
+	ifindex_t pin_ifindex = IFINDEX_INTERNAL;
 	struct pim_dimt_fwd_detail local_detail;
 
 	/* Every non-READY return below must set a cause: bgpd emits
@@ -1984,10 +2038,22 @@ pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up,
 
 	tun = pim_dimt_tunnel_find(pim, umh->umh);
 	if (!tun) {
-		detail->reason = ZAPI_MVPN_SG_FWD_REASON_TUNNEL_REMOVED;
-		return ZAPI_MVPN_SG_FWD_PENDING;
-	}
-	if (tun->state == PIM_DIMT_TUNNEL_FAILED) {
+		/* A static pin: an operator-built pim-light netdev covering
+		 * the UMH, with no endpoint row, so pimd requested no tunnel
+		 * and holds no row for it.  Conjunct (1) is vacuous -- there
+		 * is no netlink ack pimd could have waited for -- so the
+		 * verdict rests on (2) and (3) against the interface DIMT
+		 * actually pinned.  Returning PENDING here unconditionally
+		 * reported a link the kernel was forwarding on as never
+		 * ready.
+		 */
+		if (!PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags) ||
+		    !up->rpf.source_nexthop.interface) {
+			detail->reason = ZAPI_MVPN_SG_FWD_REASON_TUNNEL_REMOVED;
+			return ZAPI_MVPN_SG_FWD_PENDING;
+		}
+		pin_ifindex = up->rpf.source_nexthop.interface->ifindex;
+	} else if (tun->state == PIM_DIMT_TUNNEL_FAILED) {
 		/* Includes zebra's anti-recursion refusal, which lands in
 		 * FAILED (see pim_dimt.c tunnel-ack handling).  pimd cannot
 		 * tell the two apart from tunnel state alone, so this reports
@@ -1995,18 +2061,19 @@ pim_dimt_forwarding_state(struct pim_instance *pim, struct pim_upstream *up,
 		 * claiming the more specific anti-recursion cause. */
 		detail->reason = ZAPI_MVPN_SG_FWD_REASON_TUNNEL_FAIL_INSTALL;
 		return ZAPI_MVPN_SG_FWD_FAILED;
-	}
-	/* (1) positive netlink ack for the netdev. */
-	if (tun->state != PIM_DIMT_TUNNEL_INSTALLED) {
+	} else if (tun->state != PIM_DIMT_TUNNEL_INSTALLED) {
+		/* (1) positive netlink ack for the netdev. */
 		detail->reason = ZAPI_MVPN_SG_FWD_REASON_TUNNEL_REMOVED;
 		return ZAPI_MVPN_SG_FWD_PENDING;
+	} else {
+		pin_ifindex = tun->ifindex;
 	}
 
 	/* (2) RPF actually pinned onto that netdev.  Interface-UP alone is
 	 * explicitly insufficient (D8.3): a GRE link is admin-up regardless
 	 * of whether the peer is reachable, so "up" proves nothing. */
 	ifp = up->rpf.source_nexthop.interface;
-	if (!ifp || ifp->ifindex != tun->ifindex) {
+	if (!ifp || ifp->ifindex != pin_ifindex) {
 		detail->reason = ZAPI_MVPN_SG_FWD_REASON_RPF_UNPINNED;
 		return ZAPI_MVPN_SG_FWD_PENDING;
 	}
@@ -2071,6 +2138,59 @@ void pim_dimt_readiness_update(struct pim_instance *pim)
 		pim_gtm_forwarding_update(pim, up);
 }
 
+/*
+ * How long an (S,G) may sit Joined through a DIMT netdev with no packet at
+ * its kernel MFC entry before it counts as a suspected blackhole.
+ */
+#define PIM_DIMT_ZERO_PKT_SECS 10
+
+/*
+ * (S,G)s pinned onto `ifindex`, Joined for at least PIM_DIMT_ZERO_PKT_SECS,
+ * whose kernel MFC entry has counted no packet.  This is the one signal the
+ * silent blackholes have in common -- outer TTL 1 dying a hop out, GRO
+ * eating the tunnel's packets -- since every readiness conjunct holds through
+ * both.  Read from the kernel's per-entry counter (SIOCGETSGCNT), never from
+ * pimd's own state, and recomputed on every read, so the first packet takes
+ * an (S,G) straight back out of the count.
+ *
+ * A Joined (S,G) whose source is simply idle counts too; the kernel cannot
+ * tell a quiet source from a lost one.
+ *
+ * ponytail: "no packet ever" on the entry, so a path that forwarded once and
+ * then broke is not caught; compare against a per-(S,G) packet count sampled
+ * N seconds ago if that case matters.
+ */
+static uint32_t pim_dimt_zero_pkt_count(struct pim_instance *pim,
+					ifindex_t ifindex)
+{
+	struct pim_upstream *up;
+	int64_t now = pim_time_monotonic_sec();
+	uint32_t count = 0;
+
+	if (!ifindex)
+		return 0;
+
+	frr_each (rb_pim_upstream, &pim->upstream_head, up) {
+		struct interface *ifp = up->rpf.source_nexthop.interface;
+
+		if (!PIM_UPSTREAM_FLAG_TEST_SRC_DIMT(up->flags) || !ifp ||
+		    ifp->ifindex != ifindex ||
+		    up->join_state != PIM_UPSTREAM_JOINED ||
+		    now - up->state_transition < PIM_DIMT_ZERO_PKT_SECS)
+			continue;
+		/* No MFC entry, no kernel counter: readiness already
+		 * reports that case as mfc_evicted.
+		 */
+		if (!up->channel_oil || !up->channel_oil->installed)
+			continue;
+		pim_mroute_update_counters(up->channel_oil);
+		if (!up->channel_oil->cc.pktcnt)
+			count++;
+	}
+
+	return count;
+}
+
 void pim_dimt_show_tunnel(struct pim_instance *pim, struct vty *vty, bool json)
 {
 	struct listnode *node;
@@ -2087,13 +2207,16 @@ void pim_dimt_show_tunnel(struct pim_instance *pim, struct vty *vty, bool json)
 	if (json)
 		jobj = json_object_new_object();
 	else
-		vty_out(vty, "%-16s %-10s %-16s %-10s %-8s %s\n", "UMH", "TunnelId",
-			"Interface", "State", "Refcount", "Ifindex");
+		vty_out(vty, "%-16s %-10s %-16s %-10s %-8s %-8s %s\n", "UMH",
+			"TunnelId", "Interface", "State", "Refcount", "Ifindex",
+			"ZeroPkt");
 
 	if (!pim->dimt_tunnel_list)
 		goto done;
 
 	for (ALL_LIST_ELEMENTS_RO(pim->dimt_tunnel_list, node, tun)) {
+		uint32_t zero_pkt = pim_dimt_zero_pkt_count(pim, tun->ifindex);
+
 		if (jobj) {
 			json_object *jtun = json_object_new_object();
 			char umh_str[PIM_ADDRSTRLEN];
@@ -2106,12 +2229,14 @@ void pim_dimt_show_tunnel(struct pim_instance *pim, struct vty *vty, bool json)
 					       states[tun->state]);
 			json_object_int_add(jtun, "refcount", tun->refcount);
 			json_object_int_add(jtun, "ifindex", tun->ifindex);
+			json_object_int_add(jtun, "joinedZeroPackets",
+					    zero_pkt);
 			json_object_object_add(jobj, umh_str, jtun);
 		} else {
-			vty_out(vty, "%-16pPAs %-10u %-16s %-10s %-8u %d\n",
+			vty_out(vty, "%-16pPAs %-10u %-16s %-10s %-8u %-8d %u\n",
 				&tun->umh, tun->tunnel_id, tun->ifname,
 				states[tun->state], tun->refcount,
-				tun->ifindex);
+				tun->ifindex, zero_pkt);
 		}
 	}
 

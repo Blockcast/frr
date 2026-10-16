@@ -111,6 +111,7 @@ from lib.kernel_state import (
     check_link_absent,
     check_no_ip_mr_cache,
     link_ifindex,
+    parse_ip_mr_cache,
     resolve_mr_vif,
 )
 from lib.topogen import Topogen, TopoRouter, get_topogen
@@ -1084,6 +1085,225 @@ def test_out_of_band_link_delete_rebuilds_the_tunnel():
     #    building a second one beside a survivor.
     links = r2.run("ip -o link show | grep -c 'dimt-' || true").strip()
     assert links == "1", "expected exactly one DIMT netdev, found {}".format(links)
+
+
+# --- BLO-36564: joined-but-zero-packets, MTU floor, static pin ------------
+
+# PIM_DIMT_ZERO_PKT_SECS in pimd/pim_dimt.c.
+ZERO_PKT_SECS = 10
+
+# Encapsulates exactly like r2's DIMT netdev expects (local/remote swapped, no
+# key), so r2 decapsulates on that netdev and the inner packet reaches the MFC
+# entry the tunnel's vif is the iif of.
+INJECT_IFACE = "gre-inj"
+
+# Five (S,G) datagrams sent raw out INJECT_IFACE.  The source is h1's address,
+# so the packet hits the (S,G) entry, not a (*,G) or no entry at all.
+INJECT_SCRIPT = (
+    "python3 -c 'import socket, struct; "
+    "s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW); "
+    's.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"{dev}"); '
+    'u = struct.pack("!HHHH", 5000, 5000, 40, 0) + b"x" * 32; '
+    'i = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(u), 0, 0, 64, 17, 0, '
+    'socket.inet_aton("{src}"), socket.inet_aton("{grp}")); '
+    '[s.sendto(i + u, ("{grp}", 0)) for _ in range(5)]\' 2>&1'
+)
+
+
+def mfc_pkts(router, source, group):
+    """The kernel MFC entry's own packet counter for (S,G), or None."""
+    for entry in parse_ip_mr_cache(router.run("cat /proc/net/ip_mr_cache 2>&1")):
+        if entry["source"] == source and entry["group"] == group:
+            return entry["pkts"]
+    return None
+
+
+def check_zero_pkt(router, expected):
+    entry = tunnel_entry(router)
+    if entry is None:
+        return "pimd holds no DIMT tunnel for UMH {}".format(UMH)
+    if entry.get("joinedZeroPackets") != expected:
+        return "joinedZeroPackets is {}, expected {}: {}".format(
+            entry.get("joinedZeroPackets"), expected, entry
+        )
+    return None
+
+
+def test_joined_zero_packet_counter_tracks_the_kernel_mfc():
+    """A Joined (S,G) with no packet at its MFC entry is counted on its tunnel.
+
+    r1 has no tunnel back to r2 in this suite, so nothing ever arrives on the
+    DIMT netdev: every readiness conjunct holds and the data plane is dead --
+    the shape of the lab's outer-TTL-1 and GRO-loss blackholes, which looked
+    exactly this healthy.  The counter is the one signal that differs, and the
+    kernel's own per-entry packet counter is the evidence it rests on (G10).
+    Then one burst of packets through the tunnel must take the (S,G) straight
+    back out of the count.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    r1 = tgen.gears["r1"]
+    r2 = tgen.gears["r2"]
+
+    # 1. A ready tunnel whose kernel MFC entry has seen nothing.
+    expect(lambda: check_tunnel_state(r2, "installed"))
+    expect(lambda: check_forwarding(r2, "ready"))
+    ifname = tunnel_ifname(r2)
+    assert mfc_pkts(r2, SOURCE, GROUP) == 0, r2.run("cat /proc/net/ip_mr_cache")
+
+    # 2. Once it has been Joined for the threshold, it is counted.
+    expect(lambda: check_zero_pkt(r2, 1), count=ZERO_PKT_SECS + 30)
+
+    # 3. Feed the tunnel from r1.  rp_filter would drop the inner packet on
+    #    r2 before ipmr sees it: the unicast route back to the source is via
+    #    the underlay, not the tunnel.
+    r1.run(
+        "ip link add {} type gre local {} remote {} ttl 64".format(
+            INJECT_IFACE, OUTER_REMOTE, OUTER_LOCAL
+        )
+    )
+    r1.run("ip address add 192.0.2.1/32 dev {}".format(INJECT_IFACE))
+    r1.run("ip link set {} up".format(INJECT_IFACE))
+    r2.run("sysctl -qw net.ipv4.conf.all.rp_filter=0")
+    r2.run("sysctl -qw net.ipv4.conf.{}.rp_filter=0".format(ifname))
+    r1.run(INJECT_SCRIPT.format(dev=INJECT_IFACE, src=SOURCE, grp=GROUP))
+
+    # 4. Kernel first: the packets reached the entry.  Then the counter
+    #    clears on that, with no timer involved.
+    expect(
+        lambda: None
+        if (mfc_pkts(r2, SOURCE, GROUP) or 0) > 0
+        else "no packet reached the kernel MFC: {}".format(
+            r2.run("cat /proc/net/ip_mr_cache")
+        )
+    )
+    expect(lambda: check_zero_pkt(r2, 0))
+
+    r1.run("ip link del {}".format(INJECT_IFACE))
+
+
+# PIM_DIMT_PAYLOAD_FLOOR in pimd/pim_dimt.c: one 7 x 188 MPEG-TS datagram plus
+# UDP and IPv4 headers.  1360 - 24 (IPv4 + GRE) = 1336 is below it.
+PAYLOAD_FLOOR = 1344
+LOW_MTU = 1360
+
+
+def floor_warnings(router):
+    return router.net.getLog("log", "pimd").count(
+        "below the {}-byte floor".format(PAYLOAD_FLOOR)
+    )
+
+
+def test_mtu_below_the_payload_floor_warns_once():
+    """A DIMT netdev whose MTU cannot carry the floor says so, exactly once.
+
+    Every stage before this one ran at the kernel-derived MTU, which clears
+    the floor -- so the log must hold no warning yet.  Then the row is given
+    an MTU that does not, and the rebuilt netdev must produce one warning
+    naming it, and no more when the same link is re-adopted.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    r2 = tgen.gears["r2"]
+
+    # 1. An adequate MTU logs nothing.
+    assert floor_warnings(r2) == 0, "floor warning at an adequate MTU"
+
+    # 2. State an MTU below the floor.  A row edit is a DEL + ADD, so the
+    #    netdev is rebuilt carrying it -- kernel first.
+    r2.vtysh_cmd(
+        "conf t\ndimt tunnel-endpoint {} inner-local {} outer-local {} "
+        "outer {} encap gre mtu {}".format(
+            UMH, INNER_LOCAL, OUTER_LOCAL, OUTER_REMOTE, LOW_MTU
+        )
+    )
+    expect(lambda: check_tunnel_state(r2, "installed"))
+    ifname = tunnel_ifname(r2)
+    expect(
+        lambda: check_gre_link(
+            r2, ifname, local=OUTER_LOCAL, remote=OUTER_REMOTE, mtu=LOW_MTU
+        )
+    )
+
+    # 3. One warning, naming the interface, the MTU, the payload and floor.
+    expect(
+        lambda: None
+        if floor_warnings(r2) == 1
+        else "{} floor warnings".format(floor_warnings(r2))
+    )
+    text = "DIMT tunnel {}: MTU {} leaves {} bytes".format(
+        ifname, LOW_MTU, LOW_MTU - 24
+    )
+    assert text in r2.net.getLog("log", "pimd"), text
+
+    # 4. Re-adopt the same, unchanged link: no second warning.
+    r2.run("ip link set {} down".format(ifname))
+    r2.run("ip link set {} up".format(ifname))
+    expect(lambda: check_forwarding(r2, "ready"))
+    assert floor_warnings(r2) == 1, "{} floor warnings".format(floor_warnings(r2))
+
+
+STATIC_IFACE = "gre-static"
+
+
+def test_static_pin_reports_ready_when_the_kernel_forwards():
+    """An operator-built tunnel the kernel forwards on reads `ready`.
+
+    No endpoint row, so pimd requests nothing and holds no tunnel row; the
+    UMH mapping pins onto a hand-made pim-light GRE whose ptp peer is the
+    UMH.  That used to report `pending` forever, contradicting the kernel.
+    The kernel is asserted first: the link is GRE to the right outer, and the
+    MFC entry's incoming vif is that link's vif.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    r2 = tgen.gears["r2"]
+
+    # 1. Drop the endpoint row: no tunnel row, and the DIMT netdev goes.
+    ifname = tunnel_ifname(r2)
+    r2.vtysh_cmd(
+        "conf t\nno dimt tunnel-endpoint {} inner-local {} outer-local {} "
+        "outer {} encap gre".format(UMH, INNER_LOCAL, OUTER_LOCAL, OUTER_REMOTE)
+    )
+    expect(lambda: check_no_tunnel(r2))
+    expect(lambda: check_link_absent(r2, ifname))
+
+    # 2. The static tunnel, built the way an operator would.
+    r2.run(
+        "ip link add {} type gre local {} remote {} ttl 64".format(
+            STATIC_IFACE, OUTER_LOCAL, OUTER_REMOTE
+        )
+    )
+    r2.run(
+        "ip address add {} peer {}/32 dev {}".format(INNER_LOCAL, UMH, STATIC_IFACE)
+    )
+    r2.run("ip link set {} up".format(STATIC_IFACE))
+    r2.vtysh_cmd(
+        "conf t\ninterface {}\nip pim\nip pim light".format(STATIC_IFACE)
+    )
+    expect(
+        lambda: check_gre_link(
+            r2, STATIC_IFACE, local=OUTER_LOCAL, remote=OUTER_REMOTE, ttl=64
+        )
+    )
+    expect(lambda: check_pin(r2, STATIC_IFACE, "light"))
+
+    # 3. The kernel admits the (S,G) on the static link's vif.
+    def kernel_admitted():
+        vif, error = resolve_mr_vif(r2, STATIC_IFACE)
+        if error:
+            return error
+        return check_ip_mr_cache_iif(r2, SOURCE, GROUP, vif)
+
+    expect(kernel_admitted)
+
+    # 4. ...and pimd agrees, both live and on the wire.
+    expect(lambda: check_forwarding(r2, "ready"))
+    expect(lambda: check_announced(r2, SG, "ready"))
+    assert forwarding_entry(r2, SG)["interface"] == STATIC_IFACE
 
 
 if __name__ == "__main__":

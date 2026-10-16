@@ -423,8 +423,20 @@ void zebra_dimt_tunnel_if_update(struct interface *ifp)
 		}
 		if (entry->state != ZEBRA_DIMT_ADDING)
 			break;
-		if (zebra_dimt_if_stale_outer_hdr(entry, ifp))
+		if (zebra_dimt_if_stale_outer_hdr(entry, ifp)) {
+			/* Left ADDING with no adoption, no FAIL_INSTALL and no
+			 * retry from pimd: say so, or the stall is silent.
+			 */
+			const struct zebra_l2info_gre *gre =
+				&((const struct zebra_if *)ifp->info)
+					 ->l2info.gre;
+
+			if (IS_ZEBRA_DEBUG_KERNEL)
+				zlog_debug("DIMT tunnel %s: link %s(%d) has the wrong outer header (ttl %u flags 0x%x); not adopting it",
+					   entry->ctx.ifname, ifp->name,
+					   ifp->ifindex, gre->ttl, gre->flags);
 			break;
+		}
 		entry->ifindex = ifp->ifindex;
 		/* A link bound earlier and deleted out of band is replaced by
 		 * this one. */
@@ -788,7 +800,7 @@ static void zebra_dimt_tunnel_add(const struct zebra_dimt_tunnel_ctx *ctx,
 		zrouter.dimt_tunnels->del = zebra_dimt_tunnel_free;
 	}
 	if (!(ctx->tunnel.options & ZAPI_DIMT_TUNNEL_MTU_PRESENT))
-		zlog_warn("DIMT tunnel %s: no MTU in the request; the netdev inherits the kernel default, which does not account for the %s outer header and fragments or drops full-size payloads",
+		zlog_warn("DIMT tunnel %s: no MTU in the request; zebra will not set one, so the netdev keeps whatever MTU it has, which may not account for the %s outer header",
 			  ctx->ifname,
 			  IS_IPADDR_V6(&ctx->tunnel.outer_local)
 				  ? "IPv6 + GRE"
