@@ -44,6 +44,7 @@ def parse_ip_mr_cache(output):
                 "group": _proc_ipv4(fields[0]),
                 "source": _proc_ipv4(fields[1]),
                 "iif": int(fields[2]),
+                "pkts": int(fields[3]),
                 "oifs": oifs,
             }
         )

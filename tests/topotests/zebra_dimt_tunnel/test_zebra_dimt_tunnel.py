@@ -2275,8 +2275,9 @@ def test_request_without_mtu_warns():
     """A request with no MTU option is accepted, and says so in the log.
 
     dimt_zapi_client.py sends options=0, so every ADD in this file takes the
-    no-MTU path: the netdev inherits the kernel default, which does not
-    subtract the outer header, and full-size payloads then fragment or drop.
+    no-MTU path: zebra sets no MTU, so the netdev keeps whatever it has --
+    the kernel default on create, the existing value on adopt -- and neither
+    is guaranteed to subtract the outer header.
     zebra cannot invent an MTU it was not given, so the warning is the whole
     remedy -- and a silent warning is the same as no warning.
     """

@@ -595,6 +595,26 @@ class TestDimtLifecycleWiring(unittest.TestCase):
         )
         self.assertIn('#include "lib/log.h"', dimt)
 
+    def test_stale_outer_header_stall_is_logged(self):
+        """A same-identity link with the wrong outer header is not adopted.
+
+        That leaves the entry ADDING with no adoption, no FAIL_INSTALL and no
+        retry from pimd -- a permanent stall -- so the branch must at least
+        say so, naming the observed ttl and flags (BLO-36564).
+        """
+        dimt = (ROOT / "zebra" / "zebra_dimt.c").read_text()
+        update = dimt.split("void zebra_dimt_tunnel_if_update(", 1)[1].split(
+            "\n}\n", 1
+        )[0]
+        stale = update.split("zebra_dimt_if_stale_outer_hdr(entry, ifp)", 1)[
+            1
+        ].split("break;", 1)[0]
+
+        self.assertIn("IS_ZEBRA_DEBUG_KERNEL", stale)
+        self.assertIn("zlog_debug", stale)
+        self.assertIn("gre->ttl", stale)
+        self.assertIn("gre->flags", stale)
+
 
 if __name__ == "__main__":
     unittest.main()
