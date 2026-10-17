@@ -2703,6 +2703,28 @@ DEFPY (show_ip_pim_dimt_tunnel,
 	return CMD_SUCCESS;
 }
 
+DEFPY (show_ip_pim_dimt_tunnel_limit,
+       show_ip_pim_dimt_tunnel_limit_cmd,
+       "show ip pim [vrf NAME] dimt tunnel-limit [json$json]",
+       SHOW_STR
+       IP_STR
+       PIM_STR
+       VRF_CMD_HELP_STR
+       "DIMT dynamic multicast tunneling\n"
+       "Per-box tunnel cap: tunnels, limit, vif budget and refusals\n"
+       JSON_STR)
+{
+	struct vrf *v;
+
+	v = vrf_lookup_by_name(vrf ? vrf : VRF_DEFAULT_NAME);
+	if (!v || !v->info)
+		return CMD_WARNING;
+
+	pim_dimt_show_tunnel_limit(v->info, vty, !!json);
+
+	return CMD_SUCCESS;
+}
+
 DEFPY (show_ip_pim_dimt_forwarding,
        show_ip_pim_dimt_forwarding_cmd,
        "show ip pim [vrf NAME] dimt forwarding [json$json]",
@@ -2817,6 +2839,27 @@ DEFPY (pim_dimt_tunnel_endpoint,
 		vty_out(vty, "%% Invalid DIMT tunnel endpoint: outer addresses must share a family, and gre-in-fou requires a dport\n");
 		return CMD_WARNING_CONFIG_FAILED;
 	}
+
+	return CMD_SUCCESS;
+}
+
+/*
+ * Per-box DIMT tunnel cap (BLO-36556).  Unset, the cap is the vif budget the
+ * kernel's MAXVIFS table has left after every non-DIMT vif; a configured
+ * value can only lower it.  CONFIG_NODE for the same reason as
+ * `dimt tunnel-endpoint` below its registration.
+ */
+DEFPY (pim_dimt_tunnel_limit,
+       pim_dimt_tunnel_limit_cmd,
+       "[no] dimt tunnel-limit ![(1-32)$limit]",
+       NO_STR
+       "DIMT dynamic multicast tunneling\n"
+       "Maximum number of DIMT tunnels on this box (default: the vif budget)\n"
+       "Tunnel count; clamped to the vif budget\n")
+{
+	PIM_DECLVAR_CONTEXT_VRF(vrf, pim);
+
+	pim_dimt_tunnel_limit_set(pim, no ? 0 : limit);
 
 	return CMD_SUCCESS;
 }
@@ -9713,6 +9756,7 @@ void pim_cmd_init(void)
 	install_element(VIEW_NODE, &show_ip_pim_dimt_umh_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_dimt_tunnel_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_dimt_forwarding_cmd);
+	install_element(VIEW_NODE, &show_ip_pim_dimt_tunnel_limit_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_join_desired_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_upstream_rpf_cmd);
 	install_element(VIEW_NODE, &show_ip_pim_rp_cmd);
@@ -9892,6 +9936,7 @@ void pim_cmd_init(void)
 	 * match this, so it round-trips.
 	 */
 	install_element(CONFIG_NODE, &pim_dimt_tunnel_endpoint_cmd);
+	install_element(CONFIG_NODE, &pim_dimt_tunnel_limit_cmd);
 
 	pim_install_deprecated();
 }

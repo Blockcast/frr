@@ -181,6 +181,14 @@ struct pim_instance {
 	/* DIMT: live tunnel request/ack state, one per UMH under demand
 	 * (struct pim_dimt_tunnel) */
 	struct list *dimt_tunnel_list;
+	/* DIMT: per-box tunnel cap (`dimt tunnel-limit`).  0 = auto, i.e. the
+	 * VIF budget left by every non-DIMT vif; a configured value is still
+	 * clamped to that budget (pim_dimt_tunnel_limit()). */
+	uint32_t dimt_tunnel_limit;
+	/* DIMT: tunnel requests refused at the cap, counted once per UMH per
+	 * demand episode, and the UMHs currently refused (pim_addr *). */
+	uint64_t dimt_tunnel_refusals;
+	struct list *dimt_refused_list;
 	/* DIMT: bounds how long a zebra reconnect holds unreplayed mappings
 	 * before declaring them gone (pim_dimt_umh_resync_begin()) */
 	struct event *dimt_umh_resync_timer;
