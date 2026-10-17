@@ -48,6 +48,20 @@ extern struct zclient *pim_zclient;
 DEFINE_MTYPE_STATIC(PIMD, PIM_DIMT_UMH, "PIM DIMT UMH mapping");
 DEFINE_MTYPE_STATIC(PIMD, PIM_DIMT_ENDPOINT, "PIM DIMT tunnel endpoint");
 DEFINE_MTYPE_STATIC(PIMD, PIM_DIMT_TUNNEL, "PIM DIMT tunnel state");
+DEFINE_MTYPE_STATIC(PIMD, PIM_DIMT_REFUSED, "PIM DIMT refused UMH");
+
+/* A UMH whose tunnel request is being refused at the per-box cap.  `seen`
+ * is the mark for pim_dimt_reconcile()'s mark-and-sweep, which is what makes
+ * the refusal counter count episodes, not reconcile passes. */
+struct pim_dimt_refused {
+	pim_addr umh;
+	bool seen;
+};
+
+static void pim_dimt_refused_free(void *arg)
+{
+	XFREE(MTYPE_PIM_DIMT_REFUSED, arg);
+}
 
 static void pim_dimt_umh_free(void *arg)
 {
@@ -72,6 +86,8 @@ void pim_dimt_init(struct pim_instance *pim)
 	pim->dimt_endpoint_list->del = pim_dimt_endpoint_free;
 	pim->dimt_tunnel_list = list_new();
 	pim->dimt_tunnel_list->del = pim_dimt_tunnel_free;
+	pim->dimt_refused_list = list_new();
+	pim->dimt_refused_list->del = pim_dimt_refused_free;
 }
 
 void pim_dimt_terminate(struct pim_instance *pim)
@@ -83,6 +99,8 @@ void pim_dimt_terminate(struct pim_instance *pim)
 		list_delete(&pim->dimt_endpoint_list);
 	if (pim->dimt_tunnel_list)
 		list_delete(&pim->dimt_tunnel_list);
+	if (pim->dimt_refused_list)
+		list_delete(&pim->dimt_refused_list);
 }
 
 static struct pim_dimt_umh *pim_dimt_umh_find(struct pim_instance *pim,
@@ -132,7 +150,16 @@ static struct pim_dimt_endpoint *pim_dimt_endpoint_find(struct pim_instance *pim
  * the ordinary RFC 7761 reason instead of the RFC 9739 one.  Testing the DIMT
  * flag rather than dropping the light requirement outright keeps
  * pim_dimt_covering_iface()'s no-tunnel search unchanged: an interface pimd
- * did not build for a UMH is still only pinnable when it is light. */
+ * did not build for a UMH is still only pinnable when it is light.
+ *
+ * And it must hold a multicast vif.  An interface without one cannot be an
+ * MFC iif, so a pin on it programs a bogus iif and the stream silently never
+ * arrives.  That is not only a transient: once the kernel's MAXVIFS table is
+ * full, pim_if_add_vif() fails for good and the interface stays vif-less
+ * forever.  Checked here, not inferred from the tunnel cap -- the cap bounds
+ * DIMT netdevs, but any interface can lose (or never get) its vif.  The vif
+ * arriving later is not lost: pim_if_addr_add() calls pim_dimt_iface_up()
+ * after pim_if_add_vif(), which re-resolves every pin. */
 static bool pim_dimt_iface_pinnable(struct interface *ifp)
 {
 	struct pim_interface *pim_ifp;
@@ -144,7 +171,7 @@ static bool pim_dimt_iface_pinnable(struct interface *ifp)
 
 	return pim_ifp && pim_ifp->pim_enable &&
 	       (pim_ifp->pim_light_enable || pim_ifp->pim_dimt_normal) &&
-	       if_is_operative(ifp);
+	       pim_ifp->mroute_vif_index >= 0 && if_is_operative(ifp);
 }
 
 /* First pinnable, *non-tunnel* light interface whose connected subnet (or ptp
@@ -1218,6 +1245,11 @@ int pim_dimt_endpoint_config_write(struct pim_instance *pim, struct vty *vty)
 		written++;
 	}
 
+	if (pim->dimt_tunnel_limit) {
+		vty_out(vty, "dimt tunnel-limit %u\n", pim->dimt_tunnel_limit);
+		written++;
+	}
+
 	return written;
 }
 
@@ -1567,6 +1599,161 @@ static void pim_dimt_tunnel_rejoin_riders(struct pim_instance *pim,
 	}
 }
 
+/* ------------------------------------------------------------------------
+ * Per-box tunnel cap (BLO-36556)
+ *
+ * Linux allows MAXVIFS (32) multicast vifs per MRT table.  Every DIMT netdev
+ * needs one, and so do pimreg (index 0, always reserved), the underlay and
+ * every other pim interface.  Past the ceiling zebra still builds the netdev,
+ * but pim_if_add_vif() fails, so the tunnel installs clean and never
+ * forwards.  The cap refuses the request before the tunnel record -- and so
+ * before any ZAPI ADD or netdev -- exists.
+ * ------------------------------------------------------------------------
+ */
+
+/* Vifs the box can give to DIMT netdevs: MAXVIFS less every vif held by
+ * something else.  Computed live, so it tracks interfaces coming and going. */
+static uint32_t pim_dimt_vif_budget(struct pim_instance *pim)
+{
+	struct listnode *node;
+	struct pim_dimt_tunnel *tun;
+	uint32_t used = 1; /* index 0: pimreg's, reserved even before it exists */
+	int i;
+
+	for (i = 1; i < MAXVIFS; i++)
+		if (pim->iface_vif_index[i])
+			used++;
+
+	/* Give back the vifs DIMT netdevs already hold: those are counted
+	 * against the cap, not against the budget. */
+	for (ALL_LIST_ELEMENTS_RO(pim->dimt_tunnel_list, node, tun)) {
+		struct interface *ifp = NULL;
+		struct pim_interface *pim_ifp;
+
+		if (tun->ifindex)
+			ifp = if_lookup_by_index(tun->ifindex,
+						 pim->vrf->vrf_id);
+		pim_ifp = ifp ? ifp->info : NULL;
+		if (pim_ifp && pim_ifp->mroute_vif_index > 0 && used > 1)
+			used--;
+	}
+
+	return MAXVIFS > used ? MAXVIFS - used : 0;
+}
+
+/* The effective cap: the configured `dimt tunnel-limit`, never above what
+ * the vif budget allows.  A configured value above the budget would only
+ * re-admit the vif-less tunnels the cap exists to refuse. */
+static uint32_t pim_dimt_tunnel_limit(struct pim_instance *pim)
+{
+	uint32_t budget = pim_dimt_vif_budget(pim);
+
+	if (pim->dimt_tunnel_limit && pim->dimt_tunnel_limit < budget)
+		return pim->dimt_tunnel_limit;
+	return budget;
+}
+
+static struct pim_dimt_refused *
+pim_dimt_refused_find(struct pim_instance *pim, pim_addr umh)
+{
+	struct listnode *node;
+	struct pim_dimt_refused *ref;
+
+	for (ALL_LIST_ELEMENTS_RO(pim->dimt_refused_list, node, ref))
+		if (!pim_addr_cmp(ref->umh, umh))
+			return ref;
+	return NULL;
+}
+
+/* Refuse `umh` a tunnel.  Loud once per demand episode: the counter and the
+ * warning fire only when the UMH newly enters the refused set, so a UMH that
+ * stays refused across many reconcile passes is one refusal, not one per
+ * pass, and the log cannot be flooded by reconcile churn. */
+static void pim_dimt_tunnel_refuse(struct pim_instance *pim, pim_addr umh,
+				   uint32_t limit)
+{
+	struct pim_dimt_refused *ref = pim_dimt_refused_find(pim, umh);
+
+	if (ref) {
+		ref->seen = true;
+		return;
+	}
+
+	ref = XCALLOC(MTYPE_PIM_DIMT_REFUSED, sizeof(*ref));
+	ref->umh = umh;
+	ref->seen = true;
+	listnode_add(pim->dimt_refused_list, ref);
+	pim->dimt_tunnel_refusals++;
+
+	zlog_warn("DIMT: refusing tunnel to UMH %pPAs: per-box tunnel limit %u reached (%u tunnels; MAXVIFS %d)",
+		  &umh, limit, listcount(pim->dimt_tunnel_list), MAXVIFS);
+}
+
+void pim_dimt_tunnel_limit_set(struct pim_instance *pim, uint32_t limit)
+{
+	pim->dimt_tunnel_limit = limit;
+	/* A raised limit may admit UMHs refused so far.  A lowered one does
+	 * not tear down tunnels that already hold their vif: it only stops
+	 * new ones. */
+	pim_dimt_reconcile(pim);
+}
+
+void pim_dimt_show_tunnel_limit(struct pim_instance *pim, struct vty *vty,
+				bool json)
+{
+	struct listnode *node;
+	struct pim_dimt_refused *ref;
+	uint32_t tunnels = listcount(pim->dimt_tunnel_list);
+	uint32_t budget = pim_dimt_vif_budget(pim);
+	uint32_t limit = pim_dimt_tunnel_limit(pim);
+
+	if (json) {
+		json_object *jobj = json_object_new_object();
+		json_object *jref = json_object_new_array();
+
+		json_object_int_add(jobj, "tunnels", tunnels);
+		json_object_int_add(jobj, "limit", limit);
+		json_object_int_add(jobj, "configuredLimit",
+				    pim->dimt_tunnel_limit);
+		json_object_int_add(jobj, "vifBudget", budget);
+		json_object_int_add(jobj, "maxVifs", MAXVIFS);
+		json_object_int_add(jobj, "refusals",
+				    pim->dimt_tunnel_refusals);
+		for (ALL_LIST_ELEMENTS_RO(pim->dimt_refused_list, node, ref)) {
+			char umh_str[PIM_ADDRSTRLEN];
+
+			snprintfrr(umh_str, sizeof(umh_str), "%pPAs",
+				   &ref->umh);
+			json_object_array_add(jref,
+					      json_object_new_string(umh_str));
+		}
+		json_object_object_add(jobj, "refusedUmhs", jref);
+		vty_json(vty, jobj);
+		return;
+	}
+
+	vty_out(vty, "Tunnels:          %u\n", tunnels);
+	if (pim->dimt_tunnel_limit)
+		vty_out(vty, "Limit:            %u (configured %u)\n", limit,
+			pim->dimt_tunnel_limit);
+	else
+		vty_out(vty, "Limit:            %u (auto)\n", limit);
+	vty_out(vty, "Vif budget:       %u of %d\n", budget, MAXVIFS);
+	vty_out(vty, "Refusals:         %" PRIu64 "\n",
+		pim->dimt_tunnel_refusals);
+	for (ALL_LIST_ELEMENTS_RO(pim->dimt_refused_list, node, ref))
+		vty_out(vty, "Refused UMH:      %pPAs\n", &ref->umh);
+}
+
+/* A vif was just freed.  Under the derived cap that is budget a refused UMH
+ * may now fit, and no demand edge will follow to reconcile, so do it here.
+ * Only when something is refused: otherwise the answer cannot change. */
+void pim_dimt_vif_freed(struct pim_instance *pim)
+{
+	if (pim->dimt_refused_list && listcount(pim->dimt_refused_list))
+		pim_dimt_reconcile(pim);
+}
+
 /* Recompute tunnel demand across every upstream and drive the resulting
  * ADD/DEL edges.  Idempotent by construction: it is safe (and expected) to
  * call this from any event that can change the answer. */
@@ -1577,6 +1764,9 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 	struct pim_upstream *up;
 	struct pim_dimt_umh *umh;
 	struct pim_dimt_endpoint *ep;
+	struct pim_dimt_refused *ref;
+	uint32_t limit;
+	bool freed = false;
 
 	if (!pim->dimt_tunnel_list || !pim->dimt_endpoint_list)
 		return;
@@ -1589,13 +1779,21 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 	 * the pim_upstream_new()/pim_upstream_del() hooks free for every
 	 * deployment not using DIMT, which is the overwhelming majority. */
 	if (!listcount(pim->dimt_endpoint_list) &&
-	    !listcount(pim->dimt_tunnel_list))
+	    !listcount(pim->dimt_tunnel_list)) {
+		/* Nothing can be refused either: end any open episodes. */
+		list_delete_all_node(pim->dimt_refused_list);
 		return;
+	}
 
 	/* Recount demand from scratch rather than incrementing on events:
 	 * a missed decrement would strand a tunnel forever. */
 	for (ALL_LIST_ELEMENTS_RO(pim->dimt_tunnel_list, node, tun))
 		tun->refcount = 0;
+	for (ALL_LIST_ELEMENTS_RO(pim->dimt_refused_list, node, ref))
+		ref->seen = false;
+
+	/* Once per pass: nothing in the walk below changes a vif. */
+	limit = pim_dimt_tunnel_limit(pim);
 
 	frr_each (rb_pim_upstream, &pim->upstream_head, up) {
 		umh = pim_dimt_upstream_demand(pim, up);
@@ -1614,6 +1812,12 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 		}
 
 		tun = pim_dimt_tunnel_find(pim, umh->umh);
+		if (!tun && listcount(pim->dimt_tunnel_list) >= limit) {
+			/* Before the record exists, so no ADD goes out and
+			 * no netdev is built: nothing to clean up. */
+			pim_dimt_tunnel_refuse(pim, umh->umh, limit);
+			continue;
+		}
 		if (!tun) {
 			tun = XCALLOC(MTYPE_PIM_DIMT_TUNNEL, sizeof(*tun));
 			tun->umh = umh->umh;
@@ -1624,6 +1828,14 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 		}
 		tun->refcount++;
 	}
+
+	/* A UMH no longer refused (demand gone, or now admitted) ends its
+	 * episode; refusing it again later counts again. */
+	for (ALL_LIST_ELEMENTS(pim->dimt_refused_list, node, nnode, ref))
+		if (!ref->seen) {
+			listnode_delete(pim->dimt_refused_list, ref);
+			pim_dimt_refused_free(ref);
+		}
 
 	for (ALL_LIST_ELEMENTS(pim->dimt_tunnel_list, node, nnode, tun)) {
 		if (tun->refcount) {
@@ -1696,12 +1908,19 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 			}
 			listnode_delete(pim->dimt_tunnel_list, tun);
 			pim_dimt_tunnel_free(tun);
+			freed = true;
 			break;
 		case PIM_DIMT_TUNNEL_REMOVING:
 			tun->readd_pending = false;
 			break;
 		}
 	}
+
+	/* The refusals above were judged against records this pass has just
+	 * freed.  One more pass admits whoever the freed slots now fit; it
+	 * frees nothing itself, so it cannot recurse again. */
+	if (freed && listcount(pim->dimt_refused_list))
+		pim_dimt_reconcile(pim);
 }
 
 /* An interface pimd asked zebra to create just appeared (or was addressed).
@@ -1846,6 +2065,11 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
 			listnode_delete(pim->dimt_tunnel_list, tun);
 			pim_dimt_tunnel_free(tun);
 			tun = NULL;
+			/* A slot under the tunnel cap just opened: admit a
+			 * UMH refused at the cap now, not on some later,
+			 * unrelated demand edge. */
+			if (listcount(pim->dimt_refused_list))
+				pim_dimt_reconcile(pim);
 			break;
 		case PIM_DIMT_TUNNEL_REQUESTED:
 			/* zebra answers an ADD only INSTALLED or FAIL_INSTALL,

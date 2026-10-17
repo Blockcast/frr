@@ -190,6 +190,11 @@ void pim_dimt_neighbor_change(struct pim_instance *pim, struct interface *ifp);
 
 void pim_dimt_show_umh(struct pim_instance *pim, struct vty *vty, bool json);
 void pim_dimt_show_tunnel(struct pim_instance *pim, struct vty *vty, bool json);
+void pim_dimt_show_tunnel_limit(struct pim_instance *pim, struct vty *vty,
+				bool json);
+
+/* `dimt tunnel-limit` (BLO-36556); 0 = auto, the VIF budget. */
+void pim_dimt_tunnel_limit_set(struct pim_instance *pim, uint32_t limit);
 
 /* Per-(S,G) readiness aggregation.  The verdict is otherwise unobservable:
  * pim_dimt_forwarding_state() only ever leaves pimd as a zapi re-ADD toward
@@ -218,6 +223,9 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
  * delete, zebra reconnect, and an unsolicited REMOVED (the netdev vanished).
  * Not on interface events: those only move pins (pim_dimt_iface_up/down). */
 void pim_dimt_reconcile(struct pim_instance *pim);
+
+/* A vif was freed: re-admit refused UMHs the budget now fits (BLO-36556). */
+void pim_dimt_vif_freed(struct pim_instance *pim);
 
 /* Drop acknowledgement state for every tunnel without sending anything --
  * the zebra session that owned those requests is gone, so nothing can be

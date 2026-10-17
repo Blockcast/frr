@@ -381,6 +381,29 @@ VRF where indicated), instead of under the 'router pim' submode.
    :clicmd:`show ip pim [vrf NAME] dimt forwarding [json]` for the per-(S,G)
    readiness it feeds.
 
+.. clicmd:: dimt tunnel-limit (1-32)
+
+   Cap the number of DIMT tunnels on this box. Linux allows at most 32
+   multicast vifs (``MAXVIFS``) per MRT table, and every DIMT netdev needs
+   one, as do ``pimreg`` and every other PIM interface. Past that ceiling a
+   netdev would still be built but never get a vif, so its stream would
+   silently never arrive.
+
+   Without this command the cap is the vif budget: ``MAXVIFS`` less every vif
+   held by something other than a DIMT netdev, recomputed live. A configured
+   value can only lower the cap, never raise it above that budget.
+
+   A tunnel request past the cap is refused before anything is built: no
+   netdev, no vif, no zebra request. Each refusal logs a warning naming the
+   UMH and the cap, once per UMH until its demand goes away or it is
+   admitted, and increments a counter. When a tunnel is removed, refused UMHs
+   are admitted in the freed slots. Lowering the cap does not tear down
+   tunnels that already exist. See
+   :clicmd:`show ip pim [vrf NAME] dimt tunnel-limit [json]`.
+
+   Independently of the cap, a DIMT pin never selects an interface that has
+   no multicast vif.
+
 .. _pim-dimt-pim-mode:
 
 DIMT tunnel PIM mode, and what neighbor expiry does
@@ -801,6 +824,14 @@ keyword at the end.
 
    The endpoints themselves are configured with the
    ``dimt tunnel-endpoint`` command.
+
+.. clicmd:: show ip pim [vrf NAME] dimt tunnel-limit [json]
+
+   Display the per-box DIMT tunnel cap: current tunnel count, effective
+   limit, configured limit (``0`` in JSON when unset), the vif budget, the
+   number of refusals so far and the UMHs currently refused. JSON keys are
+   ``tunnels``, ``limit``, ``configuredLimit``, ``vifBudget``, ``maxVifs``,
+   ``refusals`` and ``refusedUmhs``.
 
 .. clicmd:: show ip pim [vrf NAME] dimt forwarding [json]
 
