@@ -28,5 +28,6 @@ jobs:
   relay:
     if: false
     runs-on: arc-light
+    timeout-minutes: 10
     steps:
       - run: "true"
