@@ -98,8 +98,20 @@ def test_parse_ip_mr_cache_decodes_addresses_and_oifs():
     entries = parse_ip_mr_cache(MR_CACHE)
 
     assert entries == [
-        {"group": "239.1.1.1", "source": "10.0.0.1", "iif": 1, "oifs": {2, 7}},
-        {"group": "239.1.1.2", "source": "10.0.0.2", "iif": 3, "oifs": {9}},
+        {
+            "group": "239.1.1.1",
+            "source": "10.0.0.1",
+            "iif": 1,
+            "pkts": 12,
+            "oifs": {2, 7},
+        },
+        {
+            "group": "239.1.1.2",
+            "source": "10.0.0.2",
+            "iif": 3,
+            "pkts": 4,
+            "oifs": {9},
+        },
     ]
 
 
