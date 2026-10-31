@@ -45,7 +45,9 @@ jobs:
     # while arc-light served a dozen frr jobs; frr's `default` queue still holds
     # github-ci runs orphaned since 2026-07-19.  Same pool review-gate-selftest
     # uses, for the same reason.
-    runs-on: arc-light
+    runs-on:
+      group: default-tools
+      labels: arc-light
     steps:
       - name: Checkout
         uses: actions/checkout@v5

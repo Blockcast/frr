@@ -27,7 +27,9 @@ permissions: {}
 jobs:
   relay:
     if: false
-    runs-on: arc-light
+    runs-on:
+      group: default-tools
+      labels: arc-light
     timeout-minutes: 10
     steps:
       - run: "true"

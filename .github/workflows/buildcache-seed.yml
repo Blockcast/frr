@@ -84,7 +84,9 @@ jobs:
     # arc-light: this job, verify and freshness-gate are a checkout plus
     # buildcache_freshness.py, which reads Harbor over urllib (no docker, no
     # sudo), so none of them needs a dind pod. Only `seed` builds.
-    runs-on: arc-light
+    runs-on:
+      group: default-tools
+      labels: arc-light
     name: Probe buildcache age (before)
     timeout-minutes: 10
     outputs:
@@ -264,7 +266,9 @@ jobs:
     # Repository check restated because always() ignores skipped dependencies.
     if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
     # arc-light, like probe-before: see the comment on its runs-on.
-    runs-on: arc-light
+    runs-on:
+      group: default-tools
+      labels: arc-light
     name: Verify buildcache advanced
     timeout-minutes: 10
     steps:
@@ -319,7 +323,9 @@ jobs:
     # Repository check restated because always() ignores skipped dependencies.
     if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
     # arc-light, like probe-before: see the comment on its runs-on.
-    runs-on: arc-light
+    runs-on:
+      group: default-tools
+      labels: arc-light
     name: Buildcache freshness gate (${{ github.event_name }})
     timeout-minutes: 10
     steps:
