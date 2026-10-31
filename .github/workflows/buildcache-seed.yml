@@ -149,10 +149,10 @@ jobs:
     # success() condition used to inherit that boundary for free; always()
     # discards it, so each always() job below restates it.
     if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
-    # arc-dind, like github-ci.yml's Build (see the comment on its runs-on):
-    # on `default` these seed runs waited out the day and the caches went
-    # stale.
-    runs-on: arc-dind
+    # arc-default, like github-ci.yml's Build (see the comment on its
+    # runs-on): it provides the privileged dind sidecar and avoids the retired
+    # dedicated dind lane.
+    runs-on: arc-default
     name: Seed ${{ matrix.cfg.name }}
     timeout-minutes: 90
     strategy:
