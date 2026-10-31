@@ -824,8 +824,15 @@ class TestGateWiring(unittest.TestCase):
         check out shallow, so never on `default`, where it queued for hours
         before Build queued again (the comment on its runs-on has the
         numbers)."""
-        (runs_on,) = re.findall(r"(?m)^    runs-on: (.*)$", self.filter)
-        self.assertEqual(runs_on, "arc-light")
+        match = re.search(
+            r"(?m)^    runs-on:[ \t]*\n"
+            r"^      group:[ \t]*(\S+)[ \t]*\n"
+            r"^      labels:[ \t]*(\S+)[ \t]*$",
+            self.filter,
+        )
+        self.assertIsNotNone(match, "doc-path-filter must use the grouped tools runner")
+        self.assertEqual(match.group(1), "default-tools")
+        self.assertEqual(match.group(2), "arc-light")
 
     def test_one_lost_build_leg_does_not_skip_the_other_platform(self):
         for name in ("Unit-Test", "Test"):

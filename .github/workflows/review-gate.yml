@@ -124,7 +124,7 @@ jobs:
     # -- it is an impossible one. arc-light runs the byte-identical runner image
     # at maxRunners=32 and mounts none of the privileged surface, which also
     # suits a `pull_request_target` job holding `statuses: write`.
-    # Matches the canonical wiring in Blockcast/review-gate-action's README.
+    # Match the canonical grouped wiring in Blockcast/review-gate-action's README.
     runs-on:
       group: default-tools
       labels: arc-light

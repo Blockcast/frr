@@ -1615,19 +1615,25 @@ class TestWorkflowContracts(unittest.TestCase):
     def test_workflows_share_one_self_hosted_runner_label(self):
         # The vendoring overlay's single allowed diff is the runner label,
         # applied uniformly. Asserting consistency (not a hardcoded name)
-        # keeps this test itself byte-identical across the fleet. Each file
-        # must contribute at least one scalar match: an overlay rewriting one
-        # workflow to a list/expression form (`runs-on: [self-hosted, gpu]`)
-        # would otherwise contribute zero labels and the consistency check
-        # would pass on exactly the divergence it exists to catch.
+        # keeps this test itself byte-identical across the fleet. The tools
+        # runner group is part of the mapping form so GitHub cannot select a
+        # same-label runner from an unintended group.
         labels = set()
+        groups = set()
         for name in ("review-gate.yml", "review-gate-selftest.yml"):
-            matches = re.findall(r"(?m)^\s*runs-on:\s*(\S+)\s*$", self._read(name))
+            matches = re.findall(
+                r"(?m)^\s*runs-on:[ \t]*\n"
+                r"^\s+group:[ \t]*(\S+)[ \t]*\n"
+                r"^\s+labels:[ \t]*(\S+)[ \t]*$",
+                self._read(name),
+            )
             self.assertTrue(
                 matches,
-                "%s has no scalar runs-on -- overlay must keep the scalar form" % name,
+                "%s has no grouped runs-on -- overlay must pin group and label" % name,
             )
-            labels.update(matches)
+            groups.update(group for group, _ in matches)
+            labels.update(label for _, label in matches)
+        self.assertEqual(groups, {"default-tools"}, "gate and selftest must use the tools group")
         self.assertEqual(len(labels), 1, "gate and selftest must run on the same label: %s" % labels)
         label = next(iter(labels))
         self.assertNotRegex(
