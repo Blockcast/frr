@@ -108,7 +108,7 @@ jobs:
     # gtm-image-build.yml and docker-daily-master.yml use, so a sync can never
     # make this fire upstream.
     if: github.repository == 'Blockcast/frr'
-    runs-on: arc-dind
+    runs-on: arc-default
     timeout-minutes: 120
     steps:
       # Two checkouts on purpose. The build DEFINITION must come from the ref

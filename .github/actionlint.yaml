@@ -2,5 +2,5 @@ self-hosted-runner:
   labels:
     - default
     - arc-light
-    - arc-dind
+    - arc-default
     - arc-e2e

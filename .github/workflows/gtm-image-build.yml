@@ -29,7 +29,7 @@ jobs:
     # some workflow files from upstream frrouting/frr — mirror the belt-and-braces
     # gate docker-daily-master.yml uses so a sync can never make this fire upstream.
     if: github.repository == 'Blockcast/frr'
-    runs-on: arc-dind
+    runs-on: arc-default
     steps:
       - name: Checkout requested ref
         uses: actions/checkout@v5
