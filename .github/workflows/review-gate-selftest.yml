@@ -62,7 +62,7 @@ jobs:
       labels: arc-light
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
 
       - name: Ensure PyYAML
         # discover -p 'test_*.py' sweeps every test_*.py under .github/scripts,
