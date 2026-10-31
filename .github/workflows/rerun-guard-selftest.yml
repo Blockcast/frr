@@ -64,7 +64,9 @@ jobs:
     # `default` (runs 36441104995, 36464895267, 36423351119; jobs API
     # created_at to started_at) and review-gate-selftest at most 2.6 min on
     # arc-light for the same three commits.
-    runs-on: arc-light
+    runs-on:
+      group: default-tools
+      labels: arc-light
     # A template roll of arc-light takes no new jobs until every pending or
     # running one finishes (ARC updateStrategy eventual, onprem-k8s
     # arc/controller-values.yaml), so at the 360-minute default one hung job

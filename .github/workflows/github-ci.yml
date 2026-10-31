@@ -131,7 +131,9 @@ jobs:
     # this job saves, and no other job saves one.  The image's own fetch_mib
     # (docker/ubuntu-ci/Dockerfile) then downloads the MIBs, as on any
     # miss: slower, not broken.
-    runs-on: arc-light
+    runs-on:
+      group: default-tools
+      labels: arc-light
     name: Documentation path filter
     # The folded MIB population's budget (Prepare-MIB-Cache's 20).
     timeout-minutes: 20
@@ -1626,7 +1628,9 @@ jobs:
     # skipped, because a skipped required check counts as passing.
     # arc-light: checkout plus one stdlib Python script, the same shape the
     # review gate runs there (review-gate.yml).
-    runs-on: arc-light
+    runs-on:
+      group: default-tools
+      labels: arc-light
     if: ${{ always() }}
     needs: [doc-path-filter, Build, Build-LTTng, Unit-Test, Test, Documentation-HTML]
     name: CI-Verdict

@@ -53,7 +53,9 @@ jobs:
     # that finishes in seconds, the same shape hosted-runner-policy and
     # review-gate-selftest run there.  `default` is the chronically
     # saturated build pool (BLO-20032, BLO-25481).
-    runs-on: arc-light
+    runs-on:
+      group: default-tools
+      labels: arc-light
     # A template roll of arc-light takes no new jobs until every pending or
     # running one finishes (ARC updateStrategy eventual, onprem-k8s
     # arc/controller-values.yaml), so the 360-minute default would let one

@@ -24,7 +24,9 @@ jobs:
   enforce:
     # arc-light, not `default`: checkout plus one stdlib Python script, the
     # same shape CI-Verdict runs there on every push and PR (github-ci.yml).
-    runs-on: arc-light
+    runs-on:
+      group: default-tools
+      labels: arc-light
     # A template roll of arc-light takes no new jobs until every pending or
     # running one finishes (ARC updateStrategy eventual, onprem-k8s
     # arc/controller-values.yaml), so at the 360-minute default one hung job
