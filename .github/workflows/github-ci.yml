@@ -1008,11 +1008,29 @@ jobs:
         with:
           name: test-results-${{ matrix.cfg.platform }}-s${{ matrix.shard }}
           path: prev-results
+      # A security roll can put the runner hosts on a kernel that is still only
+      # in -proposed (6.8.0-149 for CVE-2026-98432, BLO-50264), so its modules
+      # are in no enabled pocket and the install below cannot find them. Enable
+      # -proposed only in that case. Its Release is NotAutomatic, so a package
+      # that also exists in another pocket still comes from that pocket.
+      - name: Enable -proposed if the running kernel's modules need it
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y || true
+          if ! apt-cache show "linux-modules-$(uname -r)" >/dev/null 2>&1; then
+            codename=$(. /etc/os-release && echo "${VERSION_CODENAME}")
+            echo "deb http://archive.ubuntu.com/ubuntu ${codename}-proposed main" |
+              sudo tee /etc/apt/sources.list.d/kernel-proposed.list
+          fi
       - name: Run topotests
         # BLO-29817: `id` lets the runtime report below distinguish "the cap
         # killed the suite mid-run" from "the suite finished and the cap killed
         # the artifact tail".
         id: topotests
+        # This script uses expression syntax, so GitHub parses all of it as one
+        # expression, capped at 21,000 characters; it is ~20,500. Put new
+        # host-prep in its own step: one more line here once rejected the whole
+        # workflow with no jobs and no error check.
         run: |
           # Fail fast on command errors, undefined vars, and pipeline failures.
           set -euo pipefail
@@ -1030,20 +1048,6 @@ jobs:
             if sudo apt-get update -y; then break; fi
             sleep 10
           done
-          # A security roll can put the runner hosts on a kernel that is still
-          # only in -proposed (6.8.0-149 for CVE-2026-98432, BLO-50264), and
-          # then its modules are in no enabled pocket.  Enable -proposed only
-          # in that case.  Its Release is NotAutomatic, so every package that
-          # also exists in another pocket is still installed from that pocket.
-          if ! apt-cache show "linux-modules-${MODPKGVER}" >/dev/null 2>&1; then
-            codename=$(. /etc/os-release && echo "${VERSION_CODENAME}")
-            echo "deb http://archive.ubuntu.com/ubuntu ${codename}-proposed main" |
-              sudo tee /etc/apt/sources.list.d/kernel-proposed.list
-            for _ in $(seq 1 "${APT_RETRIES}"); do
-              if sudo apt-get update -y; then break; fi
-              sleep 10
-            done
-          fi
           # Retry install as well; mirrors can fail between update and install.
           install_ok=0
           for _ in $(seq 1 "${APT_RETRIES}"); do
