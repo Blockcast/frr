@@ -134,13 +134,13 @@ jobs:
       # build script. Nothing here needs the token after the fetch: every later
       # git operation is local (rev-parse, merge-base, log) or a file:// clone.
       - name: Checkout build definition
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           path: ci
           persist-credentials: false
 
       - name: Checkout requested FRR tag
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: ${{ github.event.inputs.ref || env.DEFAULT_REF }}
           fetch-depth: 0
