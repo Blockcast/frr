@@ -169,7 +169,7 @@ jobs:
         # steps below need no checkout: they only write
         # docker/ubuntu-ci/mib-cache under the workspace.
         if: ${{ github.event_name != 'pull_request' }}
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           fetch-depth: 2
       - uses: dorny/paths-filter@v4
@@ -260,7 +260,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           fetch-depth: 1
       - name: Install Sphinx dependencies
@@ -338,7 +338,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           fetch-depth: 1
       - name: Ensure local MIB cache directory exists
@@ -541,7 +541,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           fetch-depth: 1
       - name: Ensure local MIB cache directory exists
@@ -961,7 +961,7 @@ jobs:
         # only a few seconds.
         run: echo "TOPOTEST_LANE_START_EPOCH=$(date +%s)" >> "${GITHUB_ENV}"
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           fetch-depth: 1
       - name: Log in to Harbor
@@ -1008,11 +1008,29 @@ jobs:
         with:
           name: test-results-${{ matrix.cfg.platform }}-s${{ matrix.shard }}
           path: prev-results
+      # A security roll can put the runner hosts on a kernel that is still only
+      # in -proposed (6.8.0-149 for CVE-2026-98432, BLO-50264), so its modules
+      # are in no enabled pocket and the install below cannot find them. Enable
+      # -proposed only in that case. Its Release is NotAutomatic, so a package
+      # that also exists in another pocket still comes from that pocket.
+      - name: Enable -proposed if the running kernel's modules need it
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y || true
+          if ! apt-cache show "linux-modules-$(uname -r)" >/dev/null 2>&1; then
+            codename=$(. /etc/os-release && echo "${VERSION_CODENAME}")
+            echo "deb http://archive.ubuntu.com/ubuntu ${codename}-proposed main" |
+              sudo tee /etc/apt/sources.list.d/kernel-proposed.list
+          fi
       - name: Run topotests
         # BLO-29817: `id` lets the runtime report below distinguish "the cap
         # killed the suite mid-run" from "the suite finished and the cap killed
         # the artifact tail".
         id: topotests
+        # This script uses expression syntax, so GitHub parses all of it as one
+        # expression, capped at 21,000 characters; it is ~20,500. Put new
+        # host-prep in its own step: one more line here once rejected the whole
+        # workflow with no jobs and no error check.
         run: |
           # Fail fast on command errors, undefined vars, and pipeline failures.
           set -euo pipefail
@@ -1637,7 +1655,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           fetch-depth: 1
       - name: Download topotest shard plans

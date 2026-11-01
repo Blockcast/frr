@@ -32,7 +32,7 @@ jobs:
     runs-on: arc-default
     steps:
       - name: Checkout requested ref
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0

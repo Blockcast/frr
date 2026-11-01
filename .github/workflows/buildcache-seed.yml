@@ -94,7 +94,7 @@ jobs:
       probe_ok: ${{ steps.probe.outputs.probe_ok }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           fetch-depth: 1
       - name: Read current buildcache push timestamps
@@ -167,7 +167,7 @@ jobs:
         -  { rel: '24.04', name: 'Ubuntu 24.04 amd64 LTTng', platform: 'amd64_u24_lttng', lttng: 'true' }
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           fetch-depth: 1
       - name: Ensure local MIB cache directory exists
@@ -281,7 +281,7 @@ jobs:
           echo "::error::pre-seed baseline probe did not run, so cache advancement cannot be proven for this run. The seed legs themselves may have succeeded -- check them -- but this gate will not certify an unmeasured cache."
           exit 1
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           fetch-depth: 1
       - name: Restore pre-seed timestamps
@@ -344,7 +344,7 @@ jobs:
           echo "::error::verify concluded '${VERIFY_RESULT}'; refusing to report the buildcache fresh on the strength of a previously published cache."
           exit 1
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           fetch-depth: 1
       - name: Fail if any buildcache tag is older than the budget (inert while age is unmeasurable)
