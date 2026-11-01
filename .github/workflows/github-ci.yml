@@ -1030,6 +1030,20 @@ jobs:
             if sudo apt-get update -y; then break; fi
             sleep 10
           done
+          # A security roll can put the runner hosts on a kernel that is still
+          # only in -proposed (6.8.0-149 for CVE-2026-98432, BLO-50264), and
+          # then its modules are in no enabled pocket.  Enable -proposed only
+          # in that case.  Its Release is NotAutomatic, so every package that
+          # also exists in another pocket is still installed from that pocket.
+          if ! apt-cache show "linux-modules-${MODPKGVER}" >/dev/null 2>&1; then
+            codename=$(. /etc/os-release && echo "${VERSION_CODENAME}")
+            echo "deb http://archive.ubuntu.com/ubuntu ${codename}-proposed main" |
+              sudo tee /etc/apt/sources.list.d/kernel-proposed.list
+            for _ in $(seq 1 "${APT_RETRIES}"); do
+              if sudo apt-get update -y; then break; fi
+              sleep 10
+            done
+          fi
           # Retry install as well; mirrors can fail between update and install.
           install_ok=0
           for _ in $(seq 1 "${APT_RETRIES}"); do
