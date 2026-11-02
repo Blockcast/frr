@@ -40,7 +40,7 @@ jobs:
     # arc-light run took 101 s, 5.9 times that.
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
       - name: Reject GitHub-hosted runner labels
         run: python3 .github/scripts/check-runner-labels.py
       - name: Multi-exporter rule fixtures
