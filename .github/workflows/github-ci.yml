@@ -1008,34 +1008,36 @@ jobs:
         with:
           name: test-results-${{ matrix.cfg.platform }}-s${{ matrix.shard }}
           path: prev-results
-      # A security roll can put the runner hosts on a kernel that is still only
-      # in -proposed (6.8.0-149 for CVE-2026-98432, BLO-50264), so its modules
-      # are in no enabled pocket and the install below cannot find them. Enable
-      # -proposed only in that case. Its Release is NotAutomatic, so a package
-      # that also exists in another pocket still comes from that pocket.
-      - name: Enable -proposed if the running kernel's modules need it
+      # Host kernel prep, kept out of "Run topotests" (its script is near the
+      # 21,000-char expression cap).  Ubuntu hosts: apt-install the running
+      # kernel's modules (which also ship /boot/config-*, read by that step)
+      # and modprobe.  A security roll can put the hosts on a kernel that is
+      # still only in -proposed (6.8.0-149 for CVE-2026-98432, BLO-50264), so
+      # enable -proposed only in that case; its Release is NotAutomatic.
+      # Talos hosts (every ARC host since 2026-11-05, BLO-53653): no Ubuntu
+      # kernel packages exist and module autoload is off.  MPLS and
+      # MPLS_IPTUNNEL are built in; vrf is =m and loads only if the node's
+      # machine.kernel.modules lists it (talosctl, human-only).
+      - name: Host kernel prep
         run: |
           set -euo pipefail
+          uname -a
+          MODPKGVER=$(uname -r)
+          if [[ "${MODPKGVER}" == *-talos ]]; then
+            sudo apt-get update -y || true
+            sudo apt-get install -y kmod python3-xmltodict
+            sudo mkdir -p /boot
+            zcat /proc/config.gz | sudo tee "/boot/config-${MODPKGVER}" >/dev/null
+            [ -d /proc/sys/net/mpls ] || { echo "ERROR: kernel has no MPLS" >&2; exit 1; }
+            [ -d /sys/module/vrf ] || echo "::warning title=vrf not loaded::This Talos node does not load vrf; VRF topotests will fail (BLO-53653)"
+            exit 0
+          fi
           sudo apt-get update -y || true
-          if ! apt-cache show "linux-modules-$(uname -r)" >/dev/null 2>&1; then
+          if ! apt-cache show "linux-modules-${MODPKGVER}" >/dev/null 2>&1; then
             codename=$(. /etc/os-release && echo "${VERSION_CODENAME}")
             echo "deb http://archive.ubuntu.com/ubuntu ${codename}-proposed main" |
               sudo tee /etc/apt/sources.list.d/kernel-proposed.list
           fi
-      - name: Run topotests
-        # BLO-29817: `id` lets the runtime report below distinguish "the cap
-        # killed the suite mid-run" from "the suite finished and the cap killed
-        # the artifact tail".
-        id: topotests
-        # This script uses expression syntax, so GitHub parses all of it as one
-        # expression, capped at 21,000 characters; it is ~20,500. Put new
-        # host-prep in its own step: one more line here once rejected the whole
-        # workflow with no jobs and no error check.
-        run: |
-          # Fail fast on command errors, undefined vars, and pipeline failures.
-          set -euo pipefail
-          uname -a
-          MODPKGVER=$(uname -r)
           # Retry loop for apt-get update in case of transient mirror failures
           APT_RETRIES=3
           # `if cmd; then break; fi` rather than `cmd && break || sleep 10`:
@@ -1064,6 +1066,18 @@ jobs:
           sudo modprobe vrf || true
           sudo modprobe mpls-iptunnel
           sudo modprobe mpls-router
+      - name: Run topotests
+        # BLO-29817: `id` lets the runtime report below distinguish "the cap
+        # killed the suite mid-run" from "the suite finished and the cap killed
+        # the artifact tail".
+        id: topotests
+        # This script uses expression syntax, so GitHub parses all of it as one
+        # expression, capped at 21,000 characters; it is ~19,300. Put new
+        # host-prep in its own step: one more line here once rejected the whole
+        # workflow with no jobs and no error check.
+        run: |
+          # Fail fast on command errors, undefined vars, and pipeline failures.
+          set -euo pipefail
 
           # An array, not a string: the three `docker run`s below relied on
           # leaving the scalar unquoted so the shell would split "-e X=1"

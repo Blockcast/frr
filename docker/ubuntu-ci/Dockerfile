@@ -247,8 +247,15 @@ RUN set -eux; \
     make install; \
     cd /; rm -rf /tmp/strace*; \
     # Fail the image build in seconds, not a topotest 40 minutes later, if the
-    # tracer cannot do the one thing it was upgraded for.
-    strace -e trace-fds=1 -o /dev/null true
+    # tracer cannot do the one thing it was upgraded for. strace parses -e
+    # before it attaches, so a PTRACE_TRACEME EPERM still proves the option
+    # parsed: Talos ARC hosts set kernel.yama.ptrace_scope=2 and the buildkit
+    # RUN has no CAP_SYS_PTRACE (BLO-53653). The topotests run privileged, so
+    # they keep ptrace. Anything else (jammy's parse error) still fails here.
+    out="$(strace -e trace-fds=1 -o /dev/null true 2>&1)" || case "$out" in \
+      *PTRACE_TRACEME*"Operation not permitted"*) echo "ptrace denied on build host; trace-fds parsed" ;; \
+      *) echo "$out"; exit 1 ;; \
+    esac
 
 # ccache for the two FRR compile steps at the end, pinned and verified like
 # strace above. Not the distro package: --enable-gcov compiles everything with
