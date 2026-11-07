@@ -11,8 +11,18 @@
 #
 # Nine vendored copies of one merge control WILL drift; this script makes
 # re-syncing one command instead of nine hand-edits. The durable fix is a
-# shared composite action -- revisit once the rollout proves the logic stable
-# across repos.
+# shared composite action -- see tools/REVIEW-GATE-CANONICITY.md for the
+# 2026-11-07 disposition on that note (PEN-5925): not built, and the guards
+# below are the accepted mitigation rather than a stopgap.
+#
+# Drift is NOT hypothetical and NOT symmetric. Measured 2026-11-07, every
+# target that has had a local commit since its last sync carries work that is
+# in no other copy, and Blockcast/onprem-k8s had diverged into a different
+# program -- 18,133 lines, 192 local commits, 288 definitions canonical has
+# never had -- which a run of this script would have replaced with frr's
+# 3,499. onprem-k8s is no longer a target; it owns its copy outright. Every
+# remaining target is screened by tools/review-gate-sync-guard.sh BEFORE
+# anything is copied, and that guard fails closed.
 #
 # Advisory-first: the gate only POSTS the review/ally-complete status. Making
 # it a required check is a per-repo branch-protection change done manually
@@ -22,7 +32,20 @@
 # base branch cannot yet produce deadlocks every PR including the rollout PR.
 #
 # Usage:
-#   tools/sync-review-gate.sh [--dry-run] [repo[:runs-on] ...]
+#   tools/sync-review-gate.sh [options] [repo[:runs-on] ...]
+#
+#   --dry-run                 clone and SCREEN every target, report what the
+#                             sync would do, write nothing. The screen is the
+#                             point: a dry run that only echoed the canonical
+#                             sha could not have told anyone about onprem-k8s.
+#   --max-net-added N         raise the guard's net-removal threshold
+#   --allow-definition-loss   sync a target that defines names canonical lacks
+#   --allow-older-canonical   sync a target whose copy is newer than canonical
+#
+# The three override flags are blanket, not per-repo: they apply to every
+# target in the run. Pass the one repo you mean on the command line when you
+# use them.
+#
 # With no repos listed, syncs the default fleet below.
 
 set -euo pipefail
@@ -30,8 +53,14 @@ set -euo pipefail
 # repo:runs-on. Runner labels are NOT uniform across the org (verified
 # 2026-07-28); default to the ARC 'default' pool unless a repo is known to
 # use hosted runners.
+#
+# Blockcast/onprem-k8s is deliberately ABSENT. It took exactly one sync
+# (2026-07-29, frr@554f3bdbe6) and has had 192 commits on its copy since,
+# against 16 ever in frr; it is the upstream of this gate's development, not a
+# downstream of it. Re-adding it here is a decision to delete that work --
+# tools/REVIEW-GATE-CANONICITY.md records why, and the guard would refuse it
+# anyway (PEN-5925).
 DEFAULT_FLEET=(
-  "Blockcast/onprem-k8s:ubuntu-latest"
   "Blockcast/trafficcontrol:default"
   "Blockcast/Network-Operator-Portal:default"
   "Blockcast/multicast:default"
@@ -51,19 +80,66 @@ CANON_FILES=(
   .github/scripts/test_require_ally_review.py
   .github/workflows/review-gate.yml
   .github/workflows/review-gate-selftest.yml
+  # review-gate.yml carries `workflow_run: workflows: [review-gate-relay]`, so
+  # a target that gets the gate without the relay never receives a formal
+  # review event at all -- a silent hole in the control, which is the exact
+  # failure the gate exists to close. It was added to frr on 2026-10-31
+  # (481bf44) and NOT added here, which also made the canonical suite's
+  # TestWorkflowRunRelay fail from $CANON_TMP and left this whole script
+  # refusing to propagate anything since. (PEN-5925)
+  .github/workflows/review-gate-relay.yml
 )
+# Split CANON_FILES by destination: workflows get the runner-label rewrite,
+# scripts ship verbatim. Both lists are DERIVED rather than written out again,
+# so adding a file above cannot leave a copy loop behind -- which is exactly
+# how review-gate-relay.yml went missing.
+CANON_WORKFLOWS=()
+CANON_SCRIPTS=()
+for f in "${CANON_FILES[@]}"; do
+  case "$f" in
+    .github/workflows/*) CANON_WORKFLOWS+=("$f") ;;
+    .github/scripts/*) CANON_SCRIPTS+=("$f") ;;
+    *) echo "CANON_FILES entry has no known destination: $f" >&2; exit 1 ;;
+  esac
+done
 
 DRY_RUN=0
 FLEET=()
+# Guard overrides. Each one is forwarded to tools/review-gate-sync-guard.sh and
+# echoed into the generated pull request body, so an override taken on the
+# command line is visible to whoever reviews the result rather than only in the
+# terminal that ran it.
+GUARD_FLAGS=()
+GUARD="$(cd "$(dirname "$0")" && pwd)/review-gate-sync-guard.sh"
+next_is_threshold=0
 for arg in "$@"; do
+  if [ "$next_is_threshold" = "1" ]; then
+    GUARD_FLAGS+=(--max-net-added "$arg"); next_is_threshold=0; continue
+  fi
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
+    --allow-definition-loss|--allow-older-canonical) GUARD_FLAGS+=("$arg") ;;
+    --max-net-added) next_is_threshold=1 ;;
+    --max-net-added=*) GUARD_FLAGS+=(--max-net-added "${arg#*=}") ;;
+    -*) echo "unknown option: $arg" >&2; exit 64 ;;
     *) FLEET+=("$arg") ;;
   esac
 done
+[ "$next_is_threshold" = "0" ] || { echo "--max-net-added needs a value" >&2; exit 64; }
+[ -x "$GUARD" ] || { echo "guard missing or not executable: $GUARD" >&2; exit 1; }
 [ ${#FLEET[@]} -gt 0 ] || FLEET=("${DEFAULT_FLEET[@]}")
 
 CANON_SHA=$(git -C "$CANON_ROOT" rev-parse HEAD)
+# The guard compares this against each target's own last-commit date. Taken
+# from the commit that last touched the GATE SCRIPT at CANON_SHA, not from
+# CANON_SHA itself: syncing from a HEAD whose latest commit was an unrelated
+# routing change must not read as "canonical moved". Normalized to UTC because
+# %cI carries the committer's offset and the guard requires a UTC stamp.
+CANON_GATE_PATH=.github/scripts/require-ally-review.py
+canon_epoch=$(git -C "$CANON_ROOT" log -1 --format=%ct "$CANON_SHA" -- "$CANON_GATE_PATH")
+CANON_DATE=$(date -u -d "@${canon_epoch:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+[ -n "$canon_epoch" ] && [ -n "$CANON_DATE" ] || {
+  echo "cannot date canonical $CANON_GATE_PATH at ${CANON_SHA:0:10}" >&2; exit 1; }
 
 # Materialize the canonical files FROM THE COMMIT the rollout is attributed
 # to, never from the working tree: local staged/unstaged edits must not ship
@@ -99,10 +175,10 @@ for entry in "${FLEET[@]}"; do
   esac
   echo "=== $repo (runs-on: $runner) ==="
 
-  if [ "$DRY_RUN" = "1" ]; then
-    echo "  dry-run: would sync gate @ ${CANON_SHA:0:10}"
-    continue
-  fi
+  # NOTE: --dry-run does NOT skip ahead from here. It clones and screens the
+  # target like a real run and stops just before the first write, because the
+  # question an operator asks a dry run is "what would this do to the target",
+  # and only the target's own copy can answer it.
 
   work=$(mktemp -d)
   # Run the per-repo body as a PLAIN subshell, never as an `if !` condition:
@@ -131,15 +207,64 @@ for entry in "${FLEET[@]}"; do
         exit 2
       fi
     done
+    # Screen the target's EXISTING copy before overwriting it. This runs
+    # against the checkout's pre-sync state, so it must come before the first
+    # cp -- after it there is nothing left to compare. The guard fails closed:
+    # any non-zero exit, including one it took because it could not read
+    # something, stops this repo and leaves it untouched.
+    #
+    # The target's date comes from the API rather than the checkout because
+    # the clone is --depth 1: `git log -- <path>` there reports the tip
+    # commit, not the commit that last touched the gate, so a shallow read
+    # would compare the wrong two instants and quietly pass.
+    target_gate_date=$(gh api \
+      "repos/$repo/commits?path=${CANON_GATE_PATH}&per_page=1" \
+      --jq '.[0].commit.committer.date' 2>/dev/null) || target_gate_date=""
+    set +e
+    guard_report=$("$GUARD" \
+      --canonical "$CANON_TMP/$CANON_GATE_PATH" \
+      --target "$CANON_GATE_PATH" \
+      --canonical-committed "$CANON_DATE" \
+      ${target_gate_date:+--target-committed "$target_gate_date"} \
+      "${GUARD_FLAGS[@]+"${GUARD_FLAGS[@]}"}" 2>&1)
+    guard_rc=$?
+    set -e
+    printf '%s\n' "$guard_report" | sed 's/^/  /'
+    if [ "$guard_rc" -ne 0 ]; then
+      echo "  REFUSING sync for $repo: guard exit ${guard_rc}; target left untouched" >&2
+      exit 2
+    fi
+
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "  dry-run: would sync gate @ ${CANON_SHA:0:10} (screen passed; nothing written)"
+      exit 0
+    fi
+
     mkdir -p .github/scripts .github/workflows
-    cp "$CANON_TMP/.github/scripts/require-ally-review.py" .github/scripts/
-    cp "$CANON_TMP/.github/scripts/test_require_ally_review.py" .github/scripts/
-    # Rewrite only the runs-on label; everything else ships verbatim so a
-    # diff against canonical is a pure drift check.
-    sed "s/^    runs-on: default$/    runs-on: ${runner}/" \
-      "$CANON_TMP/.github/workflows/review-gate.yml" > .github/workflows/review-gate.yml
-    sed "s/^    runs-on: default$/    runs-on: ${runner}/" \
-      "$CANON_TMP/.github/workflows/review-gate-selftest.yml" > .github/workflows/review-gate-selftest.yml
+    for f in "${CANON_SCRIPTS[@]}"; do
+      cp "$CANON_TMP/$f" "$f"
+    done
+    # Rewrite only the runs-on label; everything else ships verbatim.
+    #
+    # This substitution is NO LONGER A NO-OP WHEN IT MATCHES NOTHING. frr's
+    # canonical workflows moved from `runs-on: default` to the block form
+    # (`group: default-tools` / `labels: arc-light`) on 2026-10-31 (481bf44),
+    # and this pattern has matched zero lines since. A repo asking for its own
+    # runner label was therefore silently shipped frr's ARC group instead --
+    # and a gate job that never starts because its runner group does not
+    # resolve is a merge control that is quietly absent. So: when a label
+    # other than `default` is requested and nothing changed, refuse. Repos
+    # that ask for `default` are unaffected; they are asking for canonical's
+    # own runner, which is what they now get. (PEN-5925)
+    for f in "${CANON_WORKFLOWS[@]}"; do
+      sed "s/^    runs-on: default$/    runs-on: ${runner}/" "$CANON_TMP/$f" > "$f"
+      if [ "$runner" != "default" ] && cmp -s "$CANON_TMP/$f" "$f" &&
+         grep -q '^[[:space:]]*runs-on:' "$CANON_TMP/$f"; then
+        echo "  REFUSING sync: runner label '${runner}' could not be applied to $f;" >&2
+        echo "  canonical no longer carries a 'runs-on: default' line to rewrite." >&2
+        exit 2
+      fi
+    done
     # Normalize modes to the canonical tree entries so the generated
     # commit is byte- AND mode-deterministic (cp inherits checkout modes,
     # redirection inherits the umask); the force-push guard verifies both.
@@ -312,7 +437,13 @@ tools/sync-review-gate.sh." >/dev/null
 
 Advisory-first: this only POSTS the status. Making \`review/ally-complete\` required is a per-repo branch-protection step taken manually after the gate shows correct \`pending\`/\`success\` on real PRs here — and only after this lands on the default branch, since \`pull_request_target\` runs base-branch workflows.
 
-Runner label for this repo: \`${runner}\`. Everything except that label is byte-identical to canonical, so \`diff\` against frr is a pure drift check." 2>/dev/null) || true
+Requested runner label for this repo: \`${runner}\`. Where canonical still carries a rewritable \`runs-on: default\` line that is the only intended difference from canonical; where it does not, canonical's own runner block ships verbatim and a non-\`default\` request is refused rather than silently dropped.
+
+This PR was screened by \`tools/review-gate-sync-guard.sh\` against this repo's copy as it stood at branch time. The screen is what the sync measured; it is NOT a claim that the result is byte-identical to canonical, which this automation does not verify after the fact:
+
+\`\`\`
+${guard_report}
+\`\`\`" 2>/dev/null) || true
     fi
     if [ -n "$url" ]; then
       echo "  $url"
