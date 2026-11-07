@@ -1,0 +1,97 @@
+name: review-gate-sync-selftest
+
+# Tests for the fleet-sync tooling: tools/sync-review-gate.sh and the guard it
+# screens every target with, tools/review-gate-sync-guard.sh.
+#
+# Deliberately NOT folded into review-gate-selftest.yml, even though that job
+# already sweeps `test_*.py`. That workflow is one of the files the sync
+# vendors byte-identically into every fleet repo, so adding frr-only paths to
+# its triggers would ship triggers for files those repos do not have. This one
+# is frr-only and is not in CANON_FILES.
+#
+# What these tests are for: the guard's whole job is to REFUSE, and a guard
+# that quietly stops refusing is indistinguishable from the three months
+# tools/sync-review-gate.sh spent with no target-side check at all, during
+# which a run of it would have replaced onprem-k8s's 18,133-line gate with
+# frr's 3,499 under a PR body calling the diff a drift check (PEN-5925). Every
+# refusal path is pinned, not just the passing ones.
+
+on:
+  pull_request:
+    paths:
+      - 'tools/sync-review-gate.sh'
+      - 'tools/review-gate-sync-guard.sh'
+      - 'tools/test_review_gate_sync_guard.py'
+      - 'tools/REVIEW-GATE-CANONICITY.md'
+      - '.github/workflows/review-gate-sync-selftest.yml'
+  push:
+    branches:
+      - master
+    paths:
+      - 'tools/sync-review-gate.sh'
+      - 'tools/review-gate-sync-guard.sh'
+      - 'tools/test_review_gate_sync_guard.py'
+      - '.github/workflows/review-gate-sync-selftest.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: Review gate sync guard self-test
+    runs-on:
+      group: default-tools
+      labels: arc-light
+    # Checkout plus a stdlib-only Python suite that shells out to bash; the
+    # same shape as hosted-runner-policy.yml, which is sized at 5 on this lane.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Guard decision-logic tests
+        # -v so a regression names the exact refusal path it stopped taking.
+        run: python3 -m unittest discover -s tools -p 'test_review_gate_sync_guard.py' -v
+
+      - name: Both scripts parse
+        run: |
+          bash -n tools/review-gate-sync-guard.sh
+          bash -n tools/sync-review-gate.sh
+
+      - name: Every canonical file the sync ships exists
+        # CANON_FILES going stale is not hypothetical: review-gate-relay.yml
+        # was added to frr on 2026-10-31 and left out of the sync set, which
+        # both stranded the fleet on an incomplete gate and made the canonical
+        # suite fail from $CANON_TMP, so the script refused to propagate
+        # anything at all. Cheap to assert, and it fails loudly here instead of
+        # silently at the next sync.
+        run: |
+          set -euo pipefail
+          missing=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if [ ! -f "$f" ]; then echo "CANON_FILES names a missing file: $f" >&2; missing=1; fi
+          done < <(
+            sed -n '/^CANON_FILES=(/,/^)/p' tools/sync-review-gate.sh |
+              sed -e '1d' -e '$d' -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+          )
+          [ "$missing" = "0" ] || exit 1
+
+      - name: Every workflow review-gate.yml waits on is shipped by the sync
+        # review-gate.yml's `workflow_run.workflows` names the relay that wakes
+        # it. A name there that CANON_FILES does not ship is a gate that never
+        # receives the event, in every repo that takes the sync.
+        run: |
+          set -euo pipefail
+          canon=$(sed -n '/^CANON_FILES=(/,/^)/p' tools/sync-review-gate.sh)
+          missing=0
+          while IFS= read -r w; do
+            [ -n "$w" ] || continue
+            if ! printf '%s' "$canon" | grep -q "workflows/${w}.yml"; then
+              echo "review-gate.yml waits on '${w}' but CANON_FILES does not ship it" >&2
+              missing=1
+            fi
+          done < <(
+            sed -n '/^    workflows:$/,/^    [a-z_]*:$/p' .github/workflows/review-gate.yml |
+              sed -n 's/^      -[[:space:]]*\([a-z0-9-]\{1,\}\)[[:space:]]*$/\1/p'
+          )
+          [ "$missing" = "0" ] || exit 1
