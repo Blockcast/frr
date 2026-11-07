@@ -107,8 +107,13 @@ flush_report() {
 
 # Python def/class names at ANY indentation. Methods count: a subsystem moved
 # into a class is still work that an overwrite would delete.
+# `|| true` is load-bearing under `set -o pipefail`: a file with no def/class
+# line at all makes grep exit 1, which failed the pipeline, failed the
+# command substitution at the call site, and aborted the whole script with
+# rc=1 and an EMPTY report -- fail-closed, but with nothing to tell the
+# operator or the generated pull request why.
 definition_names() {
-  grep -oE '^[[:space:]]*(def|class) [A-Za-z_][A-Za-z_0-9]*' "$1" 2>/dev/null |
+  { grep -oE '^[[:space:]]*(def|class) [A-Za-z_][A-Za-z_0-9]*' "$1" 2>/dev/null || true; } |
     sed -E 's/^[[:space:]]*(def|class) //' | sort -u
 }
 
@@ -131,6 +136,33 @@ fi
 if [ ! -r "$TARGET" ]; then
   echo "REFUSING: target copy exists but is unreadable: $TARGET" >&2
   exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Target already identical to canonical. Overwriting it cannot lose anything,
+# so every check below is vacuous -- and check C would otherwise REFUSE this,
+# which is the normal propagation path rather than an edge case.
+#
+# A synced target's date is the SYNC COMMIT's, which is by construction later
+# than the canonical commit it copied. CANON_DATE is anchored on the gate
+# script alone, so any later canonical change that does not touch that script
+# -- a review-gate-relay.yml or review-gate.yml fix, exactly the kind this
+# repo made on 10-18 and 10-31 while the script last moved on 10-15 -- would
+# read as "target NEWER than canonical" on a repo that is perfectly in sync.
+# The only way through would have been the blanket --allow-older-canonical,
+# which also switches the check off for genuinely diverged targets: a guard
+# that makes operators reach for the override on the ROUTINE path has taught
+# them to reach for it on the dangerous one.
+#
+# A target edited after its sync has a newer date AND differing content, so it
+# does not reach here and stays refused.
+# ---------------------------------------------------------------------------
+if cmp -s "$CANONICAL" "$TARGET"; then
+  emit "verdict: SAFE (target is byte-identical to canonical -- nothing to lose)"
+  emit "canonical: ${canon_lines} lines${CANON_DATE:+, last committed ${CANON_DATE}}"
+  emit "target:    identical${TARGET_DATE:+, last committed ${TARGET_DATE}}"
+  flush_report
+  exit 0
 fi
 
 target_lines=$(wc -l < "$TARGET" | tr -d ' ')

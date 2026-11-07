@@ -30,6 +30,14 @@ CANONICAL = "\n".join(
 )
 
 
+# A target that differs from canonical without defining anything new and
+# without changing the size materially, so checks A and B pass and check C is
+# the one under test. Identical content short-circuits to SAFE before any
+# check runs -- correctly, since nothing can be lost -- so a recency test MUST
+# use differing content or it silently stops testing recency.
+DIFFERING = CANONICAL + "\n# a local edit at the target\n"
+
+
 def write(directory, name, text):
     path = pathlib.Path(directory) / name
     path.write_text(text)
@@ -80,6 +88,50 @@ class FirstRollout(GuardTestCase):
                 "--canonical", canonical, "--target", pathlib.Path(d) / "nope.py"
             )
             self.assertEqual(code, SAFE, out)
+
+
+class IdenticalTarget(GuardTestCase):
+    """A target already byte-identical to canonical. This is the ROUTINE
+    propagation path, not an edge case: it is what every synced repo looks
+    like whenever canonical changes a workflow rather than the gate script."""
+
+    def test_identical_target_is_safe_even_when_newer(self):
+        """Regression: check C refused this, because a synced target's date is
+        the sync commit's and is always later than the canonical commit it
+        copied. That blocked every workflow-only canonical change to an
+        already-synced repo, and the only way through was the blanket
+        --allow-older-canonical."""
+        with tempfile.TemporaryDirectory() as d:
+            canonical = write(d, "canon.py", CANONICAL)
+            target = write(d, "target.py", CANONICAL)
+            code, out = self.guard(
+                canonical, target,
+                canon_date="2026-10-15T20:58:05Z",
+                target_date="2026-10-16T00:36:08Z",
+            )
+            self.assertEqual(code, SAFE, out)
+            self.assertIn("byte-identical", out)
+
+    def test_identical_target_needs_no_dates(self):
+        with tempfile.TemporaryDirectory() as d:
+            canonical = write(d, "canon.py", CANONICAL)
+            target = write(d, "target.py", CANONICAL)
+            code, out = self.run_guard("--canonical", canonical, "--target", target)
+            self.assertEqual(code, SAFE, out)
+
+    def test_a_newer_target_that_differs_is_still_refused(self):
+        """The short-circuit must not become a hole: a target edited after its
+        sync has a newer date AND differing content, so it never reaches it."""
+        with tempfile.TemporaryDirectory() as d:
+            canonical = write(d, "canon.py", CANONICAL)
+            target = write(d, "target.py", CANONICAL + "\n# local fix\n")
+            code, out = self.guard(
+                canonical, target,
+                canon_date="2026-10-15T20:58:05Z",
+                target_date="2026-10-16T00:36:08Z",
+            )
+            self.assertEqual(code, REFUSE, out)
+            self.assertIn("NEWER", out)
 
 
 class DefinitionLoss(GuardTestCase):
@@ -160,7 +212,7 @@ class Recency(GuardTestCase):
     def test_newer_target_refuses(self):
         with tempfile.TemporaryDirectory() as d:
             canonical = write(d, "canon.py", CANONICAL)
-            target = write(d, "target.py", CANONICAL)
+            target = write(d, "target.py", DIFFERING)
             code, out = self.guard(canonical, target, target_date="2026-11-07T11:20:38Z")
             self.assertEqual(code, REFUSE, out)
             self.assertIn("NEWER", out)
@@ -168,7 +220,7 @@ class Recency(GuardTestCase):
     def test_newer_target_override(self):
         with tempfile.TemporaryDirectory() as d:
             canonical = write(d, "canon.py", CANONICAL)
-            target = write(d, "target.py", CANONICAL)
+            target = write(d, "target.py", DIFFERING)
             code, out = self.guard(
                 canonical, target, target_date="2026-11-07T11:20:38Z",
                 flags=["--allow-older-canonical"],
@@ -181,7 +233,7 @@ class Recency(GuardTestCase):
         date; refusing it would make every re-run of a landed sync fail."""
         with tempfile.TemporaryDirectory() as d:
             canonical = write(d, "canon.py", CANONICAL)
-            target = write(d, "target.py", CANONICAL)
+            target = write(d, "target.py", DIFFERING)
             code, out = self.guard(canonical, target, target_date="2026-10-15T20:58:05Z")
             self.assertEqual(code, SAFE, out)
 
@@ -190,7 +242,7 @@ class Recency(GuardTestCase):
         'probably fine' is the fail-open behaviour this guard replaces."""
         with tempfile.TemporaryDirectory() as d:
             canonical = write(d, "canon.py", CANONICAL)
-            target = write(d, "target.py", CANONICAL)
+            target = write(d, "target.py", DIFFERING)
             code, out = self.run_guard("--canonical", canonical, "--target", target)
             self.assertEqual(code, REFUSE, out)
             self.assertIn("cannot compare commit dates", out)
@@ -198,7 +250,7 @@ class Recency(GuardTestCase):
     def test_malformed_date_refuses(self):
         with tempfile.TemporaryDirectory() as d:
             canonical = write(d, "canon.py", CANONICAL)
-            target = write(d, "target.py", CANONICAL)
+            target = write(d, "target.py", DIFFERING)
             code, out = self.guard(canonical, target, target_date="last tuesday")
             self.assertEqual(code, REFUSE, out)
             self.assertIn("ISO-8601", out)
@@ -209,7 +261,7 @@ class Recency(GuardTestCase):
         spelling would be a refusal with no safety content."""
         with tempfile.TemporaryDirectory() as d:
             canonical = write(d, "canon.py", CANONICAL)
-            target = write(d, "target.py", CANONICAL)
+            target = write(d, "target.py", DIFFERING)
             code, out = self.guard(
                 canonical, target,
                 canon_date="2026-10-15T20:58:05+00:00",
@@ -254,6 +306,29 @@ class Plumbing(GuardTestCase):
             code, out = self.guard(canonical, target, report=report)
             self.assertEqual(code, REFUSE, out)
             self.assertIn("REFUSED", report.read_text())
+
+    def test_file_with_no_definitions_still_reports(self):
+        """Regression: zero def/class lines made grep exit 1, which under
+        pipefail aborted the script with rc=1 and an EMPTY report -- the
+        operator and the generated PR body got `guard exit 1` explaining
+        nothing. The verdict may be anything the checks decide; what is pinned
+        is that a report comes back and the run does not abort."""
+        with tempfile.TemporaryDirectory() as d:
+            canonical = write(d, "canon.py", "x = 1\n")
+            target = write(d, "target.py", "y = 2\n")
+            code, out = self.guard(canonical, target)
+            self.assertIn(code, (SAFE, REFUSE), out)
+            self.assertNotEqual(code, 1, out)
+            self.assertTrue(out.strip(), "guard produced no report at all")
+            self.assertIn("verdict:", out)
+
+    def test_definitionless_target_against_real_canonical(self):
+        with tempfile.TemporaryDirectory() as d:
+            canonical = write(d, "canon.py", CANONICAL)
+            target = write(d, "target.py", "x = 1\n")
+            code, out = self.guard(canonical, target)
+            self.assertEqual(code, SAFE, out)
+            self.assertIn("verdict: SAFE", out)
 
     def test_non_integer_threshold_is_a_usage_error(self):
         with tempfile.TemporaryDirectory() as d:

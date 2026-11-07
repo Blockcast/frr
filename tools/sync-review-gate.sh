@@ -217,9 +217,15 @@ for entry in "${FLEET[@]}"; do
     # the clone is --depth 1: `git log -- <path>` there reports the tip
     # commit, not the commit that last touched the gate, so a shallow read
     # would compare the wrong two instants and quietly pass.
+    # `.[0]` on an empty array renders the literal string "null", which would
+    # reach the guard as a malformed date and be refused there. Correct, but it
+    # reports "not UTC ISO-8601" for what is really "this path has no commits",
+    # so normalize it to empty and let the guard say which of its inputs it did
+    # not get.
     target_gate_date=$(gh api \
       "repos/$repo/commits?path=${CANON_GATE_PATH}&per_page=1" \
       --jq '.[0].commit.committer.date' 2>/dev/null) || target_gate_date=""
+    [ "$target_gate_date" != "null" ] || target_gate_date=""
     set +e
     guard_report=$("$GUARD" \
       --canonical "$CANON_TMP/$CANON_GATE_PATH" \

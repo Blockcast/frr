@@ -137,8 +137,21 @@ generated pull request body:
 Check A is the decisive one and the only one that catches onprem-k8s on its own
 evidence; B and C are defence in depth for work that reuses canonical's names,
 and for the general shape of propagating something older than what it replaces.
-A first rollout — target carries no copy — skips all three, because there is
-nothing to lose; that is the only path that does.
+
+Two paths skip all three, and both are cases where nothing can be lost:
+
+- **First rollout** — the target carries no copy at all.
+- **Target byte-identical to canonical** — the overwrite is a no-op on that
+  file. This is the *routine* propagation path, not an edge case: a synced
+  target's gate-script date is its own sync commit's, which is always later
+  than the canonical commit it copied, so without this short-circuit check C
+  would refuse every canonical change that touches a workflow rather than the
+  gate script — exactly the kind frr made on 2026-10-18 and 2026-10-31 while
+  the script last moved on 2026-10-15. The only way through would have been the
+  blanket `--allow-older-canonical`, and a guard that makes operators reach for
+  the override on the routine path has taught them to reach for it on the
+  dangerous one. A target edited after its sync has a newer date *and*
+  differing content, so it does not reach this short-circuit and stays refused.
 
 `--dry-run` now clones and screens every target and writes nothing, rather than
 echoing the canonical sha. A dry run that does not read the target cannot answer
