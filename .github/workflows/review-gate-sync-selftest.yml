@@ -91,7 +91,7 @@ jobs:
               missing=1
             fi
           done < <(
-            sed -n '/^  workflow_run:/,/^  [a-z_]*:/p' .github/workflows/review-gate.yml |
-              sed -n 's/^[[:space:]]*-[[:space:]]*\([a-z0-9-]*\)[[:space:]]*$/\1/p'
+            sed -n '/^    workflows:$/,/^    [a-z_]*:$/p' .github/workflows/review-gate.yml |
+              sed -n 's/^      -[[:space:]]*\([a-z0-9-]\{1,\}\)[[:space:]]*$/\1/p'
           )
           [ "$missing" = "0" ] || exit 1
