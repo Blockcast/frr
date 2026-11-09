@@ -11,6 +11,10 @@ on:
         description: 'Blockcast/frr git ref to build (branch, tag, or full SHA)'
         required: true
         default: master
+      verify_reproducible:
+        description: 'Build the ref twice on separate runners WITHOUT pushing and fail if the FRR binary hashes differ (BLO-55291)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -28,7 +32,7 @@ jobs:
     # This workflow only ever exists in the Blockcast fork, but the fork syncs
     # some workflow files from upstream frrouting/frr — mirror the belt-and-braces
     # gate docker-daily-master.yml uses so a sync can never make this fire upstream.
-    if: github.repository == 'Blockcast/frr'
+    if: github.repository == 'Blockcast/frr' && !inputs.verify_reproducible
     runs-on: arc-default
     steps:
       - name: Checkout requested ref
@@ -44,7 +48,10 @@ jobs:
           {
             echo "sha=$(git rev-parse --short HEAD)"
             echo "full_sha=$(git rev-parse HEAD)"
-            echo "date=$(date +'%Y%m%d')"
+            # Commit date/time, not wall-clock: the same commit must build the
+            # same package version and timestamps on any day (BLO-55291).
+            echo "date=$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d)"
+            echo "epoch=$(git show -s --format=%ct)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -65,7 +72,9 @@ jobs:
           file: ./docker/alpine/Dockerfile
           push: true
           tags: ${{ env.IMAGE }}:gtm-${{ steps.vars.outputs.sha }}
-          build-args: PKGVER=${{ steps.vars.outputs.date }}
+          build-args: |
+            PKGVER=${{ steps.vars.outputs.date }}
+            SOURCE_DATE_EPOCH=${{ steps.vars.outputs.epoch }}
           platforms: linux/amd64
 
       - name: Record digest
@@ -91,3 +100,100 @@ jobs:
             echo "| image | \`${image}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
           printf '::notice::pushed %s\n' "$image"
+
+  # Two independent no-cache builds of the same ref, each on its own runner pod,
+  # exported as a rootfs (never pushed). The FRR binary hash set is the gate; the
+  # whole-rootfs diff is informational only, since Alpine apk index churn between
+  # the two builds can legitimately change base-image files.
+  verify-build:
+    if: github.repository == 'Blockcast/frr' && inputs.verify_reproducible
+    runs-on: arc-default
+    strategy:
+      matrix:
+        replica: [a, b]
+    steps:
+      - name: Checkout requested ref
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Resolve build metadata
+        id: vars
+        run: |
+          set -euo pipefail
+          {
+            echo "full_sha=$(git rev-parse HEAD)"
+            echo "date=$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d)"
+            echo "epoch=$(git show -s --format=%ct)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build rootfs (no cache, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/alpine/Dockerfile
+          no-cache: true
+          build-args: |
+            PKGVER=${{ steps.vars.outputs.date }}
+            SOURCE_DATE_EPOCH=${{ steps.vars.outputs.epoch }}
+          platforms: linux/amd64
+          outputs: type=local,dest=rootfs
+
+      - name: Hash FRR binaries and full rootfs
+        env:
+          RESOLVED_SHA: ${{ steps.vars.outputs.full_sha }}
+        run: |
+          set -euo pipefail
+          cd rootfs
+          { find usr/lib/frr -type f; find usr/lib -maxdepth 1 -type f -name 'libfrr*'; echo usr/bin/vtysh; } \
+            | LC_ALL=C sort | xargs sha256sum > ../frr-hashes.txt
+          find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > ../rootfs-hashes.txt
+          echo "$RESOLVED_SHA" > ../resolved-sha.txt
+          test -s ../frr-hashes.txt
+          wc -l ../frr-hashes.txt ../rootfs-hashes.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repro-${{ matrix.replica }}
+          path: |
+            frr-hashes.txt
+            rootfs-hashes.txt
+            resolved-sha.txt
+
+  verify-reproducible:
+    needs: verify-build
+    runs-on: arc-default
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Compare the two builds
+        run: |
+          set -euo pipefail
+          cmp repro-a/resolved-sha.txt repro-b/resolved-sha.txt
+          frr_a=$(sha256sum < repro-a/frr-hashes.txt | cut -d' ' -f1)
+          frr_b=$(sha256sum < repro-b/frr-hashes.txt | cut -d' ' -f1)
+          root_a=$(sha256sum < repro-a/rootfs-hashes.txt | cut -d' ' -f1)
+          root_b=$(sha256sum < repro-b/rootfs-hashes.txt | cut -d' ' -f1)
+          rootfs_diff=$(diff repro-a/rootfs-hashes.txt repro-b/rootfs-hashes.txt | grep -c '^<' || true)
+          {
+            echo "### GTM FRR reproducibility (BLO-55291)"
+            echo
+            echo "| | build a | build b |"
+            echo "|---|---|---|"
+            echo "| commit | \`$(cat repro-a/resolved-sha.txt)\` | \`$(cat repro-b/resolved-sha.txt)\` |"
+            echo "| FRR binary hash set ($(wc -l < repro-a/frr-hashes.txt) files) — **gate** | \`$frr_a\` | \`$frr_b\` |"
+            echo "| full rootfs hash set — informational | \`$root_a\` | \`$root_b\` |"
+            echo
+            echo "rootfs files differing: $rootfs_diff"
+          } >> "$GITHUB_STEP_SUMMARY"
+          diff repro-a/rootfs-hashes.txt repro-b/rootfs-hashes.txt | head -50 || true
+          if [ "$frr_a" != "$frr_b" ]; then
+            diff repro-a/frr-hashes.txt repro-b/frr-hashes.txt || true
+            echo "::error::FRR binaries differ between two builds of the same commit"
+            exit 1
+          fi
+          printf '::notice::FRR binary hash set reproducible: %s\n' "$frr_a"
