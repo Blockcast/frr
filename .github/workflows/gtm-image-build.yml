@@ -169,6 +169,9 @@ jobs:
     runs-on: arc-default
     steps:
       - uses: actions/download-artifact@v4
+        with:
+          # only ours: build-push-action also uploads *.dockerbuild records, which flake on download
+          pattern: repro-*
 
       - name: Compare the two builds
         run: |
