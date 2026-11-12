@@ -28,7 +28,7 @@ jobs:
   relay:
     if: false
     runs-on:
-      group: default-tools
+      group: public-repo-ci
       labels: arc-light
     timeout-minutes: 10
     steps:

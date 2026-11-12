@@ -1633,7 +1633,7 @@ class TestWorkflowContracts(unittest.TestCase):
             )
             groups.update(group for group, _ in matches)
             labels.update(label for _, label in matches)
-        self.assertEqual(groups, {"default-tools"}, "gate and selftest must use the tools group")
+        self.assertEqual(groups, {"public-repo-ci"}, "gate and selftest must use the tools group")
         self.assertEqual(len(labels), 1, "gate and selftest must run on the same label: %s" % labels)
         label = next(iter(labels))
         self.assertNotRegex(

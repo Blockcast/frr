@@ -25,7 +25,7 @@ jobs:
     # arc-light, not `default`: checkout plus one stdlib Python script, the
     # same shape CI-Verdict runs there on every push and PR (github-ci.yml).
     runs-on:
-      group: default-tools
+      group: public-repo-ci
       labels: arc-light
     # A template roll of arc-light takes no new jobs until every pending or
     # running one finishes (ARC updateStrategy eventual, onprem-k8s

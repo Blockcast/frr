@@ -54,7 +54,7 @@ jobs:
     # review-gate-selftest run there.  `default` is the chronically
     # saturated build pool (BLO-20032, BLO-25481).
     runs-on:
-      group: default-tools
+      group: public-repo-ci
       labels: arc-light
     # A template roll of arc-light takes no new jobs until every pending or
     # running one finishes (ARC updateStrategy eventual, onprem-k8s

@@ -46,7 +46,7 @@ jobs:
     # github-ci runs orphaned since 2026-07-19.  Same pool review-gate-selftest
     # uses, for the same reason.
     runs-on:
-      group: default-tools
+      group: public-repo-ci
       labels: arc-light
     steps:
       - name: Checkout

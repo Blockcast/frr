@@ -58,7 +58,7 @@ jobs:
   selftest:
     name: Review gate self-test
     runs-on:
-      group: default-tools
+      group: public-repo-ci
       labels: arc-light
     steps:
       - name: Checkout

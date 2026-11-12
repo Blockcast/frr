@@ -831,7 +831,7 @@ class TestGateWiring(unittest.TestCase):
             self.filter,
         )
         self.assertIsNotNone(match, "doc-path-filter must use the grouped tools runner")
-        self.assertEqual(match.group(1), "default-tools")
+        self.assertEqual(match.group(1), "public-repo-ci")
         self.assertEqual(match.group(2), "arc-light")
 
     def test_one_lost_build_leg_does_not_skip_the_other_platform(self):

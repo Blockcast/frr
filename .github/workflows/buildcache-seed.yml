@@ -85,7 +85,7 @@ jobs:
     # buildcache_freshness.py, which reads Harbor over urllib (no docker, no
     # sudo), so none of them needs a dind pod. Only `seed` builds.
     runs-on:
-      group: default-tools
+      group: public-repo-ci
       labels: arc-light
     name: Probe buildcache age (before)
     timeout-minutes: 10
@@ -267,7 +267,7 @@ jobs:
     if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
     # arc-light, like probe-before: see the comment on its runs-on.
     runs-on:
-      group: default-tools
+      group: public-repo-ci
       labels: arc-light
     name: Verify buildcache advanced
     timeout-minutes: 10
@@ -324,7 +324,7 @@ jobs:
     if: ${{ always() && !cancelled() && github.repository == 'Blockcast/frr' }}
     # arc-light, like probe-before: see the comment on its runs-on.
     runs-on:
-      group: default-tools
+      group: public-repo-ci
       labels: arc-light
     name: Buildcache freshness gate (${{ github.event_name }})
     timeout-minutes: 10
