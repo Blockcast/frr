@@ -64,7 +64,11 @@ jobs:
           context: .
           file: ./docker/alpine/Dockerfile
           push: true
-          tags: ${{ env.IMAGE }}:gtm-${{ steps.vars.outputs.sha }}
+          # The full-SHA tag is the one tests/junos-interop pins by default: --short
+          # is auto-sized per clone, so a harness cannot know its length (BLO-44857).
+          tags: |
+            ${{ env.IMAGE }}:gtm-${{ steps.vars.outputs.sha }}
+            ${{ env.IMAGE }}:gtm-${{ steps.vars.outputs.full_sha }}
           build-args: PKGVER=${{ steps.vars.outputs.date }}
           platforms: linux/amd64
 

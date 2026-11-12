@@ -41,11 +41,21 @@ esac
 # See BLO-15630 for the current values; they are checked below, once `die` exists.
 JUNOS_USER="${JUNOS_USER:-root}"
 JUNOS_JUMP="${JUNOS_JUMP:-}"          # set when this host is not the jump host itself
+# A Junos `root` login lands in csh, not the CLI, so a bare `show ...` is
+# "Command not found" (BLO-44857).  1 = wrap every command in `cli -c '...'` and
+# feed stdin scripts to `cli`; 0 = the login is a CLI-class user.  Auto: root => 1.
+JUNOS_VIA_CLI="${JUNOS_VIA_CLI:-$([[ "$JUNOS_USER" == root ]] && echo 1 || echo 0)}"
+# Pin the box's host key: a known_hosts file holding only the vJunos key, checked
+# strictly.  Unset keeps the old accept-new against ~/.ssh/known_hosts, which
+# refuses a re-imaged box whose stale key is already there.
+JUNOS_KNOWN_HOSTS="${JUNOS_KNOWN_HOSTS:-}"
 
 # Pin the FRR build.  FRR_IMAGE is produced by .github/workflows/gtm-image-build.yml
-# (workflow_dispatch with ref=<sha>), which tags harbor.blockcast.net/blockcast/frr:gtm-<shortsha>.
+# (workflow_dispatch with ref=<sha>), which tags harbor.blockcast.net/blockcast/frr:gtm-<full sha>
+# as well as gtm-<shortsha>.  The full one, because `--short` is auto-sized per clone
+# (10 chars in CI) and a guessed length names an image that does not exist.
 FRR_SHA="${FRR_SHA:-$(git -C "$HERE" rev-parse HEAD 2>/dev/null || echo unknown)}"
-FRR_IMAGE="${FRR_IMAGE:-harbor.blockcast.net/blockcast/frr:gtm-${FRR_SHA:0:7}}"
+FRR_IMAGE="${FRR_IMAGE:-harbor.blockcast.net/blockcast/frr:gtm-${FRR_SHA}}"
 
 # Protocol parameters.  These are RFC 5737 / RFC 3849 documentation ranges and the
 # SSM ranges; they are not lab facts and are safe to carry in the repo.
@@ -121,13 +131,28 @@ else
   [[ -n "${JUNOS_KEY:-}"  ]] || die "set JUNOS_KEY (path to the lab SSH key -- see BLO-15630)"
   [[ -n "${JUNOS_LAN_IFL:-}" ]] || die "set JUNOS_LAN_IFL (Junos receiver-stub ifl, e.g. ge-0/0/1.0)"
   [[ -r "$JUNOS_KEY" ]] || die "JUNOS_KEY is not readable: $JUNOS_KEY"
+  [[ -z "$JUNOS_KNOWN_HOSTS" || -r "$JUNOS_KNOWN_HOSTS" ]] || die "JUNOS_KNOWN_HOSTS is not readable: $JUNOS_KNOWN_HOSTS"
 fi
 JUNOS_RID="${JUNOS_RID:-$JUNOS_HOST}"
 
 # ----------------------------------------------------------------- transport
-ssh_opts=(-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
-          -o ConnectTimeout=15 -o BatchMode=yes -i "$JUNOS_KEY")
+ssh_opts=(-o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes -i "$JUNOS_KEY")
+if [[ -n "$JUNOS_KNOWN_HOSTS" ]]; then
+  ssh_opts+=(-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$JUNOS_KNOWN_HOSTS")
+else
+  ssh_opts+=(-o StrictHostKeyChecking=accept-new)
+fi
 [[ -n "$JUNOS_JUMP" ]] && ssh_opts+=(-J "$JUNOS_JUMP")
+
+# The remote command line for one Junos call.  No argument = a stdin script.
+# csh parses the line, so the command goes in single quotes; a quote or a
+# newline in it cannot be carried and is refused rather than mangled.
+jremote() {
+  (( JUNOS_VIA_CLI )) || { printf '%s' "$*"; return 0; }
+  (( $# )) || { printf 'cli'; return 0; }
+  [[ "$*" != *[$'\'\n']* ]] || { echo "jremote: cannot quote for csh: $*" >&2; return 1; }
+  printf "cli -c '%s'" "$*"
+}
 
 if (( DRY_RUN )); then
   FIXTURES="$HERE/fixtures/${FIXTURE_MODE:-good}"
@@ -264,7 +289,8 @@ if (( DRY_RUN )); then
   }
   sleep() { :; }
 else
-  jcmd() { ssh "${ssh_opts[@]}" "$JUNOS_USER@$JUNOS_HOST" "$@" 2>&1; }
+  # ${r:+"$r"}: no remote command at all for a CLI-class stdin script, not an empty one.
+  jcmd() { local r; r="$(jremote "$@")" || return 1; ssh "${ssh_opts[@]}" "$JUNOS_USER@$JUNOS_HOST" ${r:+"$r"} 2>&1; }
   # stdin = `set` lines; loads them into a private candidate and reports.
   jload() {
     local f="$PRIV/.junos-load.set"; cat >"$f"
@@ -518,6 +544,13 @@ gate() { log "GATE $1: $2"; }
 
 step0() {
   local o
+
+  gate G0 "the pinned FRR image is present locally or pullable -- before any Junos read or commit"
+  if (( ! DRY_RUN )); then
+    { docker image inspect "$FRR_IMAGE" >/dev/null 2>&1 || docker pull "$FRR_IMAGE" 2>&1 | sanitize >>"$OUT/run.log"; } \
+      || { record FAIL step0-G0-image "no $FRR_IMAGE (build it: gtm-image-build.yml, ref=$FRR_SHA); see run.log"; return 1; }
+  fi
+  record PASS step0-G0-image ""
 
   gate G1 "lab host can reach the Junos on TCP/179 (TCP/22 reachability does not imply it)"
   if (( ! DRY_RUN )); then
@@ -913,6 +946,17 @@ if (( DRY_WRAPPER )); then
     bash "${BASH_SOURCE[0]}" --dry-run-inner >"$OUT/dryrun-notype1.log" 2>&1 || true
 
   echo "== assertions"
+  assert "root (csh) login wraps a command in cli -c" \
+    "[ \"\$(JUNOS_VIA_CLI=1 jremote 'show configuration | display set')\" = \"cli -c 'show configuration | display set'\" ]"
+  assert "root (csh) login feeds a stdin script to cli" "[ \"\$(JUNOS_VIA_CLI=1 jremote)\" = cli ]"
+  assert "a CLI-class login sends the command bare, and nothing for a stdin script" \
+    "[ \"\$(JUNOS_VIA_CLI=0 jremote show version)\" = 'show version' ] && [ -z \"\$(JUNOS_VIA_CLI=0 jremote)\" ]"
+  assert "a command csh cannot carry in single quotes is refused" \
+    "! JUNOS_VIA_CLI=1 jremote \"show 'x'\" 2>/dev/null"
+  assert "the default image is tagged by the full SHA, not a guessed short one" \
+    "grep -qF -- ':gtm-$FRR_SHA' '$OUT/dryrun-good/summary.md'"
+  assert "the image is checked before any Junos commit (G0 ahead of G2)" \
+    "grep -n -e step0-G0-image -e step0-G2-baseline '$OUT/dryrun-good/summary.md' | head -1 | grep -q G0"
   assert "good fixtures produce zero FAIL cells (got $good_fail)"  "[ '$good_fail' -eq 0 ]"
   assert "empty fixtures produce FAIL cells (got $empty_fail)"     "[ '$empty_fail' -gt 5 ]"
   assert "summary.md was written"             "[ -s '$OUT/dryrun-good/summary.md' ]"
