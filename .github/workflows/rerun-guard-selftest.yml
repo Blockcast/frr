@@ -58,15 +58,15 @@ permissions:
 jobs:
   selftest:
     name: Rerun coverage guard self-test
-    # arc-light, not `default`: checkout plus test_*.py suites that
+    # Light job, never `default`: checkout plus test_*.py suites that
     # review-gate-selftest.yml already runs there (its discover pattern
     # covers both below).  On 2026-09-28 this job queued 1.3-2.3 h on
     # `default` (runs 36441104995, 36464895267, 36423351119; jobs API
     # created_at to started_at) and review-gate-selftest at most 2.6 min on
     # arc-light for the same three commits.
-    runs-on:
-      group: default-tools
-      labels: arc-light
+    # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
+    # workflow refs, so a pull_request run cannot start there (BLO-55992).
+    runs-on: ubuntu-latest
     # A template roll of arc-light takes no new jobs until every pending or
     # running one finishes (ARC updateStrategy eventual, onprem-k8s
     # arc/controller-values.yaml), so at the 360-minute default one hung job

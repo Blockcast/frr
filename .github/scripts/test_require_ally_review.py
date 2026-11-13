@@ -1612,33 +1612,25 @@ class TestWorkflowContracts(unittest.TestCase):
         branches = re.findall(r"(?m)^\s*-\s*([\w./-]+)\s*$", push_block.split("paths:", 1)[0])
         self.assertLessEqual({"master", "main"}, set(branches))
 
-    def test_workflows_share_one_self_hosted_runner_label(self):
-        # The vendoring overlay's single allowed diff is the runner label,
-        # applied uniformly. Asserting consistency (not a hardcoded name)
-        # keeps this test itself byte-identical across the fleet. The tools
-        # runner group is part of the mapping form so GitHub cannot select a
-        # same-label runner from an unintended group.
-        labels = set()
-        groups = set()
-        for name in ("review-gate.yml", "review-gate-selftest.yml"):
-            matches = re.findall(
-                r"(?m)^\s*runs-on:[ \t]*\n"
-                r"^\s+group:[ \t]*(\S+)[ \t]*\n"
-                r"^\s+labels:[ \t]*(\S+)[ \t]*$",
-                self._read(name),
-            )
-            self.assertTrue(
-                matches,
-                "%s has no grouped runs-on -- overlay must pin group and label" % name,
-            )
-            groups.update(group for group, _ in matches)
-            labels.update(label for _, label in matches)
-        self.assertEqual(groups, {"default-tools"}, "gate and selftest must use the tools group")
-        self.assertEqual(len(labels), 1, "gate and selftest must run on the same label: %s" % labels)
-        label = next(iter(labels))
-        self.assertNotRegex(
-            label, r"(?i)\b(?:ubuntu|macos|windows)-", "hosted runner labels are forbidden"
+    def test_gate_self_hosted_and_selftest_github_hosted(self):
+        # review-gate.yml runs on the default-branch ref (pull_request_target,
+        # workflow_run, issue_comment), so it may use the workflow-pinned
+        # public-repo-ci group; the mapping form keeps GitHub from picking a
+        # same-label runner from another group. The selftest also runs on
+        # pull_request, whose refs/pull/N/merge ref that group never admits,
+        # so it is GitHub-hosted (BLO-55992).
+        gate = re.findall(
+            r"(?m)^\s*runs-on:[ \t]*\n"
+            r"^\s+group:[ \t]*(\S+)[ \t]*\n"
+            r"^\s+labels:[ \t]*(\S+)[ \t]*$",
+            self._read("review-gate.yml"),
         )
+        self.assertTrue(gate, "review-gate.yml has no grouped runs-on")
+        self.assertEqual({g for g, _ in gate}, {"public-repo-ci"})
+        for _, label in gate:
+            self.assertNotRegex(label, r"(?i)\b(?:ubuntu|macos|windows)-", "the gate stays self-hosted")
+        selftest = re.findall(r"(?m)^\s*runs-on:[ \t]*(\S*)[ \t]*$", self._read("review-gate-selftest.yml"))
+        self.assertEqual(set(selftest), {"ubuntu-latest"}, "PR-triggered selftest must be GitHub-hosted")
 
 
 class TestUserSeatCannotProvidePositiveEvidence(unittest.TestCase):

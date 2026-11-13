@@ -27,9 +27,9 @@ permissions: {}
 jobs:
   relay:
     if: false
-    runs-on:
-      group: default-tools
-      labels: arc-light
+    # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
+    # workflow refs, so a pull_request run cannot start there (BLO-55992).
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - run: "true"

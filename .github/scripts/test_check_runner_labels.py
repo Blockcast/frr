@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixtures for check-runner-labels.py's multi-exporter rule.
+"""Fixtures for check-runner-labels.py's hosted-label and multi-exporter rules.
 
 Stdlib only. Run: python3 -m unittest discover -s .github/scripts -p 'test_check_runner_labels.py'
 """
@@ -69,6 +69,42 @@ class MultiExporterRule(unittest.TestCase):
             "            type=registry,ref=a\n"
             "            type=registry,ref=b\n"
         ), [])
+
+
+def hosted(workflow: str) -> list:
+    return labels.check_hosted_labels(PATH, workflow)
+
+
+class HostedLabelRule(unittest.TestCase):
+    """BLO-55992: hosted labels are allowed only in jobs with no Harbor or buildx."""
+
+    LIGHT = ("  lint:\n"
+             "    runs-on: ubuntu-latest\n"
+             "    steps:\n"
+             "      - run: python3 check.py  # harbor in a comment does not count\n")
+
+    def test_light_job_may_use_hosted(self):
+        self.assertEqual(hosted("on: push\njobs:\n" + self.LIGHT), [])
+
+    def test_harbor_job_is_refused(self):
+        found = hosted("jobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n"
+                       "      - run: docker push registry.blockcast.net/x:y\n")
+        self.assertEqual(len(found), 1)
+        self.assertIn("registry.blockcast.net", found[0])
+
+    def test_buildx_cache_job_is_refused(self):
+        found = hosted("jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n"
+                       "      - uses: docker/build-push-action@v6\n"
+                       "        with:\n          cache-from: type=registry,ref=a\n")
+        self.assertEqual(len(found), 1)
+
+    def test_harbor_in_another_job_does_not_taint(self):
+        other = "  build:\n    runs-on: arc-default\n    steps:\n      - run: echo registry.blockcast.net\n"
+        self.assertEqual(hosted("jobs:\n" + self.LIGHT + other), [])
+        self.assertEqual(len(hosted("jobs:\n" + other.replace("arc-default", "ubuntu-latest") + self.LIGHT)), 1)
+
+    def test_label_outside_jobs_is_refused(self):
+        self.assertEqual(len(hosted("env:\n  RUNNER: ubuntu-latest\njobs:\n" + self.LIGHT)), 1)
 
 
 if __name__ == "__main__":

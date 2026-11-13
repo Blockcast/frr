@@ -126,7 +126,7 @@ jobs:
     # suits a `pull_request_target` job holding `statuses: write`.
     # Match the canonical grouped wiring in Blockcast/review-gate-action's README.
     runs-on:
-      group: default-tools
+      group: public-repo-ci
       labels: arc-light
     steps:
       - name: Checkout
