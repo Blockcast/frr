@@ -255,7 +255,7 @@ jobs:
     needs: doc-path-filter
     # The decided `docs` output, never the raw doc: see doc-path-filter.
     if: ${{ needs.doc-path-filter.outputs.docs == 'true' }}
-    runs-on: default
+    runs-on: ubuntu-latest  # BLO-56666: PR-triggered; public repo leaves org group 1
     name: HTML documentation (user + developer)
     timeout-minutes: 20
     steps:
