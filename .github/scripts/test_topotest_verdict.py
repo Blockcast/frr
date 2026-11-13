@@ -819,20 +819,13 @@ class TestGateWiring(unittest.TestCase):
         self.assertNotRegex(_code(co), r"(?m)^\s+(filter|sparse-checkout):")
         self.assertRegex(self.filter, r"(?m)^      pull-requests: read$")
 
-    def test_filter_runs_on_arc_light_for_every_event(self):
-        """Seconds of work on every event now that push and workflow_dispatch
-        check out shallow, so never on `default`, where it queued for hours
-        before Build queued again (the comment on its runs-on has the
-        numbers)."""
-        match = re.search(
-            r"(?m)^    runs-on:[ \t]*\n"
-            r"^      group:[ \t]*(\S+)[ \t]*\n"
-            r"^      labels:[ \t]*(\S+)[ \t]*$",
-            self.filter,
-        )
-        self.assertIsNotNone(match, "doc-path-filter must use the grouped tools runner")
-        self.assertEqual(match.group(1), "public-repo-ci")
-        self.assertEqual(match.group(2), "arc-light")
+    def test_filter_runs_github_hosted_for_every_event(self):
+        """Seconds of work on every event, so never on `default`, where it
+        queued for hours before Build queued again.  GitHub-hosted, not the
+        public-repo-ci group: that group admits only default-branch workflow
+        refs, so a pull_request run could never start there (BLO-55992)."""
+        self.assertRegex(self.filter, r"(?m)^    runs-on: ubuntu-latest$")
+        self.assertNotRegex(self.filter, r"(?m)^      group:")
 
     def test_one_lost_build_leg_does_not_skip_the_other_platform(self):
         for name in ("Unit-Test", "Test"):

@@ -57,9 +57,9 @@ permissions:
 jobs:
   selftest:
     name: Review gate self-test
-    runs-on:
-      group: public-repo-ci
-      labels: arc-light
+    # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
+    # workflow refs, so a pull_request run cannot start there (BLO-55992).
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09

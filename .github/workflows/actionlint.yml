@@ -49,13 +49,13 @@ env:
 jobs:
   actionlint:
     name: Workflow lint (actionlint + shellcheck)
-    # arc-light, not `default`: checkout, two small downloads and a linter
+    # Light job, never `default`: checkout, two small downloads and a linter
     # that finishes in seconds, the same shape hosted-runner-policy and
     # review-gate-selftest run there.  `default` is the chronically
     # saturated build pool (BLO-20032, BLO-25481).
-    runs-on:
-      group: public-repo-ci
-      labels: arc-light
+    # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
+    # workflow refs, so a pull_request run cannot start there (BLO-55992).
+    runs-on: ubuntu-latest
     # A template roll of arc-light takes no new jobs until every pending or
     # running one finishes (ARC updateStrategy eventual, onprem-k8s
     # arc/controller-values.yaml), so the 360-minute default would let one

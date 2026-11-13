@@ -106,7 +106,7 @@ jobs:
   # Documentation-HTML 'success' exactly when docs is 'true'.
   doc-path-filter:
     if: ${{ github.event_name != 'pull_request' || github.actor != 'mergify[bot]' }}
-    # arc-light, not `default`, for every event.  The job is seconds of
+    # Light job, never `default`, for every event.  The job is seconds of
     # work: the paths-filter call, the decide script and the MIB cache (a
     # 48 KB restore, or on a miss nine fetches from IANA/IEEE) -- 14 s in
     # run 36229238558 -- and every other job waits for it.  On `default`,
@@ -131,9 +131,9 @@ jobs:
     # this job saves, and no other job saves one.  The image's own fetch_mib
     # (docker/ubuntu-ci/Dockerfile) then downloads the MIBs, as on any
     # miss: slower, not broken.
-    runs-on:
-      group: public-repo-ci
-      labels: arc-light
+    # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
+    # workflow refs, so a pull_request run cannot start there (BLO-55992).
+    runs-on: ubuntu-latest
     name: Documentation path filter
     # The folded MIB population's budget (Prepare-MIB-Cache's 20).
     timeout-minutes: 20
@@ -1658,11 +1658,11 @@ jobs:
     #
     # `always()`, not `!cancelled()`: a cancelled run must read red here, not
     # skipped, because a skipped required check counts as passing.
-    # arc-light: checkout plus one stdlib Python script, the same shape the
+    # Light job: checkout plus one stdlib Python script, the same shape the
     # review gate runs there (review-gate.yml).
-    runs-on:
-      group: public-repo-ci
-      labels: arc-light
+    # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
+    # workflow refs, so a pull_request run cannot start there (BLO-55992).
+    runs-on: ubuntu-latest
     if: ${{ always() }}
     needs: [doc-path-filter, Build, Build-LTTng, Unit-Test, Test, Documentation-HTML]
     name: CI-Verdict

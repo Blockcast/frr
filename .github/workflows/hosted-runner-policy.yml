@@ -22,11 +22,11 @@ permissions:
 
 jobs:
   enforce:
-    # arc-light, not `default`: checkout plus one stdlib Python script, the
+    # Light job, never `default`: checkout plus one stdlib Python script, the
     # same shape CI-Verdict runs there on every push and PR (github-ci.yml).
-    runs-on:
-      group: public-repo-ci
-      labels: arc-light
+    # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
+    # workflow refs, so a pull_request run cannot start there (BLO-55992).
+    runs-on: ubuntu-latest
     # A template roll of arc-light takes no new jobs until every pending or
     # running one finishes (ARC updateStrategy eventual, onprem-k8s
     # arc/controller-values.yaml), so at the 360-minute default one hung job
