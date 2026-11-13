@@ -1016,8 +1016,11 @@ jobs:
       # enable -proposed only in that case; its Release is NotAutomatic.
       # Talos hosts (every ARC host since 2026-11-05, BLO-53653): no Ubuntu
       # kernel packages exist and module autoload is off.  MPLS and
-      # MPLS_IPTUNNEL are built in; vrf is =m and loads only if the node's
-      # machine.kernel.modules lists it (talosctl, human-only).
+      # MPLS_IPTUNNEL are built in; vrf, ip_gre and ip6_gre are =m and load
+      # only if the node's machine.kernel.modules lists them (talosctl,
+      # human-only, BLO-53656).  Without them ~200 tests fail and wait out
+      # their timeouts, so the leg hits the 240-min cap with no verdict while
+      # holding an arc-e2e slot (BLO-56767).  Fail the leg here instead.
       - name: Host kernel prep
         run: |
           set -euo pipefail
@@ -1029,7 +1032,12 @@ jobs:
             sudo mkdir -p /boot
             zcat /proc/config.gz | sudo tee "/boot/config-${MODPKGVER}" >/dev/null
             [ -d /proc/sys/net/mpls ] || { echo "ERROR: kernel has no MPLS" >&2; exit 1; }
-            [ -d /sys/module/vrf ] || echo "::warning title=vrf not loaded::This Talos node does not load vrf; VRF topotests will fail (BLO-53653)"
+            missing=""
+            for m in vrf ip_gre ip6_gre; do [ -d "/sys/module/${m}" ] || missing="${missing} ${m}"; done
+            if [ -n "${missing}" ]; then
+              echo "::error title=Talos kernel modules not loaded::${missing# } not loaded on $(uname -n); topotests cannot pass here (BLO-53656)"
+              exit 1
+            fi
             exit 0
           fi
           sudo apt-get update -y || true
