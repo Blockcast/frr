@@ -37,6 +37,8 @@ RUN source /src/alpine/APKBUILD.in \
 		$makedepends
 COPY . /src
 ARG PKGVER
+# Pinned by gtm-image-build.yml to the commit time so builds are reproducible (BLO-55291)
+ARG SOURCE_DATE_EPOCH
 RUN cd /src \
 	&& ./bootstrap.sh \
 	&& ./configure \
@@ -59,6 +61,7 @@ RUN source /dist/APKBUILD.in \
 		$makedepends \
 		$depends
 USER builder
+ARG SOURCE_DATE_EPOCH
 RUN cd /dist \
 	&& abuild checksum \
 	&& git init \

@@ -106,7 +106,7 @@ jobs:
   # Documentation-HTML 'success' exactly when docs is 'true'.
   doc-path-filter:
     if: ${{ github.event_name != 'pull_request' || github.actor != 'mergify[bot]' }}
-    # arc-light, not `default`, for every event.  The job is seconds of
+    # Light job, never `default`, for every event.  The job is seconds of
     # work: the paths-filter call, the decide script and the MIB cache (a
     # 48 KB restore, or on a miss nine fetches from IANA/IEEE) -- 14 s in
     # run 36229238558 -- and every other job waits for it.  On `default`,
@@ -131,9 +131,9 @@ jobs:
     # this job saves, and no other job saves one.  The image's own fetch_mib
     # (docker/ubuntu-ci/Dockerfile) then downloads the MIBs, as on any
     # miss: slower, not broken.
-    runs-on:
-      group: default-tools
-      labels: arc-light
+    # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
+    # workflow refs, so a pull_request run cannot start there (BLO-55992).
+    runs-on: ubuntu-latest
     name: Documentation path filter
     # The folded MIB population's budget (Prepare-MIB-Cache's 20).
     timeout-minutes: 20
@@ -255,7 +255,7 @@ jobs:
     needs: doc-path-filter
     # The decided `docs` output, never the raw doc: see doc-path-filter.
     if: ${{ needs.doc-path-filter.outputs.docs == 'true' }}
-    runs-on: default
+    runs-on: ubuntu-latest  # BLO-56666: PR-triggered; public repo leaves org group 1
     name: HTML documentation (user + developer)
     timeout-minutes: 20
     steps:
@@ -1016,8 +1016,11 @@ jobs:
       # enable -proposed only in that case; its Release is NotAutomatic.
       # Talos hosts (every ARC host since 2026-11-05, BLO-53653): no Ubuntu
       # kernel packages exist and module autoload is off.  MPLS and
-      # MPLS_IPTUNNEL are built in; vrf is =m and loads only if the node's
-      # machine.kernel.modules lists it (talosctl, human-only).
+      # MPLS_IPTUNNEL are built in; vrf, ip_gre and ip6_gre are =m and load
+      # only if the node's machine.kernel.modules lists them (talosctl,
+      # human-only, BLO-53656).  Without them ~200 tests fail and wait out
+      # their timeouts, so the leg hits the 240-min cap with no verdict while
+      # holding an arc-e2e slot (BLO-56767).  Fail the leg here instead.
       - name: Host kernel prep
         run: |
           set -euo pipefail
@@ -1029,7 +1032,12 @@ jobs:
             sudo mkdir -p /boot
             zcat /proc/config.gz | sudo tee "/boot/config-${MODPKGVER}" >/dev/null
             [ -d /proc/sys/net/mpls ] || { echo "ERROR: kernel has no MPLS" >&2; exit 1; }
-            [ -d /sys/module/vrf ] || echo "::warning title=vrf not loaded::This Talos node does not load vrf; VRF topotests will fail (BLO-53653)"
+            missing=""
+            for m in vrf ip_gre ip6_gre; do [ -d "/sys/module/${m}" ] || missing="${missing} ${m}"; done
+            if [ -n "${missing}" ]; then
+              echo "::error title=Talos kernel modules not loaded::${missing# } not loaded on $(uname -n); topotests cannot pass here (BLO-53656)"
+              exit 1
+            fi
             exit 0
           fi
           sudo apt-get update -y || true
@@ -1658,11 +1666,11 @@ jobs:
     #
     # `always()`, not `!cancelled()`: a cancelled run must read red here, not
     # skipped, because a skipped required check counts as passing.
-    # arc-light: checkout plus one stdlib Python script, the same shape the
+    # Light job: checkout plus one stdlib Python script, the same shape the
     # review gate runs there (review-gate.yml).
-    runs-on:
-      group: default-tools
-      labels: arc-light
+    # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
+    # workflow refs, so a pull_request run cannot start there (BLO-55992).
+    runs-on: ubuntu-latest
     if: ${{ always() }}
     needs: [doc-path-filter, Build, Build-LTTng, Unit-Test, Test, Documentation-HTML]
     name: CI-Verdict
