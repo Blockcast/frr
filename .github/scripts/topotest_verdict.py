@@ -105,14 +105,6 @@ REQUIRED_JOBS = ("Build", "Build-LTTng", "Unit-Test", "Test")
 # BLO-56666: Test runs only for this ref (group 26 pins the workflow to it).
 TEST_JOB = "Test"
 TEST_REF = "refs/heads/master"
-
-
-def on_test_ref(ref):
-    """Whether Test's `if: github.ref == 'refs/heads/master'` holds.
-
-    GitHub's `==` ignores case, so this does too.
-    """
-    return ref.lower() == TEST_REF
 # Needed by the verdict, but conditional: it runs only when doc/ changed.
 DOCS_JOB = "Documentation-HTML"
 MERGIFY_ACTOR = "mergify[bot]"
@@ -124,6 +116,14 @@ PLAN_FILES = (
     "collected-ids.txt",
     "accounted.txt",
 )
+
+
+def on_test_ref(ref):
+    """Whether Test's `if: github.ref == 'refs/heads/master'` holds.
+
+    GitHub's `==` ignores case, so this does too.
+    """
+    return ref.lower() == TEST_REF
 
 
 def artifact_name(platform, k):
