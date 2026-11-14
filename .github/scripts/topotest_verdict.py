@@ -8,18 +8,16 @@
 # a skipped or missing shard is not a red check on its own: GitHub renders a
 # skipped job as neutral.  This job needs every gating job and reads their
 # results plus the plan artifact each Test shard uploads, so "a shard never
-# ran" and "the shards did not cover the tree" are red here -- on
-# refs/heads/master, the one ref Test runs on (BLO-56666; see below).
+# ran" and "the shards did not cover the tree" are red here.
 #
 #   topotest_verdict.py --needs-env NEEDS_JSON --plans DIR --shards N \
-#       --platforms p1,p2 --event-name EVENT --actor ACTOR --ref REF
+#       --platforms p1,p2 --event-name EVENT --actor ACTOR
 #
 # NEEDS_JSON names an environment variable holding `toJSON(needs)`.
 #
-# FAIL CLOSED.  There are three ways to pass without the full checks, each
-# matched exactly, never by exclusion: the two cases where the workflow
-# deliberately builds no image, and a run off refs/heads/master, where Test
-# does not run (the last case below):
+# FAIL CLOSED.  The only two ways to pass without the full checks are the
+# two cases where the workflow deliberately builds no image, and each is
+# matched exactly, never by exclusion:
 #
 #   * doc-only:  doc-path-filter.result == 'success' AND its build output
 #                is the string 'false' AND its raw paths-filter
@@ -47,16 +45,8 @@
 #   * mergify:   doc-path-filter.result == 'skipped' AND the event is
 #                pull_request AND the actor is mergify[bot] -- the exact
 #                condition doc-path-filter's own `if:` skips on.
-#   * off master: the run's ref is not refs/heads/master (compared ignoring
-#                case, as GitHub's `==` in Test's `if:` compares).  Test runs
-#                only on group 26, which admits this workflow only
-#                @refs/heads/master (BLO-56666), so on a pull_request, a
-#                stable/rc/ci push or a dispatch from another branch Test
-#                must be exactly 'skipped' and the plan checks are not run.
-#                Build, Build-LTTng and Unit-Test must still be 'success';
-#                a run off master that ran Test is red.
 #
-# Both build-less exemptions additionally require Build, Build-LTTng, Unit-Test and
+# Both exemptions additionally require Build, Build-LTTng, Unit-Test and
 # Test to be 'skipped'; if any ran, the exemption does not describe this
 # run.  build == 'true' (including a filter that errored: it defaults to
 # building everything) and every other combination go through the full
@@ -64,9 +54,7 @@
 #
 #   * Build, Build-LTTng, Unit-Test and Test are each 'success'.
 #     Build-LTTng is not needed by any other job (BLO-35428 moved it off
-#     the Test gate), so this is the one place its failure counts.  (Off
-#     master, Test is 'skipped' instead and the checks below are not run;
-#     see above.);
+#     the Test gate), so this is the one place its failure counts;
 #   * per platform, all N plan artifacts are present and complete, their
 #     plans are pairwise disjoint, their universe.txt files are identical,
 #     and the plans' union is that universe;
@@ -102,9 +90,6 @@ from topotest_coverage import normalize, split_id  # noqa: E402
 
 FILTER_JOB = "doc-path-filter"
 REQUIRED_JOBS = ("Build", "Build-LTTng", "Unit-Test", "Test")
-# BLO-56666: Test runs only for this ref (group 26 pins the workflow to it).
-TEST_JOB = "Test"
-TEST_REF = "refs/heads/master"
 # Needed by the verdict, but conditional: it runs only when doc/ changed.
 DOCS_JOB = "Documentation-HTML"
 MERGIFY_ACTOR = "mergify[bot]"
@@ -118,14 +103,6 @@ PLAN_FILES = (
 )
 
 
-def on_test_ref(ref):
-    """Whether Test's `if: github.ref == 'refs/heads/master'` holds.
-
-    GitHub's `==` ignores case, so this does too.
-    """
-    return ref.lower() == TEST_REF
-
-
 def artifact_name(platform, k):
     """The plan artifact name the Test job uploads (topotest-plan-${RESULT_ID})."""
     return "topotest-plan-{}-s{}".format(platform, k)
@@ -136,14 +113,12 @@ def _lines(path):
         return [line.strip() for line in f if line.strip()]
 
 
-def job_rules(needs, event_name, actor, required=REQUIRED_JOBS, ref=TEST_REF):
+def job_rules(needs, event_name, actor, required=REQUIRED_JOBS):
     """Return (problems, exempt_reason).
 
     exempt_reason is a string when the run is one of the two no-build cases
     and every required job was skipped; the caller then skips the plan
-    checks.  Off refs/heads/master (`ref`), Test must be 'skipped' instead of
-    'success', and main() skips the plan checks too (BLO-56666).
-    Documentation-HTML is judged on every path.
+    checks.  Documentation-HTML is judged on every path.
     """
     problems = []
     for job in (FILTER_JOB,) + tuple(required) + (DOCS_JOB,):
@@ -240,15 +215,7 @@ def job_rules(needs, event_name, actor, required=REQUIRED_JOBS, ref=TEST_REF):
             )
     else:
         for job, r in others.items():
-            if job == TEST_JOB and not on_test_ref(ref):
-                if r != "skipped":
-                    problems.append(
-                        "{} concluded {!r} on ref {!r}, not 'skipped': it runs "
-                        "only for {}, on group 26 (BLO-56666)".format(
-                            job, r, ref, TEST_REF
-                        )
-                    )
-            elif r != "success":
+            if r != "success":
                 problems.append("{} concluded {!r}, not 'success'".format(job, r))
 
     if docs != docs_want:
@@ -402,7 +369,6 @@ def main(argv=None):
     parser.add_argument("--platforms", required=True, help="comma-separated")
     parser.add_argument("--event-name", required=True)
     parser.add_argument("--actor", required=True)
-    parser.add_argument("--ref", required=True, help="github.ref of the run")
     args = parser.parse_args(argv)
 
     problems = []
@@ -424,14 +390,11 @@ def main(argv=None):
 
     exempt = None
     if not problems:
-        job_problems, exempt = job_rules(
-            needs, args.event_name, args.actor, ref=args.ref
-        )
+        job_problems, exempt = job_rules(needs, args.event_name, args.actor)
         problems += job_problems
 
     summaries = []
-    # Off refs/heads/master Test does not run (BLO-56666): no plans to check.
-    if not problems and exempt is None and on_test_ref(args.ref):
+    if not problems and exempt is None:
         for platform in platforms:
             p, summary = plan_rules(args.plans, platform, args.shards)
             problems += p
@@ -447,13 +410,6 @@ def main(argv=None):
         return 1
     if exempt is not None:
         print("CI-Verdict: green by exemption: " + exempt)
-    elif not on_test_ref(args.ref):
-        print(
-            "CI-Verdict: green: Build, Build-LTTng and Unit-Test succeeded; "
-            "Test was skipped, as it is on every ref but {} (BLO-56666).".format(
-                TEST_REF
-            )
-        )
     else:
         print(
             "CI-Verdict: green: Build, Build-LTTng, Unit-Test and every Test "
