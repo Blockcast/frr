@@ -210,11 +210,22 @@ def do_config_inner(
     )
 
 
+def kernel_has_ipv6_subtrees(r1):
+    # IPv6 source-dest routes need CONFIG_IPV6_SUBTREES; Talos kernels ship
+    # without it and reject any route carrying a source prefix (BLO-53653).
+    route = "blackhole 2001:db8:ffff::/64 from 2001:db8:fffe::/64"
+    out = r1.cmd(f"ip -6 route add {route} && ip -6 route del {route} && echo sadr-ok")
+    return "sadr-ok" in out
+
+
 def do_config(*args, **kwargs):
     do_config_inner(*args, do_ipv6=False, do_sadr=False, **kwargs)
     do_config_inner(*args, do_ipv6=False, do_ipv6_nexthop=True, **kwargs)
     do_config_inner(*args, do_ipv6=True, do_sadr=False, **kwargs)
-    do_config_inner(*args, do_ipv6=True, do_sadr=True, **kwargs)
+    if kernel_has_ipv6_subtrees(args[0]):
+        do_config_inner(*args, do_ipv6=True, do_sadr=True, **kwargs)
+    else:
+        logger.info("kernel lacks CONFIG_IPV6_SUBTREES; skipping IPv6 SADR routes")
 
 
 def guts(tgen, vrf, use_cli):
