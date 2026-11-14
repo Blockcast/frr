@@ -808,11 +808,7 @@ jobs:
     # arc-default's pod template (Docker/NET_ADMIN/KVM) but is capacity-capped.
     # Hosted, like Build: see the comment on its runs-on.  BLO-56666 fallback
     # if a shard exceeds ~5 h here: default-ref only, on a group-26 pin.
-    # ubuntu-24.04, not ubuntu-latest: ubuntu-latest is Ubuntu 26.04
-    # (kernel 7.0.0-1019-azure), where apt finds no linux-modules-extra-azure
-    # or linux-modules-extra-$(uname -r), so "Host kernel prep" failed on all
-    # four legs before any topotest ran (run 43565548815).
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     needs: Build
     # BLO-35428: as for Unit-Test -- one lost Build leg no longer skips the
     # other platform's shards (run 35776450503); CI-Verdict still requires
@@ -1064,12 +1060,23 @@ jobs:
             if sudo apt-get update -y; then break; fi
             sleep 10
           done
+          # Hosted azure kernels from 7.0 on carry vrf, mpls_router and
+          # mpls_iptunnel in linux-modules-<ver> and publish no
+          # linux-modules-extra-<ver> (checked for 7.0.0-1017 on 24.04 and
+          # 7.0.0-1019 on 26.04; run 43565548815 failed on the missing
+          # package).  Install -extra only where it exists; the strict
+          # modprobes below still fail the step if a module is absent.
+          # The linux-modules-extra-azure meta is gone: it tracks the
+          # flavour's default kernel (6.17 on 24.04), not the running one.
+          extra=""
+          if apt-cache show "linux-modules-extra-${MODPKGVER}" >/dev/null 2>&1; then
+            extra="linux-modules-extra-${MODPKGVER}"
+          fi
           # Retry install as well; mirrors can fail between update and install.
           install_ok=0
           for _ in $(seq 1 "${APT_RETRIES}"); do
-            if sudo apt-get install -y kmod linux-modules-extra-azure \
-                "linux-modules-${MODPKGVER}" "linux-modules-extra-${MODPKGVER}" \
-                python3-xmltodict; then
+            if sudo apt-get install -y kmod "linux-modules-${MODPKGVER}" \
+                ${extra:+"${extra}"} python3-xmltodict; then
               install_ok=1
               break
             fi
