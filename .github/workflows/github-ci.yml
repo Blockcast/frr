@@ -1104,6 +1104,37 @@ jobs:
           sudo modprobe vrf || true
           sudo modprobe mpls-iptunnel
           sudo modprobe mpls-router
+      # BLO-57067: hosted Ubuntu images (kernel 7.0, apparmor 4) ship enforcing
+      # AppArmor profiles for the FRR daemons (/etc/apparmor.d/bgpd, ospfd, ...,
+      # each including <abstractions/frr>).  They attach by exec path, so they
+      # confine /usr/lib/frr/* inside our --privileged container too.  They deny
+      # the --enable-gcov .gcda writes (EACCES even for root, so every daemon
+      # and `bgpd -v` prints "profiling:...:Cannot open", which breaks
+      # checkRouterVersion and output parsing) and confine the daemons to
+      # distro paths.  Run 43570828202 lost 74 tests of one shard to it.
+      # Talos (ARC) has no AppArmor, so there this step finds nothing to do.
+      - name: Unload host AppArmor profiles for FRR daemons
+        run: |
+          set -euo pipefail
+          loaded=/sys/kernel/security/apparmor/profiles
+          if ! sudo test -r "${loaded}"; then
+            echo "AppArmor not active on this host; nothing to unload."
+            exit 0
+          fi
+          names=""
+          for p in $(sudo grep -lE '^[[:space:]]*include[[:space:]]+<abstractions/frr>' /etc/apparmor.d/* 2>/dev/null || true); do
+            names="${names} $(sudo sed -nE 's/^profile[[:space:]]+([^[:space:]]+).*/\1/p' "$p" | head -1)"
+            sudo apparmor_parser -R "$p"
+          done
+          echo "unloaded:${names:- none}"
+          # Fail closed: a profile still loaded under one of those names would
+          # reproduce the failure as 74 unrelated-looking test failures.
+          for n in ${names}; do
+            if sudo grep -qE "^${n} \(" "${loaded}"; then
+              echo "::error title=FRR AppArmor profile still loaded::${n}" >&2
+              exit 1
+            fi
+          done
       - name: Run topotests
         # BLO-29817: `id` lets the runtime report below distinguish "the cap
         # killed the suite mid-run" from "the suite finished and the cap killed
