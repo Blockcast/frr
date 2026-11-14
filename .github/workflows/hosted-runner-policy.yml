@@ -41,7 +41,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-      - name: Reject GitHub-hosted runner labels
+      - name: Multi-exporter name rule
         run: python3 .github/scripts/check-runner-labels.py
       - name: Multi-exporter rule fixtures
         run: python3 -m unittest discover -s .github/scripts -p 'test_check_runner_labels.py' -v

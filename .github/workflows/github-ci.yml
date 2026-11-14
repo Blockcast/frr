@@ -34,12 +34,11 @@ on:
 # lands while a master run is executing and no newer head is already pending.
 # That run used to be cancelled at once. A merge that only replaces a pending
 # run costs nothing extra. At the current merge rate (about 2 a day) this
-# keeps roughly one master run in flight on arc-default and arc-e2e almost all
-# the time, which adds to PR queue waits on both. Each such run puts 5 jobs
-# on arc-default (the 2 Build legs, Build-LTTng and the 2 Unit-Test legs, see
-# Build's runs-on), 4 Test legs on arc-e2e, and 1 on `default`
-# (Documentation-HTML, only when docs change); the path filter runs on
-# arc-light, see doc-path-filter. A master verdict can also trail the tip by
+# keeps roughly one master run in flight almost all the time. Every job in
+# this workflow but Test runs on GitHub-hosted runners (BLO-56666; see Build's
+# runs-on).  Test runs only for master, on group 26's arc-e2e twin, one leg
+# at a time (see its runs-on), so a stuck queued Test leg is the case the
+# next paragraph describes. A master verdict can also trail the tip by
 # about one run plus the queue wait; it belongs to the SHA it ran on, not to
 # the current tip.
 #
@@ -122,15 +121,14 @@ jobs:
     # min at the median and 5 min 41 s in run 36588232306.  Their checkout
     # is shallow now (see the Checkout step).
     #
-    # arc-light and arc-default are pinned to one runner image digest
-    # (onprem-k8s arc/runner-image-pins.rb holds every ARC pool's pin to
-    # arc/arc-runner-image.txt).  actions/cache folds the compression it
-    # picks (zstd if the image has it, else gzip) into an entry's version.
-    # Were the two images ever to differ on zstd, Build, Build-LTTng and
-    # buildcache-seed.yml's seed, all on arc-default, could restore no entry
-    # this job saves, and no other job saves one.  The image's own fetch_mib
-    # (docker/ubuntu-ci/Dockerfile) then downloads the MIBs, as on any
-    # miss: slower, not broken.
+    # actions/cache folds the compression it picks (zstd if the image has
+    # it, else gzip) into an entry's version.  This job, Build and
+    # Build-LTTng are all GitHub-hosted (BLO-56666), so they agree.
+    # buildcache-seed.yml's seed still runs on ARC (arc-default, which lands
+    # in group 26), so it restores this job's entries only if the ARC runner
+    # image has zstd as the hosted image does.  The cache path is relative,
+    # so it does not split them.  On a miss the image's own fetch_mib
+    # (docker/ubuntu-ci/Dockerfile) downloads the MIBs: slower, not broken.
     # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
     # workflow refs, so a pull_request run cannot start there (BLO-55992).
     runs-on: ubuntu-latest
@@ -290,15 +288,13 @@ jobs:
           if-no-files-found: error
 
   Build:
-    # frr's image jobs use arc-default's privileged dind sidecar. The former
-    # dedicated dind lane is retired; arc-default already provides the same
-    # Docker/buildx interface with a larger Ceph-backed work volume. Build
-    # checks out at fetch-depth 1 and only pushes its image (no type=docker
-    # tarball), so its bounded workspace remains within that volume.
-    # HTML documentation stays on `default`, not here (it builds no image)
-    # and not on arc-light: it runs only on doc changes, and needs sudo apt
-    # plus more memory than an arc-light runner has.
-    runs-on: arc-default
+    # BLO-56666: GitHub-hosted. frr is public and org runner groups 1/21 stop
+    # admitting public repos (BLO-40782), so every PR-triggered job here runs
+    # hosted. registry.blockcast.net is publicly reachable, so the Harbor
+    # login, read-only cache-from and image push work as they did on ARC.
+    # Build checks out at fetch-depth 1 and only pushes its image (no
+    # type=docker tarball), so its workspace stays small.
+    runs-on: ubuntu-latest
     needs: doc-path-filter
     # `build`, never the raw non_doc: see the comment on doc-path-filter.
     if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
@@ -359,6 +355,12 @@ jobs:
         # restores; only master writes (see "Save ccache"), so a PR reads the
         # newest master entry through the prefix in restore-keys. A miss is a
         # cold compile, as before this cache existed, never a failure.
+        # actions/cache also folds the resolved path into the version, and
+        # runner.temp differs between hosted (/home/runner/work/_temp) and
+        # ARC (/home/runner/_work/_temp). So since BLO-56666 this job and
+        # buildcache-seed.yml's seed, still on ARC, cannot restore each
+        # other's entries under the shared key prefix; PRs read master
+        # Build's hosted entries.
         uses: actions/cache/restore@v5
         with:
           path: ${{ runner.temp }}/frr-ccache
@@ -524,8 +526,8 @@ jobs:
     # gates nothing.  test_buildcache_freshness.py fails on
     # any other drift, and checks this matrix together with Build's against
     # buildcache-seed.yml's.
-    # arc-default, like Build: see the comment on its runs-on.
-    runs-on: arc-default
+    # Hosted, like Build: see the comment on its runs-on.
+    runs-on: ubuntu-latest
     needs: doc-path-filter
     if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
     name: ${{ matrix.cfg.name }}
@@ -602,8 +604,8 @@ jobs:
             type=registry,ref=registry.blockcast.net/cache/frr-ci:amd64_u24-buildcache
 
   Unit-Test:
-    # arc-default, like Build: see the comment on its runs-on.
-    runs-on: arc-default
+    # Hosted, like Build: see the comment on its runs-on.
+    runs-on: ubuntu-latest
     needs: Build
     # BLO-35428: one lost Build leg must not skip the other platform.  With
     # the default `success()` a failed Build leg skipped every Unit-Test and
@@ -661,8 +663,8 @@ jobs:
     # and a skipped required context wedges merge.  CI-Verdict is the context
     # to require when the time comes: it already consumes this job through
     # `needs`, and topotest_verdict.py already encodes which skips are legal.
-    # Requiring it today would gate every merge on the `Test` pair, which is
-    # still cap-killing (BLO-29817) under runner starvation (BLO-25404).
+    # Off master it no longer waits on Test, which is skipped there
+    # (BLO-56666).
     timeout-minutes: 24
     env:
       UNIT_TEST_CONTAINER: frr-${{ matrix.cfg.platform }}-unit-${{ github.run_id }}-${{ github.run_attempt }}
@@ -806,12 +808,26 @@ jobs:
     # same long/CPU-heavy shape BLO-19140 moved off arc-default for NOP after
     # mid-job runner loss under pool oversubscription. arc-e2e shares
     # arc-default's pod template (Docker/NET_ADMIN/KVM) but is capacity-capped.
-    runs-on: arc-e2e
+    # BLO-56666 (CTO ruling, 2026-11-14): Test runs on group 26's e2e twin,
+    # and only for refs/heads/master (push or workflow_dispatch there).
+    # Group 26 admits this workflow only @refs/heads/master, so a pull_request,
+    # a stable/rc/ci push or a dispatch from another branch would queue
+    # forever.  On a hosted runner both shard-2 legs failed 74 topotests
+    # each and both shard-1 legs hit the 240 min cap (run 43570828202): the
+    # hosted runner OS ships AppArmor profiles that confine the FRR daemons
+    # (fix: frr#162).  Every other ref skips Test, and CI-Verdict (--ref)
+    # accepts exactly that skip.
+    # The twin is arc-e2e-public in Kubernetes but arc-e2e to GitHub
+    # (onprem-k8s arc/arc-e2e-public-values.yaml githubRunnerScaleSetName),
+    # and it has maxRunners 1: the four legs run one at a time.
+    runs-on:
+      group: public-repo-ci
+      labels: arc-e2e
     needs: Build
     # BLO-35428: as for Unit-Test -- one lost Build leg no longer skips the
     # other platform's shards (run 35776450503); CI-Verdict still requires
     # Build to be 'success'.
-    if: ${{ !cancelled() && needs.Build.result != 'skipped' }}
+    if: ${{ github.ref == 'refs/heads/master' && !cancelled() && needs.Build.result != 'skipped' }}
     name: ${{ matrix.cfg.name }} (shard ${{ matrix.shard }}/2)
     # Topotest runs can be long; still cap runtime for stuck jobs.
     #
@@ -940,6 +956,9 @@ jobs:
       #   * at 2: to 1 (the shards run one at a time) if any shard's "Run
       #     topotests" step exceeds 229 min -- the 240 cap less the 11.3 min
       #     of measured fixed per-leg overhead.
+      # On the group-26 twin (maxRunners 1, BLO-56666) the legs already run
+      # one at a time whatever max-parallel says, so the segment is four
+      # shard sessions and the rollback to 1 is moot until that cap rises.
       # Leg-window PSI above 0.4 or steal above 0.25 (the measured cap-kill
       # band) is an early warning only.  The frr CI lane checks after each of
       # the first 5 runs:
@@ -1058,12 +1077,23 @@ jobs:
             if sudo apt-get update -y; then break; fi
             sleep 10
           done
+          # Hosted azure kernels from 7.0 on carry vrf, mpls_router and
+          # mpls_iptunnel in linux-modules-<ver> and publish no
+          # linux-modules-extra-<ver> (checked for 7.0.0-1017 on 24.04 and
+          # 7.0.0-1019 on 26.04; run 43565548815 failed on the missing
+          # package).  Install -extra only where it exists; the strict
+          # modprobes below still fail the step if a module is absent.
+          # The linux-modules-extra-azure meta is gone: it tracks the
+          # flavour's default kernel (6.17 on 24.04), not the running one.
+          extra=""
+          if apt-cache show "linux-modules-extra-${MODPKGVER}" >/dev/null 2>&1; then
+            extra="linux-modules-extra-${MODPKGVER}"
+          fi
           # Retry install as well; mirrors can fail between update and install.
           install_ok=0
           for _ in $(seq 1 "${APT_RETRIES}"); do
-            if sudo apt-get install -y kmod linux-modules-extra-azure \
-                "linux-modules-${MODPKGVER}" "linux-modules-extra-${MODPKGVER}" \
-                python3-xmltodict; then
+            if sudo apt-get install -y kmod "linux-modules-${MODPKGVER}" \
+                ${extra:+"${extra}"} python3-xmltodict; then
               install_ok=1
               break
             fi
@@ -1222,7 +1252,8 @@ jobs:
           # BLO-35428 footprint sampler -- measurement only, nothing gates on
           # it.  The container is not inside the DinD sidecar's cgroup and has
           # no resource bounds (see TOPOTEST_WORKERS), so this is the only
-          # record of one leg's real CPU/mem/pids; it feeds the capacity work.
+          # record of one leg's real CPU/mem/pids and root-disk headroom; it
+          # feeds the capacity work.
           # It runs in the background and can never fail this step: its exit
           # status is never waited on, errexit is off inside it, and the EXIT
           # trap kills it.  The first sample goes to this log with stderr
@@ -1243,6 +1274,7 @@ jobs:
             while sleep 30; do
               docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} pids={{.PIDs}}' 2>&1 \
                 | sed "s/^/$(date -u +%FT%TZ) /"
+              echo "$(date -u +%FT%TZ) disk:/ avail_mib=$(df -BM --output=avail / | tail -1 | tr -dc 0-9)"
             done
           ) &
           STATS_PID=$!
@@ -1494,6 +1526,11 @@ jobs:
           set -uo pipefail
           log="${RUNNER_TEMP}/topotest-stats.log"
           cont="frr-${RESULT_ID}-cont"
+          # Disk headroom on /: the lowest free
+          # space any sample saw, plus the state now, before Cleanup.
+          awk '$2 == "disk:/" { v = $3; sub(/^avail_mib=/, "", v); if (m == "" || v + 0 < m) m = v + 0 }
+            END { printf "min_root_avail_mib=%s\n", (m == "" ? "unknown" : m) }' "${log}" 2>/dev/null || true
+          df -h / || true
           if [ ! -s "${log}" ]; then
             echo "::warning title=Footprint sampler recorded nothing::${log} is missing or empty; this leg's CPU/mem/pids footprint is unknown."
             exit 1
@@ -1632,9 +1669,11 @@ jobs:
     # GitHub renders a skipped job as neutral.  This job reads every gating
     # job's result plus each shard's plan artifact, and
     # .github/scripts/topotest_verdict.py (its header has the rules) fails
-    # closed: the only two ways to pass without a green Build, Build-LTTng,
-    # Unit-Test and every Test shard are the two cases this workflow
-    # deliberately builds no image, each matched exactly --
+    # closed: the only ways to pass without a green Build, Build-LTTng,
+    # Unit-Test and every Test shard are a run off refs/heads/master, where
+    # Test must be exactly 'skipped' and no plan is read (BLO-56666: Test runs
+    # only there, on group 26), and the two cases this workflow deliberately
+    # builds no image, each matched exactly --
     #   * doc-only: doc-path-filter concluded 'success' AND its build output
     #     is the string 'false' AND the raw classification is doc 'true',
     #     non_doc 'false'.  Never an inequality such as `build != 'true'`:
@@ -1681,7 +1720,8 @@ jobs:
         with:
           fetch-depth: 1
       - name: Download topotest shard plans
-        # continue-on-error: on a doc-only or mergify run there are no plans,
+        # continue-on-error: on a doc-only or mergify run, or any run off
+        # refs/heads/master (Test skipped, BLO-56666), there are no plans,
         # and whether plans are required is the script's decision, not this
         # step's.  A missing plan on a run that needed one is red there.
         continue-on-error: true
@@ -1697,6 +1737,8 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
           EVENT_NAME: ${{ github.event_name }}
           ACTOR: ${{ github.actor }}
+          REF: ${{ github.ref }}
         run: |
           python3 .github/scripts/topotest_verdict.py --needs-env NEEDS_JSON --plans plans \
-            --shards 2 --platforms amd64_u22,amd64_u24 --event-name "${EVENT_NAME}" --actor "${ACTOR}"
+            --shards 2 --platforms amd64_u22,amd64_u24 --event-name "${EVENT_NAME}" --actor "${ACTOR}" \
+            --ref "${REF}"

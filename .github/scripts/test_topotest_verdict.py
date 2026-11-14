@@ -4,7 +4,8 @@
 The property every case protects: the verdict can only be green when Build,
 Build-LTTng, Unit-Test and every Test shard succeeded and the shards covered
 the collection exactly once -- or in the two deliberately build-less cases,
-each matched exactly.  A filter job that failed, was cancelled or lost its
+each matched exactly, or off refs/heads/master, where Test must be exactly
+'skipped' (BLO-56666).  A filter job that failed, was cancelled or lost its
 runner (empty outputs) must be red, because the jobs behind it were skipped
 and nothing was built or tested (critic blocker: the first draft passed on
 `non_doc != 'true'`).  An empty change list (doc and non_doc both 'false')
@@ -148,8 +149,16 @@ class Base(unittest.TestCase):
         return d
 
     def run_verdict(
-        self, needs_obj, event="pull_request", actor="someone", shards=SHARDS, raw=None
+        self,
+        needs_obj,
+        event="push",
+        actor="someone",
+        shards=SHARDS,
+        raw=None,
+        ref=None,
     ):
+        if ref is None:
+            ref = "refs/pull/1/merge" if event == "pull_request" else verdict.TEST_REF
         env_name = "NEEDS_JSON_TEST"
         saved = os.environ.get(env_name)
         if raw is not None:
@@ -175,6 +184,8 @@ class Base(unittest.TestCase):
                         event,
                         "--actor",
                         actor,
+                        "--ref",
+                        ref,
                     ]
                 )
         finally:
@@ -238,6 +249,74 @@ class TestFullRun(Base):
             )
         )
         self.assertEqual(self.out.count("::error title=CI-Verdict::"), 4, self.out)
+
+
+class TestTestOnlyOnMaster(Base):
+    """BLO-56666: Test runs only for refs/heads/master, on group 26."""
+
+    OFF_MASTER = (
+        ("pull_request", "refs/pull/1/merge"),
+        ("push", "refs/heads/stable/10.3"),
+        ("push", "refs/heads/ci/blo-1-x"),
+        ("workflow_dispatch", "refs/heads/some-branch"),
+    )
+
+    def test_skipped_test_off_master_is_green(self):
+        for event, ref in self.OFF_MASTER:
+            with self.subTest(event=event, ref=ref):
+                self.assertGreen(needs(Test="skipped"), event=event, ref=ref)
+                self.assertIn("Test was skipped", self.out)
+
+    def test_off_master_needs_no_plans(self):
+        shutil.rmtree(self.plans)
+        for event, ref in self.OFF_MASTER:
+            with self.subTest(event=event, ref=ref):
+                self.assertGreen(needs(Test="skipped"), event=event, ref=ref)
+
+    def test_master_is_matched_ignoring_case_like_github(self):
+        """Test's `if:` uses GitHub's case-insensitive `==`."""
+        self.assertRed(
+            needs(Test="skipped"), ref="refs/heads/Master", why="Test concluded"
+        )
+        self.assertGreen(needs(), ref="refs/heads/MASTER")
+
+    def test_test_that_ran_off_master_is_red(self):
+        for event, ref in self.OFF_MASTER:
+            for r in ("success", "failure", "cancelled"):
+                with self.subTest(event=event, ref=ref, result=r):
+                    self.assertRed(
+                        needs(Test=r), event=event, ref=ref, why="not 'skipped'"
+                    )
+
+    def test_other_jobs_still_need_success(self):
+        self.assertRed(
+            needs(Build="failure", Test="skipped"),
+            event="pull_request",
+            why="Build concluded 'failure'",
+        )
+        self.assertRed(
+            needs(Unit_Test="skipped", Test="skipped"),
+            event="pull_request",
+            why="Unit-Test concluded 'skipped'",
+        )
+
+    def test_master_still_needs_test(self):
+        for event in ("push", "workflow_dispatch"):
+            with self.subTest(event=event):
+                self.assertRed(
+                    needs(Test="skipped"), event=event, why="Test concluded 'skipped'"
+                )
+
+    def test_doc_only_pull_request_is_still_exempt(self):
+        self.assertGreen(needs(build="false", **SKIPPED), event="pull_request")
+        self.assertIn("doc-only", self.out)
+
+    def test_ref_is_required(self):
+        with self.assertRaises(SystemExit):
+            verdict.main(
+                ["--needs-env", "X", "--plans", self.plans, "--shards", "2",
+                 "--platforms", "amd64_u22", "--event-name", "push", "--actor", "a"]
+            )
 
 
 class TestLttngBuild(Base):
@@ -828,15 +907,29 @@ class TestGateWiring(unittest.TestCase):
         self.assertNotRegex(self.filter, r"(?m)^      group:")
 
     def test_one_lost_build_leg_does_not_skip_the_other_platform(self):
+        # Test also runs only for refs/heads/master (BLO-56666).
+        guard = {"Unit-Test": "", "Test": r"github\.ref == 'refs/heads/master' && "}
         for name in ("Unit-Test", "Test"):
             with self.subTest(job=name):
                 job = _job(self.workflow, name)
                 self.assertRegex(job, r"(?m)^    needs: Build$")
                 self.assertRegex(
                     job,
-                    r"(?m)^    if: \$\{\{ !cancelled\(\) && "
+                    r"(?m)^    if: \$\{\{ " + guard[name] + r"!cancelled\(\) && "
                     r"needs\.Build\.result != 'skipped' \}\}$",
                 )
+
+    def test_test_runs_only_on_master_on_group_26(self):
+        """BLO-56666: group 26 pins github-ci.yml@refs/heads/master; GitHub
+        sees the e2e twin as arc-e2e."""
+        job = _job(self.workflow, "Test")
+        self.assertRegex(
+            job, r"(?m)^    runs-on:\n      group: public-repo-ci\n      labels: arc-e2e$"
+        )
+        self.assertIn("github.ref == '" + verdict.TEST_REF + "'", job)
+        verdict_job = _job(self.workflow, "CI-Verdict")
+        self.assertIn("REF: ${{ github.ref }}", verdict_job)
+        self.assertIn('--ref "${REF}"', verdict_job)
 
     def test_build_exports_only_the_registry_image(self):
         build = _job(self.workflow, "Build")
