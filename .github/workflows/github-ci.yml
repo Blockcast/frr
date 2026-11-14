@@ -35,8 +35,10 @@ on:
 # That run used to be cancelled at once. A merge that only replaces a pending
 # run costs nothing extra. At the current merge rate (about 2 a day) this
 # keeps roughly one master run in flight almost all the time. Every job in
-# this workflow runs on GitHub-hosted runners (BLO-56666; see Build's
-# runs-on), so that run no longer competes with PRs for an ARC pool. A master verdict can also trail the tip by
+# this workflow but Test runs on GitHub-hosted runners (BLO-56666; see Build's
+# runs-on).  Test runs only for master, on group 26's arc-e2e twin, one leg
+# at a time (see its runs-on), so a stuck queued Test leg is the case the
+# next paragraph describes. A master verdict can also trail the tip by
 # about one run plus the queue wait; it belongs to the SHA it ran on, not to
 # the current tip.
 #
@@ -661,8 +663,8 @@ jobs:
     # and a skipped required context wedges merge.  CI-Verdict is the context
     # to require when the time comes: it already consumes this job through
     # `needs`, and topotest_verdict.py already encodes which skips are legal.
-    # Requiring it today would gate every merge on the `Test` pair, which is
-    # still cap-killing (BLO-29817) under runner starvation (BLO-25404).
+    # Off master it no longer waits on Test, which is skipped there
+    # (BLO-56666).
     timeout-minutes: 24
     env:
       UNIT_TEST_CONTAINER: frr-${{ matrix.cfg.platform }}-unit-${{ github.run_id }}-${{ github.run_attempt }}
@@ -806,14 +808,26 @@ jobs:
     # same long/CPU-heavy shape BLO-19140 moved off arc-default for NOP after
     # mid-job runner loss under pool oversubscription. arc-e2e shares
     # arc-default's pod template (Docker/NET_ADMIN/KVM) but is capacity-capped.
-    # Hosted, like Build: see the comment on its runs-on.  BLO-56666 fallback
-    # if a shard exceeds ~5 h here: default-ref only, on a group-26 pin.
-    runs-on: ubuntu-latest
+    # BLO-56666 (CTO ruling, 2026-11-14): Test runs on group 26's e2e twin,
+    # and only for refs/heads/master (push or workflow_dispatch there).
+    # Group 26 admits this workflow only @refs/heads/master, so a pull_request,
+    # a stable/rc/ci push or a dispatch from another branch would queue
+    # forever.  On a hosted runner both shard-2 legs failed 74 topotests
+    # each and both shard-1 legs hit the 240 min cap (run 43570828202): the
+    # hosted runner OS ships AppArmor profiles that confine the FRR daemons
+    # (fix: frr#162).  Every other ref skips Test, and CI-Verdict (--ref)
+    # accepts exactly that skip.
+    # The twin is arc-e2e-public in Kubernetes but arc-e2e to GitHub
+    # (onprem-k8s arc/arc-e2e-public-values.yaml githubRunnerScaleSetName),
+    # and it has maxRunners 1: the four legs run one at a time.
+    runs-on:
+      group: public-repo-ci
+      labels: arc-e2e
     needs: Build
     # BLO-35428: as for Unit-Test -- one lost Build leg no longer skips the
     # other platform's shards (run 35776450503); CI-Verdict still requires
     # Build to be 'success'.
-    if: ${{ !cancelled() && needs.Build.result != 'skipped' }}
+    if: ${{ github.ref == 'refs/heads/master' && !cancelled() && needs.Build.result != 'skipped' }}
     name: ${{ matrix.cfg.name }} (shard ${{ matrix.shard }}/2)
     # Topotest runs can be long; still cap runtime for stuck jobs.
     #
@@ -942,6 +956,9 @@ jobs:
       #   * at 2: to 1 (the shards run one at a time) if any shard's "Run
       #     topotests" step exceeds 229 min -- the 240 cap less the 11.3 min
       #     of measured fixed per-leg overhead.
+      # On the group-26 twin (maxRunners 1, BLO-56666) the legs already run
+      # one at a time whatever max-parallel says, so the segment is four
+      # shard sessions and the rollback to 1 is moot until that cap rises.
       # Leg-window PSI above 0.4 or steal above 0.25 (the measured cap-kill
       # band) is an early warning only.  The frr CI lane checks after each of
       # the first 5 runs:
@@ -1509,7 +1526,7 @@ jobs:
           set -uo pipefail
           log="${RUNNER_TEMP}/topotest-stats.log"
           cont="frr-${RESULT_ID}-cont"
-          # Disk headroom on / (hosted VMs guarantee ~14 GB): the lowest free
+          # Disk headroom on /: the lowest free
           # space any sample saw, plus the state now, before Cleanup.
           awk '$2 == "disk:/" { v = $3; sub(/^avail_mib=/, "", v); if (m == "" || v + 0 < m) m = v + 0 }
             END { printf "min_root_avail_mib=%s\n", (m == "" ? "unknown" : m) }' "${log}" 2>/dev/null || true
@@ -1652,9 +1669,11 @@ jobs:
     # GitHub renders a skipped job as neutral.  This job reads every gating
     # job's result plus each shard's plan artifact, and
     # .github/scripts/topotest_verdict.py (its header has the rules) fails
-    # closed: the only two ways to pass without a green Build, Build-LTTng,
-    # Unit-Test and every Test shard are the two cases this workflow
-    # deliberately builds no image, each matched exactly --
+    # closed: the only ways to pass without a green Build, Build-LTTng,
+    # Unit-Test and every Test shard are a run off refs/heads/master, where
+    # Test must be exactly 'skipped' and no plan is read (BLO-56666: Test runs
+    # only there, on group 26), and the two cases this workflow deliberately
+    # builds no image, each matched exactly --
     #   * doc-only: doc-path-filter concluded 'success' AND its build output
     #     is the string 'false' AND the raw classification is doc 'true',
     #     non_doc 'false'.  Never an inequality such as `build != 'true'`:
@@ -1701,7 +1720,8 @@ jobs:
         with:
           fetch-depth: 1
       - name: Download topotest shard plans
-        # continue-on-error: on a doc-only or mergify run there are no plans,
+        # continue-on-error: on a doc-only or mergify run, or any run off
+        # refs/heads/master (Test skipped, BLO-56666), there are no plans,
         # and whether plans are required is the script's decision, not this
         # step's.  A missing plan on a run that needed one is red there.
         continue-on-error: true
@@ -1717,6 +1737,8 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
           EVENT_NAME: ${{ github.event_name }}
           ACTOR: ${{ github.actor }}
+          REF: ${{ github.ref }}
         run: |
           python3 .github/scripts/topotest_verdict.py --needs-env NEEDS_JSON --plans plans \
-            --shards 2 --platforms amd64_u22,amd64_u24 --event-name "${EVENT_NAME}" --actor "${ACTOR}"
+            --shards 2 --platforms amd64_u22,amd64_u24 --event-name "${EVENT_NAME}" --actor "${ACTOR}" \
+            --ref "${REF}"
