@@ -5,8 +5,10 @@
 #
 
 """
-test_bgp_mvpn_gtm_umh_lc.py: UMH resolution from the draft-ietf-mboned-dimt
-transitive large community (RFC 8092), canonical RFC 8195 layout
+test_bgp_mvpn_gtm_umh_lc.py: UMH resolution from this fork's transitive UMH
+large community (RFC 8092; no draft defines it, and
+draft-zzhang-mboned-dynamic-internet-mcast-tunnel-00 Section 3.1 carries the
+UMH as an extended community instead), canonical RFC 8195 layout
 <sourceAS>:<function>:<UMH-IPv4-as-uint32>, gated by the per-instance
 "bgp mvpn umh-large-community <function>" knob (unset = decode disabled).
 
