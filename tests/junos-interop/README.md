@@ -25,9 +25,19 @@ export JUNOS_HOST=...        # the vJunos address            (BLO-15630)
 export JUNOS_KEY=...         # path to the lab SSH key       (BLO-15630)
 export JUNOS_LAN_IFL=...     # Junos receiver-stub ifl, e.g. ge-0/0/1.0
 export JUNOS_JUMP=...        # ONLY if this host is not the jump host itself
+export LOCAL_ADDR=...        # ONLY if this host's route to the vJunos is not the
+                             # source address Junos sees (NAT, a Tailscale default)
+export JUNOS_KNOWN_HOSTS=... # a known_hosts file holding the vJunos key, checked strictly
 
 ./tests/junos-interop/mvpn-gtm-interop.sh
 ```
+
+A `root` login on Junos lands in csh, not the CLI, so for `JUNOS_USER=root` (the
+default) every command is sent as `cli -c '...'` and every configure script is piped
+to `cli`. Set `JUNOS_VIA_CLI=0` for a CLI-class user. The FRR image defaults to
+`harbor.blockcast.net/blockcast/frr:gtm-<full SHA of this checkout>`, which
+`.github/workflows/gtm-image-build.yml` pushes when dispatched with `ref=<that SHA>`;
+gate G0 checks it is pullable before the Junos is read or touched.
 
 The script refuses to start if any required value is missing, naming the one it wants —
 so a missed export costs a second, not a lab round-trip.
