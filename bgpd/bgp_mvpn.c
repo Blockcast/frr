@@ -1169,14 +1169,17 @@ static void bgp_mvpn_resolve_from_ecommunity(struct bgp_path_info *pi, uint32_t 
 }
 
 /*
- * UMH via a transitive large community (draft-ietf-mboned-dimt, RFC 8092
- * carrier) in the canonical RFC 8195 ASN:function:parameter layout: Global
- * Administrator = the Source AS, data1 = the operator-configured function
- * code point ("bgp mvpn umh-large-community"; IANA has not assigned one),
- * data2 = the upstream PE's IPv4 address as a 32-bit integer
- * (10.255.255.254 <-> 184549374). The function field is matched in full (a
- * 32-bit exact compare); should the draft later assign type/preference
- * nibbles, they must be folded into the configured value. A large community is
+ * UMH via a transitive large community (RFC 8092 carrier) in the canonical
+ * RFC 8195 ASN:function:parameter layout. This encoding is local to this
+ * fork: draft-zzhang-mboned-dynamic-internet-mcast-tunnel-00 Section 3.1
+ * defines the UMH only as an IP-address-specific extended community, and no
+ * draft defines a large-community form. Global Administrator = the Source
+ * AS, data1 = the operator-configured function code point ("bgp mvpn
+ * umh-large-community"; IANA has not assigned one), data2 = the upstream
+ * PE's IPv4 address as a 32-bit integer (10.255.255.254 <-> 184549374). The
+ * function field is matched in full (a 32-bit exact compare); should a draft
+ * later define a large-community UMH with type/preference fields, they must
+ * be folded into the configured value. A large community is
  * TRANSITIVE where the RFC 6514 route-import EC is not -- it survives an IX
  * route server hop, which is the point of this encoding.
  *

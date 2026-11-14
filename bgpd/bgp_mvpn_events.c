@@ -821,7 +821,8 @@ static struct bgp_mvpn_event_join *bgp_mvpn_event_join_get(struct bgp_mvpn_event
 	return join;
 }
 
-/* RFC 6514 Section 5 / draft-ietf-mboned-dimt encoding, matching the
+/* RFC 6514 Section 5 Source AS and UMH, in this fork's UMH large-community
+ * layout (no draft defines it; see bgp_mvpn.c), matching the
  * settlement contract's SessionLease.lc_umh_origin field byte-for-byte
  * (BLO-17643, Section 4): "<sourceAS>:1:<UMH-u32>". The literal "1" is the
  * function code point this contract fixes for the resolved-origin

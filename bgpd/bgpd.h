@@ -1001,9 +1001,11 @@ struct bgp {
 
 	/* GTM MCAST-VPN: function code point identifying the UMH large
 	 * community <sourceAS>:<function>:<UMH-IPv4-as-uint32> on the unicast
-	 * route toward C-S (draft-ietf-mboned-dimt; IANA has not assigned a
-	 * code point, so the operator picks one). 0 = LC decode disabled;
-	 * the RFC 6514 extended communities remain the fallback either way.
+	 * route toward C-S. The encoding is local to this fork (no draft
+	 * defines a large-community UMH; see bgp_mvpn.c), and IANA has not
+	 * assigned a code point, so the operator picks one. 0 = LC decode
+	 * disabled; the RFC 6514 extended communities remain the fallback
+	 * either way.
 	 */
 	uint32_t mvpn_umh_lc_function;
 
