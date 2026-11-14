@@ -5,16 +5,6 @@ import re
 import sys
 
 
-HOSTED_LABEL = re.compile(r"\b(?:ubuntu|macos|windows)-(?:latest|\d[\w.-]*)\b", re.IGNORECASE)
-
-# What a GitHub-hosted runner cannot serve: the in-cluster Harbor registry and
-# its buildx cache.  Hosted labels are allowed only in a job that touches none
-# of these (BLO-55992); frr#16 moved the image builds off hosted runners for
-# that cache, not for security.
-NEEDS_SELF_HOSTED = re.compile(
-    r"registry\.blockcast\.net|harbor|buildx|build-push-action|cache-(?:from|to)\s*:", re.IGNORECASE)
-JOB_KEY = re.compile(r"^  [A-Za-z0-9_-]+:\s*$")
-
 # A YAML list item ("- name: ...", "- uses: ...", "- { rel: ... }"). Splitting on
 # these gives one chunk per step, which is all the exporter check below needs.
 LIST_ITEM = re.compile(r"^\s*-\s", re.MULTILINE)
@@ -75,59 +65,17 @@ def check_exporter_names(path: pathlib.Path, text: str) -> list:
     return violations
 
 
-def _active(line: str) -> str:
-    return line.split("#", 1)[0]
-
-
-def check_hosted_labels(path: pathlib.Path, text: str) -> list:
-    """A hosted label is refused outside a job, or in a job that uses Harbor
-    or a buildx cache/exporter."""
-    lines = text.splitlines()
-    jobs, in_jobs, start = [], False, None
-    for n, line in enumerate(lines):
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if not line[0].isspace():
-            if start is not None:
-                jobs.append((start, n))
-                start = None
-            in_jobs = line.startswith("jobs:")
-        elif in_jobs and JOB_KEY.match(_active(line).rstrip()):
-            if start is not None:
-                jobs.append((start, n))
-            start = n
-    if start is not None:
-        jobs.append((start, len(lines)))
-
-    violations = []
-    for n, line in enumerate(lines):
-        match = HOSTED_LABEL.search(_active(line))
-        if not match:
-            continue
-        job = next(((s, e) for s, e in jobs if s <= n < e), None)
-        where = f"{path}:{n + 1}: hosted runner label {match.group(0)!r}"
-        if job is None:
-            violations.append(f"{where} outside a job")
-            continue
-        uses = NEEDS_SELF_HOSTED.search("\n".join(_active(l) for l in lines[job[0]:job[1]]))
-        if uses:
-            violations.append(f"{where} in a job that uses {uses.group(0)!r}, which hosted runners cannot reach")
-    return violations
-
-
 def main() -> int:
     violations = []
     workflows = pathlib.Path(".github/workflows")
     for path in sorted((*workflows.glob("*.yml"), *workflows.glob("*.yaml"))):
         text = path.read_text()
-        violations.extend(check_hosted_labels(path, text))
         violations.extend(check_exporter_names(path, text))
 
     if violations:
         print("\n".join(violations), file=sys.stderr)
         return 1
 
-    print("Hosted runner label policy (no Harbor/buildx on hosted): pass")
     print("Multi-exporter name policy: pass")
     return 0
 

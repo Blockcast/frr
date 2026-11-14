@@ -34,12 +34,9 @@ on:
 # lands while a master run is executing and no newer head is already pending.
 # That run used to be cancelled at once. A merge that only replaces a pending
 # run costs nothing extra. At the current merge rate (about 2 a day) this
-# keeps roughly one master run in flight on arc-default and arc-e2e almost all
-# the time, which adds to PR queue waits on both. Each such run puts 5 jobs
-# on arc-default (the 2 Build legs, Build-LTTng and the 2 Unit-Test legs, see
-# Build's runs-on), 4 Test legs on arc-e2e, and 1 on `default`
-# (Documentation-HTML, only when docs change); the path filter runs on
-# arc-light, see doc-path-filter. A master verdict can also trail the tip by
+# keeps roughly one master run in flight almost all the time. Every job in
+# this workflow runs on GitHub-hosted runners (BLO-56666; see Build's
+# runs-on), so that run no longer competes with PRs for an ARC pool. A master verdict can also trail the tip by
 # about one run plus the queue wait; it belongs to the SHA it ran on, not to
 # the current tip.
 #
@@ -290,15 +287,13 @@ jobs:
           if-no-files-found: error
 
   Build:
-    # frr's image jobs use arc-default's privileged dind sidecar. The former
-    # dedicated dind lane is retired; arc-default already provides the same
-    # Docker/buildx interface with a larger Ceph-backed work volume. Build
-    # checks out at fetch-depth 1 and only pushes its image (no type=docker
-    # tarball), so its bounded workspace remains within that volume.
-    # HTML documentation stays on `default`, not here (it builds no image)
-    # and not on arc-light: it runs only on doc changes, and needs sudo apt
-    # plus more memory than an arc-light runner has.
-    runs-on: arc-default
+    # BLO-56666: GitHub-hosted. frr is public and org runner groups 1/21 stop
+    # admitting public repos (BLO-40782), so every PR-triggered job here runs
+    # hosted. registry.blockcast.net is publicly reachable, so the Harbor
+    # login, read-only cache-from and image push work as they did on ARC.
+    # Build checks out at fetch-depth 1 and only pushes its image (no
+    # type=docker tarball), so its workspace stays small.
+    runs-on: ubuntu-latest
     needs: doc-path-filter
     # `build`, never the raw non_doc: see the comment on doc-path-filter.
     if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
@@ -524,8 +519,8 @@ jobs:
     # gates nothing.  test_buildcache_freshness.py fails on
     # any other drift, and checks this matrix together with Build's against
     # buildcache-seed.yml's.
-    # arc-default, like Build: see the comment on its runs-on.
-    runs-on: arc-default
+    # Hosted, like Build: see the comment on its runs-on.
+    runs-on: ubuntu-latest
     needs: doc-path-filter
     if: ${{ needs.doc-path-filter.outputs.build == 'true' }}
     name: ${{ matrix.cfg.name }}
@@ -602,8 +597,8 @@ jobs:
             type=registry,ref=registry.blockcast.net/cache/frr-ci:amd64_u24-buildcache
 
   Unit-Test:
-    # arc-default, like Build: see the comment on its runs-on.
-    runs-on: arc-default
+    # Hosted, like Build: see the comment on its runs-on.
+    runs-on: ubuntu-latest
     needs: Build
     # BLO-35428: one lost Build leg must not skip the other platform.  With
     # the default `success()` a failed Build leg skipped every Unit-Test and
@@ -806,7 +801,9 @@ jobs:
     # same long/CPU-heavy shape BLO-19140 moved off arc-default for NOP after
     # mid-job runner loss under pool oversubscription. arc-e2e shares
     # arc-default's pod template (Docker/NET_ADMIN/KVM) but is capacity-capped.
-    runs-on: arc-e2e
+    # Hosted, like Build: see the comment on its runs-on.  BLO-56666 fallback
+    # if a shard exceeds ~5 h here: default-ref only, on a group-26 pin.
+    runs-on: ubuntu-latest
     needs: Build
     # BLO-35428: as for Unit-Test -- one lost Build leg no longer skips the
     # other platform's shards (run 35776450503); CI-Verdict still requires
