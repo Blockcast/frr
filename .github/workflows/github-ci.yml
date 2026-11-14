@@ -119,15 +119,14 @@ jobs:
     # min at the median and 5 min 41 s in run 36588232306.  Their checkout
     # is shallow now (see the Checkout step).
     #
-    # arc-light and arc-default are pinned to one runner image digest
-    # (onprem-k8s arc/runner-image-pins.rb holds every ARC pool's pin to
-    # arc/arc-runner-image.txt).  actions/cache folds the compression it
-    # picks (zstd if the image has it, else gzip) into an entry's version.
-    # Were the two images ever to differ on zstd, Build, Build-LTTng and
-    # buildcache-seed.yml's seed, all on arc-default, could restore no entry
-    # this job saves, and no other job saves one.  The image's own fetch_mib
-    # (docker/ubuntu-ci/Dockerfile) then downloads the MIBs, as on any
-    # miss: slower, not broken.
+    # actions/cache folds the compression it picks (zstd if the image has
+    # it, else gzip) into an entry's version.  This job, Build and
+    # Build-LTTng are all GitHub-hosted (BLO-56666), so they agree.
+    # buildcache-seed.yml's seed still runs on ARC (arc-default, which lands
+    # in group 26), so it restores this job's entries only if the ARC runner
+    # image has zstd as the hosted image does.  The cache path is relative,
+    # so it does not split them.  On a miss the image's own fetch_mib
+    # (docker/ubuntu-ci/Dockerfile) downloads the MIBs: slower, not broken.
     # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
     # workflow refs, so a pull_request run cannot start there (BLO-55992).
     runs-on: ubuntu-latest
@@ -354,6 +353,12 @@ jobs:
         # restores; only master writes (see "Save ccache"), so a PR reads the
         # newest master entry through the prefix in restore-keys. A miss is a
         # cold compile, as before this cache existed, never a failure.
+        # actions/cache also folds the resolved path into the version, and
+        # runner.temp differs between hosted (/home/runner/work/_temp) and
+        # ARC (/home/runner/_work/_temp). So since BLO-56666 this job and
+        # buildcache-seed.yml's seed, still on ARC, cannot restore each
+        # other's entries under the shared key prefix; PRs read master
+        # Build's hosted entries.
         uses: actions/cache/restore@v5
         with:
           path: ${{ runner.temp }}/frr-ccache
@@ -803,7 +808,11 @@ jobs:
     # arc-default's pod template (Docker/NET_ADMIN/KVM) but is capacity-capped.
     # Hosted, like Build: see the comment on its runs-on.  BLO-56666 fallback
     # if a shard exceeds ~5 h here: default-ref only, on a group-26 pin.
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest: ubuntu-latest is Ubuntu 26.04
+    # (kernel 7.0.0-1019-azure), where apt finds no linux-modules-extra-azure
+    # or linux-modules-extra-$(uname -r), so "Host kernel prep" failed on all
+    # four legs before any topotest ran (run 43565548815).
+    runs-on: ubuntu-24.04
     needs: Build
     # BLO-35428: as for Unit-Test -- one lost Build leg no longer skips the
     # other platform's shards (run 35776450503); CI-Verdict still requires
@@ -1219,7 +1228,8 @@ jobs:
           # BLO-35428 footprint sampler -- measurement only, nothing gates on
           # it.  The container is not inside the DinD sidecar's cgroup and has
           # no resource bounds (see TOPOTEST_WORKERS), so this is the only
-          # record of one leg's real CPU/mem/pids; it feeds the capacity work.
+          # record of one leg's real CPU/mem/pids and root-disk headroom; it
+          # feeds the capacity work.
           # It runs in the background and can never fail this step: its exit
           # status is never waited on, errexit is off inside it, and the EXIT
           # trap kills it.  The first sample goes to this log with stderr
@@ -1240,6 +1250,7 @@ jobs:
             while sleep 30; do
               docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} pids={{.PIDs}}' 2>&1 \
                 | sed "s/^/$(date -u +%FT%TZ) /"
+              echo "$(date -u +%FT%TZ) disk:/ avail_mib=$(df -BM --output=avail / | tail -1 | tr -dc 0-9)"
             done
           ) &
           STATS_PID=$!
@@ -1491,6 +1502,11 @@ jobs:
           set -uo pipefail
           log="${RUNNER_TEMP}/topotest-stats.log"
           cont="frr-${RESULT_ID}-cont"
+          # Disk headroom on / (hosted VMs guarantee ~14 GB): the lowest free
+          # space any sample saw, plus the state now, before Cleanup.
+          awk '$2 == "disk:/" { v = $3; sub(/^avail_mib=/, "", v); if (m == "" || v + 0 < m) m = v + 0 }
+            END { printf "min_root_avail_mib=%s\n", (m == "" ? "unknown" : m) }' "${log}" 2>/dev/null || true
+          df -h / || true
           if [ ! -s "${log}" ]; then
             echo "::warning title=Footprint sampler recorded nothing::${log} is missing or empty; this leg's CPU/mem/pids footprint is unknown."
             exit 1
