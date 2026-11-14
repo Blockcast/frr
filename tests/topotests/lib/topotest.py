@@ -14,6 +14,7 @@ import difflib
 import errno
 import functools
 import glob
+import gzip
 import json
 import os
 import platform
@@ -762,6 +763,33 @@ def iproute2_is_fdb_get_capable():
     return False
 
 
+# Kconfig symbols for modules the topotests probe; a built-in (=y) module
+# never appears in /proc/modules and modprobe cannot find it (e.g. Talos).
+MODULE_KCONFIG = {
+    "mpls-router": "CONFIG_MPLS_ROUTING",
+    "mpls-iptunnel": "CONFIG_MPLS_IPTUNNEL",
+}
+
+
+def module_builtin_linux(module):
+    """Returns whether `module` is compiled into the running kernel."""
+    name = module.replace("-", "_")
+    try:
+        with open("/lib/modules/{}/modules.builtin".format(platform.release())) as f:
+            if any(l.rstrip().endswith("/{}.ko".format(name)) for l in f):
+                return True
+    except OSError:
+        pass
+    symbol = MODULE_KCONFIG.get(module)
+    if symbol is None:
+        return False
+    try:
+        with gzip.open("/proc/config.gz", "rt") as f:
+            return any(l.strip() == symbol + "=y" for l in f)
+    except OSError:
+        return False
+
+
 def module_present_linux(module, load):
     """
     Returns whether `module` is present.
@@ -771,6 +799,8 @@ def module_present_linux(module, load):
     with open("/proc/modules", "r") as modules_file:
         if module.replace("-", "_") in modules_file.read():
             return True
+    if module_builtin_linux(module):
+        return True
     cmd = "/sbin/modprobe {}{}".format("" if load else "-n ", module)
     if os.system(cmd) != 0:
         return False
