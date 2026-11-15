@@ -665,6 +665,9 @@ static void ifjoin_to_noinfo(struct pim_ifchannel *ch)
 
 	PIM_IF_FLAG_UNSET_PROTO_PIM(ch->flags);
 
+	/* The ET runs on in Prune-Pending; NoInfo runs none (RFC 7761 4.5.2) */
+	event_cancel(&ch->t_ifjoin_expiry_timer);
+
 	delete_on_noinfo(ch);
 }
 
@@ -934,6 +937,8 @@ void pim_ifchannel_join_add(struct interface *ifp, pim_addr neigh_addr,
 			pim_upstream_keep_alive_timer_start(
 				ch->upstream, pim_ifp->pim->keep_alive_time);
 		}
+		/* NoInfo -> Join starts the ET afresh (RFC 7761 4.5.2), below */
+		event_cancel(&ch->t_ifjoin_expiry_timer);
 		break;
 	case PIM_IFJOIN_JOIN:
 		assert(!ch->t_ifjoin_prune_pending_timer);
