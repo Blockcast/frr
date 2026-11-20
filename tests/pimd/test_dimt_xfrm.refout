@@ -1,0 +1,48 @@
+no policies: no-policy
+gre in: protected
+gre out: protected
+gre out missing: no-policy
+gre in, policy for another peer: no-policy
+fwd policy does not count: no-policy
+level use: no-policy
+covering /24 any proto: protected
+/31 that misses the remote: no-policy
+udp policy on a gre flow: no-policy
+higher-precedence clear policy: bypassed
+equal-priority clear policy: bypassed
+lower-precedence clear policy: protected
+wider clear policy above: bypassed
+key-specific clear policy above: bypassed
+block policy above: protected
+xfrm-interface clear policy above: protected
+marked clear policy above: bypassed
+sub policy: bypassed
+xfrm-interface protector: no-policy
+marked protector: no-policy
+key-specific protector: no-policy
+fou in: protected
+fou other port: no-policy
+fou any port: protected
+fou fixed source port: no-policy
+gre policy on a fou flow: no-policy
+clear policy on another udp port: protected
+v6 gre in: protected
+v6 covering /64: protected
+v6 /64 that misses the remote: no-policy
+v4 policy on a v6 flow: no-policy
+parse esp required: OK
+parsed policy protects: protected
+parse esp level use: OK
+parse ipcomp required, esp level use: OK
+parse esp required second: OK
+parse no template: OK
+parse zero mark: OK
+parse mark: OK
+parse if_id: OK
+parse security context: OK
+parse selector ifindex: OK
+parse sub type: OK
+parse short mark refused: OK
+parse truncated refused: OK
+parse other type refused: OK
+failures: 0

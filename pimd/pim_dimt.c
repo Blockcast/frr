@@ -28,6 +28,7 @@
 #include "stream.h"
 #include "jhash.h"
 #include "frrevent.h"
+#include "network.h"
 
 #include "pimd.h"
 #include "pim_instance.h"
@@ -42,6 +43,7 @@
 #include "pim_jp_agg.h"
 #include "pim_neighbor.h"
 #include "pim_dimt.h"
+#include "pim_dimt_xfrm.h"
 #include "pim_time.h"
 
 extern struct zclient *pim_zclient;
@@ -50,6 +52,8 @@ DEFINE_MTYPE_STATIC(PIMD, PIM_DIMT_UMH, "PIM DIMT UMH mapping");
 DEFINE_MTYPE_STATIC(PIMD, PIM_DIMT_ENDPOINT, "PIM DIMT tunnel endpoint");
 DEFINE_MTYPE_STATIC(PIMD, PIM_DIMT_TUNNEL, "PIM DIMT tunnel state");
 DEFINE_MTYPE_STATIC(PIMD, PIM_DIMT_REFUSED, "PIM DIMT refused UMH");
+DEFINE_MTYPE_STATIC(PIMD, PIM_DIMT_XFRM, "PIM DIMT XFRM policy watch");
+DEFINE_MTYPE_STATIC(PIMD, PIM_DIMT_XFRM_POL, "PIM DIMT XFRM policies");
 
 /* A UMH whose tunnel request is being refused at the per-box cap.  `seen`
  * is the mark for pim_dimt_reconcile()'s mark-and-sweep, which is what makes
@@ -91,9 +95,12 @@ void pim_dimt_init(struct pim_instance *pim)
 	pim->dimt_refused_list->del = pim_dimt_refused_free;
 }
 
+static void pim_dimt_xfrm_stop(struct pim_instance *pim);
+
 void pim_dimt_terminate(struct pim_instance *pim)
 {
 	event_cancel(&pim->dimt_umh_resync_timer);
+	pim_dimt_xfrm_stop(pim);
 	if (pim->dimt_umh_list)
 		list_delete(&pim->dimt_umh_list);
 	if (pim->dimt_endpoint_list)
@@ -235,6 +242,9 @@ enum pim_dimt_pin_source {
 	 * self-heals.  pim_dimt_forwarding_state() already separates them.
 	 */
 	PIM_DIMT_PIN_TUNNEL_FAILED,
+	/* `protect ipsec` holds the tunnel: the kernel would accept its outer
+	 * flow in clear, so there is no netdev to pin and no fallback either */
+	PIM_DIMT_PIN_TUNNEL_UNPROTECTED,
 
 	/* Sentinel, so the string table below can be size-checked.  Keep it
 	 * last and add new sources above it. */
@@ -250,6 +260,7 @@ static const char *const pim_dimt_pin_source_str[] = {
 	[PIM_DIMT_PIN_LIGHT] = "light",
 	[PIM_DIMT_PIN_TUNNEL_PENDING] = "tunnel-pending",
 	[PIM_DIMT_PIN_TUNNEL_FAILED] = "tunnel-failed",
+	[PIM_DIMT_PIN_TUNNEL_UNPROTECTED] = "tunnel-unprotected",
 };
 
 /*
@@ -351,7 +362,11 @@ static void pim_dimt_resolve_pin(struct pim_instance *pim, pim_addr umh_addr,
 	if (tun->ifindex)
 		tun_ifp = if_lookup_by_index(tun->ifindex, pim->vrf->vrf_id);
 
-	if (pim_dimt_iface_pinnable(tun_ifp)) {
+	if (tun->unprotected) {
+		/* Checked first: a held tunnel's netdev may still be up while
+		 * its DEL is in flight, and it must not carry the pin. */
+		pin->source = PIM_DIMT_PIN_TUNNEL_UNPROTECTED;
+	} else if (pim_dimt_iface_pinnable(tun_ifp)) {
 		pin->ifp = tun_ifp;
 		pin->source = PIM_DIMT_PIN_TUNNEL;
 	} else if (tun->state == PIM_DIMT_TUNNEL_FAILED) {
@@ -407,6 +422,9 @@ static struct interface *pim_dimt_light_iface(struct pim_instance *pim,
 	else if (PIM_DEBUG_PIM_TRACE &&
 		 pin.source == PIM_DIMT_PIN_TUNNEL_FAILED)
 		zlog_debug("DIMT: UMH %pPAs has a failed tunnel; not pinning until demand changes",
+			   &umh_addr);
+	else if (PIM_DEBUG_PIM_TRACE && pin.source == PIM_DIMT_PIN_TUNNEL_UNPROTECTED)
+		zlog_debug("DIMT: UMH %pPAs tunnel is held by protect ipsec; not pinning",
 			   &umh_addr);
 
 	return pin.ifp;
@@ -1145,6 +1163,7 @@ static struct pim_dimt_endpoint *pim_dimt_endpoint_find(struct pim_instance *pim
 
 static void pim_dimt_endpoint_apply_change(struct pim_instance *pim,
 					   const struct pim_dimt_endpoint *ep);
+static void pim_dimt_xfrm_start(struct pim_instance *pim);
 
 bool pim_dimt_endpoint_set(struct pim_instance *pim,
 			   const struct pim_dimt_endpoint *in)
@@ -1190,6 +1209,13 @@ bool pim_dimt_endpoint_set(struct pim_instance *pim,
 		if (ifp)
 			pim_dimt_ifp_adopt(pim, ifp);
 	}
+
+	/* protect_ipsec is pimd-local too; reconcile() re-judges every
+	 * demanded tunnel's hold, so starting the watch is all a flip needs.
+	 * The watch takes its first dump inline, so turning the knob on over
+	 * a tunnel that is already protected does not drop it. */
+	if (ep->protect_ipsec)
+		pim_dimt_xfrm_start(pim);
 
 	pim_dimt_reconcile(pim);
 	return true;
@@ -1242,6 +1268,8 @@ int pim_dimt_endpoint_config_write(struct pim_instance *pim, struct vty *vty)
 		 * keyword existed. */
 		if (ep->pim_normal)
 			vty_out(vty, " pim-mode normal");
+		if (ep->protect_ipsec)
+			vty_out(vty, " protect ipsec");
 		vty_out(vty, "\n");
 		written++;
 	}
@@ -1755,6 +1783,508 @@ void pim_dimt_vif_freed(struct pim_instance *pim)
 		pim_dimt_reconcile(pim);
 }
 
+/* ------------------------------------------------------------------------
+ * `protect ipsec`: hold a tunnel until the kernel forces ESP on its outer
+ * flow.
+ *
+ * Two NETLINK_XFRM sockets, opened only once a row asks for protection: one
+ * joined to the policy and expire groups and used purely as a trigger, and
+ * one that dumps the policy database.  The dump is the only truth -- no event
+ * is applied incrementally -- and anything short of a clean dump reads as
+ * unprotected.  The expire group is needed as well as the policy group: a
+ * hard policy expiry deletes the policy without a DELPOLICY and announces it
+ * only as a POLEXPIRE on XFRMNLGRP_EXPIRE (net/xfrm/xfrm_user.c,
+ * xfrm_exp_policy_notify()).
+ *
+ * Every XFRM request needs CAP_NET_ADMIN, checked against the sender at send
+ * time as well as against the socket's opener (xfrm_user_rcv_msg()), so the
+ * opens and every dump request run with privileges raised.
+ * ------------------------------------------------------------------------
+ */
+
+#ifdef __linux__
+
+/* Coalesce a burst of events (an IKE rekey raises several) into one dump. */
+#define PIM_DIMT_XFRM_DUMP_DELAY_MSEC 100
+/* Retry a failed open or dump this often; tunnels stay held meanwhile. */
+#define PIM_DIMT_XFRM_RETRY_SEC 10
+
+struct pim_dimt_xfrm {
+	int ev_fd;
+	int dump_fd;
+	struct event *t_ev;
+	struct event *t_dump_read;
+	struct event *t_dump;
+	struct event *t_retry;
+
+	/* the last clean dump, meaningful only while `valid` */
+	struct pim_dimt_xfrm_pol *pols;
+	size_t npols;
+	bool valid;
+
+	/* the dump in flight */
+	struct pim_dimt_xfrm_pol *next;
+	size_t nnext, cap;
+	uint32_t seq;
+	bool dumping;
+	bool dirty; /* an event arrived mid-dump: dump again after it */
+
+	int err; /* last failure, so a repeat does not log again */
+};
+
+/* Large enough that a netlink dump skb (capped at 32 KiB) never truncates. */
+static uint8_t pim_dimt_xfrm_buf[32768] __attribute__((aligned(8)));
+
+static enum pim_dimt_xfrm_verdict
+pim_dimt_xfrm_verdict(struct pim_instance *pim, const struct pim_dimt_tunnel *tun, bool inbound)
+{
+	struct pim_dimt_xfrm *x = pim->dimt_xfrm;
+	struct pim_dimt_xfrm_flow flow;
+	uint8_t dir = inbound ? XFRM_POLICY_IN : XFRM_POLICY_OUT;
+
+	if (!x || !x->valid)
+		return PIM_DIMT_XFRM_UNKNOWN;
+
+	pim_dimt_xfrm_flow_init(&flow, dir, &tun->req.outer_local, &tun->req.outer_remote,
+				tun->req.encap == ZAPI_DIMT_TUNNEL_ENCAP_GRE_IN_FOU ? tun->req.dport
+										    : 0);
+	return pim_dimt_xfrm_check(x->pols, x->npols, dir, &flow);
+}
+
+static void pim_dimt_xfrm_close(struct pim_dimt_xfrm *x)
+{
+	event_cancel(&x->t_ev);
+	event_cancel(&x->t_dump_read);
+	event_cancel(&x->t_dump);
+	if (x->ev_fd >= 0)
+		close(x->ev_fd);
+	if (x->dump_fd >= 0)
+		close(x->dump_fd);
+	x->ev_fd = x->dump_fd = -1;
+	XFREE(MTYPE_PIM_DIMT_XFRM_POL, x->next);
+	x->nnext = x->cap = 0;
+	x->dumping = x->dirty = false;
+}
+
+static bool pim_dimt_xfrm_changed(struct pim_instance *pim);
+static void pim_dimt_xfrm_retry(struct event *t);
+
+/* Anything short of a clean dump: forget the policy view -- which holds
+ * every protected tunnel -- and start over later. */
+static void pim_dimt_xfrm_fail(struct pim_instance *pim, const char *what, int err)
+{
+	struct pim_dimt_xfrm *x = pim->dimt_xfrm;
+
+	if (x->valid || x->err != err)
+		zlog_warn("DIMT: XFRM policy %s failed: %s; protect ipsec tunnels are held until a clean dump",
+			  what, safe_strerror(err));
+	x->err = err;
+	pim_dimt_xfrm_close(x);
+	XFREE(MTYPE_PIM_DIMT_XFRM_POL, x->pols);
+	x->npols = 0;
+	x->valid = false;
+	event_add_timer(router->master, pim_dimt_xfrm_retry, pim, PIM_DIMT_XFRM_RETRY_SEC,
+			&x->t_retry);
+	if (pim_dimt_xfrm_changed(pim))
+		pim_dimt_reconcile(pim);
+}
+
+/* One datagram from the kernel: >0 its length, 0 drained, <0 error. */
+static ssize_t pim_dimt_xfrm_recv(int fd)
+{
+	struct sockaddr_nl snl = {};
+	struct iovec iov = {
+		.iov_base = pim_dimt_xfrm_buf,
+		.iov_len = sizeof(pim_dimt_xfrm_buf),
+	};
+	struct msghdr msg = {
+		.msg_name = &snl,
+		.msg_namelen = sizeof(snl),
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+	};
+	ssize_t len;
+
+	do
+		len = recvmsg(fd, &msg, 0);
+	while (len < 0 && errno == EINTR);
+
+	if (len < 0)
+		return (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
+	/* Only the kernel speaks for the policy database, and a truncated
+	 * read has lost part of it. */
+	if (snl.nl_pid != 0 || (msg.msg_flags & MSG_TRUNC)) {
+		errno = EBADMSG;
+		return -1;
+	}
+	return len;
+}
+
+static void pim_dimt_xfrm_dump_send(struct pim_instance *pim)
+{
+	struct pim_dimt_xfrm *x = pim->dimt_xfrm;
+	struct nlmsghdr req = {
+		.nlmsg_len = NLMSG_LENGTH(0),
+		.nlmsg_type = XFRM_MSG_GETPOLICY,
+		.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP,
+	};
+	struct sockaddr_nl snl = { .nl_family = AF_NETLINK };
+	ssize_t ret = -1;
+	int err = 0;
+
+	/* A socket runs one dump at a time; this one restarts after it. */
+	if (x->dumping) {
+		x->dirty = true;
+		return;
+	}
+
+	req.nlmsg_seq = ++x->seq;
+	x->nnext = 0;
+	frr_with_privs (&pimd_privs) {
+		ret = sendto(x->dump_fd, &req, req.nlmsg_len, 0, (struct sockaddr *)&snl,
+			     sizeof(snl));
+		if (ret < 0)
+			err = errno;
+	}
+	if (ret < 0) {
+		pim_dimt_xfrm_fail(pim, "dump request", err);
+		return;
+	}
+	x->dumping = true;
+}
+
+static void pim_dimt_xfrm_dump(struct event *t)
+{
+	pim_dimt_xfrm_dump_send(EVENT_ARG(t));
+}
+
+static void pim_dimt_xfrm_commit(struct pim_instance *pim)
+{
+	struct pim_dimt_xfrm *x = pim->dimt_xfrm;
+
+	XFREE(MTYPE_PIM_DIMT_XFRM_POL, x->pols);
+	x->pols = x->next;
+	x->npols = x->nnext;
+	x->next = NULL;
+	x->nnext = x->cap = 0;
+	x->dumping = false;
+
+	if (!x->valid)
+		zlog_info("DIMT: XFRM policy watch up, %zu policies", x->npols);
+	x->valid = true;
+	x->err = 0;
+
+	if (x->dirty) {
+		x->dirty = false;
+		event_add_timer_msec(router->master, pim_dimt_xfrm_dump, pim,
+				     PIM_DIMT_XFRM_DUMP_DELAY_MSEC, &x->t_dump);
+	}
+
+	/* Only when a hold actually moves: a reconcile pass also re-requests
+	 * FAILED tunnels, and every IKE rekey lands here. */
+	if (pim_dimt_xfrm_changed(pim))
+		pim_dimt_reconcile(pim);
+}
+
+/* Take in whatever the dump socket holds.  False when that failed the
+ * watch (and closed the sockets). */
+static bool pim_dimt_xfrm_dump_drain(struct pim_instance *pim)
+{
+	struct pim_dimt_xfrm *x = pim->dimt_xfrm;
+	ssize_t len;
+
+	while ((len = pim_dimt_xfrm_recv(x->dump_fd)) > 0) {
+		struct nlmsghdr *nlh = (struct nlmsghdr *)pim_dimt_xfrm_buf;
+		unsigned int rest = len;
+
+		for (; NLMSG_OK(nlh, rest); nlh = NLMSG_NEXT(nlh, rest)) {
+			/* A late reply to a dump abandoned by a failure. */
+			if (!x->dumping || nlh->nlmsg_seq != x->seq)
+				continue;
+
+			if (nlh->nlmsg_type == NLMSG_ERROR) {
+				const struct nlmsgerr *e = NLMSG_DATA(nlh);
+
+				if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*e))) {
+					pim_dimt_xfrm_fail(pim, "dump", EBADMSG);
+					return false;
+				}
+				if (e->error) {
+					pim_dimt_xfrm_fail(pim, "dump", -e->error);
+					return false;
+				}
+				continue;
+			}
+
+			if (nlh->nlmsg_type == NLMSG_DONE) {
+				int derr = 0;
+
+				if (nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(derr)))
+					memcpy(&derr, NLMSG_DATA(nlh), sizeof(derr));
+				if (derr < 0) {
+					pim_dimt_xfrm_fail(pim, "dump", -derr);
+					return false;
+				}
+				pim_dimt_xfrm_commit(pim);
+				/* Anything left in the buffer belongs to the
+				 * finished dump's sequence. */
+				break;
+			}
+
+			if (nlh->nlmsg_type != XFRM_MSG_NEWPOLICY)
+				continue;
+
+			if (x->nnext == x->cap) {
+				x->cap = x->cap ? x->cap * 2 : 64;
+				x->next = XREALLOC(MTYPE_PIM_DIMT_XFRM_POL, x->next,
+						   x->cap * sizeof(*x->next));
+			}
+			if (!pim_dimt_xfrm_parse(nlh, &x->next[x->nnext])) {
+				pim_dimt_xfrm_fail(pim, "dump", EBADMSG);
+				return false;
+			}
+			x->nnext++;
+		}
+	}
+
+	if (len < 0) {
+		pim_dimt_xfrm_fail(pim, "dump read", errno);
+		return false;
+	}
+	return true;
+}
+
+static void pim_dimt_xfrm_dump_read(struct event *t)
+{
+	struct pim_instance *pim = EVENT_ARG(t);
+
+	if (pim_dimt_xfrm_dump_drain(pim))
+		event_add_read(router->master, pim_dimt_xfrm_dump_read, pim,
+			       pim->dimt_xfrm->dump_fd, &pim->dimt_xfrm->t_dump_read);
+}
+
+static void pim_dimt_xfrm_ev_read(struct event *t)
+{
+	struct pim_instance *pim = EVENT_ARG(t);
+	struct pim_dimt_xfrm *x = pim->dimt_xfrm;
+	ssize_t len;
+
+	/* The content does not matter: a policy event, an expiry, and a lost
+	 * event (ENOBUFS) all mean the same thing -- dump again. */
+	while ((len = pim_dimt_xfrm_recv(x->ev_fd)) > 0)
+		;
+	if (len < 0 && errno != ENOBUFS) {
+		pim_dimt_xfrm_fail(pim, "event read", errno);
+		return;
+	}
+
+	event_add_read(router->master, pim_dimt_xfrm_ev_read, pim, x->ev_fd, &x->t_ev);
+	event_add_timer_msec(router->master, pim_dimt_xfrm_dump, pim,
+			     PIM_DIMT_XFRM_DUMP_DELAY_MSEC, &x->t_dump);
+}
+
+/* Call with privileges raised. */
+static int pim_dimt_xfrm_socket(struct pim_instance *pim, bool events)
+{
+	struct sockaddr_nl snl = { .nl_family = AF_NETLINK };
+	static const int groups[] = { XFRMNLGRP_POLICY, XFRMNLGRP_EXPIRE };
+	int fd, err;
+	size_t i;
+
+	fd = vrf_socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM, pim->vrf->vrf_id, NULL);
+	if (fd < 0)
+		return -1;
+
+	if (bind(fd, (struct sockaddr *)&snl, sizeof(snl)) < 0)
+		goto fail;
+	for (i = 0; events && i < array_size(groups); i++)
+		if (setsockopt(fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &groups[i],
+			       sizeof(groups[i])) < 0)
+			goto fail;
+	if (set_nonblocking(fd) < 0 || set_cloexec(fd) < 0)
+		goto fail;
+	return fd;
+
+fail:
+	err = errno;
+	close(fd);
+	errno = err;
+	return -1;
+}
+
+static void pim_dimt_xfrm_open(struct pim_instance *pim)
+{
+	struct pim_dimt_xfrm *x = pim->dimt_xfrm;
+	int err = 0;
+
+	frr_with_privs (&pimd_privs) {
+		x->ev_fd = pim_dimt_xfrm_socket(pim, true);
+		if (x->ev_fd >= 0)
+			x->dump_fd = pim_dimt_xfrm_socket(pim, false);
+		if (x->ev_fd < 0 || x->dump_fd < 0)
+			err = errno;
+	}
+	if (err) {
+		pim_dimt_xfrm_fail(pim, "watch", err);
+		return;
+	}
+
+	event_add_read(router->master, pim_dimt_xfrm_ev_read, pim, x->ev_fd, &x->t_ev);
+
+	/* The first dump runs inline (the groups are already joined, so no
+	 * change can fall between): turning `protect ipsec` on over a tunnel
+	 * that is already protected must not see an empty view and tear it
+	 * down for the length of one event-loop round trip. */
+	pim_dimt_xfrm_dump_send(pim);
+	while (x->dumping) {
+		struct pollfd pfd = { .fd = x->dump_fd, .events = POLLIN };
+
+		if (poll(&pfd, 1, 1000) <= 0)
+			break; /* slow kernel: finish it from the event loop */
+		if (!pim_dimt_xfrm_dump_drain(pim))
+			return;
+	}
+	if (x->dump_fd >= 0)
+		event_add_read(router->master, pim_dimt_xfrm_dump_read, pim, x->dump_fd,
+			       &x->t_dump_read);
+}
+
+static void pim_dimt_xfrm_retry(struct event *t)
+{
+	pim_dimt_xfrm_open(EVENT_ARG(t));
+}
+
+static void pim_dimt_xfrm_start(struct pim_instance *pim)
+{
+	if (pim->dimt_xfrm)
+		return;
+
+	pim->dimt_xfrm = XCALLOC(MTYPE_PIM_DIMT_XFRM, sizeof(*pim->dimt_xfrm));
+	pim->dimt_xfrm->ev_fd = pim->dimt_xfrm->dump_fd = -1;
+	pim_dimt_xfrm_open(pim);
+}
+
+static void pim_dimt_xfrm_stop(struct pim_instance *pim)
+{
+	if (!pim->dimt_xfrm)
+		return;
+
+	pim_dimt_xfrm_close(pim->dimt_xfrm);
+	event_cancel(&pim->dimt_xfrm->t_retry);
+	XFREE(MTYPE_PIM_DIMT_XFRM_POL, pim->dimt_xfrm->pols);
+	XFREE(MTYPE_PIM_DIMT_XFRM, pim->dimt_xfrm);
+}
+
+#else /* !__linux__ */
+
+/* No XFRM: a row that asks for protection is held for good. */
+static enum pim_dimt_xfrm_verdict
+pim_dimt_xfrm_verdict(struct pim_instance *pim, const struct pim_dimt_tunnel *tun, bool inbound)
+{
+	return PIM_DIMT_XFRM_UNKNOWN;
+}
+
+static void pim_dimt_xfrm_start(struct pim_instance *pim)
+{
+}
+
+static void pim_dimt_xfrm_stop(struct pim_instance *pim)
+{
+}
+
+#endif /* __linux__ */
+
+/* Does `protect ipsec` hold this tunnel right now? */
+static bool pim_dimt_tunnel_unprotected(struct pim_instance *pim, const struct pim_dimt_tunnel *tun)
+{
+	const struct pim_dimt_endpoint *ep = pim_dimt_endpoint_find(pim, tun->umh);
+
+	return ep && ep->protect_ipsec &&
+	       (pim_dimt_xfrm_verdict(pim, tun, true) != PIM_DIMT_XFRM_PROTECTED ||
+		pim_dimt_xfrm_verdict(pim, tun, false) != PIM_DIMT_XFRM_PROTECTED);
+}
+
+/* Would a reconcile pass move any demanded tunnel's hold? */
+static bool __attribute__((unused)) pim_dimt_xfrm_changed(struct pim_instance *pim)
+{
+	struct listnode *node;
+	struct pim_dimt_tunnel *tun;
+
+	for (ALL_LIST_ELEMENTS_RO(pim->dimt_tunnel_list, node, tun))
+		if (tun->refcount && pim_dimt_tunnel_unprotected(pim, tun) != tun->unprotected)
+			return true;
+	return false;
+}
+
+/* Re-judge one demanded tunnel's hold, logging the edges. */
+static void pim_dimt_tunnel_protect_update(struct pim_instance *pim, struct pim_dimt_tunnel *tun)
+{
+	bool unprotected = pim_dimt_tunnel_unprotected(pim, tun);
+	enum pim_dimt_xfrm_verdict in, out;
+
+	if (unprotected == tun->unprotected)
+		return;
+	tun->unprotected = unprotected;
+
+	if (!unprotected) {
+		const struct pim_dimt_endpoint *ep = pim_dimt_endpoint_find(pim, tun->umh);
+
+		zlog_info("DIMT: tunnel %s to UMH %pPAs released: %s", tun->ifname, &tun->umh,
+			  ep && ep->protect_ipsec ? "the kernel requires ESP on its outer flow"
+						  : "protect ipsec removed");
+		/* A netdev that survived the hold (a refused DEL) was never
+		 * adopted.  Re-request it: zebra answers a byte-identical ADD
+		 * INSTALLED, and that notify adopts it -- outside this pass. */
+		if (tun->state == PIM_DIMT_TUNNEL_INSTALLED)
+			tun->state = PIM_DIMT_TUNNEL_IDLE;
+		return;
+	}
+
+	in = pim_dimt_xfrm_verdict(pim, tun, true);
+	out = pim_dimt_xfrm_verdict(pim, tun, false);
+	/* "unknown" is the watch's own failure, already logged there. */
+	if (in == PIM_DIMT_XFRM_UNKNOWN || out == PIM_DIMT_XFRM_UNKNOWN) {
+		if (PIM_DEBUG_PIM_TRACE)
+			zlog_debug("DIMT: tunnel %s to UMH %pPAs held: no XFRM policy view yet",
+				   tun->ifname, &tun->umh);
+		return;
+	}
+	zlog_warn("DIMT: tunnel %s to UMH %pPAs held by protect ipsec: inbound %s, outbound %s",
+		  tun->ifname, &tun->umh, pim_dimt_xfrm_verdict_name(in),
+		  pim_dimt_xfrm_verdict_name(out));
+}
+
+/* A held tunnel keeps its record -- that is what keeps the pin resolver off
+ * the covering-interface fallback -- but no netdev: without one the kernel
+ * has nothing to decapsulate a forged outer packet into.  The DEL takes the
+ * same path as a lost demand, except that REMOVED keeps the record. */
+static void pim_dimt_tunnel_hold(struct pim_instance *pim, struct pim_dimt_tunnel *tun)
+{
+	switch (tun->state) {
+	case PIM_DIMT_TUNNEL_IDLE:
+	case PIM_DIMT_TUNNEL_FAILED:
+		/* Nothing built, unless a zebra reconnect left one behind. */
+		if (!tun->kernel_present)
+			break;
+		/* fallthrough */
+	case PIM_DIMT_TUNNEL_REQUESTED:
+	case PIM_DIMT_TUNNEL_INSTALLED:
+		if (!pim_dimt_zclient_usable())
+			break;
+		pim_dimt_tunnel_prune_riders(pim, tun);
+		if (pim_dimt_tunnel_send(pim, tun, false)) {
+			tun->state = PIM_DIMT_TUNNEL_REMOVING;
+			tun->readd_pending = true;
+		} else {
+			pim_dimt_tunnel_rejoin_riders(pim, tun);
+		}
+		break;
+	case PIM_DIMT_TUNNEL_REMOVING:
+		tun->readd_pending = true;
+		break;
+	}
+}
+
 /* Recompute tunnel demand across every upstream and drive the resulting
  * ADD/DEL edges.  Idempotent by construction: it is safe (and expected) to
  * call this from any event that can change the answer. */
@@ -1840,6 +2370,11 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 
 	for (ALL_LIST_ELEMENTS(pim->dimt_tunnel_list, node, nnode, tun)) {
 		if (tun->refcount) {
+			pim_dimt_tunnel_protect_update(pim, tun);
+			if (tun->unprotected) {
+				pim_dimt_tunnel_hold(pim, tun);
+				continue;
+			}
 			switch (tun->state) {
 			case PIM_DIMT_TUNNEL_IDLE:
 			case PIM_DIMT_TUNNEL_FAILED:
@@ -1997,6 +2532,11 @@ void pim_dimt_ifp_adopt(struct pim_instance *pim, struct interface *ifp)
 		tun->ifindex = ifp->ifindex;
 		pim_dimt_mtu_check(tun, ifp);
 
+		/* Held by `protect ipsec`: this netdev is on its way out, so
+		 * no PIM on it meanwhile.  A release re-adopts. */
+		if (tun->unprotected)
+			return;
+
 		pim_ifp = ifp->info;
 		if (!pim_ifp)
 			pim_ifp = pim_if_new(ifp, false /*gm*/, true /*pim*/,
@@ -2078,6 +2618,11 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
 		ifp = if_lookup_by_index(notify->ifindex, pim->vrf->vrf_id);
 		if (ifp)
 			pim_dimt_ifp_adopt(pim, ifp);
+		/* The ADD crossed a hold (zebra refuses a DEL while an add is
+		 * still in its dataplane): take the netdev down now rather
+		 * than on whatever reconcile() pass comes next. */
+		if (tun->unprotected)
+			pim_dimt_tunnel_hold(pim, tun);
 		break;
 	case ZAPI_DIMT_TUNNEL_FAIL_INSTALL:
 		/* Includes zebra's anti-recursion refusal: an outer endpoint
@@ -2109,10 +2654,14 @@ void pim_dimt_tunnel_notify(struct pim_instance *pim,
 			/* The answer to our DEL. */
 			if (tun->readd_pending) {
 				tun->readd_pending = false;
-				tun->state =
-					pim_dimt_tunnel_send(pim, tun, true)
-						? PIM_DIMT_TUNNEL_REQUESTED
-						: PIM_DIMT_TUNNEL_IDLE;
+				/* Held by `protect ipsec`: keep the record,
+				 * build nothing until a dump releases it. */
+				if (tun->unprotected)
+					tun->state = PIM_DIMT_TUNNEL_IDLE;
+				else
+					tun->state = pim_dimt_tunnel_send(pim, tun, true)
+							     ? PIM_DIMT_TUNNEL_REQUESTED
+							     : PIM_DIMT_TUNNEL_IDLE;
 				break;
 			}
 			listnode_delete(pim->dimt_tunnel_list, tun);
@@ -2431,15 +2980,25 @@ void pim_dimt_show_tunnel(struct pim_instance *pim, struct vty *vty, bool json)
 	if (json)
 		jobj = json_object_new_object();
 	else
-		vty_out(vty, "%-16s %-10s %-16s %-10s %-8s %-8s %s\n", "UMH",
-			"TunnelId", "Interface", "State", "Refcount", "Ifindex",
-			"ZeroPkt");
+		vty_out(vty, "%-16s %-10s %-16s %-10s %-8s %-8s %-8s %s\n", "UMH", "TunnelId",
+			"Interface", "State", "Refcount", "Ifindex", "ZeroPkt", "IPsec");
 
 	if (!pim->dimt_tunnel_list)
 		goto done;
 
 	for (ALL_LIST_ELEMENTS_RO(pim->dimt_tunnel_list, node, tun)) {
 		uint32_t zero_pkt = pim_dimt_zero_pkt_count(pim, tun->ifindex);
+		const struct pim_dimt_endpoint *ep = pim_dimt_endpoint_find(pim, tun->umh);
+		bool protect = ep && ep->protect_ipsec;
+		const char *in = NULL, *out = NULL;
+		char ipsec[64] = "-";
+
+		if (protect) {
+			in = pim_dimt_xfrm_verdict_name(pim_dimt_xfrm_verdict(pim, tun, true));
+			out = pim_dimt_xfrm_verdict_name(pim_dimt_xfrm_verdict(pim, tun, false));
+			snprintf(ipsec, sizeof(ipsec), "%s(in:%s,out:%s)",
+				 tun->unprotected ? "held" : "ok", in, out);
+		}
 
 		if (jobj) {
 			json_object *jtun = json_object_new_object();
@@ -2455,12 +3014,17 @@ void pim_dimt_show_tunnel(struct pim_instance *pim, struct vty *vty, bool json)
 			json_object_int_add(jtun, "ifindex", tun->ifindex);
 			json_object_int_add(jtun, "joinedZeroPackets",
 					    zero_pkt);
+			json_object_boolean_add(jtun, "protectIpsec", protect);
+			if (protect) {
+				json_object_boolean_add(jtun, "ipsecHeld", tun->unprotected);
+				json_object_string_add(jtun, "ipsecInbound", in);
+				json_object_string_add(jtun, "ipsecOutbound", out);
+			}
 			json_object_object_add(jobj, umh_str, jtun);
 		} else {
-			vty_out(vty, "%-16pPAs %-10u %-16s %-10s %-8u %-8d %u\n",
-				&tun->umh, tun->tunnel_id, tun->ifname,
-				states[tun->state], tun->refcount,
-				tun->ifindex, zero_pkt);
+			vty_out(vty, "%-16pPAs %-10u %-16s %-10s %-8u %-8d %-8u %s\n", &tun->umh,
+				tun->tunnel_id, tun->ifname, states[tun->state], tun->refcount,
+				tun->ifindex, zero_pkt, ipsec);
 		}
 	}
 

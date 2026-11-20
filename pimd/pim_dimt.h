@@ -72,6 +72,10 @@ struct pim_dimt_endpoint {
 	 * the tunnel.  pim_dimt_endpoint_set() re-adopts the interface instead.
 	 */
 	bool pim_normal;
+	/* `protect ipsec`: hold the tunnel until the kernel's XFRM policy
+	 * requires ESP on its outer flow.  pimd-local, like pim_normal, so it
+	 * is not in the zapi request either. */
+	bool protect_ipsec;
 };
 
 /*
@@ -135,6 +139,11 @@ struct pim_dimt_tunnel {
 	 * for an id it does not know with REMOVED, which frees the record.
 	 */
 	bool kernel_present;
+	/* Held by `protect ipsec`: the kernel would accept this tunnel's
+	 * outer flow in clear, so no netdev is kept and nothing pins to it.
+	 * Recomputed for every demanded tunnel on each reconcile() pass.
+	 */
+	bool unprotected;
 	/* netdev MTU last checked against PIM_DIMT_PAYLOAD_FLOOR, so the
 	 * warning fires once per observed MTU, not on every re-adopt.
 	 */

@@ -189,6 +189,9 @@ struct pim_instance {
 	 * demand episode, and the UMHs currently refused (pim_addr *). */
 	uint64_t dimt_tunnel_refusals;
 	struct list *dimt_refused_list;
+	/* DIMT: the XFRM policy watch behind `protect ipsec`; NULL until a
+	 * row asks for it */
+	struct pim_dimt_xfrm *dimt_xfrm;
 	/* DIMT: bounds how long a zebra reconnect holds unreplayed mappings
 	 * before declaring them gone (pim_dimt_umh_resync_begin()) */
 	struct event *dimt_umh_resync_timer;
