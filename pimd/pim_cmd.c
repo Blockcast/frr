@@ -2758,7 +2758,7 @@ DEFPY (show_ip_pim_dimt_forwarding,
  */
 DEFPY (pim_dimt_tunnel_endpoint,
        pim_dimt_tunnel_endpoint_cmd,
-       "[no] dimt tunnel-endpoint A.B.C.D$umh inner-local A.B.C.D$inner_local outer-local <A.B.C.D|X:X::X:X>$outer_local outer <A.B.C.D|X:X::X:X>$outer_remote encap <gre|gre-in-fou>$encap [dport (1-65535)$dport] [key (0-4294967295)$key] [mtu (68-65535)$mtu] [pim-mode <normal|light>$pim_mode]",
+       "[no] dimt tunnel-endpoint A.B.C.D$umh inner-local A.B.C.D$inner_local outer-local <A.B.C.D|X:X::X:X>$outer_local outer <A.B.C.D|X:X::X:X>$outer_remote encap <gre|gre-in-fou>$encap [dport (1-65535)$dport] [key (0-4294967295)$key] [mtu (68-65535)$mtu] [pim-mode <normal|light>$pim_mode] [protect ipsec$protect_ipsec]",
        NO_STR
        "DIMT dynamic multicast tunneling\n"
        "Explicit tunnel endpoint for one Upstream Multicast Hop\n"
@@ -2782,7 +2782,9 @@ DEFPY (pim_dimt_tunnel_endpoint,
        "MTU value\n"
        "PIM mode to run on this tunnel's netdev\n"
        "Normal PIM: send hellos, form an adjacency, address Join/Prune to it\n"
-       "PIM Light (default): no hellos, Join/Prune addressed to the UMH\n")
+       "PIM Light (default): no hellos, Join/Prune addressed to the UMH\n"
+       "Require protection on the tunnel's outer flow\n"
+       "Hold the tunnel until the kernel's XFRM policy requires ESP on it\n")
 {
 	struct pim_dimt_endpoint ep = {};
 
@@ -2834,6 +2836,7 @@ DEFPY (pim_dimt_tunnel_endpoint,
 	/* Absent keyword == light, so an existing config line means exactly
 	 * what it meant before the keyword was added. */
 	ep.pim_normal = pim_mode && strmatch(pim_mode, "normal");
+	ep.protect_ipsec = !!protect_ipsec;
 
 	if (!pim_dimt_endpoint_set(pim, &ep)) {
 		vty_out(vty, "%% Invalid DIMT tunnel endpoint: outer addresses must share a family, and gre-in-fou requires a dport\n");

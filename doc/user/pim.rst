@@ -345,7 +345,7 @@ VRF where indicated), instead of under the 'router pim' submode.
    groups. The ``no`` form of the command disables the warning generation.
    This command is VRF-aware.
 
-.. clicmd:: dimt tunnel-endpoint A.B.C.D inner-local A.B.C.D outer-local <A.B.C.D|X:X::X:X> outer <A.B.C.D|X:X::X:X> encap <gre|gre-in-fou> [dport (1-65535)] [key (0-4294967295)] [mtu (68-65535)] [pim-mode <normal|light>]
+.. clicmd:: dimt tunnel-endpoint A.B.C.D inner-local A.B.C.D outer-local <A.B.C.D|X:X::X:X> outer <A.B.C.D|X:X::X:X> encap <gre|gre-in-fou> [dport (1-65535)] [key (0-4294967295)] [mtu (68-65535)] [pim-mode <normal|light>] [protect ipsec]
 
    Configure the tunnel used to reach one DIMT Upstream Multicast Hop (UMH),
    for dynamic multicast tunneling
@@ -359,6 +359,10 @@ VRF where indicated), instead of under the 'router pim' submode.
 
    ``pim-mode`` selects which flavour of PIM runs on the ``dimt-`` netdev,
    and defaults to ``light``. See :ref:`pim-dimt-pim-mode` below.
+
+   ``protect ipsec`` keeps the tunnel down until the kernel's IPsec (XFRM)
+   policy requires ESP on its outer flow in both directions. See
+   :ref:`pim-dimt-protect-ipsec` below.
 
    Two constraints are enforced, and violating either rejects the command
    with ``% Invalid DIMT tunnel endpoint``:
@@ -412,7 +416,7 @@ DIMT tunnel PIM mode, and what neighbor expiry does
 ``pim-mode`` on a :clicmd:`dimt tunnel-endpoint A.B.C.D inner-local A.B.C.D
 outer-local <A.B.C.D|X:X::X:X> outer <A.B.C.D|X:X::X:X> encap <gre|gre-in-fou>
 [dport (1-65535)] [key (0-4294967295)] [mtu (68-65535)] [pim-mode
-<normal|light>]` row chooses which flavour of PIM runs on that UMH's
+<normal|light>] [protect ipsec]` row chooses which flavour of PIM runs on that UMH's
 ``dimt-`` netdev.
 
 ``light`` (the default)
@@ -479,6 +483,88 @@ interface's lifecycle is owned by the endpoint configuration and zebra, not
 by adjacency state: a far-end pimd restart does not tear down the data path,
 and losing the pin is not a reason to remove a tunnel. The interface going
 *down* is a different event, and does unpin.
+
+.. _pim-dimt-protect-ipsec:
+
+DIMT tunnel protection (``protect ipsec``)
+------------------------------------------
+
+A DIMT tunnel is GRE between two outer addresses. Without more, any host
+that can send a packet with the far end's outer address as its source can
+put GRE into the ``dimt-`` netdev, and from there into PIM and into the data
+path the RPF pin admits. IPsec on the outer flow closes that: Linux checks
+inbound GRE (and the UDP of ``gre-in-fou``) against the XFRM policy database
+before decapsulating it, and a matching policy whose ESP template is at
+``level required`` rejects a packet that did not arrive under ESP.
+
+``protect ipsec`` on an endpoint row makes FRR refuse to use the tunnel
+until that protection is in place. FRR does not install IPsec itself; the
+policies and SAs come from the IKE daemon or from ``ip xfrm``. FRR only
+checks them:
+
+- The *outer flow* is GRE (IP protocol 47) between ``outer-local`` and
+  ``outer``, or, for ``gre-in-fou``, UDP to ``dport`` between them.
+- Each direction (``in``: from ``outer``; ``out``: to ``outer``) must be
+  covered in full by one policy that allows the traffic with an ESP template
+  at ``level required``.
+- No other policy that could match any part of that flow may let it through
+  without ESP at the same or a higher precedence (a lower or equal
+  ``priority`` value).
+
+Until both directions pass, the tunnel is *held*:
+
+- No ``dimt-`` netdev is kept for it. A tunnel that was up is torn down the
+  same way as one that lost its demand, its upstreams pruned first; one that
+  was never built is not requested. With no netdev, the kernel has nothing
+  to decapsulate a forged packet into. If zebra cannot delete the netdev
+  yet, pimd takes PIM and its multicast vif off it at once and retries the
+  delete.
+- Its row stays in :clicmd:`show ip pim [vrf NAME] dimt tunnel [json]`, and
+  the UMH's pin reports ``tunnel-unprotected``. As with a pending tunnel,
+  nothing else is pinned in its place.
+
+FRR re-checks whenever the kernel reports a policy added, updated, deleted,
+flushed or expired, by dumping the whole policy database again; a hard
+expiry is caught too. If the database cannot be read (for example pimd
+lacks ``CAP_NET_ADMIN``), every protected tunnel stays held and the read is
+retried every 10 seconds. Rows without ``protect ipsec`` are not affected,
+and FRR opens no XFRM socket until a row asks for protection.
+
+A transport-mode policy pair for a plain GRE tunnel, installed by hand
+(check what an IKE daemon installed with ``ip xfrm policy``)::
+
+   ip xfrm policy add src 192.0.2.1/32 dst 192.0.2.2/32 proto gre dir in \
+      tmpl src 192.0.2.1 dst 192.0.2.2 proto esp mode transport level required
+   ip xfrm policy add src 192.0.2.2/32 dst 192.0.2.1/32 proto gre dir out \
+      tmpl src 192.0.2.2 dst 192.0.2.1 proto esp mode transport level required
+
+The check fails closed, so these setups read as unprotected and hold the
+tunnel even where they may in fact protect it:
+
+- route-based IPsec, where the policy carries an ``if_id`` (XFRM
+  interfaces): a cleartext packet never matches such a policy;
+- a policy restricted by a ``mark``, a security context or a selector
+  ``dev``, since FRR cannot see which packets those match;
+- a selector that names a GRE key (the key travels in the selector's port
+  fields), or a fixed source port for ``gre-in-fou``;
+- sub-type policies (``ptype sub``);
+- protection done only by a firewall (nftables or iptables) rule, which FRR
+  does not read.
+
+And these are not checked:
+
+- ``net.ipv4.conf.*.disable_policy`` (and the IPv6 equivalent) turns the
+  inbound check off on an interface. Leave it off on the underlay.
+- For ``gre-in-fou`` the local FOU listener is assumed to use ``dport``,
+  the same port as the far end.
+- Whether SAs exist. A tunnel whose policies are in place but whose IKE has
+  not come up yet is protected and silent, not held.
+- A ``dimt-`` netdev left behind by an earlier pimd or zebra process is not
+  removed while held, and one whose delete zebra refuses stays until the next
+  retry. pimd does not run PIM on either.
+
+``protect ipsec`` is supported on Linux only; elsewhere a row with it is
+held for good.
 
 .. _pim-dimt-outer-header:
 
@@ -798,6 +884,11 @@ keyword at the end.
       here, and waiting will not clear it.  Check
       :clicmd:`show ip pim [vrf NAME] dimt tunnel [json]` and the endpoint row.
 
+   ``tunnel-unprotected``
+      the endpoint row has ``protect ipsec`` and the kernel's XFRM policy does
+      not yet require ESP on the tunnel's outer flow, so the tunnel is held
+      and nothing is pinned. See :ref:`pim-dimt-protect-ipsec`.
+
    ``none``
       nothing resolves.
 
@@ -819,8 +910,17 @@ keyword at the end.
    is one of ``idle``, ``requested``, ``installed``, ``failed`` or
    ``removing``.
 
+   ``IPsec`` is ``-`` for a row without ``protect ipsec``. Otherwise it is
+   ``ok`` or ``held``, followed by the verdict for each direction:
+   ``protected``, ``no-policy`` (no single policy covers the flow with ESP
+   required), ``bypassed`` (one does, but another lets part of the flow
+   through in clear at equal or higher precedence) or ``unknown`` (no policy
+   view yet). See :ref:`pim-dimt-protect-ipsec`.
+
    In JSON output the object is keyed by UMH address, and each value carries
-   ``tunnelId``, ``interface``, ``state``, ``refcount`` and ``ifindex``.
+   ``tunnelId``, ``interface``, ``state``, ``refcount``, ``ifindex`` and
+   ``protectIpsec``; with ``protect ipsec`` also ``ipsecHeld``,
+   ``ipsecInbound`` and ``ipsecOutbound``.
 
    The endpoints themselves are configured with the
    ``dimt tunnel-endpoint`` command.

@@ -1,0 +1,23 @@
+if !PIMD
+PYTEST_IGNORE += --ignore=pimd/
+endif
+if !LINUX
+PYTEST_IGNORE += --ignore=pimd/test_dimt_xfrm.py
+endif
+
+# The XFRM policy model behind `dimt tunnel-endpoint ... protect ipsec`.
+# pim_dimt_xfrm.c holds no pimd state, so it links alone.
+if PIMD
+if LINUX
+check_PROGRAMS += tests/pimd/test_dimt_xfrm
+endif
+endif
+tests_pimd_test_dimt_xfrm_CFLAGS = $(TESTS_CFLAGS)
+tests_pimd_test_dimt_xfrm_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_pimd_test_dimt_xfrm_LDADD = $(ALL_TESTS_LDADD)
+tests_pimd_test_dimt_xfrm_SOURCES = tests/pimd/test_dimt_xfrm.c \
+	pimd/pim_dimt_xfrm.c
+EXTRA_DIST += \
+	tests/pimd/test_dimt_xfrm.py \
+	tests/pimd/test_dimt_xfrm.refout \
+	# end
