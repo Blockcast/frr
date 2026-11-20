@@ -2257,7 +2257,9 @@ static void pim_dimt_tunnel_protect_update(struct pim_instance *pim, struct pim_
 /* A held tunnel keeps its record -- that is what keeps the pin resolver off
  * the covering-interface fallback -- but no netdev: without one the kernel
  * has nothing to decapsulate a forged outer packet into.  The DEL takes the
- * same path as a lost demand, except that REMOVED keeps the record. */
+ * same path as a lost demand, except that REMOVED keeps the record, and a
+ * DEL that cannot go out does not rejoin the riders: reconcile() strips PIM
+ * off the netdev regardless, and the next pass retries the DEL. */
 static void pim_dimt_tunnel_hold(struct pim_instance *pim, struct pim_dimt_tunnel *tun)
 {
 	switch (tun->state) {
@@ -2275,8 +2277,6 @@ static void pim_dimt_tunnel_hold(struct pim_instance *pim, struct pim_dimt_tunne
 		if (pim_dimt_tunnel_send(pim, tun, false)) {
 			tun->state = PIM_DIMT_TUNNEL_REMOVING;
 			tun->readd_pending = true;
-		} else {
-			pim_dimt_tunnel_rejoin_riders(pim, tun);
 		}
 		break;
 	case PIM_DIMT_TUNNEL_REMOVING:
@@ -2298,6 +2298,8 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 	struct pim_dimt_refused *ref;
 	uint32_t limit;
 	bool freed = false;
+	ifindex_t held[MAXVIFS];
+	size_t nheld = 0;
 
 	if (!pim->dimt_tunnel_list || !pim->dimt_endpoint_list)
 		return;
@@ -2450,6 +2452,20 @@ void pim_dimt_reconcile(struct pim_instance *pim)
 			tun->readd_pending = false;
 			break;
 		}
+	}
+
+	/* Fail closed whatever zebra does with the DELs above: a held tunnel's
+	 * netdev loses PIM and its vif now (the `no ip pim` path, which also
+	 * unpins its riders).  From a snapshot of ifindexes, because tearing
+	 * PIM off an interface can delete upstreams and so re-enter here. */
+	for (ALL_LIST_ELEMENTS_RO(pim->dimt_tunnel_list, node, tun))
+		if (tun->unprotected && tun->ifindex && nheld < array_size(held))
+			held[nheld++] = tun->ifindex;
+	while (nheld) {
+		struct interface *ifp = if_lookup_by_index(held[--nheld], pim->vrf->vrf_id);
+
+		if (ifp && ifp->info)
+			pim_pim_interface_delete(ifp);
 	}
 
 	/* The refusals above were judged against records this pass has just

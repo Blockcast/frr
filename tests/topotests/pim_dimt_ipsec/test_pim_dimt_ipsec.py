@@ -41,7 +41,13 @@ CWD = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(CWD, "../"))
 
 from lib import topotest
-from lib.kernel_state import check_gre_link, check_link_absent
+from lib.common_config import kill_router_daemons, start_router_daemons
+from lib.kernel_state import (
+    check_gre_link,
+    check_link_absent,
+    link_names,
+    resolve_mr_vif,
+)
 from lib.topogen import Topogen, TopoRouter, get_topogen
 
 pytestmark = [pytest.mark.bgpd, pytest.mark.pimd]
@@ -342,6 +348,38 @@ def test_hard_expiry_holds_the_tunnel():
     )
     expect(lambda: check_released(r2), count=2)
     expect(lambda: check_held(r2, "no-policy", "protected"), count=15)
+
+
+def test_hold_strips_pim_when_zebra_cannot_delete():
+    """With zebra gone the netdev cannot be deleted, so the hold must not
+    depend on it: the netdev stays, but loses its vif and the pin at once."""
+    tgen = get_topogen()
+    r2 = tgen.gears["r2"]
+
+    xfrm(r2, "add {} priority 100 {} level required".format(SEL_IN, TMPL_IN))
+    expect(lambda: check_released(r2))
+    ifname = tunnel_ifname(r2)
+
+    kill_router_daemons(tgen, "r2", ["zebra"])
+    xfrm(r2, "delete {}".format(SEL_IN))
+
+    def stripped():
+        error = check_tunnel(r2, "installed", True, "no-policy", "protected")
+        if error:
+            return error
+        if ifname not in (link_names(r2) or ()):
+            return "netdev {} is gone; this stage needs it kept".format(ifname)
+        vif, _ = resolve_mr_vif(r2, ifname)
+        if vif is not None:
+            return "held netdev {} still has vif {}".format(ifname, vif)
+        return check_pin_source(r2, "tunnel-unprotected")
+
+    expect(stripped)
+
+    # zebra back, policy back: the tunnel is released and adopted again.
+    start_router_daemons(tgen, "r2", ["zebra"])
+    xfrm(r2, "add {} priority 100 {} level required".format(SEL_IN, TMPL_IN))
+    expect(lambda: check_released(r2), count=60)
 
 
 def test_protect_off_releases_regardless_of_policy():

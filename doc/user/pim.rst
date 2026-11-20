@@ -516,7 +516,9 @@ Until both directions pass, the tunnel is *held*:
 - No ``dimt-`` netdev is kept for it. A tunnel that was up is torn down the
   same way as one that lost its demand, its upstreams pruned first; one that
   was never built is not requested. With no netdev, the kernel has nothing
-  to decapsulate a forged packet into.
+  to decapsulate a forged packet into. If zebra cannot delete the netdev
+  yet, pimd takes PIM and its multicast vif off it at once and retries the
+  delete.
 - Its row stays in :clicmd:`show ip pim [vrf NAME] dimt tunnel [json]`, and
   the UMH's pin reports ``tunnel-unprotected``. As with a pending tunnel,
   nothing else is pinned in its place.
