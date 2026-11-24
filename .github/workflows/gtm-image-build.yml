@@ -112,6 +112,8 @@ jobs:
   verify-build:
     if: github.repository == 'Blockcast/frr' && inputs.verify_reproducible
     runs-on: arc-default
+    # BLO-46578: bounded; a no-cache build takes ~32m (run 43536932674 build job).
+    timeout-minutes: 90
     strategy:
       matrix:
         replica: [a, b]
@@ -171,6 +173,7 @@ jobs:
   verify-reproducible:
     needs: verify-build
     runs-on: arc-default
+    timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@v4
         with:
